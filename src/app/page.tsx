@@ -2,7 +2,7 @@ import Link from "next/link";
 import { ArrowRight } from "lucide-react";
 import { TopNav } from "@/components/top-nav";
 import { Terrain } from "@/components/terrain";
-import { groups, topics, labs, livePages, SPINE } from "@/lib/manifest";
+import { groups, topics, labs, livePages, countOf } from "@/lib/manifest";
 import { cn } from "@/lib/utils";
 
 const DOT: Record<string, string> = {
@@ -13,6 +13,33 @@ const FROM: Record<string, string> = {
   machine: "from-machine", os: "from-os", conc: "from-conc", data: "from-data",
   dist: "from-dist", cloud: "from-cloud", ops: "from-ops", lab: "from-lab",
 };
+
+const SHAPE_CARDS = [
+  {
+    name: "Mechanism",
+    blurb: "A system you can open up and trace one operation through.",
+    steps: "contract → layout → hot path → failure → cost → operating",
+    count: `${countOf("mechanism")} chapters`,
+  },
+  {
+    name: "Decision",
+    blurb: "Several viable options, and the measured point where one overtakes another.",
+    steps: "choice → options → crossover → choosing → mistakes",
+    count: `${countOf("decision")} chapters`,
+  },
+  {
+    name: "Model",
+    blurb: "A small piece of theory that predicts something, and its limits.",
+    steps: "question → model → origin → breaks → applying",
+    count: `${countOf("model")} chapters`,
+  },
+  {
+    name: "Phenomenon",
+    blurb: "An effect you can observe and reproduce, not a component you can open.",
+    steps: "observe → why → controls → measurements → act",
+    count: `${countOf("phenomenon")} chapters`,
+  },
+];
 
 const RULES = [
   ["Every number is derived here or attributed.",
@@ -83,32 +110,35 @@ export default function Home() {
           </div>
         </section>
 
-        {/* ── the spine ────────────────────────────────────────────────── */}
+        {/* ── the shapes ───────────────────────────────────────────── */}
         <section className="pt-20">
           <div className="mb-3 text-[10.5px] font-semibold uppercase tracking-[0.15em] text-accent">
             How everything here is written
           </div>
-          <h2 className="mb-4 max-w-[22ch] text-[28px] font-bold leading-tight tracking-[-0.02em] text-ink sm:text-[36px]">
-            Six questions, asked of every system, in the same order
+          <h2 className="mb-4 max-w-[24ch] text-[28px] font-bold leading-tight tracking-[-0.02em] text-ink sm:text-[36px]">
+            Four shapes, and a chapter only gets the one that fits it
           </h2>
           <p className="mb-10 max-w-[62ch] text-[16px] leading-relaxed text-muted">
-            Redis and a mutex get the same interrogation. Learn the shape once, and the next
-            unfamiliar system is six familiar questions instead of one architecture diagram
-            you have to squint at.
+            A mutex and a queueing model are not the same kind of subject, so they
+            don&rsquo;t get the same sections. Each chapter declares its shape, and CI
+            fails if the sections don&rsquo;t match &mdash; which is how a template stops
+            being something you can feel.
           </p>
 
-          <ol className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-3">
-            {SPINE.map((s, i) => (
-              <li key={s} className="glass glass-hover group flex items-center gap-4 rounded-2xl p-4">
-                <span className="relative grid size-9 shrink-0 place-items-center rounded-xl border border-line bg-surface-2">
-                  <span className="tnum font-mono text-[12px] font-semibold text-accent">
-                    {String(i + 1).padStart(2, "0")}
-                  </span>
-                </span>
-                <span className="text-[15px] font-semibold text-ink">{s}</span>
-              </li>
+          <div className="grid gap-3 sm:grid-cols-2">
+            {SHAPE_CARDS.map((s) => (
+              <div key={s.name} className="glass rounded-2xl p-5">
+                <div className="mb-1.5 flex items-baseline gap-2.5">
+                  <span className="text-[15.5px] font-semibold text-ink">{s.name}</span>
+                  <span className="tnum font-mono text-[11px] text-faint">{s.count}</span>
+                </div>
+                <p className="mb-3 text-[13.5px] leading-relaxed text-muted">{s.blurb}</p>
+                <div className="font-mono text-[11.5px] leading-relaxed text-accent">
+                  {s.steps}
+                </div>
+              </div>
             ))}
-          </ol>
+          </div>
         </section>
 
         {/* ── groups ───────────────────────────────────────────────────── */}

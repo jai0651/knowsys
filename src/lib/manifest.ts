@@ -72,3 +72,9 @@ export function neighbours(slug: string): { prev?: Page; next?: Page } {
   if (i === -1) return {};
   return { prev: list[i - 1], next: list[i + 1] };
 }
+
+/** How many chapters use a given shape. Read from the manifest so the homepage
+ *  cannot claim a count the content does not have. */
+export function countOf(a: string): number {
+  return topics.filter((p) => (p.archetype ?? "mechanism") === a).length;
+}
