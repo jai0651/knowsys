@@ -12,6 +12,7 @@ import { Mdx } from "@/components/mdx";
 import { readDoc, outlineOf } from "@/lib/mdx";
 import { topics, pageBySlug, neighbours, colourOf } from "@/lib/manifest";
 import { shapeOf } from "@/lib/spine";
+import { Notes } from "@/components/notes/notes";
 
 export function generateStaticParams() {
   return topics.map((p) => ({ slug: p.slug }));
@@ -60,7 +61,7 @@ export default async function TopicPage({ params }: { params: Promise<{ slug: st
           <div className="mx-auto max-w-[768px] px-1 sm:px-6">
             <ChapterHeader page={page} colour={colour} fm={doc?.frontmatter} />
 
-            <article className="prose">
+            <article className="prose" id="chapter-body">
               {doc ? (
                 <Mdx source={doc.body} />
               ) : (
@@ -103,6 +104,8 @@ export default async function TopicPage({ params }: { params: Promise<{ slug: st
 
         <SpineRail spine={railSpine} tail={railTail} title={shape.name} />
       </div>
+
+      <Notes title={page.title} />
     </>
   );
 }
