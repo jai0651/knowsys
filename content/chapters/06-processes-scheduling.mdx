@@ -1,0 +1,393 @@
+---
+title: Processes, Threads & Scheduling
+dek: "Your thread is runnable far more often than it is running. Everything that makes a service feel slow under load lives in that gap."
+readingTime: "~23 min"
+versions: "Measured on Apple M4 (4P + 6E cores) · Linux EEVDF behaviour attributed"
+prereqs: "Chapters 13 and 16"
+updated: "2026-09-19"
+---
+
+<SectionHeading n="01" cmd="cat CONTRACT.md" id="contract">The contract</SectionHeading>
+
+A scheduler promises that every runnable thread eventually runs. That's close to
+the entire guarantee, and it's weaker than most people design against.
+
+It does not promise when. It does not promise for how long. It does not promise
+which core, and on a machine with fast and slow cores it does not promise they
+are equivalent. Anything your design needs beyond "eventually" probably has to come from
+somewhere else — priorities, affinity, or a real-time class.
+
+<Callout label="Process or thread is a memory question">
+Both are schedulable. What differs is what they share. Threads in one process
+share an address space, file descriptors and signal handlers; processes share
+nothing by default. So "should this be a thread or a process" is really "do I
+want a shared address space, or do I want a failure boundary" — and the
+scheduler treats them almost identically either way.
+</Callout>
+
+<Sub n="1.1" title="Thread states, and the one that matters">
+
+<Compare
+  cols={["State", "Meaning", "Shows up in"]}
+  rows={[
+    ["Running", "On a core right now", "CPU profiles, flame graphs"],
+    ["Runnable", "Ready, waiting for a core", "Run queue depth. Almost nothing else."],
+    ["Blocked", "Waiting on I/O, a lock, a timer", "Off-CPU analysis only"],
+  ]}
+/>
+
+**Runnable-but-not-running is invisible in a CPU profile** and is where latency
+under load actually comes from. A thread in that state burns no cycles, so it
+never appears in a flame graph, and every symptom looks like something else.
+
+</Sub>
+
+<SectionHeading n="02" cmd="hexdump -C ./layout" id="layout">The layout</SectionHeading>
+
+<Sub n="2.1" title="What a context switch has to save">
+
+Switching threads within one process means saving registers and the stack
+pointer. Switching between processes additionally swaps the page table root,
+which invalidates translation caching — chapter 04's TLB, refilled from scratch.
+
+That difference is why thread switches are cheaper than process switches, and
+why Meltdown mitigations made even same-process syscalls more expensive: page
+table isolation reintroduced part of that cost on every kernel entry.
+
+</Sub>
+
+<Sub n="2.2" title="How Linux decides">
+
+Linux ran CFS for fifteen years and replaced it with **EEVDF** in 6.6. Both are
+fair-share schedulers: each thread gets CPU time proportional to its weight,
+with weight derived from nice value.
+
+EEVDF adds an explicit notion of **lag** — how far a thread is from its fair
+share — and a deadline, so a thread that has been starved is picked first. In
+practice it improves latency for threads that wake rarely — most interactive
+and I/O-bound work.
+
+What neither does is guarantee anything. Fair share is a target the scheduler
+converges toward, not a contract for any individual slice.
+
+</Sub>
+
+<Sub n="2.3" title="Heterogeneous cores">
+
+This machine has performance and efficiency cores. So does every recent phone,
+and so do Intel's P/E designs. The scheduler places threads based on utilisation
+history and thermal state, and **the same thread can run at very different
+speeds depending on where it lands.**
+
+That breaks a background assumption in almost every benchmark: that threads are
+interchangeable. Section 5 shows it directly — going from one thread to five
+gives 4.3× instead of the 5× you'd expect, because those five didn't all get
+equal hardware.
+
+</Sub>
+
+<SectionHeading n="03" cmd="perf record ./hot-path" id="hot-path">The hot path</SectionHeading>
+
+<Flow
+  wrap={3}
+  steps={[
+    { label: "timer interrupt", sub: "or a blocking call" },
+    { label: "scheduler runs", sub: "pick the next thread", accent: true },
+    { label: "save state", sub: "registers, stack pointer" },
+    { label: "swap page table", sub: "only across processes" },
+    { label: "restore state", sub: "the incoming thread's registers" },
+    { label: "return to user", sub: "cold caches, cold TLB" },
+  ]}
+/>
+
+<Sub n="3.1" title="The cost you cannot see in the switch">
+
+Counting the switch itself undersells it. The incoming thread finds a cache
+full of somebody else's data and a TLB that no longer describes its address
+space. Those refills happen *after* the switch completes, charged to your
+thread's execution time, and they can dwarf the switch.
+
+That's the mechanism behind convoy latency in chapter 16: not the handoff cost,
+but everything each woken thread has to re-warm.
+
+</Sub>
+
+<SectionHeading n="04" cmd="dmesg | grep -i fail" id="failure">When it fails</SectionHeading>
+
+<Sub n="4.1" title="cgroup CPU throttling">
+
+Container CPU limits are enforced by quota over a period — by default 100 ms.
+A container with a 0.5 CPU limit gets 50 ms of CPU per 100 ms window. Spend it
+in the first 20 ms and **your process is frozen for the remaining 80**.
+
+This is the most under-diagnosed latency problem in containerised services. The
+symptoms are distinctive once you know them: p99 latency in clean multiples of
+100 ms, average CPU usage well under the limit, and no application-level
+explanation. Check `nr_throttled` and `throttled_time` in `cpu.stat`.
+
+A multi-threaded runtime probably makes it worse. Eight threads burning quota
+concurrently exhaust a 50 ms budget in about 6 ms of wall time, then stall for
+94.
+
+</Sub>
+
+<Sub n="4.2" title="Oversubscription and priority inversion">
+
+More runnable threads than cores means time-slicing, which means every thread's
+latency grows even though throughput may not. Section 5 measures the point
+where adding threads stops helping.
+
+Priority inversion belongs here too — chapter 13 covers it, but note that Linux
+`nice` only affects the fair-share weight. A `nice 19` thread still runs, and
+still holds any lock it took.
+
+</Sub>
+
+<Sub n="4.3" title="Thundering herds">
+
+Wake a hundred threads for one available unit of work and ninety-nine wake up,
+context switch, find nothing, and go back to sleep. `epoll` has `EPOLLEXCLUSIVE`
+and futexes have `FUTEX_WAKE` with a count precisely to avoid this. The default
+for condition variables is `notify_one` for the same reason, and the reflex to reach for `notify_all` is
+probably a bug.
+
+</Sub>
+
+<SectionHeading n="05" cmd="perf stat ./bench" id="cost">What it costs</SectionHeading>
+
+<Callout label="The machine" kind="note">
+Apple M4, 10 cores, macOS 26.5.1, clang 21 `-O2`. Core placement is the
+scheduler's choice and this chip has both performance and efficiency cores, so
+the scaling numbers reflect a heterogeneous machine. That's the normal case
+now, not an exotic one.
+</Callout>
+
+<Sub n="5.1" title="The primitives">
+
+<Cost items={[
+  { what: "Create and join an OS thread", value: "13.8 µs", source: "2,000 iterations" },
+  { what: "Round trip between two live threads", value: "109 ns", source: "200k ping-pongs through an atomic" },
+  { what: "sched_yield()", value: "75 ns", source: "500k calls, no other runnable thread" },
+]} />
+
+Creation is about 127× a round trip. That ratio is the argument for pools, and
+chapter 15 works it through.
+
+</Sub>
+
+<Sub n="5.2" title="Where adding threads stops helping">
+
+Fixed total work — 40 million multiply-adds — split across an increasing number
+of threads on a 10-core machine.
+
+<Figure caption="Scaling stops at the core count and then goes flat. Not worse — the scheduler is doing its job — but definitively not better.">
+<Plot
+  xLabel="threads"
+  yLabel="wall time (ms)"
+  xTicks={[1, 5, 10, 20, 40]}
+  series={[{ name: "measured", points: [[1,36.29],[5,8.46],[10,4.40],[20,4.42],[40,4.45]] }]}
+/>
+</Figure>
+
+<Compare
+  cols={["Threads", "Wall time", "Speedup", "Reading"]}
+  rows={[
+    ["1", "36.29 ms", "1.0×", "Baseline, one core"],
+    ["5", "8.46 ms", "4.3×", "Not 5× — see below"],
+    ["10", "4.40 ms", "8.2×", "All ten cores, not 10×"],
+    ["20", "4.42 ms", "8.2×", "Oversubscribed. No gain."],
+    ["40", "4.45 ms", "8.2×", "Still no gain, and no collapse."],
+  ]}
+/>
+
+Two findings, and the second surprised me.
+
+**Scaling falls short of linear at every point.** Five threads gives 4.3× and
+ten gives 8.2×, not 5× and 10×. On a homogeneous machine you'd blame memory
+bandwidth. Here the likelier explanation is efficiency cores doing genuinely
+less work per unit time — the threads aren't running on equivalent hardware. I
+haven't isolated that with core pinning, which macOS makes awkward, so treat it
+as the leading hypothesis and not a proven cause.
+
+**Oversubscription costs almost nothing here.** Going from 10 to 40 threads —
+4× the runnable threads — changed wall time by under 1%. Time-slicing overhead
+on modern schedulers is genuinely small for CPU-bound work. What it does destroy
+is *latency*, which this measurement doesn't show. Chapter 16 has that side.
+
+</Sub>
+
+<SectionHeading n="06" cmd="watch -n1 ./status" id="operating">Operating it</SectionHeading>
+
+<Sub n="6.1" title="Finding scheduling problems">
+
+```shell
+# Runnable-but-not-running. The number that matters, and the one nobody watches.
+vmstat 1                     # 'r' column = run queue depth
+perf sched latency --sort max
+
+# Where a thread went to sleep, and for how long
+perf record -e sched:sched_switch -g ./app
+
+# Container throttling — check this FIRST in any container
+cat /sys/fs/cgroup/cpu.stat  | grep -E 'nr_throttled|throttled_usec'
+
+# Which core, and did it move?
+perf stat -e context-switches,cpu-migrations ./app
+taskset -c 0-3 ./app         # pin, then re-measure
+```
+
+If `nr_throttled` is climbing, stop everything else and fix that. No other
+measurement in a throttled container means anything.
+
+</Sub>
+
+<Sub n="6.2" title="Reading the symptoms">
+
+<Compare
+  cols={["Symptom", "Likely cause", "Check"]}
+  rows={[
+    ["p99 in multiples of 100 ms", "cgroup CPU throttling", "cpu.stat nr_throttled"],
+    ["High run queue, low CPU%", "Blocked on I/O, or throttled", "vmstat r column, then off-CPU"],
+    ["More threads, same throughput", "At the core count already", "Count cores; check affinity"],
+    ["Latency varies run to run", "Heterogeneous core placement", "Pin with taskset and compare"],
+    ["Many wakeups, little work", "Thundering herd", "notify_all, or epoll without EXCLUSIVE"],
+  ]}
+/>
+
+</Sub>
+
+<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+
+**Reproduce cgroup throttling on purpose**, because recognising its signature
+once is worth more than reading about it three times.
+
+- Run a CPU-bound loop in a container limited to 0.5 CPU.
+- Record per-iteration latency and plot the distribution.
+- You should see clean stalls around 100 ms — the quota period.
+- Now give it 4 threads at the same 0.5 limit. The stalls get longer and more
+  frequent, because four threads drain the quota four times faster.
+
+Then read `cpu.stat` and match `throttled_usec` against the gaps you plotted.
+Once you've seen that shape you'll recognise it in a production dashboard in
+about five seconds.
+
+<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
+
+<Compare
+  cols={["You get", "You pay", "When the bill arrives"]}
+  rows={[
+    ["Preemptive multitasking", "No control over when you run", "As latency variance nobody can attribute"],
+    ["Fair-share scheduling", "Fair is not predictable", "When one tenant needs a guarantee"],
+    ["Cheap oversubscription for throughput", "Latency degrades even when throughput doesn't", "At p99, never at the mean"],
+    ["cgroup CPU limits", "Quota exhaustion freezes you for the rest of the period", "As p99 in multiples of 100 ms"],
+    ["Heterogeneous cores and better battery", "Threads are no longer interchangeable", "As benchmarks that will not reproduce"],
+  ]}
+/>
+
+<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
+
+<CardGrid>
+  <WildCard name="The Kubernetes CPU limits debate" verdict="A rare case where the community consensus moved to 'do not set the limit at all' — set requests, skip limits, and let the scheduler do its job.">
+    Years of blog posts and incident reports about services throttled while
+    apparently using 30% CPU. The mechanism is quota-per-period, and a bursty
+    multi-threaded runtime exhausts a period's budget in a fraction of it.
+  </WildCard>
+  <WildCard name="EEVDF replacing CFS in Linux 6.6" verdict="Worth knowing which one you are on, because latency behaviour for rarely-waking threads changed noticeably.">
+    Peter Zijlstra's rewrite after fifteen years of CFS, adding explicit lag
+    tracking and deadlines so starved threads get picked first.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What's the difference between a process and a thread?">
+What they share. Threads within a process share an address space, file
+descriptors and signal handlers; processes share none of that by default. Both
+are scheduled the same way on Linux — the kernel schedules tasks and doesn't
+much care which kind you made.
+
+So the real question is whether you want a shared address space or a failure
+boundary. A crashed thread takes the process with it; a crashed process doesn't.
+</QA>
+
+<QA level="intermediate" q="Your containerised service has p99 latency at almost exactly 100 ms multiples and uses 30% CPU. What is it?">
+cgroup CPU throttling. Limits are enforced as a quota per period, 100 ms by
+default. Once the quota is spent the container is frozen until the period rolls
+over, so stalls quantise to the period length.
+
+Average CPU looks low because the average includes the frozen time. Check
+`nr_throttled` and `throttled_usec` in `cpu.stat`. A multi-threaded runtime
+makes it worse — eight threads drain a 50 ms budget in about 6 ms of wall time.
+</QA>
+
+<QA level="intermediate" q="You doubled threads from 10 to 20 on a 10-core box. Throughput is unchanged. Is that expected?">
+Yes for CPU-bound work. Ten threads already saturate ten cores; the rest just
+time-slice. I measured 4.40 ms at 10 threads and 4.42 ms at 20 — under 1%
+difference, so the scheduler's overhead is genuinely small.
+
+What does change is latency. Each thread now waits behind others, so p99
+degrades while throughput holds. If your work is I/O-bound the answer flips, and
+more threads help until you run out of something else.
+</QA>
+
+<QA level="deep" q="Why is a context switch more expensive than the register save suggests?">
+Because the expensive part happens after it. The incoming thread finds caches
+holding another thread's data and, across processes, a TLB that no longer
+describes its address space. Those refills are charged to your thread's run
+time, not to the switch.
+
+Crossing processes also swaps the page table root. Meltdown mitigations made
+this worse by unmapping most kernel pages from the user page table, so even a
+syscall now involves page table work that used to be free.
+</QA>
+
+<QA level="deep" q="Scaling to 5 threads gave 4.3x and to 10 gave 8.2x on a 10-core machine. Why not linear?">
+On a homogeneous machine I'd suspect memory bandwidth or a shared resource. On
+this one the likelier cause is heterogeneous cores: the M4 has performance and
+efficiency cores, and a thread on an E-core does less work per unit time. Five
+threads probably didn't all land on P-cores.
+
+I haven't proven that — pinning threads to core types on macOS is awkward and I
+didn't do it. On Linux it's one `taskset` away, and that's the experiment that
+would settle it.
+</QA>
+
+<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Which thread state is invisible in a CPU flame graph?">
+    Runnable-but-not-running, and blocked. Neither burns cycles, so neither
+    appears — and that's where latency under load lives.
+  </Q>
+  <Q q="Your container is limited to 0.5 CPU and has 8 threads. What happens?">
+    Eight threads drain the 50 ms quota about eight times faster, so you stall
+    for most of each 100 ms period. More threads makes throttling worse, not
+    better.
+  </Q>
+  <Q q="Roughly what does creating an OS thread cost compared to using an existing one?">
+    Around 127× on this hardware — 13.8 µs to create and join, against 109 ns
+    for a round trip between two live threads.
+  </Q>
+  <Q q="Why might the same benchmark give different numbers run to run on a modern laptop?">
+    Heterogeneous cores. Placement on performance versus efficiency cores is the
+    scheduler's choice and it varies. Pin threads before comparing.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Linux — EEVDF scheduler (LWN coverage)">
+    Jonathan Corbet's write-ups on the CFS replacement, and the clearest
+    explanation of lag and virtual deadlines available.
+  </WildCard>
+  <WildCard name="Brendan Gregg — Off-CPU Analysis">
+    The technique for finding time your threads spend not running. Complements
+    a flame graph exactly where a flame graph is blind.
+  </WildCard>
+  <WildCard name="'CPU limits and aggressive throttling in Kubernetes'">
+    The Omio post that made this a mainstream concern, with reproductions.
+  </WildCard>
+  <WildCard name="cpu.stat and the cgroup v2 docs">
+    `nr_throttled` and `throttled_usec`. Two counters that resolve a whole class
+    of latency mystery in one `cat`.
+  </WildCard>
+</CardGrid>

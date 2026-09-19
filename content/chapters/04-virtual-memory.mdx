@@ -1,0 +1,388 @@
+---
+title: Virtual Memory & Page Tables
+dek: "Every address your program uses is fake. Translating it costs a cache of its own, and running out of that cache is a performance cliff nobody profiles for."
+readingTime: "~23 min"
+versions: "Measured on Apple M4 · 16 KB base pages · macOS 26.5.1"
+prereqs: "Chapter 02"
+updated: "2026-09-19"
+---
+
+<SectionHeading n="01" cmd="cat CONTRACT.md" id="contract">The contract</SectionHeading>
+
+Virtual memory sells you three things at once, and most people only notice the
+first.
+
+- **A private address space.** Your pointers mean nothing in another process.
+- **More address space than RAM.** Allocation reserves addresses; physical
+  pages arrive later, or never.
+- **Protection and sharing.** Per-page permissions, and one physical page
+  mappable into many address spaces at different addresses.
+
+What it doesn't sell you is free translation. Every load and store needs a
+virtual-to-physical lookup, and section 5 measures what happens when those
+lookups stop hitting their cache.
+
+<Callout label="The size that is probably not what you think">
+Page size is 4 KB on x86-64 Linux and **16 KB on Apple Silicon**. That changes
+the arithmetic for TLB reach, for internal fragmentation, and for how many
+pages your allocation actually touches. Query it — `getconf PAGE_SIZE` — instead of
+assuming.
+</Callout>
+
+<SectionHeading n="02" cmd="hexdump -C ./layout" id="layout">The layout</SectionHeading>
+
+<Sub n="2.1" title="A page table is a tree">
+
+Mapping every address individually would need a table bigger than memory. So
+the address is split into fields that index successive levels of a radix tree,
+and only populated branches exist.
+
+<Figure caption="Four levels on x86-64. An unmapped region costs nothing because its branch is simply absent. That's how a process reserves terabytes and consumes kilobytes.">
+<Tree
+  nodeWidth={110}
+  root={{
+    label: "PGD", sub: "bits 47-39",
+    children: [
+      { label: "PUD", sub: "bits 38-30", children: [
+        { label: "PMD", sub: "bits 29-21", children: [
+          { label: "PTE", sub: "bits 20-12", accent: true },
+          { label: "PTE", sub: "…" },
+        ]},
+      ]},
+      { label: "(absent)", sub: "nothing mapped", dim: true },
+    ],
+  }}
+/>
+</Figure>
+
+A miss in the translation cache means walking that tree: four dependent memory
+accesses, each of which can itself miss cache. That's the cost section 5
+isolates.
+
+</Sub>
+
+<Sub n="2.2" title="The TLB, and the word 'reach'">
+
+Walking the tree on every access would be unusable, so translations are cached
+in the **TLB**. The number that matters is **reach** — entries × page size —
+because that's how much memory you can touch before translations start missing.
+
+<Compare
+  cols={["Configuration", "Entries (typical)", "Reach"]}
+  rows={[
+    ["x86-64, 4 KB pages", "~1,500 L2 TLB", "~6 MB"],
+    ["x86-64, 2 MB huge pages", "~1,500", "~3 GB"],
+    ["Apple Silicon, 16 KB pages", "~3,000 (undocumented)", "~48 MB"],
+  ]}
+/>
+
+Look at rows one and two. **Same TLB, same silicon, 500× the reach**, purely
+from page size. That's the entire argument for huge pages, and it's why
+databases and JVMs go out of their way to get them.
+
+</Sub>
+
+<SectionHeading n="03" cmd="perf record ./hot-path" id="hot-path">The hot path</SectionHeading>
+
+<Sub n="3.1" title="From pointer to byte">
+
+<Flow
+  wrap={3}
+  steps={[
+    { label: "virtual address", sub: "what your pointer holds" },
+    { label: "TLB lookup", sub: "hit → physical address, ~free", accent: true },
+    { label: "cache access", sub: "chapter 02 takes over" },
+    { label: "TLB miss", sub: "walk the page table" },
+    { label: "4 dependent loads", sub: "each may miss cache itself" },
+    { label: "page not present", sub: "→ trap to the kernel" },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="3.2" title="Lazy allocation, and why malloc is a liar">
+
+`malloc(1_000_000_000)` usually succeeds instantly on a machine with 8 GB of
+RAM. Nothing was allocated. The kernel recorded that a range of addresses is
+valid and returned.
+
+Physical pages arrive on **first touch**. Your first write to each page traps
+into the kernel, which finds a free frame, zeroes it, installs a page table
+entry, and returns to re-execute your instruction. That's a **minor fault** —
+no disk involved — and section 5 measures it.
+
+Two consequences people meet in production:
+
+- **Memory use appears at touch time, not allocation time.** RSS climbs while
+  your code does nothing that looks like allocating.
+- **Overcommit.** Linux by default hands out more address space than it can
+  back. When touches eventually exceed physical memory, the OOM killer decides
+  who dies, and it decides late.
+
+</Sub>
+
+<SectionHeading n="04" cmd="dmesg | grep -i fail" id="failure">When it fails</SectionHeading>
+
+<Sub n="4.1" title="TLB thrashing">
+
+A working set that fits in cache but exceeds TLB reach performs terribly for a
+reason no cache-miss counter explains. Random access over a few hundred
+megabytes is the usual shape: the data may be in L2, and every access still
+pays a page walk.
+
+Symptom: `dTLB-load-misses` high while `cache-misses` looks reasonable. Fix
+with huge pages, or by making the access pattern sequential so one translation
+serves many accesses.
+
+</Sub>
+
+<Sub n="4.2" title="Huge pages, and their cost">
+
+Transparent huge pages promote 2 MB regions automatically. Reach improves
+enormously. Two costs come with it:
+
+- **Fragmentation and stalls.** Finding a contiguous 2 MB physical region can
+  require compaction, and that can stall the faulting thread for milliseconds.
+- **Copy-on-write gets 512× more expensive.** A COW fault on a huge page copies
+  2 MB instead of 4 KB. Every Redis and Postgres production guide says to
+  disable THP, and this is why — their `fork()`-based snapshots turn into a
+  memory and latency disaster.
+
+</Sub>
+
+<Sub n="4.3" title="Fragmentation you cannot see">
+
+A 16 KB page holding one live 32-byte object is 16 KB of resident memory. A
+long-running process with a scattered live set can hold far more RSS than the
+sum of its live allocations, and no allocator statistic will show it, because
+the allocator's own accounting is correct.
+
+</Sub>
+
+<SectionHeading n="05" cmd="perf stat ./bench" id="cost">What it costs</SectionHeading>
+
+<Callout label="The machine" kind="note">
+Apple M4, macOS 26.5.1, clang 21 `-O2`, 16 KB pages. TLB numbers come from a
+dependent pointer chase touching exactly one line per page, so translation is
+on the critical path.
+</Callout>
+
+<Sub n="5.1" title="A minor page fault">
+
+<Cost items={[
+  { what: "First touch of a fresh anonymous page", value: "686 ns", source: "20,000 pages, mmap MAP_ANON, one write each" },
+  { what: "Second touch, page resident", value: "116 ns", source: "same loop, same stride, immediately after" },
+  { what: "Incremental cost of the fault itself", value: "≈ 570 ns", source: "difference of the two rows" },
+]} />
+
+Be careful reading the second row. 116 ns for a "resident write" is high
+because the loop strides 16 KB, so every access is a cache miss and probably a
+TLB miss too. Subtracting it gives roughly 570 ns for the kernel's fault
+handling — trap, find a frame, zero 16 KB, install a PTE, return. Zeroing alone
+is a meaningful share of that.
+
+</Sub>
+
+<Sub n="5.2" title="Running out of TLB">
+
+<Figure caption="One dependent access per page, so each one needs its own translation. The curve is flat while translations are cached and climbs once they are not — the same shape as chapter 02's cache curve, one level of indirection up.">
+<Plot
+  xLabel="pages touched (16 KB each)"
+  yLabel="ns per access"
+  xTicks={[4, 64, 256, 1024, 4096]}
+  series={[{
+    name: "dependent access",
+    points: [[4,0.68],[16,5.53],[64,5.81],[128,5.78],[256,8.06],[512,8.07],[1024,18.96],[2048,28.16],[4096,34.36]],
+  }]}
+/>
+</Figure>
+
+<Compare
+  cols={["Pages", "Span", "ns/access", "Reading"]}
+  rows={[
+    ["4", "64 KB", "0.68", "Everything in L1, translations cached"],
+    ["16–128", "256 KB – 2 MB", "5.5 – 5.8", "Out of L1, translations still cached"],
+    ["256–512", "4 – 8 MB", "~8.1", "Cache pressure rising"],
+    ["1024", "16 MB", "18.96", "Translations start missing"],
+    ["4096", "64 MB", "34.36", "Page walks on most accesses"],
+  ]}
+/>
+
+**Honest caveat:** these numbers confound TLB and cache. At 1,024 pages the
+span is 16 MB, roughly where chapter 02's curve also leaves L2. Both
+effects arrive together on this machine and I can't cleanly separate them
+without hardware counters macOS doesn't readily expose. On Linux,
+`perf stat -e dTLB-load-misses` separates them in one command.
+
+</Sub>
+
+<SectionHeading n="06" cmd="watch -n1 ./status" id="operating">Operating it</SectionHeading>
+
+<Sub n="6.1" title="What to look at">
+
+```shell
+# Is it translation or data?
+perf stat -e dTLB-load-misses,dtlb_load_misses.walk_active,page-faults ./app
+
+# Minor versus major faults — major means disk
+/usr/bin/time -v ./app | grep -i fault
+
+# What's actually mapped, and how much is resident
+cat /proc/$PID/smaps_rollup          # Linux
+vmmap $PID | tail -30                # macOS
+
+# Huge page status
+cat /sys/kernel/mm/transparent_hugepage/enabled
+grep -i huge /proc/meminfo
+```
+
+**Minor versus major faults** is the first distinction to make. Minor faults
+are the ~570 ns above and are normal. Major faults touch disk and cost tens of
+microseconds or more; a high major fault rate means you're swapping and nothing
+else you measure will make sense.
+
+</Sub>
+
+<Sub n="6.2" title="Reducing translation pressure">
+
+1. **Shrink the working set.** Same advice as chapter 02, and it helps twice
+   here — fewer pages means fewer translations.
+2. **Make access sequential.** One translation then serves many accesses within
+   the page.
+3. **Consider huge pages** for large, long-lived, randomly accessed regions —
+   a database buffer pool is the textbook case. Check whether you `fork()`
+   first.
+4. **Pre-fault if latency matters.** `MAP_POPULATE` or a warm-up pass moves the
+   fault cost off the critical path.
+
+</Sub>
+
+<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+
+**Find your machine's TLB reach.**
+
+- `mmap` an anonymous region and touch one byte per page, chasing pointers in a
+  random page order so each translation is on the critical path.
+- Sweep from 4 pages to 16,384 and plot ns per access.
+- On Linux, run it under `perf stat -e dTLB-load-misses` so you can prove the
+  knee is translation and not cache — the thing I couldn't do cleanly on macOS.
+- Then enable huge pages with `madvise(MADV_HUGEPAGE)` and rerun.
+
+The huge-page run should push the knee out by roughly the page size ratio. Watch
+the first-touch cost go up at the same time, and you'll have both halves of the
+trade in your own numbers.
+
+<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
+
+<Compare
+  cols={["You get", "You pay", "When the bill arrives"]}
+  rows={[
+    ["A private, contiguous-looking address space", "A translation on every access", "As TLB misses nobody profiles for"],
+    ["Allocate now, commit later", "RSS grows while your code appears idle", "When the OOM killer arrives, late"],
+    ["Huge pages, 500× the reach", "COW faults copy 2 MB, and compaction stalls", "The first time you fork() with THP on"],
+    ["Per-page protection and sharing", "Page-granular internal fragmentation", "As RSS far above your live set"],
+  ]}
+/>
+
+<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Redis, Postgres and 'disable THP'" verdict="A rare case where every serious database independently reached the same operational conclusion.">
+    Both projects' production guides tell you to turn transparent huge pages
+    off. Both use `fork()` for snapshots, and a COW fault on a 2 MB page copies
+    512× what a 4 KB one does — turning a cheap snapshot into a memory spike and
+    a latency cliff.
+  </WildCard>
+  <WildCard name="Meltdown and KPTI" verdict="If a 2017 syscall benchmark won't reproduce, page-table isolation is a likely reason.">
+    The 2018 mitigation unmapped most kernel pages from the user page table, so
+    every syscall now switches page tables and flushes translations. It made
+    virtual memory bookkeeping visible in ordinary application latency.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Why does malloc of a gigabyte succeed on a machine with less free RAM?">
+Because allocation reserves addresses, not physical memory. The kernel records
+that a range is valid and returns immediately. Physical frames arrive on first
+touch, one page at a time, via minor faults. That's also why resident memory
+climbs later, during code that isn't obviously allocating.
+</QA>
+
+<QA level="intermediate" q="What is TLB reach and why do huge pages help?">
+Reach is entries × page size — how much memory you can touch before
+translations start missing. A TLB with 1,500 entries covers about 6 MB with
+4 KB pages and about 3 GB with 2 MB pages. Same hardware, 500× the reach.
+
+That's why databases and JVMs with large heaps chase huge pages: a random
+access pattern over a multi-gigabyte buffer pool misses the TLB on nearly every
+access otherwise.
+</QA>
+
+<QA level="intermediate" q="Minor fault versus major fault?">
+A minor fault needs no I/O — the kernel finds a free frame, zeroes it and
+installs a mapping, or maps a page already in the page cache. I measured about
+570 ns of incremental cost for one on an M4.
+
+A major fault reads from disk and costs tens of microseconds at best. A high
+major fault rate means swapping, and no other measurement you take will be
+meaningful until it stops.
+</QA>
+
+<QA level="deep" q="Why do Redis and Postgres both tell you to disable transparent huge pages?">
+Both fork for snapshots and rely on copy-on-write to keep that cheap. With 4 KB
+pages, a write by the parent copies 4 KB. With 2 MB huge pages it copies 2 MB —
+512× the memory traffic and 512× the fault latency for the same logical write.
+
+A snapshot that should cost almost nothing turns into a memory spike
+proportional to the write rate and a latency cliff on the parent. THP also
+introduces compaction stalls when a contiguous 2 MB region has to be assembled.
+</QA>
+
+<QA level="deep" q="Your working set is 200 MB, fits in L3, and random access is still slow. What do you check?">
+TLB misses. Two hundred megabytes is roughly 50,000 pages at 4 KB, far past any
+TLB's entry count, so a random access pattern pays a page walk almost every
+time even though the data itself is cached. Cache-miss counters look fine and
+the code looks fine.
+
+Check `dTLB-load-misses` against `dTLB-loads`. If that ratio is high, try huge
+pages, or restructure so access is sequential within a page.
+</QA>
+
+<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="What is the base page size on Apple Silicon?">
+    16 KB, not 4 KB. It changes TLB reach, fragmentation and fault counts, so
+    query it instead of assuming the x86 value.
+  </Q>
+  <Q q="RSS is climbing but your code is only reading. How?">
+    Copy-on-write, or first-touch of pages mapped earlier. Reserved address
+    space becomes resident when touched, not when allocated.
+  </Q>
+  <Q q="Why can a page table for a 128 TB address space fit in a few kilobytes?">
+    It's a radix tree and absent branches simply don't exist. Only populated
+    regions cost anything.
+  </Q>
+  <Q q="Huge pages fixed your TLB misses and your fork-based snapshot got much worse. Why?">
+    COW now copies 2 MB per faulting write instead of 4 KB. That trade is the
+    reason database guides disable THP.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Ulrich Drepper — What Every Programmer Should Know About Memory, part 4">
+    The virtual memory sections, with the clearest page-walk diagrams available.
+  </WildCard>
+  <WildCard name="Linux — Documentation/admin-guide/mm/transhuge.rst">
+    How THP actually behaves, including the compaction stalls the marketing
+    material omits.
+  </WildCard>
+  <WildCard name="Gorman — Understanding the Linux Virtual Memory Manager">
+    Dated in its kernel version, unmatched in depth on the data structures.
+  </WildCard>
+  <WildCard name="perf stat -e dTLB-load-misses">
+    One command that separates translation cost from data cost. The measurement
+    I could not make cleanly on macOS.
+  </WildCard>
+</CardGrid>

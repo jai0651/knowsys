@@ -1,0 +1,361 @@
+---
+title: Syscalls, Interrupts & the Kernel Boundary
+dek: "A syscall costs about 350 nanoseconds. Several things that look exactly like syscalls cost two. Knowing which is which decides whether a hot loop is fast."
+readingTime: "~22 min"
+versions: "Measured on Apple M4 · macOS 26.5.1 · Linux io_uring behaviour attributed"
+prereqs: "Chapters 01 and 04"
+updated: "2026-09-19"
+---
+
+<SectionHeading n="01" cmd="cat CONTRACT.md" id="contract">The contract</SectionHeading>
+
+A syscall is a controlled transfer of execution into code you can't see, running
+at a privilege level you don't have. What the kernel promises is that it will
+validate every argument, do the thing, and hand control back — or fail with an
+error instead of a corrupted system.
+
+Everything expensive about it follows from "controlled". Each crossing must
+switch privilege level, swap stacks, validate pointers that user code could have
+changed, and eventually undo all of it.
+
+<Callout label="The measurement that reframes this chapter">
+On this machine `write()` to `/dev/null` costs **348 ns**. `getpid()` costs
+**1.9 ns**. Both look identical in C. The second one isn't a syscall at all —
+the value is cached in userspace — and that 180× gap is the difference between
+crossing the boundary and only appearing to.
+</Callout>
+
+<SectionHeading n="02" cmd="hexdump -C ./layout" id="layout">The layout</SectionHeading>
+
+<Sub n="2.1" title="Three ways to get information out of the kernel">
+
+<Compare
+  cols={["Mechanism", "Crosses the boundary?", "Typical cost", "Example"]}
+  rows={[
+    ["Real syscall", "Yes — trap, validate, return", "~350 ns", "write, read, openat"],
+    ["vDSO / commpage", "No — kernel data mapped read-only", "~13 ns", "clock_gettime, gettimeofday"],
+    ["Userspace cache", "No — libc remembered it", "~2 ns", "getpid on many libcs"],
+  ]}
+/>
+
+That middle row is the clever one. The kernel maps a small page of code and data
+into every process; calling `clock_gettime` jumps into that page, reads a
+timestamp the kernel keeps current, and returns without ever trapping. You get
+kernel-maintained data at userspace speed.
+
+</Sub>
+
+<Sub n="2.2" title="What the trap does">
+
+<Flow
+  wrap={3}
+  steps={[
+    { label: "svc / syscall", sub: "the trap instruction" },
+    { label: "privilege switch", sub: "EL0 → EL1, swap stacks" },
+    { label: "dispatch", sub: "table lookup on the number", accent: true },
+    { label: "validate args", sub: "every pointer, every length" },
+    { label: "do the work", sub: "the part you wanted" },
+    { label: "return", sub: "restore, and possibly reschedule" },
+  ]}
+/>
+
+Argument validation deserves attention. User code may pass any pointer, and may
+change it concurrently from another thread, so the kernel copies data across the
+boundary instead of trusting addresses. That copy is a real cost and it's why
+large transfers behave differently from small ones.
+
+</Sub>
+
+<SectionHeading n="03" cmd="perf record ./hot-path" id="hot-path">The hot path</SectionHeading>
+
+<Sub n="3.1" title="Interrupts, and why your syscall is not the only thing happening">
+
+Devices interrupt asynchronously. A network packet arrives, the NIC raises an
+interrupt, the CPU stops what it's doing and runs a handler.
+
+Handlers must be short, because interrupts are disabled or restricted while one
+runs. Linux splits the work: the **top half** acknowledges the device and
+queues, while the **bottom half** — softirqs, tasklets, threaded handlers —
+does real processing later with interrupts enabled.
+
+Under heavy load this can starve userspace entirely. NAPI exists for exactly
+that: past a packet rate threshold the driver stops taking interrupts and
+switches to polling, trading latency for the ability to make progress at all.
+
+</Sub>
+
+<Sub n="3.2" title="Batching, and why io_uring exists">
+
+If each crossing costs ~350 ns, a million small operations spend 350 ms just
+crossing. Every serious optimisation here is some form of doing more per
+crossing:
+
+- **Buffered I/O.** stdio accumulates writes and flushes in blocks. That's why
+  `printf` in a loop isn't a syscall per call.
+- **Vectored I/O.** `writev` and `readv` take an array of buffers, one crossing.
+- **`sendfile` and `splice`.** Move bytes between descriptors without copying
+  through userspace at all.
+- **io_uring.** Two shared ring buffers, submission and completion, mapped into
+  the process. You write entries and the kernel consumes them — potentially with
+  **zero** syscalls per operation in polled mode.
+
+io_uring is the endpoint of that progression: the boundary stops being crossed
+per operation and becomes a queue both sides can see.
+
+</Sub>
+
+<SectionHeading n="04" cmd="dmesg | grep -i fail" id="failure">When it fails</SectionHeading>
+
+<Sub n="4.1" title="A syscall in the inner loop">
+
+The classic: logging with an unbuffered `write` per line, reading a file a byte
+at a time, calling `gettimeofday` on every iteration to measure something.
+
+At 350 ns each, a syscall per item caps you around three million operations per
+second (and that's before any of your own work). Buffering to 4 KB blocks turns
+roughly forty log lines into one crossing.
+
+</Sub>
+
+<Sub n="4.2" title="Spectre mitigations, and benchmarks that no longer reproduce">
+
+Speculative execution vulnerabilities forced the kernel to stop sharing
+prediction state and, with page table isolation, most of its address space
+across the boundary. Every crossing got more expensive from 2018 onward.
+
+If you find a syscall benchmark from before then and can't reproduce its
+numbers, that's usually the reason and not anything you did wrong.
+
+</Sub>
+
+<Sub n="4.3" title="Signals, and what you may do inside one">
+
+A signal handler runs on a borrowed stack, at an arbitrary instruction, possibly
+while the interrupted code holds a lock. So the handler may only call
+**async-signal-safe** functions — a short POSIX list that excludes `malloc`,
+`printf` and almost everything else.
+
+Take a mutex in a handler that interrupted the same thread already holding it
+and you deadlock immediately. Standard safe pattern: set a
+`volatile sig_atomic_t` flag, or write one byte to a self-pipe, then do the real
+work back in the main loop.
+
+</Sub>
+
+<SectionHeading n="05" cmd="perf stat ./bench" id="cost">What it costs</SectionHeading>
+
+<Callout label="The machine" kind="note">
+Apple M4, macOS 26.5.1, clang 21 `-O2`, 1,000,000 iterations each. Note this is
+Darwin, not Linux — the mechanisms match but the numbers will differ, and
+macOS's commpage plays the role Linux gives the vDSO.
+</Callout>
+
+<Sub n="5.1" title="Crossing, and not crossing">
+
+<Compare
+  cols={["Call", "Cost", "Actually a syscall?"]}
+  rows={[
+    ["A plain arithmetic loop", "0.22 ns", "No — the baseline"],
+    ["getpid()", "1.9 ns", "**No.** Cached in userspace."],
+    ["sbrk(0)", "1.4 ns", "**No.** Library-only query."],
+    ["clock_gettime (via steady_clock)", "13.4 ns", "No — commpage, kernel data without a trap"],
+    ["write(/dev/null, 1 byte)", "347.7 ns", "**Yes.** The real thing."],
+  ]}
+/>
+
+**Only one row in that table crosses the boundary.** `getpid` is 183× cheaper
+than `write` because libc remembers the answer from process start. `sbrk(0)`
+just reads a variable. `clock_gettime` reads a shared page.
+
+Which means a microbenchmark "measuring syscall overhead" with `getpid` — a
+common choice, because it's the simplest syscall — measures nothing at all on
+these platforms.
+
+</Sub>
+
+<Sub n="5.2" title="What batching is worth">
+
+<Estimate
+  rows={[
+    { label: "Log lines per second", math: "a busy service", value: "500,000" },
+    { label: "Unbuffered: one write each", math: "500,000 × 348 ns", value: "174 ms/s" },
+    { label: "CPU spent crossing", math: "174 ms of every second", value: "17.4%" },
+    { label: "Buffered to 4 KB, ~40 lines per write", math: "12,500 × 348 ns", value: "4.3 ms/s" },
+  ]}
+  result={{ label: "CPU recovered by adding a buffer", value: "≈ 17% of one core" }}
+/>
+
+Seventeen percent of a core, for a change that's one line of configuration in
+most logging libraries. Buffering is the single highest-leverage thing in this
+chapter and it needs no new API.
+
+</Sub>
+
+<SectionHeading n="06" cmd="watch -n1 ./status" id="operating">Operating it</SectionHeading>
+
+<Sub n="6.1" title="Finding the crossings">
+
+```shell
+# Count syscalls by type. Start here — it is usually immediately obvious.
+strace -c -f ./app              # Linux
+dtruss -c ./app                 # macOS (needs SIP considerations)
+
+# Which call site?
+perf trace ./app
+perf record -e raw_syscalls:sys_enter -g ./app
+
+# Time in kernel versus user
+/usr/bin/time -v ./app | grep -E 'System time|User time'
+
+# Is the interrupt load the problem?
+cat /proc/interrupts
+mpstat -P ALL 1                 # %irq and %soft columns
+```
+
+`strace -c` is the first command to run and it answers the question most of the
+time. A count of 4 million `write` calls where you expected a few thousand is
+the entire diagnosis.
+
+</Sub>
+
+<Sub n="6.2" title="Reducing crossings, in order">
+
+1. **Buffer.** Biggest win, least effort, no new API.
+2. **Batch.** `writev`, `readv`, `sendmmsg`, `recvmmsg` — one crossing, many
+   items.
+3. **Avoid the copy.** `sendfile`, `splice`, or `mmap` for large file reads.
+4. **io_uring**, on Linux 5.10 or newer, when you genuinely need hundreds of
+   thousands of operations per second. It's a real API-shape change, so it
+   belongs last.
+
+</Sub>
+
+<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+
+**Measure your own boundary, and find a call that isn't crossing it.**
+
+- Time `getpid`, `clock_gettime`, `write` to `/dev/null`, and an empty loop.
+- Confirm with `strace -c` which ones actually produce a syscall. At least one
+  will surprise you.
+- Then write one megabyte to a file, one byte at a time, and again in 4 KB
+  blocks. Compare wall time and `strace -c` counts.
+
+Your 4 KB version should be roughly a thousand times fewer crossings and dramatically
+faster. Having produced that ratio yourself makes buffering an instinct instead
+of advice.
+
+<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
+
+<Compare
+  cols={["You get", "You pay", "When the bill arrives"]}
+  rows={[
+    ["A protected kernel that validates everything", "~350 ns per crossing", "In any loop that calls per item"],
+    ["vDSO and cached values for cheap calls", "You cannot tell which is which by reading C", "When you benchmark getpid and measure nothing"],
+    ["Buffered I/O, far fewer crossings", "Data sits in userspace until flushed", "On crash, as lost log lines"],
+    ["io_uring — potentially zero syscalls", "A harder API and a newer kernel", "As complexity, up front"],
+    ["Spectre mitigations keeping you safe", "Every crossing got more expensive in 2018", "As old benchmarks that will not reproduce"],
+  ]}
+/>
+
+<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
+
+<CardGrid>
+  <WildCard name="io_uring" verdict="The most significant change to the Linux I/O boundary in twenty years, and worth understanding even if you never call it directly.">
+    Jens Axboe's shared submission and completion rings. Applications queue work
+    into memory the kernel already sees, so in polled mode a high-throughput
+    server can run with essentially no syscalls on the data path.
+  </WildCard>
+  <WildCard name="KPTI, 2018" verdict="If a pre-2018 syscall number looks impossibly good, this is usually why.">
+    Kernel page table isolation unmapped most kernel memory from the user page
+    table to block Meltdown. Every syscall now changes page tables, and syscall
+    cost roughly doubled on some workloads overnight.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Roughly what does a syscall cost, and why isn't it free?">
+A few hundred nanoseconds — I measured 348 ns for `write` to `/dev/null` on an
+M4. Cost comes from the controlled crossing: switch privilege level, swap stacks,
+dispatch through a table, validate every pointer the caller passed, do the work,
+then restore everything. Validation matters because user code could change a
+pointer concurrently, so the kernel copies instead of trusting addresses.
+</QA>
+
+<QA level="intermediate" q="Why is calling clock_gettime so much cheaper than calling write?">
+It usually isn't a syscall. Linux and macOS both map a small read-only page — the vDSO on
+Linux, the commpage on macOS — containing code and a timestamp it keeps current.
+Calling `clock_gettime` jumps into that page and reads the value without ever
+trapping.
+
+I measured 13.4 ns for it against 348 ns for `write`. Same-looking C, one
+crossing the boundary and one not.
+</QA>
+
+<QA level="intermediate" q="Your service spends 20% of CPU in the kernel and you expected almost none. First step?">
+`strace -c -f`. It gives you syscall counts and time by type in one command, and
+the answer is usually obvious — a few million `write` calls from unbuffered
+logging, or a `gettimeofday` per loop iteration.
+
+At roughly 350 ns each, half a million log lines a second is about 17% of a core
+spent purely crossing. Buffering to 4 KB blocks cuts that by a factor of forty.
+</QA>
+
+<QA level="deep" q="What may you safely call inside a signal handler, and why is the list so short?">
+Only async-signal-safe functions — a short POSIX list. A handler runs at an
+arbitrary instruction on a borrowed stack, possibly while the interrupted code
+holds a lock or is midway through updating allocator state.
+
+Call `malloc` from a handler that interrupted `malloc` and you corrupt the heap
+or deadlock. Safe pattern: set a `volatile sig_atomic_t` flag or write
+one byte to a self-pipe, then do real work from the main loop.
+</QA>
+
+<QA level="deep" q="How does io_uring reduce syscall cost to nearly zero?">
+By replacing per-operation crossings with shared memory. Two ring buffers —
+submission and completion — are mapped into both the process and the kernel. The
+application writes submission entries directly into memory the kernel can
+already see and advances a tail pointer.
+
+With `IORING_SETUP_SQPOLL` a kernel thread polls that ring, so the data path can
+run with no syscalls at all. You trade a much harder API and a dedicated polling
+thread for removing the boundary from the hot path entirely.
+</QA>
+
+<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="You benchmark syscall overhead with getpid and measure 2 ns. What went wrong?">
+    getpid isn't a syscall on most libcs — the value is cached at process start.
+    Use something that must reach the kernel, like write to /dev/null.
+  </Q>
+  <Q q="Why can't you call printf in a signal handler?">
+    It isn't async-signal-safe. The handler may have interrupted stdio or the
+    allocator mid-update, so calling back in can deadlock or corrupt state.
+  </Q>
+  <Q q="Unbuffered logging at 500k lines/sec. Roughly what does it cost?">
+    About 17% of a core in crossings alone, at ~350 ns each. Buffering to 4 KB
+    cuts it to under half a percent.
+  </Q>
+  <Q q="Why did syscalls get slower in 2018?">
+    Spectre and Meltdown mitigations — page table isolation and predictor
+    flushing across the boundary. Old benchmarks stopped reproducing.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Jens Axboe — Efficient IO with io_uring">
+    Design document from the author. Short, and the clearest explanation of
+    the ring protocol.
+  </WildCard>
+  <WildCard name="Linux vDSO(7)">
+    What's in the mapped page and why. Explains the 13 ns row in section 5.
+  </WildCard>
+  <WildCard name="signal-safety(7)">
+    Actual list of what you may call in a handler. Shorter than you expect.
+  </WildCard>
+  <WildCard name="Brendan Gregg — perf trace">
+    Lower-overhead than strace and usable on production traffic, which strace
+    mostly is not.
+  </WildCard>
+</CardGrid>

@@ -1,0 +1,357 @@
+---
+title: The Memory Model & Atomics
+dek: "A formal answer to one question: if I write A then B, when is another thread allowed to see B before A? The answer is a relation, not a rule, and ARM will enforce it where x86 quietly won't."
+readingTime: "~23 min"
+versions: "C++20 · clang 21 · disassembled on Apple M4 (ARMv8.6)"
+prereqs: "Chapters 01, 02 and 13"
+updated: "2026-09-19"
+---
+
+<SectionHeading n="01" cmd="cat QUESTION.md" id="question">The question</SectionHeading>
+
+You write two statements in order:
+
+```cpp
+data  = compute();     // A
+ready = true;          // B
+```
+
+Another thread observes `ready == true`. Is it guaranteed to see the new `data`?
+
+Intuition says obviously yes — A is written before B. Intuition is wrong, and
+it's wrong at two separate layers. Your **compiler** may reorder A and B,
+because its only obligation is that a single thread can't tell. Your
+**processor** may reorder them too, because stores sit in a buffer and drain
+later.
+
+Neither layer owes anything to another thread unless you ask, and a memory model
+is the formal statement of what asking costs and what it buys.
+
+<Callout label="Why this is worse than a stale read">
+A **data race** — two threads touching one location, one writing, no
+synchronisation — is *undefined behaviour* in C++. Not "you observe an old
+value". The compiler is entitled to assume races cannot happen and transform
+surrounding code accordingly. That's why racy programs work for years and then
+break on a compiler upgrade with no source change.
+</Callout>
+
+<SectionHeading n="02" cmd="cat model.txt" id="model">The model</SectionHeading>
+
+<Sub n="2.1" title="Happens-before">
+
+The whole model rests on one relation. If action X **happens-before** action Y,
+then everything X wrote is visible to Y. If no such relation exists between two
+conflicting accesses, you have a data race and the program has no defined
+meaning.
+
+Happens-before is built from two sources: program order within a thread, and
+**synchronises-with** edges between threads. Atomics are how you create those
+edges. Nothing else does.
+
+</Sub>
+
+<Sub n="2.2" title="The orderings, and what each edge costs">
+
+<Compare
+  cols={["Ordering", "Guarantees", "Creates an edge?"]}
+  rows={[
+    ["relaxed", "Atomicity only. No ordering with anything.", "No"],
+    ["acquire (load)", "Nothing after it moves before it", "Yes, with a matching release"],
+    ["release (store)", "Nothing before it moves after it", "Yes, with a matching acquire"],
+    ["acq_rel", "Both, on a read-modify-write", "Yes"],
+    ["seq_cst", "The above, plus one global order all threads agree on", "Yes, and transitively"],
+  ]}
+/>
+
+Acquire and release **only work in pairs, on the same variable.** Maybe the
+single most load-bearing sentence in the chapter. An acquire
+load with no matching release store compiles perfectly and guarantees nothing.
+That's the single most common way this model is misused.
+
+</Sub>
+
+<Sub n="2.3" title="The one pattern you'll actually write">
+
+Ninety percent of real atomic usage is publication:
+
+```cpp
+Config* cfg = new Config{...};                  // 1. construct
+ready.store(cfg, std::memory_order_release);    // 2. publish
+
+// another thread
+Config* c = ready.load(std::memory_order_acquire);
+if (c) use(c->field);                           // 3. safe to read
+```
+
+The release at 2 and the acquire at 3 create the edge. Everything written in 1
+is visible at 3. Weaken either to `relaxed` and the reader can observe a
+non-null pointer to an object whose fields haven't landed.
+
+</Sub>
+
+<SectionHeading n="03" cmd="git log --follow model.txt" id="origin">Where it comes from</SectionHeading>
+
+<Sub n="3.1" title="It's a description of hardware, generalised">
+
+The model didn't come from theory hunting for an application. C++11 needed one
+abstraction that could be implemented efficiently on x86, ARM, POWER and
+Itanium, all of which reorder differently. Instead of exposing each architecture's barriers, the committee defined the *weakest useful* guarantees
+and let each backend emit whatever its hardware needs.
+
+So `release` is probably not best read as "insert a fence". It's "establish this edge", and what the
+compiler emits depends entirely on the target.
+
+</Sub>
+
+<Sub n="3.2" title="What it compiles to, which surprises people">
+
+Most explanations picture acquire and release inserting a barrier instruction.
+On ARMv8 that's simply wrong, and the disassembly settles it:
+
+<SourceRead
+  file="clang++ -O2 -c, objdump"
+  repo="aarch64"
+  tag="Apple M4, ARMv8.6"
+  href="https://developer.arm.com/documentation/ddi0487/latest/"
+>
+```asm
+ld_rlx:  ldr   x0, [x8]        ; relaxed load  — an ordinary load
+ld_acq:  ldapr x0, [x8]        ; acquire load  — Load-Acquire RCpc
+st_rlx:  str   x0, [x8]        ; relaxed store — an ordinary store
+st_rel:  stlr  x0, [x8]        ; release store — Store-Release
+st_sc:   stlr  x0, [x8]        ; seq_cst store — THE SAME INSTRUCTION
+```
+</SourceRead>
+
+Three things in five lines.
+
+- **No `dmb` anywhere.** Ordering is encoded in the load and store opcodes, not
+  bolted on as a separate barrier.
+- **A sequentially consistent store is byte-identical to a release store.**
+  Paired with acquire-family loads, `stlr` already gives sequential consistency,
+  so the compiler has nothing extra to emit.
+- **`ldapr`, not `ldar`.** That's the ARMv8.3 RCpc variant — a weaker, cheaper
+  acquire that Apple's cores implement.
+
+</Sub>
+
+<SectionHeading n="04" cmd="./validate --against-reality" id="breaks">Where it breaks</SectionHeading>
+
+<Sub n="4.1" title="The model is fine. Your testing hardware isn't.">
+
+<Compare
+  cols={["Architecture", "Reorders", "Consequence"]}
+  rows={[
+    ["x86-64 (TSO)", "Store→load only", "Most under-synchronised code accidentally works"],
+    ["ARMv8 / AArch64", "Almost anything", "The same code fails, months later"],
+    ["POWER, RISC-V", "Even more freely", "Rare in production, brutal when hit"],
+  ]}
+/>
+
+**x86 hides ordering bugs.** Code missing acquire/release can pass every test on
+an Intel laptop and fail on Graviton, an M-series Mac or an Ampere server.
+
+```cpp
+// WRONG — and it passes everything on x86-64
+data = compute();                             // plain store
+ready.store(true, std::memory_order_relaxed);
+```
+
+TSO won't reorder those two stores, so an x86 reader observing `ready` also sees
+`data`. ARM reorders happily. Same source, same compiler, and the bug waits for
+different silicon.
+
+</Sub>
+
+<Sub n="4.2" title="volatile is not part of this model">
+
+`volatile` tells the compiler not to elide or cache an access. It says nothing
+about the processor, nothing about atomicity, and nothing about ordering between
+different variables. It creates no happens-before edge at all.
+
+Java's `volatile` does mean roughly sequential consistency, which is where the
+confusion comes from. In C and C++ it's for memory-mapped device registers and
+signal handlers. Thread synchronisation wants `std::atomic`.
+
+</Sub>
+
+<Sub n="4.3" title="Weakening an ordering you never measured">
+
+Dropping `seq_cst` to `relaxed` because it's "faster" is probably the most
+common way to introduce a race that survives review. Section 5 shows how small
+the saving usually is — and contention, which people don't measure either, costs
+10–100× more.
+
+</Sub>
+
+<SectionHeading n="05" cmd="./solve --my-numbers" id="applying">Using it</SectionHeading>
+
+<Callout label="The machine, and a caveat" kind="note">
+Apple M4, clang 21 `-O2`. Read-modify-write numbers are medians of 3 × 50M
+iterations. I deliberately don't publish per-load and per-store timings: at
+0.2–0.4 ns they're at the edge of what the harness resolves, and my first
+attempt had the compiler hoist the plain load out of the loop. The disassembly
+in 3.2 is the trustworthy evidence, not those timings.
+</Callout>
+
+<Sub n="5.1" title="What the strongest ordering costs">
+
+<Cost items={[
+  { what: "fetch_add, relaxed", value: "1.596 ns", source: "median of 3 × 50M, single thread" },
+  { what: "fetch_add, seq_cst", value: "1.592 ns", source: "same harness — indistinguishable" },
+  { what: "Difference", value: "~0%", source: "both compile to one LSE atomic instruction" },
+]} />
+
+**Sequential consistency is free here, uncontended.** Both compile to a single
+ARMv8.1 atomic and the stronger ordering is a different opcode, not extra work.
+On older ARM without LSE, or on x86 where a `seq_cst` store needs `xchg` or
+`mfence`, there's a real gap — smaller than people assume, and dwarfed by
+contention.
+
+Chapter 14 has the comparison that matters: the same `fetch_add` goes from
+3.0 ns to 18.4 ns across eight threads, and a compare-exchange loop to 162 ns.
+**Contention costs 10–100× what ordering does.** Fix that first.
+
+</Sub>
+
+<SectionHeading n="06" cmd="./solve --interactive" id="apply">Apply it to your numbers</SectionHeading>
+
+A short rule set, then an experiment that makes the model concrete.
+
+1. **Default to `seq_cst`.** It's the C++ default because reasoning about
+   anything weaker is genuinely hard, and section 5 says it's usually free.
+2. **Use relaxed for counters** whose value never gates control flow. Metrics,
+   progress indicators, statistics.
+3. **Use acquire/release in pairs, and write the pairing in a comment.** An
+   unpaired acquire is a bug that compiles.
+4. **Never use `volatile` for thread synchronisation.**
+5. **Test on ARM.** More ordering bugs are probably found by changing hardware than by reading
+   code.
+
+**Then reproduce store-buffer reordering yourself.** Two threads, the Dekker
+shape:
+
+```
+thread 1:  x = 1;  r1 = y;
+thread 2:  y = 1;  r2 = x;
+```
+
+Sequential consistency forbids `r1 == 0 && r2 == 0` — one store must come first.
+Run it a few million times with relaxed atomics on an ARM machine and count how
+often that impossible result appears. Then add `seq_cst`, watch the count go to
+zero, and disassemble both to find the instruction that changed.
+
+Seeing an impossible outcome happen on hardware you own is what stops this being
+abstract.
+
+```shell
+clang++ -fsanitize=thread -O1 -g app.cpp        # finds what review doesn't
+clang++ -O2 -S -o - app.cpp | grep -E 'ldar|ldapr|stlr|dmb|lock'
+```
+
+<SectionHeading n="07" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Double-checked locking" verdict="Correct only with explicit acquire/release, and broadcast for years without it.">
+    The lazy-singleton idiom was widely published in a form broken on any
+    reordering machine: a reader can see a non-null pointer to a
+    half-constructed object. Java fixed it in the 1.5 memory model; C++ needs
+    acquire/release or `std::call_once`.
+  </WildCard>
+  <WildCard name="Linux memory-barriers.txt" verdict="Read it once for the ASCII diagrams of store buffers misbehaving.">
+    Possibly the most detailed practical treatment anywhere, written by people
+    who had to make one model work across every architecture Linux supports.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="08" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What is a data race, and why is it worse than a stale read?">
+Two threads accessing one location, at least one writing, with no
+synchronisation between them. In C++ it's undefined behaviour — the compiler may
+assume it can't happen and optimise on that basis.
+
+So the outcome isn't "you read an old value"; surrounding code may be
+transformed in ways that make no sense. That's why racy programs work for years
+and then break on a compiler upgrade.
+</QA>
+
+<QA level="intermediate" q="What do acquire and release actually guarantee?">
+Release on a store means nothing before it in program order moves after it.
+Acquire on a load means nothing after it moves before it. Pair them on the same
+variable and everything the releasing thread wrote before the store is visible
+to the acquiring thread after the load.
+
+They only work in pairs. An acquire load with no matching release store compiles
+fine and guarantees nothing at all.
+</QA>
+
+<QA level="intermediate" q="Is volatile enough for sharing a flag between threads in C++?">
+No. It stops the compiler eliding or caching the access and does nothing else —
+no processor ordering, no atomicity for wide types, no happens-before edge.
+
+Java's `volatile` does imply ordering, which is where the confusion comes from.
+In C++ use `std::atomic`. `volatile` is for device registers and signal
+handlers.
+</QA>
+
+<QA level="deep" q="Your code passes on x86 and fails on ARM. What's the likely class of bug?">
+Missing acquire/release. x86-64 is total-store-ordered — it only reorders a
+store followed by a load to a different address — so a plain store then a flag
+store stays in order and most under-synchronised code accidentally works. ARM
+reorders far more freely.
+
+Concretely: `data = compute(); ready.store(true, relaxed);` is fine on x86 and
+broken on ARM, because a reader can observe `ready` before `data`. Use a release
+store and an acquire load, and run your test suite on ARM routinely.
+</QA>
+
+<QA level="deep" q="How much does seq_cst cost compared to relaxed?">
+Less than people assume, and you should measure instead of guessing. On an M4 I
+measured `fetch_add` at 1.596 ns relaxed and 1.592 ns seq_cst — indistinguishable,
+because both compile to a single ARMv8.1 LSE atomic with the ordering encoded in
+the opcode. The disassembly shows a seq_cst store emitting exactly the same
+`stlr` as a release store.
+
+Contention is the expensive thing. The same operation reaches 18.4 ns across
+eight threads and a compare-exchange loop 162 ns. Reduce sharing before
+weakening ordering.
+</QA>
+
+<SectionHeading n="09" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="On ARMv8, what does a seq_cst store compile to?">
+    `stlr` — the same instruction as a release store. Paired with acquire loads
+    that already gives sequential consistency, so no extra barrier is emitted.
+  </Q>
+  <Q q="You see an acquire load with no release store anywhere. Bug?">
+    Yes. They only mean something as a pair on the same variable. An unpaired
+    acquire compiles and guarantees nothing.
+  </Q>
+  <Q q="Why can a data race break code the compiler has never seen fail?">
+    Because it's undefined behaviour, not a defined stale read. The optimiser
+    may assume no race exists and transform surrounding code on that basis.
+  </Q>
+  <Q q="Cheapest way to find ordering bugs in a codebase tested only on x86?">
+    Run the test suite on ARM. A Graviton instance or an M-series laptop exposes
+    a class of bug that x86 structurally cannot.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Herb Sutter — atomic<> Weapons">
+    Two long talks, still the clearest spoken explanation of the C++ memory
+    model.
+  </WildCard>
+  <WildCard name="Preshing on Programming">
+    Jeff Preshing's series, with a runnable experiment for every claim. Start
+    with "Memory Barriers Are Like Source Control".
+  </WildCard>
+  <WildCard name="Linux — Documentation/memory-barriers.txt">
+    Exhaustive, practical, full of diagrams of store buffers misbehaving.
+  </WildCard>
+  <WildCard name="cppreference — memory_order">
+    The precise wording. Dry, and the authority when an argument needs settling.
+  </WildCard>
+</CardGrid>

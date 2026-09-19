@@ -1,0 +1,506 @@
+---
+title: Locking Primitives, End to End
+dek: "A mutex is a single integer and a promise about who may change it. Everything expensive about locking happens on the path taken when that integer is already taken."
+readingTime: "~26 min"
+versions: "Linux 6.12 futex · glibc 2.40 · measured on Apple M4"
+prereqs: "Atomics, cache coherence, syscalls"
+updated: "2026-09-19"
+---
+
+<SectionHeading n="01" cmd="cat CONTRACT.md" id="contract">The contract</SectionHeading>
+
+A mutex promises exactly one thing: **at most one thread holds it at a time.**
+Everything else you might assume, it does not promise.
+
+It says nothing about who gets it next. It says nothing about how long you'll
+wait. A thread that just released a lock and immediately asks for it again will
+often win it back, while a thread that has been queued for a millisecond waits
+longer. That's not a defect. Barging like that is what makes the uncontended
+path fast, and the uncontended path is the one that runs a billion times a day.
+
+<Callout label="The guarantee people bolt on that isn't there">
+Ordering. `pthread_mutex_lock` with default attributes gives you **no FIFO
+guarantee**, and neither does `std::mutex`. If your design needs fairness you
+have to build it — a ticket lock, a queue, or `PTHREAD_MUTEX_ROBUST` plus your
+own ordering. Assuming fairness you were never given is how a background thread
+ends up starved for seconds under load.
+</Callout>
+
+<Sub n="1.1" title="What it does guarantee">
+
+- **Mutual exclusion.** One holder. This is the whole product.
+- **Release/acquire ordering.** Everything a thread wrote before unlocking is
+  visible to whichever thread locks next. That's a memory-ordering guarantee,
+  not just a scheduling one, and it's why you don't need extra fences inside a
+  critical section.
+- **Progress, conditionally.** If holders keep releasing, some waiter proceeds.
+  Which one is unspecified.
+
+</Sub>
+
+<Sub n="1.2" title="What it does not">
+
+- **Not reentrant.** Locking a `PTHREAD_MUTEX_NORMAL` twice from one thread
+  deadlocks instantly. `std::recursive_mutex` exists and is usually a sign the
+  ownership model needs rethinking.
+- **No fairness, as above.**
+- **No priority awareness** unless you ask for `PTHREAD_PRIO_INHERIT`. Without
+  it, a low-priority holder can block a high-priority waiter indefinitely.
+- **No protection from you.** Nothing associates a mutex with the data it
+  guards. That association lives only in your head and your reviewers'.
+
+</Sub>
+
+<SectionHeading n="02" cmd="hexdump -C ./layout" id="layout">The layout</SectionHeading>
+
+Underneath `std::mutex` on Linux is `pthread_mutex_t`, and underneath that is
+one 32-bit integer that three values are enough to describe.
+
+<Figure caption="The futex word. Three states, two bits' worth of information, and a syscall that only happens when the value is 2.">
+<MemoryLayout
+  unit="bits"
+  fields={[
+    { name: "futex word", bits: 32, accent: true, note: "0 = free · 1 = held, no waiters · 2 = held, waiters queued" },
+  ]}
+/>
+</Figure>
+
+A full `pthread_mutex_t` carries more — an owner TID, a recursion count, a
+kind field, a waiter list pointer — but the hot path touches only that first
+word. Everything else is for error checking, recursion and robustness, and none
+of it is read when the lock is uncontended.
+
+<Sub n="2.1" title="Why three states and not two">
+
+Two states would be enough for correctness: free and held. Three exist so that
+**unlock can tell whether anyone needs waking.**
+
+With two states, `unlock` would have to call into the kernel every single time,
+in case someone was waiting. At roughly a microsecond per syscall against
+roughly four nanoseconds for the uncontended path, that's a couple of hundred
+times the cost, paid on every release, to handle a case that almost never
+happens. A third state turns that into a branch on a value you already have in a
+register.
+
+</Sub>
+
+<SectionHeading n="03" cmd="perf record ./hot-path" id="hot-path">The hot path</SectionHeading>
+
+<SourceRead
+  file="Futexes Are Tricky — Ulrich Drepper, 2011"
+  repo="mutex3"
+  tag="the canonical algorithm"
+  href="https://www.akkadia.org/drepper/futex.pdf"
+>
+```c
+void lock(int *futex) {
+    int c;
+    /* Fast path: 0 -> 1. If it works, we are done. No syscall. */
+    if ((c = cmpxchg(futex, 0, 1)) != 0) {
+        do {
+            /* Someone holds it. Announce that a waiter exists (state 2)
+               and sleep until the value stops being 2.                   */
+            if (c == 2 || cmpxchg(futex, 1, 2) != 0)
+                futex_wait(futex, 2);
+        } while ((c = cmpxchg(futex, 0, 2)) != 0);
+    }
+}
+
+void unlock(int *futex) {
+    /* If the value was 2, someone is asleep and has to be woken.
+       If it was 1, nobody is waiting and we skip the kernel entirely. */
+    if (atomic_fetch_sub(futex, 1) != 1) {
+        *futex = 0;
+        futex_wake(futex, 1);
+    }
+}
+```
+</SourceRead>
+
+Read `unlock` twice. `atomic_fetch_sub` returns the *previous* value, so the
+comparison against 1 is asking "was I the only one interested?" When the answer
+is yes — the overwhelmingly common case — the function returns without ever
+entering the kernel.
+
+<Figure caption="Two paths through one function. Four instructions and no privilege transition on the left; a thread parked in a kernel wait queue on the right.">
+<Flow
+  wrap={3}
+  steps={[
+    { label: "cmpxchg 0 → 1", sub: "one atomic instruction", accent: true },
+    { label: "succeeded?", sub: "yes → return, ~4 ns" },
+    { label: "return", sub: "no syscall, no context switch" },
+    { label: "cmpxchg 1 → 2", sub: "announce a waiter" },
+    { label: "futex_wait", sub: "syscall, thread parked" },
+    { label: "woken, retry", sub: "loop back to the cmpxchg" },
+  ]}
+/>
+</Figure>
+
+<Sub n="3.1" title="What the kernel does with a parked thread">
+
+`futex_wait` hashes the *physical address* of the futex word into a global
+table of wait queues, then sleeps the calling thread on that bucket. Hashing on
+the physical address is what lets two processes share a futex in shared memory
+without agreeing on a virtual address.
+
+`futex_wake` hashes the same address and wakes up to `n` waiters from the
+bucket. Note the kernel holds no state about the lock between calls — the word
+in userspace *is* the lock. All the kernel manages is the queue of disappointed threads.
+
+<Sequence
+  actors={["thread A", "futex word", "thread B"]}
+  gap={{ from: 2, to: 3, label: "B is off-CPU entirely" }}
+  messages={[
+    { from: 0, to: 1, label: "cmpxchg 0 → 1", note: "A wins, no syscall", accent: true },
+    { from: 2, to: 1, label: "cmpxchg 0 → 1 fails", note: "reads 1" },
+    { from: 2, to: 1, label: "cmpxchg 1 → 2" },
+    { from: 2, to: 2, label: "futex_wait(addr, 2)", dashed: true, note: "parked in a kernel queue" },
+    { from: 0, to: 1, label: "fetch_sub → was 2", note: "so a waiter exists" },
+    { from: 0, to: 2, label: "futex_wake(addr, 1)", accent: true },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="3.2" title="The re-check that makes it correct">
+
+`futex_wait(addr, 2)` passes the value the caller *expects*. Under a bucket lock, the kernel compares it and only sleeps if it still
+matches. Without that comparison
+there's a race: A could release the lock between B's `cmpxchg` and B's syscall,
+and B would sleep forever with nobody left to wake it.
+
+macOS has no futex. `os_unfair_lock` uses `__ulock_wait`/`__ulock_wake`, and
+Windows uses `WaitOnAddress`. Different syscalls, same shape — an atomic in
+userspace, a kernel queue keyed by address, and a value check to close the race.
+
+</Sub>
+
+<SectionHeading n="04" cmd="dmesg | grep -i fail" id="failure">When it fails</SectionHeading>
+
+<Sub n="4.1" title="Deadlock, and the only reliable cure">
+
+Two threads, two locks, opposite order. Everyone knows the picture; the useful
+part is that there's exactly one prevention strategy that scales: **a global
+lock order.** Number your locks, document the order, and never acquire
+downward. Tools like `lockdep` in the kernel or ThreadSanitizer in userspace
+enforce it by watching the acquisition graph at runtime.
+
+Timeouts are not a cure. A `try_lock` with a backoff turns a deadlock into a
+livelock and a latency spike, and the bug survives to production.
+
+</Sub>
+
+<Sub n="4.2" title="Priority inversion">
+
+A low-priority thread holds a lock. A high-priority thread wants it. A
+medium-priority thread, wanting nothing, preempts the low-priority holder — and
+now the high-priority thread waits on a thread that isn't running.
+
+Mars Pathfinder is the famous case, and its fix is still the fix:
+**priority inheritance.** With `PTHREAD_PRIO_INHERIT`, the holder is temporarily
+boosted to the priority of the highest waiter. Linux supports this with PI
+futexes, a genuinely separate kernel path with the ownership recorded in the
+futex word itself.
+
+</Sub>
+
+<Sub n="4.3" title="The convoy">
+
+A holder gets descheduled mid-critical-section. Every other thread piles into
+the wait queue. When the holder is rescheduled and releases, one waiter wakes,
+runs, and the pattern repeats — with the whole group now moving in lockstep
+through the lock, one context switch per handoff.
+
+Throughput can look acceptable while latency falls apart, because the system is
+still doing work; it's just doing it in a queue whose service order nobody
+chose. A convoy is the reason a p99 can be forty times a p50 with no change in
+CPU utilisation.
+
+</Sub>
+
+<SectionHeading n="05" cmd="perf stat ./bench" id="cost">What it costs</SectionHeading>
+
+Every number below was measured on one machine, named, with the benchmark
+printed. Don't carry them to your hardware — carry the *ratios*, and re-run the
+benchmark where it matters.
+
+<Callout label="The machine" kind="note">
+Apple M4, 10 cores, **128-byte cache lines** (not 64 — that assumption is wrong
+on every Apple Silicon part). macOS 26.5.1, Apple clang 21.0.0, `-O2 -pthread`,
+median of 5 runs. `std::mutex` here is `os_unfair_lock`, not a Linux futex, so
+the syscall differs while the fast-path shape does not.
+</Callout>
+
+<Sub n="5.1" title="The uncontended path">
+
+<Cost items={[
+  { what: "Plain increment, no synchronisation", value: "~1.1 ns", source: "volatile-fed so it can't be folded away" },
+  { what: "atomic fetch_add, uncontended", value: "1.60 ns", source: "median of 5 × 20M ops" },
+  { what: "std::mutex lock + unlock, uncontended", value: "4.25 ns", source: "median of 5 × 20M ops" },
+  { what: "Mutex cost over a bare atomic", value: "2.6×", source: "derived from the two rows above" },
+]} />
+
+**An uncontended mutex costs about four nanoseconds and never enters the
+kernel.** That's the single most useful fact in this chapter. Folklore about locks being slow is describing the contended path, and people then avoid locks
+in code that would never have contended.
+
+</Sub>
+
+<Sub n="5.2" title="What contention actually does">
+
+<Estimate
+  rows={[
+    { label: "1 thread", math: "no contention at all", value: "4.10 ns" },
+    { label: "2 threads", math: "hand-off every operation", value: "6.24 ns" },
+    { label: "4 threads", math: "unstable — see below", value: "31–63 ns" },
+    { label: "8 threads", math: "waiters park in the kernel", value: "15.9 ns" },
+  ]}
+  result={{ label: "worst observed penalty vs uncontended", value: "≈ 15×" }}
+/>
+
+Two of those rows need explaining, and one I can't fully explain.
+
+The **2-thread** case is the cheapest kind of contention: the two threads
+ping-pong the cache line but rarely sleep, so you pay coherence traffic and not
+syscalls.
+
+The **8-thread** case is *faster per operation than 4 threads*, reliably, run
+after run. Once enough threads are waiting, they stop spinning and park, and a
+parked thread doesn't fight for the cache line. One thread then runs a long
+batch of critical sections unopposed. Throughput improves and fairness is
+destroyed — a convoy, measured.
+
+The **4-thread** case swings between 31 and 63 ns across runs while every other
+row is stable to two decimal places. My best guess is core placement: the M4
+has performance and efficiency cores, and four threads is right at the boundary
+where the scheduler's choice changes the answer. I haven't proved that, and
+pinning threads to verify it is the obvious next experiment. I'm flagging it
+because an unexplained 2× is exactly the kind of thing benchmarks quietly
+average away.
+
+</Sub>
+
+<Sub n="5.3" title="False sharing, which costs more than the lock">
+
+Two threads writing to *different* variables in the *same* cache line serialise
+as completely as if they shared a lock — with none of the protection.
+
+<Figure caption="Coherence works on whole lines, not on variables. In the top row every write by any thread invalidates the line in all the other cores. In the bottom row the same eight counters occupy eight lines and never interfere.">
+<Cells
+  cellWidth={58}
+  rows={[
+    { label: "packed[8]", cells: ["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"], cursor: 0, cursorLabel: "one 128 B line — all eight share it" },
+    { label: "alignas(128)", cells: ["t0", "—", "—", "—", "—", "—", "—", "—"], dimFrom: 1 },
+  ]}
+/>
+</Figure>
+
+<TryIt what="Two counters, one cache line, then padded apart" lang="cpp" toolchain="clang++ 21 -O2 -pthread, Apple M4">
+```cpp
+constexpr int LINE = 128;                  // M-series. On x86-64 it's 64.
+
+// Packed: eight 8-byte atomics = 64 bytes, all inside one line.
+std::atomic<long> packed[8] = {};
+
+// Padded: each counter gets a line to itself.
+struct alignas(LINE) Padded { std::atomic<long> v{0}; };
+std::vector<Padded> padded(8);
+
+// Each thread hammers its OWN counter 5,000,000 times.
+// No thread ever touches another thread's data.
+for (int t = 0; t < T; t++)
+    threads.emplace_back([&, t] {
+        for (long i = 0; i < 5'000'000; i++)
+            packed[t].fetch_add(1, std::memory_order_relaxed);
+    });
+```
+
+<Output>
+| threads | shared line | padded | penalty |
+| --- | --- | --- | --- |
+| 2 | 3.0 ns | 0.82 ns | **3.7×** |
+| 4 | 5.1 ns | 0.45 ns | **11×** |
+| 8 | 14.6 ns | 0.27 ns | **55×** |
+
+Stable to within 5% over six runs. Look at the padded column: it gets *faster*
+per operation as threads are added, because that's what scaling looks like when
+nothing is shared. Shared gets slower at almost exactly the rate padded gets
+faster.
+
+**At eight threads, one `alignas(128)` is worth 55×.** No algorithm changed. No
+lock was involved. All that differs is which cache line the bytes landed in.
+</Output>
+</TryIt>
+
+</Sub>
+
+<SectionHeading n="06" cmd="watch -n1 ./status" id="operating">Operating it</SectionHeading>
+
+<Sub n="6.1" title="Finding the lock that's hurting you">
+
+```shell
+# Linux: which locks, how long, who contended
+perf lock record ./yourapp && perf lock contention --threads
+
+# Off-CPU time — where a thread went to sleep and why
+perf record -e sched:sched_switch -g ./yourapp
+
+# Is it the lock or the line? Count coherence misses.
+perf stat -e cache-misses,cache-references,LLC-load-misses ./yourapp
+
+# macOS
+xcrun xctrace record --template 'System Trace' --launch ./yourapp
+```
+
+`perf lock contention` is the one to reach for first. It gives you contended
+locks ranked by total wait time, which answers "where is the time going" more
+directly than a CPU profile — a blocked thread burns no CPU and so never shows
+up in a flame graph at all.
+
+</Sub>
+
+<Sub n="6.2" title="Reading the symptoms">
+
+<Compare
+  cols={["Symptom", "Likely cause", "First thing to check"]}
+  rows={[
+    ["High p99, flat CPU, flat p50", "Convoy on one lock", "perf lock contention, sorted by wait time"],
+    ["Throughput falls as you add cores", "False sharing or a global lock", "cache-misses per op; then check struct layout"],
+    ["One thread starves for seconds", "Barging — no fairness guarantee", "Whether you assumed FIFO anywhere"],
+    ["Latency spike under priority mix", "Priority inversion", "Whether PTHREAD_PRIO_INHERIT is set"],
+    ["Hang with all threads idle", "Deadlock", "gdb thread apply all bt, or lockdep"],
+  ]}
+/>
+
+</Sub>
+
+<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+
+**Write a mutex.** Drepper's three-state algorithm is about 20 lines, and
+implementing it against `__ulock_wait` or `futex(2)` directly teaches more than
+any amount of reading.
+
+Then do the part people skip: **make it fair, and measure what fairness costs.**
+Add a ticket — each waiter takes a number, `unlock` wakes the holder of the next
+one. Benchmark both against `std::mutex` at 2, 4 and 8 threads, and plot
+throughput *and* the distribution of per-thread completion times.
+
+You should find the fair lock is slower on throughput and dramatically tighter
+on spread. That trade is the entire reason the default is unfair, and seeing
+your own numbers for it is worth more than being told.
+
+<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
+
+<Compare
+  cols={["You get", "You pay", "When the bill arrives"]}
+  rows={[
+    ["A 4 ns uncontended path", "No fairness — barging is what makes it fast", "A background thread starves under load"],
+    ["No syscall unless contended", "A third state and a subtle unlock", "Never, if you use a library mutex"],
+    ["Simple mutual exclusion", "Nothing ties the lock to the data", "During a refactor, six months later"],
+    ["Blocking instead of spinning", "~1 µs and two context switches per handoff", "At exactly the contention level you did not test"],
+  ]}
+/>
+
+<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Mars Pathfinder, 1997" verdict="The canonical priority inversion story, and the reason PTHREAD_PRIO_INHERIT exists in the standard.">
+    A high-priority bus management task blocked on a mutex held by a
+    low-priority meteorological task, which a medium-priority comms task kept
+    preempting. A watchdog rebooted the lander repeatedly. The fix, uploaded
+    from Earth, was to enable priority inheritance on that one mutex.
+  </WildCard>
+  <WildCard name="std::hardware_destructive_interference_size" verdict="Check your platform's real line size before you pad. Guessing 64 wastes half the padding on Apple Silicon and all of it on some ARM servers.">
+    C++17 added a constant for exactly the padding problem in 5.3 — and then
+    libstdc++ and libc++ disagreed about whether it's ABI-stable, so GCC warns
+    when you use it and Apple's libc++ doesn't ship it at all.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Roughly what does an uncontended mutex cost?">
+A handful of nanoseconds, and no syscall. On the M4 I measured 4.25 ns for
+lock plus unlock against 1.60 ns for a bare atomic increment. More important is the *no syscall* half: the fast path is a compare-exchange
+in userspace, so the kernel is never involved unless another thread is already
+holding the lock.
+</QA>
+
+<QA level="intermediate" q="Why does a futex-based mutex need three states and not two?">
+So that `unlock` can tell whether anybody needs waking. With free and held only,
+every unlock would have to make a `futex_wake` syscall just in case a waiter
+existed. A third state — held-with-waiters — turns that into a check of a value the
+unlocking thread already has in a register, so the common case costs
+a branch instead of about a microsecond.
+</QA>
+
+<QA level="intermediate" q="Your service has a flat p50 and a p99 forty times higher. CPU is unremarkable. Where do you look?">
+Off-CPU time, not a CPU profile. A thread blocked on a lock burns no cycles, so
+it's invisible in a flame graph. `perf lock contention` ranks locks by total
+wait time; `perf sched` shows where threads went to sleep. Flat median, terrible tail, unremarkable utilisation: that's what a convoy
+looks like from the outside.
+</QA>
+
+<QA level="deep" q="Two threads increment two different counters and never touch each other's data. Adding the second thread makes it slower. Why?">
+False sharing. Both counters sit in one cache line, and coherence works at line granularity, so each write invalidates the other core's copy of the whole
+line. Logically independent, physically serialised.
+
+Padding each counter onto its own line with `alignas` fixes it. On an M4 at
+eight threads I measured 14.6 ns per operation shared against 0.27 ns padded —
+about 55×. Note the line is 128 bytes there, not 64, so padding to 64 fixes
+nothing on that hardware.
+</QA>
+
+<QA level="deep" q="Explain the race that futex_wait's value argument prevents.">
+Thread B finds the lock held, sets the word to 2, and is about to call
+`futex_wait`. Between those two steps thread A unlocks: it sees the 2, sets the
+word to 0 and calls `futex_wake` — but B isn't in the queue yet, so the wake
+hits nothing. B then calls `futex_wait` and sleeps on a lock that's free, with
+nobody remaining to wake it.
+
+`futex_wait(addr, expected)` closes this. Under the bucket lock, the kernel compares `*addr` against `expected` and only
+sleeps if they still match. B
+passes 2, the word now reads 0, the comparison fails, and the syscall returns
+immediately instead of parking.
+</QA>
+
+<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="A thread unlocks and immediately relocks. Another thread has been queued for 1 ms. Who probably wins?">
+    The one that just released. Barging is permitted and common — there's no
+    FIFO guarantee — and the relocking thread already has the line in its cache.
+  </Q>
+  <Q q="You pad a struct to 64 bytes to stop false sharing. On an Apple M4, what happens?">
+    Nothing improves. Lines are 128 bytes there, so two 64-byte-padded counters still land in
+    one line. Check the real line size before choosing padding.
+  </Q>
+  <Q q="Why is an uncontended unlock allowed to skip the kernel entirely?">
+    Because `fetch_sub` returns the previous value. If it was 1, the thread was
+    the only party interested and there is no queue to wake.
+  </Q>
+  <Q q="Does a mutex give you any memory-ordering guarantee?">
+    Yes — release on unlock, acquire on lock. Everything written before an
+    unlock is visible to the next thread that locks. That's what lets you skip
+    extra fences inside a critical section.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Ulrich Drepper — Futexes Are Tricky">
+    Twelve pages, and the source of the three-state algorithm above. Section 5
+    on the wake race is the part to read twice.
+  </WildCard>
+  <WildCard name="linux/kernel/futex/core.c">
+    The hash bucket, the value re-check under `hb->lock`, and the requeue logic
+    that `pthread_cond_broadcast` depends on.
+  </WildCard>
+  <WildCard name="Paul McKenney — Is Parallel Programming Hard?">
+    Free, enormous, and the best treatment anywhere of why the cache line, not
+    the lock, is usually the thing costing you.
+  </WildCard>
+  <WildCard name="perf lock contention">
+    Added in Linux 6.1 and still under-used. Ranks locks by aggregate wait time
+    instead of by sample count.
+  </WildCard>
+</CardGrid>
