@@ -58,7 +58,7 @@ export default async function TopicPage({ params }: { params: Promise<{ slug: st
         <Sidebar currentSlug={slug} />
 
         <main className="min-w-0 flex-1 pb-24">
-          <div className="mx-auto max-w-[768px] px-1 sm:px-6">
+          <div className="mx-auto max-w-[680px] px-1 sm:px-6">
             <ChapterHeader page={page} colour={colour} fm={doc?.frontmatter} />
 
             <article className="prose" id="chapter-body">

@@ -1,6 +1,7 @@
 import Link from "next/link";
 import type { Page } from "@/lib/manifest";
 import type { Frontmatter } from "@/lib/mdx";
+import { PageStats } from "./page-stats";
 import { cn } from "@/lib/utils";
 
 const TEXT: Record<string, string> = {
@@ -31,7 +32,7 @@ export function ChapterHeader({
 
   return (
     <header className="mb-10">
-      <nav className="mb-5 flex items-center gap-1.5 font-mono text-[11.5px] text-faint">
+      <nav className="mb-5 flex flex-wrap items-center gap-1.5 font-mono text-[11.5px] text-faint">
         <Link href="/" className="transition-colors hover:text-accent">~</Link>
         <span className="opacity-40">/</span>
         <Link href={`/sections#${page.groupSlug}`} className="transition-colors hover:text-accent">
@@ -39,6 +40,8 @@ export function ChapterHeader({
         </Link>
         <span className="opacity-40">/</span>
         <span className={cn("tnum", TEXT[colour])}>{page.num}</span>
+        <span className="flex-1" />
+        <PageStats pageId={page.slug} />
       </nav>
 
       <h1 className="mb-4 text-[36px] font-bold leading-[1.1] tracking-[-0.02em] text-ink sm:text-[46px]">

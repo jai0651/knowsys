@@ -95,6 +95,24 @@ for (const file of files) {
     }
   }
 
+  // A parent section must not share a title with a subsection inside it. The
+  // bulk rename produced eleven of these, and each one put two identical rows
+  // in the search index pointing at different anchors.
+  {
+    const heads = [
+      ...[...src.matchAll(/<SectionHeading[^>]*>([^<]*)<\/SectionHeading>/g)].map((m) => m[1].trim()),
+      ...[...src.matchAll(/<Sub\s+n="[^"]*"\s+title="([^"]*)"/g)].map((m) => m[1].trim()),
+    ].filter(Boolean);
+    const seen = new Map();
+    for (const h of heads) seen.set(h, (seen.get(h) ?? 0) + 1);
+    for (const [h, n] of seen) {
+      if (n > 1) {
+        console.log(`  ${rel}  heading ${JSON.stringify(h)} appears ${n} times — a parent section is reusing a subsection's title`);
+        problems++;
+      }
+    }
+  }
+
   // Components used but not provided. Strip fenced code first so a C++ template
   // or a shell heredoc does not read as a JSX tag.
   const prose = src.replace(/```[\s\S]*?```/g, "");

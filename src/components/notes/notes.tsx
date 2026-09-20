@@ -22,6 +22,10 @@ export function Notes({ title }: { title: string }) {
   const { notes, ready, update } = useNotes(path);
   const [open, setOpen] = useState(false);
   const [sel, setSel] = useState<{ x: number; y: number; anchor: Anchor } | null>(null);
+  /* An existing highlight the reader has clicked. Without this, removing one
+     meant opening the drawer and finding it in a list, which is a long way
+     round for "I didn't mean that". */
+  const [active, setActive] = useState<{ x: number; y: number; id: string } | null>(null);
   const painted = useRef(false);
 
   const root = () => document.getElementById(ROOT_ID);
@@ -75,7 +79,16 @@ export function Notes({ title }: { title: string }) {
       });
     }
     function onDown(e: MouseEvent) {
-      if (!(e.target as HTMLElement)?.closest?.("[data-notes-ui]")) setSel(null);
+      const el = e.target as HTMLElement;
+      if (el?.closest?.("[data-notes-ui]")) return;
+      setSel(null);
+      const mark = el?.closest?.("mark.hl") as HTMLElement | null;
+      if (mark?.dataset.hid) {
+        const r = mark.getBoundingClientRect();
+        setActive({ x: r.left + r.width / 2, y: r.top, id: mark.dataset.hid });
+      } else {
+        setActive(null);
+      }
     }
     document.addEventListener("mouseup", onUp);
     document.addEventListener("mousedown", onDown);
@@ -95,6 +108,12 @@ export function Notes({ title }: { title: string }) {
   }
   function remove(id: string) {
     update((p) => ({ ...p, highlights: p.highlights.filter((h) => h.id !== id) }));
+  }
+  function recolour(id: string, colour: Colour) {
+    update((p) => ({
+      ...p,
+      highlights: p.highlights.map((h) => (h.id === id ? { ...h, colour } : h)),
+    }));
   }
   function setNote(id: string, note: string) {
     update((p) => ({
@@ -161,6 +180,50 @@ export function Notes({ title }: { title: string }) {
           </button>
         </div>
       )}
+
+      {/* ── clicked-highlight menu ─────────────────────────────────────── */}
+      {active && (() => {
+        const h = notes.highlights.find((x) => x.id === active.id);
+        if (!h) return null;
+        return (
+          <div
+            data-notes-ui
+            className="glass-panel fixed z-[60] w-[260px] -translate-x-1/2 -translate-y-full rounded-xl p-2"
+            style={{ left: Math.min(Math.max(active.x, 140), window.innerWidth - 140), top: active.y - 10 }}
+          >
+            <div className="flex items-center gap-1 px-1 pb-2">
+              {COLOURS.map((c) => (
+                <button
+                  key={c}
+                  onClick={() => recolour(active.id, c)}
+                  aria-label={`Recolour ${c}`}
+                  className={cn(
+                    "size-6 rounded-lg ring-1 ring-inset transition-transform hover:scale-110",
+                    `swatch-${c}`,
+                    h.colour === c ? "ring-2 ring-ink" : "ring-white/15",
+                  )}
+                />
+              ))}
+              <span className="flex-1" />
+              <button
+                onClick={() => { remove(active.id); setActive(null); }}
+                aria-label="Remove highlight"
+                className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-[12px] text-muted transition-colors hover:bg-machine/15 hover:text-machine"
+              >
+                <Trash2 className="size-3.5" /> Remove
+              </button>
+            </div>
+            <textarea
+              autoFocus={!!h.note}
+              value={h.note ?? ""}
+              onChange={(e) => setNote(active.id, e.target.value)}
+              placeholder="Add a note…"
+              rows={2}
+              className="w-full resize-y rounded-lg border border-line bg-surface-2 px-2.5 py-1.5 text-[12.5px] text-ink outline-none placeholder:text-faint focus:border-line-2"
+            />
+          </div>
+        );
+      })()}
 
       {/* ── drawer ─────────────────────────────────────────────────────── */}
       {open && (

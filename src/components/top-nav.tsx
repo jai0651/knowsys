@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { PaletteSwitcher } from "./palette-switcher";
+import { Search } from "./search";
 
 const LINKS = [
   { href: "/sections", label: "Chapters" },
@@ -33,6 +34,7 @@ export function TopNav() {
           ))}
         </nav>
 
+        <Search />
         <PaletteSwitcher />
       </header>
     </div>

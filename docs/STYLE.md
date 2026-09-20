@@ -96,6 +96,47 @@ match against `content/manifest.json`.
 
 ---
 
+## Structure — the part the checker cannot see
+
+Read `~/.claude/skills/tech-blog/references/human-patterns.md` before drafting,
+not after. Everything below comes from it, plus a measurement of where the first
+sixteen chapters failed it.
+
+**Open in the middle of something.** Not with a thesis. Julia Evans opens a
+debugging post with the problem and her own irritation; Karpathy opens by saying
+why he's writing at all. Neither states a thesis in paragraph one. A generated
+post almost always does, and the first sixteen chapters here all did.
+
+**Put the author back in.** Measured across those chapters: 0 to 5 first-person
+references each, against a corpus median of 20.9 per 100 sentences. The
+benchmarks in this project were run on a real machine, two of them were wrong
+the first time, and one experiment was silently deleted by the optimiser. That
+is the strongest material in the chapters and it was buried in callouts and
+passive voice. Lead with it.
+
+**Narrate belief, then correction, in the order it happened.** "I vaguely
+remembered" and "at first I thought" are sentences generated prose never writes,
+because they admit the author's knowledge was partial at the time. A retrospective
+that presents the right answer first has thrown away the useful part.
+
+**Moralise rarely, and late.** This is the one the chapters failed hardest: 87
+bolded takeaway sentences across sixteen chapters, roughly one per section. Each
+is individually defensible; the even distribution is the tell. Budget **two per
+chapter**, placed where something was expensive to learn, and put the rest of
+the advice in one section at the end.
+
+**Write mostly prose.** Those chapters run 25–60% prose, median 33 — the other
+two thirds is tables, cards and code. A reference manual, not something anyone
+reads. Tables are for comparisons a reader will scan back to, not for
+information that wanted a sentence.
+
+**Leave something open.** At least one thing per chapter you can reproduce but
+cannot explain. Chapter 06's 4-thread anomaly and chapter 04's TLB/cache
+confound are the model here — state the hypothesis, say it isn't proven, name
+the experiment that would settle it.
+
+---
+
 ## Specific to this subject
 
 **Every number is derived on the page or attributed.** Systems writing is

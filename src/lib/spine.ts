@@ -5,10 +5,14 @@
    section lists. That reads as a template even when each sentence is fine, so
    the shape is now chosen per chapter from four options.
 
-   `cmd` is the shell line above each heading. Not decoration: on a systems
-   site `perf stat ./bench` says what the section contains more precisely than
-   the word "Cost" does, and the commands differ per archetype so two chapters
-   of different kinds do not open the same way.
+   The labels here are DEFAULTS, shown on stubs. A written chapter names its own
+   sections — "One integer, three states" beats "The layout", and twenty-seven
+   chapters sharing one set of abstract slot names is the template problem one
+   level below the archetypes. Ids stay fixed so anchors and CI do not move.
+
+   `cmd` is the shell line above each heading, and it gets the same treatment:
+   a written chapter uses commands a reader could actually run against the
+   thing being described.
    ────────────────────────────────────────────────────────────────────────── */
 
 export type Archetype = "mechanism" | "phenomenon" | "decision" | "model";
@@ -43,17 +47,17 @@ export const SHAPES: Record<Archetype, Shape> = {
     name: "Mechanism",
     blurb: "A system you can open up and trace one operation through.",
     spine: [
-      { id: "contract", label: "The contract", cmd: "cat CONTRACT.md",
+      { id: "contract", label: "What it promises", cmd: "man 7 guarantees",
         what: "What it promises, and what it explicitly does not." },
-      { id: "layout", label: "The layout", cmd: "hexdump -C ./layout",
+      { id: "layout", label: "What it looks like in memory", cmd: "hexdump -C ./state",
         what: "The data structures, as bytes. Not boxes and arrows." },
-      { id: "hot-path", label: "The hot path", cmd: "perf record ./hot-path",
+      { id: "hot-path", label: "What happens when you call it", cmd: "perf record ./one-operation",
         what: "One operation end to end, at source level, from the real implementation." },
-      { id: "failure", label: "When it fails", cmd: "dmesg | grep -i fail",
+      { id: "failure", label: "How it breaks", cmd: "dmesg | grep -i fail",
         what: "A disk lies, a node dies, a clock jumps. Partial failure is the subject." },
       { id: "cost", label: "What it costs", cmd: "perf stat ./bench",
         what: "Nanoseconds, cache lines, hops, dollars. Derived here or attributed." },
-      { id: "operating", label: "Operating it", cmd: "watch -n1 ./status",
+      { id: "operating", label: "Running it in production", cmd: "watch -n1 ./status",
         what: "How to see inside it, what to tune, what breaks only at scale." },
     ],
     tail: [
