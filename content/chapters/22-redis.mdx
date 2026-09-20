@@ -2,10 +2,30 @@
 title: Redis Internals
 dek: "One thread, one event loop, and a hash table that rehashes a bucket at a time. Almost everything surprising about Redis follows from those three facts."
 readingTime: "~28 min"
-versions: "Redis 7.2 · source at tag 7.2.4"
+versions: "Measured on Redis 8.10.2, macOS 15, Apple M4 · source refs at tag 7.2.4"
 prereqs: "Hash tables, the event loop, fork(2)"
-updated: "2026-09-19"
+updated: "2026-09-20"
 ---
+
+This chapter told you `hash-max-listpack-entries` defaults to 128. It doesn't, and
+it hasn't for years. On the Redis 8.10.2 I finally got around to running the
+examples against, it's 512.
+
+I'd written a transcript that inserted 130 fields into a hash and showed it
+flipping from `listpack` to `hashtable`. Run it and nothing flips. The hash sits
+there at 133 fields, still a flat array, exactly as it should. Four times the
+number I'd published, which in the regime where the compact encoding applies is
+four times the memory you can keep saving.
+
+Nobody would have caught this by reading. It reads fine — 128 is a plausible
+number, it's in a hundred blog posts, and it used to be true. It took typing the
+commands in.
+
+So: every shell block below has been executed on the machine described in the
+header, and the outputs are pasted, not remembered. Where I state a number I
+didn't measure, I say so. There are two places further down where I still don't
+know why Redis does what it does. I've left those open instead of inventing a
+reason.
 
 <SectionHeading n="01" cmd="redis-cli INFO replication" id="contract">What Redis actually guarantees</SectionHeading>
 
@@ -123,42 +143,76 @@ thresholds.
 <Sub n="2.2" title="Encodings, and the thresholds that trigger them">
 
 <Compare
-  cols={["Type", "Compact form", "Promotes to", "Threshold"]}
+  cols={["Type", "Compact form", "Promotes to", "Threshold on Redis 8.10"]}
   rows={[
-    ["String", "int / embstr", "raw", "44 bytes for embstr"],
-    ["Hash", "listpack", "hashtable", "128 entries or 64-byte value"],
-    ["Sorted set", "listpack", "skiplist", "128 entries or 64-byte value"],
-    ["Set", "intset / listpack", "hashtable", "512 ints, or 128 entries"],
-    ["List", "listpack", "quicklist", "128 entries or 64-byte value"],
+    ["String", "int / embstr", "raw", "45 bytes and up is raw"],
+    ["Hash", "listpack", "hashtable", "512 entries, or a 64-byte value"],
+    ["Sorted set", "listpack", "skiplist", "128 entries, or a 64-byte value"],
+    ["Set", "intset / listpack", "hashtable", "512 ints, or 128 non-ints"],
+    ["List", "listpack", "quicklist", "8 KB per node — a size, not a count"],
   ]}
 />
 
-Note the vocabulary shift: **listpack replaced ziplist in Redis 7.0.** If you're
-reading a post that says ziplist, it predates that, and the thresholds it quotes
-have different config names.
+That table is the one thing on this page most likely to be wrong by the time you
+read it, and it was wrong in my own draft. I had 128 in the hash row, because 128
+is the number every blog post quotes. It's the ziplist-era default, and it has
+been stale for years. On the Redis 8.10.2 I'm writing against, a hash holds 512
+entries before it promotes — four times what I'd written, which is four times the
+memory in the regime where the compact encoding still applies.
 
-<TryIt what="Watch a hash change its own data structure" lang="shell" toolchain="redis-cli 7.2">
+My list row was wrong in a more interesting way. `list-max-listpack-size`
+defaults to `-2`, and that's not an entry count at all — negative values select a
+*byte* budget per node, `-2` meaning 8 KB. A thousand short strings in a list
+stay a listpack. Eighty hundred-byte strings do not. If you go looking for the
+entry count that promotes a list, you won't find one, because there isn't one.
+
+Two smaller notes. Vocabulary shifted in Redis 7.0, when **listpack replaced
+ziplist**; a post that says ziplist predates that and the config names it quotes
+no longer exist. And `CONFIG GET` reports your *running* value, which your distro
+may have overridden in `redis.conf` — I checked these against a server started
+with no config file at all before believing them.
+
+<TryIt what="Watch a hash change its own data structure" lang="shell" toolchain="redis 8.10.2, macOS 15">
 ```shell
+# Ask your build what the threshold is. Do not trust a blog post. Including this one.
+redis-cli CONFIG GET hash-max-listpack-entries | tail -1   # 512
+
 redis-cli DEL h > /dev/null
 redis-cli HSET h a 1 b 2 c 3 > /dev/null
 redis-cli OBJECT ENCODING h        # listpack
 
-# hash-max-listpack-entries defaults to 128. Cross it.
+# Cross the number everyone quotes. Nothing happens.
 for i in $(seq 1 130); do redis-cli HSET h "f$i" "$i" > /dev/null; done
+redis-cli HLEN h                   # 133
+redis-cli OBJECT ENCODING h        # listpack
+
+# Cross the real one.
+for i in $(seq 131 520); do redis-cli HSET h "f$i" "$i" > /dev/null; done
+redis-cli HLEN h                   # 523
 redis-cli OBJECT ENCODING h        # hashtable
 
 # Now shrink it back down to three fields.
-redis-cli HDEL h $(seq -f "f%g" 1 130 | tr '\n' ' ') > /dev/null
+redis-cli HDEL h $(seq -f "f%g" 1 520 | tr '\n' ' ') > /dev/null
 redis-cli HLEN h                   # 3
-redis-cli OBJECT ENCODING h        # still hashtable
+redis-cli OBJECT ENCODING h        # hashtable
 ```
 
 <Output>
-**The conversion only goes one way.** Once a hash is promoted to `hashtable` it
-stays there for the life of the key, however small it shrinks. Build a hash by
-inserting 200 fields and then deleting 195, and you're paying full hash table
-overhead for five fields. Rebuild the key if that matters — `HGETALL` into a
-new key and `RENAME` over the old one.
+A 133-field hash is still a flat array being scanned linearly, and on this build
+that's the right call — the listpack stays competitive far longer than the folk
+number suggests.
+
+**The conversion only goes one way.** Once a hash is promoted it stays promoted
+for the life of the key, however small it shrinks. Three fields, full hash table
+overhead. Build a hash by inserting 600 fields and deleting 597 and you keep
+paying; rebuild the key if that matters, `HGETALL` into a new key and `RENAME`
+over the old one.
+
+I don't have a satisfying answer for why 512 is the hash default when sorted sets
+and sets both sit at 128. The linear scan is over the same listpack layout in
+each case. Best guess is that hashes are the type people abuse hardest for
+object storage, so the memory win was judged worth more scanning — but that's a
+guess, not something I found written down.
 </Output>
 </TryIt>
 
@@ -351,28 +405,74 @@ Don't take a per-key overhead number from a blog post, probably including this o
 length, value length, encoding and allocator version all move it. Measure your
 own shape, then multiply:
 
-<TryIt what="Measure the real per-key cost of your own data shape" lang="shell" toolchain="redis-cli 7.2">
+<TryIt what="Measure the real per-key cost of your own data shape" lang="shell" toolchain="redis 8.10.2, macOS 15">
 ```shell
 # Empty baseline
 redis-cli FLUSHALL > /dev/null
-BEFORE=$(redis-cli INFO memory | awk -F: '/used_memory:/{print $2+0}')
+BEFORE=$(redis-cli INFO memory | awk -F: '/^used_memory:/{print $2+0}')
 
-# 100k keys in the shape you actually store
+# 100k keys in the shape you actually store. Note the single quotes around the
+# JSON — without them the inline protocol reads the first " as an opening quote
+# and the whole pipe dies with "unbalanced quotes in request".
 for i in $(seq 1 100000); do
-  echo "SET session:$i {\"uid\":$i,\"role\":\"member\"}"
-done | redis-cli --pipe > /dev/null
+  printf "SET session:%s '{\"uid\":%s,\"role\":\"member\"}'\n" "$i" "$i"
+done | redis-cli --pipe
 
-AFTER=$(redis-cli INFO memory | awk -F: '/used_memory:/{print $2+0}')
+AFTER=$(redis-cli INFO memory | awk -F: '/^used_memory:/{print $2+0}')
 echo "bytes per key: $(( (AFTER - BEFORE) / 100000 ))"
 redis-cli MEMORY USAGE session:1
+redis-cli STRLEN session:1
 ```
 
 <Output>
-`MEMORY USAGE` reports one key including its `dictEntry` and allocator rounding;
-the subtraction gives you the amortised figure across the whole keyspace,
-including the table itself. **Use the subtraction, not the single-key number.**
-They differ by more than you'd expect once the main table has resized, because
-the bucket array is sized to a power of two and is often half empty.
+```
+errors: 0, replies: 100000
+bytes per key: 93
+64
+25
+```
+
+A 9-byte key and a 25-byte value. Thirty-four bytes of data, 93 bytes of RAM —
+you're paying about 2.7× for the privilege, and none of that is waste you can
+configure away. It's the `robj` header, the `dictEntry`, the SDS length prefix,
+and jemalloc rounding each of those up to a size class.
+
+Those two numbers disagree, and the gap is the point. `MEMORY USAGE` says 64 —
+one key, its `dictEntry`, its allocator rounding — while the subtraction says 93,
+because it also carries this key's share of the bucket array. **Use the subtraction.** The
+single-key number is honest about the key and silent about the table.
+
+Which means the figure moves with how many keys you have, and not monotonically.
+Same measurement at three sizes:
+
+| keys | bytes/key |
+|---|---|
+| 70,000 | 105 |
+| 100,000 | 93 |
+| 131,000 | 92 |
+
+I assumed 70k was worse because it sat in an oversized, half-empty table. Wrong,
+and `DEBUG HTSTATS` says so plainly (you need `--enable-debug-command local` to
+run it, it's off by default since Redis 7):
+
+```
+Hash table 0 stats (main hash table):
+ table size: 65536
+ number of elements: 58460
+Hash table 1 stats (rehashing target):
+ table size: 131072
+ number of elements: 11540
+```
+
+At 70k the resize is still *in flight*. Both arrays exist — 196,608 buckets for
+70,000 keys — and they stay that way until the incremental rehash drains table 0,
+which is the subject of the next section. At 100k it has finished: one table,
+131,072 buckets, all 100,000 elements. That 12-byte difference is a rehash you
+caught in the middle.
+
+So a memory reading taken during a resize is measuring a transient. If you're
+benchmarking a keyspace that's actively growing, you can be 13% off and the
+number will look perfectly stable while you're reading it.
 </Output>
 </TryIt>
 
@@ -491,14 +591,18 @@ Redis — one type, one threshold, in about 200 lines of C++.
 - A `Hash` class with two representations behind one interface: a
   `std::vector<std::pair<std::string,std::string>>` scanned linearly, and a
   `std::unordered_map`.
-- Promote when entry count crosses 128 *or* any value exceeds 64 bytes. Match
-  the real thresholds so the numbers are comparable.
-- Benchmark `HGET` at 4, 16, 64, 127 and 129 entries. Plot it.
+- Promote when entry count crosses 512 *or* any value exceeds 64 bytes — whatever
+  your own `CONFIG GET hash-max-listpack-entries` says, so the numbers are
+  comparable to your build.
+- Benchmark `HGET` at 4, 16, 64, 256, 511 and 513 entries. Plot it.
 
 What you're looking for is the crossover: the point where linear scan of a
 contiguous array stops beating a hash lookup with a pointer chase. Redis picked
-128. On your cache hierarchy it's probably not 128, and working out *why it differs* will
-probably teach you more than this chapter did.
+512 for hashes and 128 for sorted sets, over what looks like the same listpack
+layout, and I couldn't find the reasoning written down anywhere. So this one has
+a real answer at the end of it. If your crossover lands nowhere near either
+number — and on a machine with a 128-byte cache line it might not — working out
+*why it differs* will teach you more than this chapter did.
 
 <SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
 
@@ -599,10 +703,14 @@ predictable latency, that's the right way round.
 <SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
-  <Q q="A hash has 200 fields. You delete 197. What encoding is it, and why?">
-    `hashtable`. Promotion is one-way — Redis checks the thresholds on insert,
-    never on delete. You're paying full hash table overhead for three fields
-    until you rebuild the key.
+  <Q q="A hash grows to 200 fields; you delete 197. A second hash grows to 600 and you delete 597. Both have three fields. Same encoding?">
+    No. First one's `listpack`, second one's `hashtable`. 200 never crossed
+    `hash-max-listpack-entries`, which is 512 on Redis 8, so nothing was ever
+    promoted. 600 did, and promotion is one-way — the thresholds are checked on
+    insert, never on delete. Two keys, identical contents, and the second costs
+    you full hash table overhead for three fields until you rebuild it. If you
+    answered `hashtable` for both, you're carrying the 128 from an old blog post,
+    which is exactly the mistake this chapter shipped with.
   </Q>
   <Q q="Why is the embstr threshold 44 bytes and not a round number?">
     16 bytes of `robj` + 3 bytes of `sdshdr8` header + 44 bytes of payload + 1
