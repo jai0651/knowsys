@@ -1,0 +1,1023 @@
+---
+title: "eBPF: Running Your Code in the Kernel"
+dek: "The verifier, maps, hooks and the JIT. A 13-instruction loop costs the verifier 960,000 steps, a kprobe doubles the cost of a syscall, and an XDP drop takes 6 nanoseconds of program time."
+readingTime: "~26 min"
+versions: "Measured on linuxkit 6.10.14 aarch64 (Docker Desktop, shared 4-CPU container) · bpftrace 0.20.2 · clang 18 · bpftool 7.4 · interpreter sketch on Apple M4"
+prereqs: "Chapters 07 and 10"
+updated: "2026-09-25"
+---
+
+I wrote a loop the verifier was supposed to reject. It loaded fine.
+
+It asked for a random 32-bit number and summed that many integers, so its
+bound could be anything up to four billion. That's exactly the shape the
+verifier exists to refuse. When I disassembled the object file there was no
+loop in it: clang had spotted the arithmetic series and replaced it with
+`n*(n-1)/2`. No back-edge ever reached the verifier, so it had nothing to
+object to.
+
+Once I gave clang something it couldn't fold, the same kernel spent **3.0
+seconds** walking my program and then gave up with `BPF program is too large.
+Processed 1000001 insn`. For a program 22 instructions long.
+
+That gap (a tiny program, a million steps of proof) is most of what you need
+to understand about eBPF. After that it's where you can hook it, what it costs
+when it fires, and what "safe" turns out not to cover.
+
+One more thing before the contract. Before I'd loaded anything,
+`bpftool prog list` inside my container already showed programs I hadn't
+written: systemd's `sd_devices`, `sd_fw_egress` and `sd_fw_ingress`, attached to
+cgroups. Later in the day it also listed a kprobe on `oom_kill_process` and an
+LSM program on `socket_connect`, loaded by other writers' experiments on the
+same VM. BPF programs belong to the kernel, not to a
+
+container, and if you run a recent systemd you're running eBPF whether or not
+you chose to.
+
+<SectionHeading n="01" cmd="cat /proc/sys/kernel/unprivileged_bpf_disabled" id="contract">Safe, bounded, verified, and what that leaves out</SectionHeading>
+
+An eBPF program is a small function you hand to the kernel as bytecode. It
+gets checked, compiled to native code, and called when some event happens: a
+packet arrives, a function is entered, a file is opened. So what are you
+promised in return? Something narrow.
+
+- **It won't touch memory it wasn't given.** Every pointer dereference is
+  proven in bounds before the program runs, not checked while it runs.
+- **It will terminate.** Every path through the program reaches `exit` within
+  a bounded number of steps.
+- **It only calls what it's allowed to.** Each program type gets a fixed list
+  of helper functions and kernel functions, and nothing else.
+- **Types line up.** Using a packet pointer where a map value is expected, or
+  leaking a kernel address into a map an unprivileged reader can see, is
+  rejected at load.
+
+That's the whole contract: the kernel's memory and the kernel's liveness,
+checked once, at load time, by `kernel/bpf/verifier.c`.
+
+
+<Callout label="What the verifier's 'safe' does not mean">
+Safe means the kernel survives your program. It doesn't mean your *service*
+does. An XDP program that returns `XDP_DROP` for everything passes the
+verifier and makes the machine unreachable. An LSM program can deny every
+`open()`. Tetragon kills processes with `SIGKILL` from inside the kernel, on
+purpose. And a kprobe can double the cost of the function it's on (section
+5). None of those are verifier failures.
+
+</Callout>
+
+Two more things fall outside it. Bugs in the verifier itself, for one: it's
+roughly 21,800 lines of C in 6.10, and when its bounds reasoning is wrong it
+accepts a program that can read and write kernel memory. And bugs in the
+kernel code a program calls. Section 4 has both.
+
+<SectionHeading n="02" cmd="bpftool feature probe kernel" id="layout">Eleven registers, a map, and a place to hang it</SectionHeading>
+
+<Sub n="2.1" title="The instruction, as bytes">
+
+Every eBPF instruction is eight bytes. This is the struct, unchanged since
+2014, from `include/uapi/linux/bpf.h`:
+
+<SourceRead file="include/uapi/linux/bpf.h" repo="torvalds/linux" tag="v6.10" href="https://github.com/torvalds/linux/blob/v6.10/include/uapi/linux/bpf.h#L77">
+
+```c
+struct bpf_insn {
+	__u8	code;		/* opcode */
+	__u8	dst_reg:4;	/* dest register */
+	__u8	src_reg:4;	/* source register */
+	__s16	off;		/* signed offset */
+	__s32	imm;		/* signed immediate constant */
+};
+```
+
+</SourceRead>
+
+<Figure caption="One eBPF instruction. Four bits per register field is why there are at most 16 registers, and the ISA uses 11.">
+<MemoryLayout
+  unit="bits"
+  fields={[
+    { name: "code", bits: 8, note: "class | op | source, e.g. 0xa5 = JLT with immediate", accent: true },
+    { name: "dst", bits: 4, note: "r0–r10" },
+    { name: "src", bits: 4, note: "r0–r10" },
+    { name: "off", bits: 16, note: "jump distance or memory offset" },
+    { name: "imm", bits: 32, note: "constant; 64-bit constants take two slots" },
+  ]}
+/>
+</Figure>
+
+The register file is small and deliberately shaped like the CPUs it gets
+compiled for:
+
+- **r0** holds return values, from helpers and from the program itself.
+- **r1 to r5** carry arguments. On entry r1 is the context pointer: an
+  `xdp_md` for XDP, `pt_regs` for a kprobe.
+- **r6 to r9** are callee-saved, so they survive a helper call.
+- **r10** is a read-only frame pointer into a **512-byte stack**. That number
+  is `MAX_BPF_STACK` in `include/linux/filter.h`, and it's the limit people
+  hit when they put a 600-byte struct on the stack.
+
+All eleven are 64 bits wide, with 32-bit sub-register operations on top.
+They map one to one onto x86-64 and arm64 registers, so the JIT can stay
+simple. Since October 2024 the ISA has been an IETF standard,
+[RFC 9669](https://www.rfc-editor.org/rfc/rfc9669.html).
+
+</Sub>
+
+<Sub n="2.2" title="Maps: the only state that outlives one call">
+
+A program has no globals of its own that persist between events (strictly,
+globals *are* maps, created behind your back by libbpf). Anything it wants to
+remember, count or hand to userspace goes in a **map**: a kernel object with a
+file descriptor, created before the program loads.
+
+<Compare
+  cols={["Map type", "Shape", "Where you meet it"]}
+  rows={[
+    ["HASH", "Key to value, preallocated buckets", "Connection tables, per-PID state"],
+    ["ARRAY", "Integer index to value, fixed size, never deleted", "Config, counters, the verifier inlines lookups"],
+    ["PERCPU_HASH / PERCPU_ARRAY", "One value slot per CPU per key", "Counters with no atomics: my drop counter below"],
+    ["LRU_HASH", "Hash that evicts least-recently-used entries when full", "Flow tables in Cilium and Katran that must not fill up"],
+    ["RINGBUF (5.8)", "One MPSC ring shared by all CPUs, mmap'd to userspace", "Event streams: Falco's modern probe, Tetragon"],
+    ["PROG_ARRAY", "Array of programs, for tail calls", "Chaining programs past the size limit"],
+  ]}
+/>
+
+Why per-CPU? A shared counter needs an atomic add, and at millions of packets
+a second its cache line bounces between cores as chapter 13 describes. With a
+slot per CPU the increment is a plain load-add-store, and userspace sums the
+slots when it reads.
+
+</Sub>
+
+<Sub n="2.3" title="Program types and attach points">
+
+A program's **type** decides what its context looks like, which helpers it can
+call and what its return value means. Its **attach point** decides when it
+runs. On this kernel `bpftool feature probe` listed 32 program types as
+available (everything except `lirc_mode2`). These are the ones a working
+engineer meets:
+
+<Compare
+  cols={["Hook", "Fires on", "Stable?", "Typical user"]}
+  rows={[
+    ["kprobe / kretprobe", "Entry or return of almost any kernel function", "No, internal functions change", "bpftrace, BCC tools"],
+    ["tracepoint / raw_tp", "Static trace points the kernel maintains", "Yes, an ABI of sorts", "Syscall and scheduler tracing"],
+    ["fentry / fexit (5.5)", "Function entry or exit, via a BPF trampoline", "No, same as kprobe", "Modern tracers, Tetragon"],
+    ["uprobe / uretprobe", "An instruction in a userspace binary", "Depends on the binary", "Tracing TLS libraries, runtimes"],
+    ["XDP", "Packet in the driver, before an skb exists", "Yes", "Cloudflare, Katran, Cilium"],
+    ["tc (sched_cls)", "Packet at ingress or egress, with an skb", "Yes", "Cilium datapath, egress policy"],
+    ["cgroup/*", "Socket ops, device access, connect(), sysctl", "Yes", "systemd, Cilium socket LB"],
+    ["LSM (5.7)", "Security hooks: file open, exec, mmap", "Yes", "Tetragon, KRSI-style policy"],
+  ]}
+/>
+
+"Unstable" is meant literally. A kprobe on `tcp_v4_connect` works until a
+release inlines or renames it, and then your tool attaches to nothing. BTF and
+CO-RE (section 3.5) partly solve that.
+
+</Sub>
+
+<SectionHeading n="03" cmd="bpftool prog load xdp_drop.o /sys/fs/bpf/drop" id="hot-path">One program, from bpf() to a packet</SectionHeading>
+
+Here's the program I'll follow the whole way: an XDP program that drops UDP to
+port 9999 and counts the drops per CPU. It's short enough to read and it trips
+over every part of the verifier that matters.
+
+```c
+SEC("xdp")
+int xdp_drop_9999(struct xdp_md *ctx)
+{
+    void *data     = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)          /* the check the verifier wants */
+        return XDP_PASS;
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        return XDP_PASS;
+
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end || ip->protocol != IPPROTO_UDP)
+        return XDP_PASS;
+
+    struct udphdr *udp = (void *)ip + ip->ihl * 4;
+    if ((void *)(udp + 1) > data_end)
+        return XDP_PASS;
+
+    if (udp->dest == bpf_htons(9999)) {
+        __u32 key = 0;
+        __u64 *n = bpf_map_lookup_elem(&drops, &key);   /* PERCPU_ARRAY */
+        if (n)
+            (*n)++;
+        return XDP_DROP;
+    }
+    return XDP_PASS;
+}
+```
+
+<Flow
+  wrap={4}
+  steps={[
+    { label: "clang -target bpf", sub: "C to eBPF ELF, with BTF" },
+    { label: "libbpf", sub: "create maps, apply CO-RE relocations" },
+    { label: "bpf(BPF_PROG_LOAD)", sub: "bytecode into the kernel" },
+    { label: "verifier", sub: "walk every path, track every register", accent: true },
+    { label: "rewrite", sub: "ctx offsets, inline helpers" },
+    { label: "JIT", sub: "eBPF to arm64 or x86-64" },
+    { label: "attach", sub: "driver hook, trampoline or breakpoint" },
+    { label: "event fires", sub: "native code runs, returns a verdict" },
+  ]}
+/>
+
+<Sub n="3.1" title="The verifier walks every path">
+
+Think of the verifier as an **abstract interpreter**. It doesn't run your
+program on real data. It runs it on *descriptions* of data, and for every register at
+every instruction it keeps a state:
+
+- **A type.** `ctx`, `pkt` (a pointer into packet data), `pkt_end`,
+  `map_value_or_null`, `scalar`, and more than a dozen others.
+- **Bounds.** For scalars: unsigned and signed minimum and maximum, tracked
+  separately for the 64-bit value and its low 32 bits, plus a *tnum*, a
+  bit-level mask of which bits are known.
+- **A range, for packet pointers.** How many bytes past this pointer have been
+  proven to lie before `data_end`.
+
+At a conditional jump it doesn't pick a side. It pushes one branch onto a
+stack, narrows each register's state for the branch it's following ("if
+`r1 > r2` was false, then r1 is at most r2"), and comes back for the other
+branch later. Here's the main loop at v6.10, with the check that produced my
+three-second failure:
+
+<SourceRead file="kernel/bpf/verifier.c" repo="torvalds/linux" tag="v6.10" href="https://github.com/torvalds/linux/blob/v6.10/kernel/bpf/verifier.c#L17767">
+
+```c
+static int do_check(struct bpf_verifier_env *env)
+{
+	...
+	for (;;) {
+		...
+		insn = &insns[env->insn_idx];
+		class = BPF_CLASS(insn->code);
+
+		if (++env->insn_processed > BPF_COMPLEXITY_LIMIT_INSNS) {
+			verbose(env,
+				"BPF program is too large. Processed %d insn\n",
+				env->insn_processed);
+			return -E2BIG;
+		}
+
+		state->last_insn_idx = env->prev_insn_idx;
+
+		if (is_prune_point(env, env->insn_idx)) {
+			err = is_state_visited(env, env->insn_idx);
+			if (err < 0)
+				return err;
+			if (err == 1) {
+				/* found equivalent state, can prune the search */
+				...
+				goto process_bpf_exit;
+			}
+		}
+```
+
+</SourceRead>
+
+Two things in those lines explain most verifier behaviour:
+
+1. **`insn_processed` counts steps of the walk, not instructions in the
+   program.** A loop body is counted once per iteration the verifier
+   simulates. `BPF_COMPLEXITY_LIMIT_INSNS` is 1,000,000, defined in
+   `include/linux/bpf.h` with the comment `/* yes. 1M insns */`.
+2. **Pruning is the only thing that keeps this tractable.** At a prune point,
+   `is_state_visited` compares the current register and stack state against
+   states it already proved safe at that instruction. If the current one is a
+   subset (every range inside an old range), this path is safe by the old
+   proof and the walk stops here.
+
+</Sub>
+
+<Sub n="3.2" title="Bounds tracking, and the error everyone hits first">
+
+To see the packet range tracking, I wrote the version everybody writes first:
+read the Ethernet type field without checking the packet is long enough.
+Here's the log, verbatim, from `bpftool prog load` on the 6.10 kernel:
+
+```text
+0: R1=ctx() R10=fp0
+; struct ethhdr *eth = (void *)(long)ctx->data; @ xdp_bad.c:9
+0: (61) r1 = *(u32 *)(r1 +0)          ; R1_w=pkt(r=0)
+; if (eth->h_proto == 0x0008)        /* htons(ETH_P_IP) on little-endian */ @ xdp_bad.c:10
+1: (71) r2 = *(u8 *)(r1 +12)
+invalid access to packet, off=12 size=1, R1(id=0,off=12,r=0)
+R1 offset is outside of the packet
+processed 2 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0
+```
+
+Read `R1_w=pkt(r=0)` as "r1 is a packet pointer, and zero bytes past it are
+known to exist". Reading byte 12 needs `r` of at least 13, so the load is
+refused. In the working version, the `if ((void *)(eth + 1) > data_end)`
+comparison is what raises `r` to 14 on the fall-through branch. It learns
+from your `if` statements and from nothing else.
+
+So why does this error confuse people? Because the fix isn't on the line the
+log points at. It's a comparison you add *before* it, in the form the verifier
+pattern-matches: pointer plus constant, compared against `data_end`.
+
+</Sub>
+
+<Sub n="3.3" title="What pruning costs you: a loop, counted">
+
+To put a number on "steps, not instructions", I compiled one loop with
+different bounds. Its body is eight eBPF instructions and the whole program is
+thirteen:
+
+```c
+#pragma clang loop unroll(disable)
+for (__u32 i = 0; i < N; i++)
+    sum += i * i;
+```
+
+<Compare
+  cols={["N", "Program size", "verified_insns", "Result"]}
+  rows={[
+    ["1,000", "2 instructions", "–", "Loaded. Clang folded the whole loop into a constant."],
+    ["100,000", "13 instructions", "800,005", "Loaded in 0.07 s"],
+    ["120,000", "13 instructions", "960,005", "Loaded"],
+    ["130,000", "13 instructions", "limit", "BPF program is too large. Processed 1000001 insn"],
+    ["400,000", "13 instructions", "limit", "Rejected after 1.9 s"],
+  ]}
+/>
+
+The `verified_insns` column comes from `bpf_prog_info`, which the kernel has
+reported since 5.16. For both loaded runs it's exactly **8 × N + 5**. Every iteration got
+simulated, because `i` is a known constant on each pass, no two states match,
+and nothing prunes. So this body's ceiling is N = 124,999, and program length
+has nothing to do with it.
+
+Before 5.3 none of this loaded at all. A control-flow check rejected any
+back-edge with `back-edge from insn %d to %d`, and people unrolled
+loops with `#pragma unroll`. Alexei Starovoitov's
+[bounded loops series](https://lwn.net/Articles/794934/) lifted that for 5.3
+by letting the walk go round the loop and trusting the complexity limit to
+stop it. The one-million complexity limit, and the end of the 4,096-instruction cap on
+program size, arrived in 5.2 with
+[commit c04c0d2b968a](https://github.com/torvalds/linux/commit/c04c0d2b968ac45d6ef020316808ef6c82325a82),
+whose message says "on typical x86 machine non-debug kernel processes 1M
+instructions in 1/10 of a second". On this shared container it took 1.9 to 3.7
+seconds to hit the limit. I haven't separated how much of that is arm64, how
+much is the linuxkit build and how much is neighbours on the box.
+
+</Sub>
+
+<Sub n="3.4" title="The rewrite, then the JIT">
+
+A program that passes isn't run as you wrote it. It gets rewritten first,
+and `bpftool prog dump xlated` shows the result. Two rewrites are
+visible in my drop program. Clang emitted this for the first two loads:
+
+```text
+1:  r2 = *(u32 *)(r1 + 0x4)      ; ctx->data_end, as a u32 in struct xdp_md
+2:  r3 = *(u32 *)(r1 + 0x0)      ; ctx->data
+```
+
+The kernel runs this instead:
+
+```text
+; void *data_end = (void *)(long)ctx->data_end;
+   1: (79) r2 = *(u64 *)(r1 +8)
+; void *data     = (void *)(long)ctx->data;
+   2: (79) r3 = *(u64 *)(r1 +0)
+```
+
+`struct xdp_md` is a stable, 32-bit-field view that exists for you. Underneath
+is the kernel's `xdp_buff`, holding 64-bit pointers, and each context access
+got rewritten to the real field. Then the map lookup: my `bpf_map_lookup_elem` call on a per-CPU array became eleven
+inline instructions with a bounds check against `max_entries`, and no call at
+all.
+
+Then the **JIT** turns that into arm64: 336 bytes for the whole program.
+bpftool from Ubuntu's `linux-tools` package refused with `No JIT disassembly
+support`, so I read the image out with `bpf_obj_get_info_by_fd` in a 20-line C
+program and fed it to `objdump -b binary -m aarch64`. Here's the middle:
+
+```text
+  40:  f9400401   ldr   x1, [x0, #8]        ; data_end
+  44:  f9400002   ldr   x2, [x0]            ; data
+  4c:  91003800   add   x0, x0, #0xe        ; eth + 1
+  50:  eb01001f   cmp   x0, x1
+  54:  54000648   b.hi  0x11c               ; too short: XDP_PASS
+  ...
+  e8:  d37df0e7   lsl   x7, x7, #3
+  ec:  8b0000e7   add   x7, x7, x0
+  f0:  f94000e7   ldr   x7, [x7]
+  f4:  d538d08a   mrs   x10, tpidr_el1      ; this CPU's per-CPU offset
+  f8:  8b0a00e7   add   x7, x7, x10
+ 10c:  f94000e0   ldr   x0, [x7]
+ 110:  91000400   add   x0, x0, #0x1        ; (*n)++, no atomic
+ 114:  f90000e0   str   x0, [x7]
+```
+
+It's roughly what you'd write by hand. Each bounds check is one compare and a
+branch. Finding the per-CPU counter is a read of `tpidr_el1` and an add, and
+the increment is plain.
+
+Why bother with a JIT when the kernel has an interpreter? I wrote a 40-line
+eBPF interpreter on the Mac to get a feel for the gap. It uses the real
+instruction layout and opcode bytes, and runs the same kind of loop:
+
+<TryIt what="A five-opcode eBPF interpreter against the same loop compiled natively" lang="cpp" toolchain="Apple clang 21 -O2, Apple M4, macOS 26.5.1">
+
+```cpp
+struct bpf_insn {
+    uint8_t code;
+    uint8_t dst_reg : 4;
+    uint8_t src_reg : 4;
+    int16_t off;
+    int32_t imm;
+};
+static_assert(sizeof(bpf_insn) == 8);
+
+enum : uint8_t {  // real opcode bytes: class | op | source
+    MOV64_K = 0xb7, ADD64_K = 0x07, ADD64_X = 0x0f, JLT_K = 0xa5, EXIT = 0x95,
+};
+
+uint64_t run(const bpf_insn* pc, uint64_t* insns_executed) {
+    uint64_t r[11] = {}, n = 0;
+    for (;; ++pc, ++n) {
+        switch (pc->code) {
+        case MOV64_K: r[pc->dst_reg] = (int64_t)pc->imm; break;
+        case ADD64_K: r[pc->dst_reg] += (int64_t)pc->imm; break;
+        case ADD64_X: r[pc->dst_reg] += r[pc->src_reg]; break;
+        case JLT_K:   if (r[pc->dst_reg] < (uint64_t)pc->imm) pc += pc->off; break;
+        case EXIT:    *insns_executed = n + 1; return r[0];
+        }
+    }
+}
+
+// r0 = 0; r1 = 0; loop: r0 += r1; r1 += 1; if r1 < N goto loop; exit
+const bpf_insn prog[] = {
+    {MOV64_K, 0, 0, 0, 0}, {MOV64_K, 1, 0, 0, 0},
+    {ADD64_X, 0, 1, 0, 0}, {ADD64_K, 1, 0, 0, 1},
+    {JLT_K, 1, 0, -3, 100'000'000}, {EXIT, 0, 0, 0, 0},
+};
+// ...timed with steady_clock against the same loop in C, with an
+// asm volatile barrier so clang can't turn it into n*(n-1)/2.
+```
+
+<Output>
+
+```text
+result 4999999950000000, 300000003 BPF insns executed
+interpreted: 0.91 ns per BPF insn
+native:      0.08 ns per loop-equivalent insn
+ratio:       10.9x
+```
+
+Three runs gave 10.9×, 9.1× and 10.7×. Linux's interpreter uses a
+computed-goto jump table, which beats a switch, but it's still a dispatch
+branch per instruction against roughly one cycle per instruction.
+
+</Output>
+</TryIt>
+
+This kernel doesn't give you the choice anyway.
+`CONFIG_BPF_JIT_ALWAYS_ON=y` is set, which removes the interpreter from the
+build. That option came in during the Spectre work of early 2018, because an
+in-kernel interpreter that executes attacker-supplied bytecode is a very
+convenient Spectre v1 gadget.
+
+</Sub>
+
+<Sub n="3.5" title="BTF and CO-RE: one binary, many kernels">
+
+A tracing program wants to read `task->mm->exe_file` or `sk->__sk_common.skc_daddr`.
+Those offsets change between kernel versions and distribution configs.
+BCC's answer was to ship clang and kernel headers to every host and compile at
+startup: a large dependency, and seconds of CPU on every node whenever the
+agent starts.
+
+**BTF** is the fix on the kernel side. It's a compact type description of the
+running kernel, built into it; on this linuxkit kernel
+`/sys/kernel/btf/vmlinux` is 6.2 MB and describes every struct. **CO-RE**
+("compile once, run everywhere") is the fix on the program side:
+
+- Clang compiles field accesses marked with `__builtin_preserve_access_index`
+  (or `BPF_CORE_READ`) into **relocations** that name the field instead of
+  hard-coding an offset.
+- At load, libbpf reads the target kernel's BTF, finds where that field lives
+  *on this kernel*, and patches the instruction's offset before calling
+  `bpf(BPF_PROG_LOAD)`.
+- If the field doesn't exist, the program can test for it with
+  `bpf_core_field_exists` and take another branch.
+
+Andrii Nakryiko's [BPF CO-RE post](https://nakryiko.com/posts/bpf-portability-and-co-re/)
+from February 2020 is the reference. BTF matters for the verifier too: it's
+what lets fentry programs take typed arguments and lets the verifier
+type-check pointers into kernel structs. That's the reason Falco made its
+CO-RE "modern eBPF" driver
+[the default in 0.38](https://falco.org/blog/falco-0-38-0/): one binary,
+embedded in Falco, no per-kernel build.
+
+</Sub>
+
+<Sub n="3.6" title="Attach, and one event firing">
+
+Loading isn't running. Nothing happens until something attaches the
+program, and each hook does that differently. That's where the cost
+differences in section 5 come from:
+
+- **XDP.** The driver calls the program's JIT'd address directly from its
+  receive loop, on the raw DMA buffer, before allocating an `sk_buff`.
+- **fentry/fexit.** The kernel builds a small **BPF trampoline** and patches
+  the function's ftrace nop into a call to it. Starovoitov's
+  [2019 series](https://lwn.net/Articles/804937/) introduced it with "unlike
+  k[ret]probe there is practically zero overhead".
+- **kprobe.** On arm64 this kernel has no `KPROBES_ON_FTRACE`. With my probe
+  attached, `/sys/kernel/debug/kprobes/list` showed
+  `ffff800080068830  k  __arm64_sys_getppid+0x0` with no `[FTRACE]` flag. So
+  each hit is a `BRK` instruction, a debug exception, a handler that finds the
+  probe, and single-stepping the displaced instruction.
+- **Tracepoints.** A static call site the kernel compiled in, enabled by a
+  static key.
+
+For the XDP program I skipped the NIC and used `BPF_PROG_TEST_RUN`, which runs
+the attached-style code path on a buffer you supply:
+
+```shell
+$ bpftool prog run pinned bpffs/drop data_in udp9999.bin repeat 10000000
+Return value: 1, duration (average): 6ns
+$ bpftool prog run pinned bpffs/drop data_in udp53.bin repeat 10000000
+Return value: 2, duration (average): 6ns
+```
+
+Return value 1 is `XDP_DROP` and 2 is `XDP_PASS`. Five runs of each gave 5
+or 6 ns every time. Afterwards the per-CPU map showed 50,000,000 drops on CPU 0
+and zero on the other nine: five runs of ten million, all on one core.
+
+</Sub>
+
+<SectionHeading n="04" cmd="dmesg | grep -i bpf" id="failure">Rejections, verifier CVEs, and the kernel underneath</SectionHeading>
+
+<Sub n="4.1" title="The rejections everyone hits">
+
+- **`invalid access to packet`.** Section 3.2. A missing or misshapen
+  `data_end` check. Sometimes the check is there, but clang reordered or
+  merged it into a form the verifier doesn't recognise, and you end up
+  massaging C until the bytecode looks right.
+- **Loops.** Before 5.3, any back-edge: `back-edge from insn 9 to 2`. After
+  5.3, a loop whose bound isn't visible to the verifier runs the walk into the
+  million-step limit. Newer kernels add `bpf_loop()` (5.17) and open-coded
+  iterators, which take the loop body out of the walk entirely.
+- **`BPF program is too large. Processed 1000001 insn`.** Section 3.3. Nearly
+  always an explosion of paths, not a large program.
+- **Pointer arithmetic the verifier won't follow.** My first loop test used the
+  packet length as the bound, and clang computed it with a bitwise trick on
+  the pointer. Its log said `R3 bitwise operator ^= on pointer prohibited`. I
+  hadn't written a `^=` anywhere.
+- **Stack and helpers.** More than 512 bytes of stack across the call chain, a
+  helper not allowed for this program type, or a GPL-only helper from a
+  program whose license section doesn't say GPL.
+
+And the loop from the top of this chapter belongs here. A loop the verifier
+should reject can load, because the optimiser proved something about it first.
+It works in reverse too. Adding `volatile` to my loop counter (to
+stop clang unrolling it) made even N = 1,000 fail after 4.8 seconds; I think
+it's because a 32-bit spill to the stack loses the verifier's precise tracking
+of `i`, though I didn't go and prove it.
+
+</Sub>
+
+<Sub n="4.2" title="When the verifier is wrong">
+
+Bounds arithmetic in the verifier is the security boundary. If it believes a
+register is in [0, 8] and at runtime it holds 4096, a "proven" load reads
+kernel memory. That has happened, repeatedly:
+
+- **[CVE-2020-8835](https://www.thezdi.com/blog/2020/4/8/cve-2020-8835-linux-kernel-privilege-escalation-via-improper-ebpf-program-verification).**
+  Manfred Paul at Pwn2Own 2020. Narrowing of 32-bit bounds in
+  `__reg_bound_offset32` was wrong, so a sequence of 32-bit operations
+  produced a register whose real value was outside its tracked range. Local
+  root on 5.5 and later.
+- **[CVE-2021-3490](https://www.openwall.com/lists/oss-security/2021/05/11/11).**
+  Manfred Paul again, via ZDI: ALU32 bounds for AND, OR and XOR weren't updated
+  correctly, turned into out-of-bounds reads and writes. Fixed in
+  commit 049c4e13714e for 5.13.
+
+Both needed nothing but the ability to load a socket filter, which any
+unprivileged user had. So that got taken away.
+`CONFIG_BPF_UNPRIV_DEFAULT_OFF` appeared in 5.13 and became
+[`default y` in 5.16](https://github.com/torvalds/linux/blob/v5.16/kernel/bpf/Kconfig).
+It sets `kernel.unprivileged_bpf_disabled` to 2: off, but root can turn it
+back on. Ubuntu
+[shipped that default](https://discourse.ubuntu.com/t/unprivileged-ebpf-disabled-by-default-for-ubuntu-20-04-lts-18-04-lts-16-04-esm/27047)
+from 21.10 and backported it to its LTS kernels in March 2022.
+
+Here's the part I didn't expect. Docker Desktop's linuxkit kernel has the
+option unset, and `/proc/sys/kernel/unprivileged_bpf_disabled` read **0**:
+unprivileged BPF is on in the VM a lot of developers run their containers
+in. It's a development VM, and the blast radius is the VM. But
+check yours.
+
+</Sub>
+
+<Sub n="4.3" title="When the kernel under the verifier is wrong">
+
+Verifier code is kernel code, and it can crash. In May 2024 Red Hat
+published a [solution note](https://access.redhat.com/solutions/7068083) for
+RHEL 9.4: loading CrowdStrike Falcon's eBPF program panicked kernels from
+5.14.0-410 onward, in the verifier's `backtrack_insn`. Nothing was wrong
+with the program; the bug was in the RHEL kernel's verifier, and a later 9.4 kernel
+fixed it.
+
+So "an eBPF agent can't crash the kernel" is true of what the program does
+while it runs. It isn't true of the kernel code that checks the program, JITs
+it or implements the helpers it calls. Those are ordinary kernel C, and when
+they're wrong they panic like any other kernel C.
+
+</Sub>
+
+<SectionHeading n="05" cmd="./probe.sh 'kprobe:__arm64_sys_getppid { @n = count(); }'" id="cost">What it costs when it fires</SectionHeading>
+
+<Callout label="The machine" kind="note">
+Docker Desktop VM, linuxkit 6.10.14, aarch64 on an Apple M4. A **shared
+4-CPU container** (other writers' benchmarks were running; one of them was
+doing 200,000 syscalls a second). gcc 13.3 `-O2`, bpftrace 0.20.2. Each row is
+seven runs of 5 million `syscall(SYS_getppid)` calls pinned to one CPU, repeated
+in three rounds. I report the median of the three round medians.
+</Callout>
+
+<Sub n="5.1" title="Six ways to watch one syscall">
+
+`getppid` is a real syscall that does almost no work, so any probe on it is
+most of the difference. Chapter 07 found `getpid` is sometimes not a syscall
+at all; that's why I called `syscall(SYS_getppid)` directly. Each probe just
+counts, `@n = count()`, and the count came out at 35,700,000-and-a-few every
+time: 7 × 5.1 million calls, plus a handful from other processes.
+
+<Compare
+  cols={["Attached", "ns per getppid", "Added by the probe", "How it's hooked"]}
+  rows={[
+    ["Nothing", "93", "–", "Baseline, 89.7 to 93.2 across rounds"],
+    ["fentry", "106", "+13 ns", "BPF trampoline via ftrace"],
+    ["tracepoint sys_enter_getppid", "115", "+22 ns", "Syscall tracepoint slow path"],
+    ["fexit", "144", "+51 ns", "Trampoline that calls the function itself"],
+    ["kprobe", "178", "+85 ns", "BRK debug exception"],
+    ["kretprobe", "228", "+135 ns", "BRK on entry plus return-address hijack"],
+  ]}
+/>
+
+A kprobe nearly doubled the syscall. An fentry probe on the same function
+added a seventh as much. If you're choosing a hook for anything that fires a
+million times a second, that ratio is the decision.
+
+<Callout label="The row I can't explain" kind="warn">
+fexit costs four times what fentry does: +51 ns against +13 ns, on the same
+function, in all three rounds. I expected a small gap. An fexit trampoline has
+to call the original function itself, save its return value and then run the
+program, where fentry runs the program and jumps back. But that's a few extra
+instructions, not 38 ns. My guess is something arm64-specific in how the
+trampoline saves registers or handles the return-address signing, and I
+haven't proven it. The experiment that would settle it is `perf record` on
+the benchmark with fexit attached, looking for where the extra cycles land,
+and then the same benchmark on an x86 box.
+</Callout>
+
+Attributed numbers agree on the shape. Brendan Gregg's measurements for *BPF
+Performance Tools* (Linux 4.15, i7-8650U), as tabulated by
+[Piotrowski at AsiaBSDCon 2024](https://papers.freebsd.org/2024/asiabsdcon/piotrowski-Benchmarking-Performance-Overhead-of-DTrace-on-FreeBSD-and-eBPF-on-Linux.files/piotrowski-Benchmarking-Performance-Overhead-of-DTrace-on-FreeBSD-and-eBPF-on-Linux-paper.pdf),
+put a kprobe at 78 ns per event, a kretprobe at 217 ns, a tracepoint at 99 ns
+and a uprobe at 1,317 ns. Piotrowski's own rerun (Linux 5.4, Xeon Gold 6226R,
+bpftrace 0.17) got 56, 199, 74 and 1,085 ns. Want a uprobe on `malloc`? That
+last number is why you should think twice: it's a trap into the kernel from
+userspace on every call.
+
+</Sub>
+
+<Sub n="5.2" title="What an XDP drop costs">
+
+<Estimate
+  rows={[
+    { label: "My drop program, one packet", math: "BPF_PROG_TEST_RUN, 10M repeats, 5 runs", value: "5–6 ns" },
+    { label: "XDP drop, whole path, one core", math: "24 Mpps → 1 / 24M", value: "41.6 ns" },
+    { label: "DPDK drop, one core, same box", math: "43.5 Mpps → 1 / 43.5M", value: "22.9 ns" },
+    { label: "iptables raw-table drop, one core", math: "4.8 Mpps", value: "208 ns" },
+  ]}
+  result={{ label: "Program share of an XDP drop", value: "≈ 15%; the driver is the rest" }}
+/>
+
+Those 24, 43.5 and 4.8 Mpps figures come from the
+[XDP paper](https://dl.acm.org/doi/10.1145/3281411.3281443)
+(Høiland-Jørgensen et al., CoNEXT 2018; Xeon E5-1650 v4 at 3.6 GHz,
+ConnectX-5 100 Gbit). It scaled XDP linearly until the PCI bus ran out at
+115 Mpps. With conntrack loaded, the regular stack managed 1.8 Mpps. My 6 ns
+is a different machine and it skips the driver, so the 15% is a
+back-of-envelope ratio and not a measurement.
+
+It does show where the time goes: receiving the packet (DMA, descriptor ring,
+page recycling) is most of an XDP drop. Cloudflare's Marek Majkowski measured
+the same ordering in
+
+[2018](https://blog.cloudflare.com/how-to-drop-10-million-packets/):
+1.688 Mpps for an iptables raw-table drop, 1.8 Mpps for tc, and 10 Mpps for
+XDP.
+
+</Sub>
+
+<SectionHeading n="06" cmd="bpftrace -l 'tracepoint:syscalls:*' | wc -l" id="operating">Seeing inside, and what to do on Monday</SectionHeading>
+
+<Sub n="6.1" title="The two one-liners that earn their keep">
+
+Syscalls by process name, for five seconds, on the shared container:
+
+```shell
+$ bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }
+               interval:s:5 { exit(); }'
+...
+@[systemd-journal]: 2866
+@[python3]: 3076
+@[(s12-echo)]: 5252
+@[systemctl]: 8654
+@[systemd]: 14961
+@[8]: 21006
+@[negdent]: 1000027
+```
+
+`negdent` was another writer's benchmark, doing a million syscalls in five
+seconds. That's the first thing this one-liner is for: someone on the box is
+doing something at a rate you didn't expect.
+
+Read latency as a histogram, in microseconds, while `dd` read 64 KB blocks
+from `/dev/zero` in a loop:
+
+```shell
+$ bpftrace -e 'tracepoint:syscalls:sys_enter_read { @start[tid] = nsecs; }
+    tracepoint:syscalls:sys_exit_read /@start[tid]/ {
+      @usecs = hist((nsecs - @start[tid]) / 1000); delete(@start[tid]); }
+    interval:s:5 { exit(); }'
+@start[194852]: 384591934090
+@start[151]: 386715091716
+@usecs:
+[0]                 2851 |@@@@                                                |
+[1]                  771 |@                                                   |
+[2, 4)             36457 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[4, 8)              6199 |@@@@@@@@                                            |
+[8, 16)             2214 |@@@                                                 |
+[16, 32)             250 |                                                    |
+```
+
+That 2–4 µs bucket is `dd` zeroing 64 KB per read. Those stray `@start` lines
+are reads still in flight when the script exited; add `END { clear(@start); }`
+if they bother you. I've cut the long tail, which reached the 1–2 ms bucket.
+On a shared box that's probably the scheduler, not `read`.
+
+</Sub>
+
+<Sub n="6.2" title="bpftool, for what's already loaded">
+
+```shell
+bpftool prog list                          # every program, with xlated/jited size
+bpftool prog show id 194 --json            # includes verified_insns on newer bpftool
+bpftool prog dump xlated id 194            # after the verifier's rewrites
+bpftool prog dump jited id 194             # needs a bpftool built with LLVM or libbfd
+bpftool map dump name drops                # per-CPU values, one per CPU
+bpftool feature probe kernel               # program types, helpers, JIT config
+sysctl kernel.bpf_stats_enabled=1          # then run_time_ns / run_cnt per program
+```
+
+That last one is the one people forget. With stats on, `bpftool prog show`
+reports how many times each program ran and its total time. That's how you
+find out a security agent's kprobe is eating a few percent of your cores. It
+adds a clock read or two per invocation, so it's off by default. (I didn't
+measure that overhead.)
+
+</Sub>
+
+<Sub n="6.3" title="On Monday">
+
+- **Prefer fentry over kprobe, and tracepoints over both,** where the kernel
+  has them. My numbers say 13 ns against 85 ns on the same function.
+- **Check `unprivileged_bpf_disabled`** on every host image you own. It should
+  read 1 or 2 unless you have a specific reason.
+- **Ask your vendors which hooks they use.** A kretprobe on a hot path costs
+  100+ ns per call, and `bpf_stats_enabled` will show it.
+- **Read verifier logs from the bottom up.** Find the register it complains
+  about and where its `r=` or bounds should have been raised. It's usually a
+  missing comparison.
+
+
+</Sub>
+
+<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+
+**Write an XDP drop filter, then fight the verifier on purpose.**
+
+- Write the port-9999 filter from section 3 with a `PERCPU_ARRAY` counter.
+  Compile with `clang -O2 -g -target bpf` and load it with `bpftool prog load`.
+- Delete the first `data_end` check and read the log. Then put it back with
+  `>=` instead of `>` and see whether the verifier still accepts it (think
+  about it first).
+- Time it with `bpftool prog run ... repeat 10000000`, then attach it to a veth
+  pair and send UDP with `iperf3 -u`. Do the counter and `iperf3` agree?
+- Loop over the payload bytes, find where the verifier gives up, then rewrite
+  with `bpf_loop()` and watch `verified_insns` drop.
+
+<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
+
+<Compare
+  cols={["You get", "You pay", "When the bill arrives"]}
+  rows={[
+    ["Kernel code without a kernel module", "Only what the verifier can prove, in a restricted C", "When a correct program is rejected and you rewrite it to please a static analyser"],
+    ["No crash from the program itself", "A 21,800-line verifier in your trusted base", "As CVEs, and as a disabled unprivileged API"],
+    ["Hooks almost anywhere", "kprobes on unstable internals", "When a kernel upgrade silently detaches your tool"],
+    ["Cheap in-kernel filtering", "85 ns per kprobe hit, 1+ µs per uprobe", "On the hottest function you chose to trace"],
+    ["Drops at 24 Mpps per core", "No skb, no stack features, driver support needed", "When you want conntrack or GRO before your program"],
+    ["One binary across kernels with CO-RE", "Needs BTF in the kernel", "On old or stripped distribution kernels"],
+  ]}
+/>
+
+<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Cloudflare: L4Drop and Magic Transit" verdict="The most-cited production XDP story, and a later choice to keep customer eBPF out of the kernel.">
+    [L4Drop](https://blog.cloudflare.com/l4drop-xdp-ebpf-based-ddos-mitigations/)
+    (November 2018) compiles DDoS rules to C, then to XDP. During one attack it
+    dropped over 8 million packets a second while CPU rose about 10%.
+    [Magic Transit](https://blog.cloudflare.com/magic-transit-network-functions/)
+    sends customer traffic "through our XDP- and iptables-based DoS detection".
+    When Cloudflare let customers upload their own eBPF in 2026
+    ([Programmable Flow Protection](https://blog.cloudflare.com/programmable-flow-protection)),
+    it verified the programs and then ran them in userspace, not in the kernel.
+  </WildCard>
+  <WildCard name="Cilium replacing kube-proxy" verdict="Where most Kubernetes engineers first run eBPF without writing any.">
+    kube-proxy turns Services into iptables rules that every new connection
+    walks. Cilium's [kube-proxy replacement](https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/)
+    uses BPF hash maps at tc, plus a cgroup hook on `connect()` that picks a
+    backend and rewrites the destination before a packet exists, so there's no
+    per-packet NAT.
+
+  </WildCard>
+  <WildCard name="Meta: Katran" verdict="An L4 load balancer that shares its hosts with the services behind it.">
+    [Open-sourced May 2018](https://engineering.fb.com/2018/05/22/open-source/open-sourcing-katran-a-scalable-network-load-balancer/),
+    replacing an IPVS-based balancer. XDP picks a backend with an extended
+    Maglev hash and IP-in-IP encapsulates, varying the outer source IP per flow
+    so receive-side scaling spreads the load. No busy polling, so it idles near
+    zero CPU.
+  </WildCard>
+  <WildCard name="Netflix and Brendan Gregg" verdict="Why bpftrace and the BCC tools exist in the form they do.">
+    Gregg's [BPF Performance Tools](https://www.brendangregg.com/bpf-performance-tools-book.html)
+    (2019), written while he was at Netflix, has more than 150 tools
+    (`biolatency`, `execsnoop`, `tcplife`). Many ship in Ubuntu's `bpfcc-tools`.
+  </WildCard>
+  <WildCard name="Falco and Tetragon" verdict="Detection first, then enforcement from inside the kernel.">
+    [Falco 0.38](https://falco.org/blog/falco-0-38-0/) made its CO-RE ring-buffer
+    driver the default, with no kernel module to build.
+    [Tetragon](https://isovalent.com/blog/post/2022-05-16-tetragon/) (open-sourced
+    May 2022) matches policy in-kernel and can send `SIGKILL` or override a
+    function's return value before the action completes, with no round trip
+    to userspace.
+  </WildCard>
+  <WildCard name="CrowdStrike, 19 July 2024" verdict="eBPF bounds what the content can do; it doesn't bound the kernel code around it.">
+    A Falcon content update, Channel File 291, supplied 21 input fields to a
+    Windows kernel driver's content interpreter that expected 20. That
+    out-of-bounds read crashed
+    [about 8.5 million Windows machines](https://blogs.microsoft.com/blog/2024/07/20/helping-our-customers-through-the-crowdstrike-outage/)
+    ([CrowdStrike's RCA](https://www.crowdstrike.com/wp-content/uploads/2024/08/Channel-File-291-Incident-Root-Cause-Analysis-08.06.2024.pdf)).
+    A verified eBPF program can't make that kind of unchecked read: every
+    access is proven in bounds before it runs. But two months earlier, Falcon's
+    Linux eBPF sensor had panicked RHEL 9.4 through a kernel verifier bug
+    (section 4.3). eBPF moves the risk into a smaller, shared, heavily reviewed
+    piece of kernel code. It doesn't make it zero.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What does the eBPF verifier guarantee, and what doesn't it?">
+In-bounds memory access for each pointer's type, termination within the
+complexity limit, and only the helpers the program type allows. Not
+correctness, cost or harmlessness to your service: an XDP program that drops
+everything is perfectly safe. Nor protection from its own bugs.
+</QA>
+
+<QA level="beginner" q="Why do XDP programs have to compare against data_end before reading a header?">
+The verifier tracks how many bytes past each packet pointer are proven to
+exist, and only a comparison against `data_end` raises that number. Without
+it you get `invalid access to packet`. It's also correct at runtime: a
+truncated packet really can be shorter than a header.
+</QA>
+
+<QA level="intermediate" q="A 15-instruction program fails with 'BPF program is too large. Processed 1000001 insn'. How?">
+The limit counts steps of the walk, not program size. Loops are simulated once
+per iteration, and branches multiply paths unless pruning finds an equivalent
+state. My 13-instruction loop cost exactly 8N + 5 steps, so it fails at
+N = 125,000. Fixes: `bpf_loop()`, iterators, or tail calls.
+</QA>
+
+<QA level="intermediate" q="kprobe or fentry for a hot kernel function, and why?">
+fentry, if the kernel has BTF and trampolines. A kprobe hits a breakpoint
+exception (on arm64 a BRK) and the handler has to find and run the probe; fentry
+is a direct call into a generated trampoline from the function's ftrace nop.
+On one getppid benchmark I measured +85 ns for a kprobe and +13 ns for fentry.
+</QA>
+
+<QA level="intermediate" q="Why use a per-CPU array for a packet counter?">
+A shared counter needs an atomic add, and the cache line bounces between every
+core that increments it. Per-CPU slots make it a plain load, add and store,
+and userspace sums the slots when it reads.
+</QA>
+
+<QA level="deep" q="What problem does CO-RE solve, and how does it work?">
+Struct layouts differ across kernels, so a program built against one kernel's
+headers reads garbage on another. With CO-RE, clang records field accesses as
+relocations, the kernel publishes its types as BTF, and libbpf patches offsets
+at load time. One binary, many kernels, no compiler on the host.
+</QA>
+
+<QA level="deep" q="Why is unprivileged eBPF disabled by default on modern kernels?">
+Because the verifier is the security boundary and it has had exploitable bugs.
+CVE-2020-8835 and CVE-2021-3490 were both bounds-tracking errors in 32-bit
+arithmetic that let an unprivileged socket filter read and write kernel memory.
+There's also a Spectre angle: attacker-controlled code running in the kernel
+makes speculation gadgets easy. `CONFIG_BPF_UNPRIV_DEFAULT_OFF` became
+default y in 5.16.
+</QA>
+
+<QA level="deep" q="Could an eBPF-based agent have caused the CrowdStrike outage?">
+Not by that mechanism. Windows crashed because of an unchecked out-of-bounds read in
+a kernel driver's content interpreter, and the verifier rejects any eBPF
+program that could make an unproven read. But eBPF agents run on top of kernel
+code that can still be buggy: in May 2024 Falcon's eBPF sensor panicked RHEL
+9.4 in the verifier itself. And a verified program can still drop all traffic
+or kill processes by policy. Smaller risk, not zero.
+</QA>
+
+<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Your loop with a bound of 4 billion loads without complaint. What happened?">
+    Probably the compiler removed the loop, for example by computing a closed
+    form. Disassemble the .o with llvm-objdump before trusting that the
+    verifier saw it.
+  </Q>
+  <Q q="What does R1_w=pkt(r=0) mean in a verifier log?">
+    r1 is a pointer into packet data, and zero bytes past it are known to be
+    before data_end. Any load through it will be rejected.
+  </Q>
+
+  <Q q="Which setting stops non-root users loading BPF programs?">
+    kernel.unprivileged_bpf_disabled, 1 or 2. It's 2 by default from 5.16.
+
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="kernel/bpf/verifier.c at v6.10">
+    [The source](https://github.com/torvalds/linux/blob/v6.10/kernel/bpf/verifier.c).
+    Start at `do_check` and `is_state_visited`; the block comments at the top
+    of the file are the best design doc there is.
+  </WildCard>
+  <WildCard name="LWN: Bounded loops in BPF for the 5.3 kernel">
+    [How loops were allowed](https://lwn.net/Articles/794934/), and why
+    pruning points moved. Pair with
+    [Taking BPF programs beyond one-million instructions](https://lwn.net/Articles/1017116/)
+    from 2025.
+  </WildCard>
+  <WildCard name="Høiland-Jørgensen et al., The eXpress Data Path (CoNEXT 2018)">
+    [The XDP paper](https://dl.acm.org/doi/10.1145/3281411.3281443). Where 24 Mpps
+    and 41.6 ns per packet come from, and an honest comparison with DPDK.
+  </WildCard>
+  <WildCard name="Andrii Nakryiko: BPF CO-RE reference guide">
+    [How relocations and BTF fit together](https://nakryiko.com/posts/bpf-portability-and-co-re/),
+    from the libbpf maintainer.
+  </WildCard>
+  <WildCard name="RFC 9669: BPF Instruction Set Architecture">
+    [The ISA as a standard](https://www.rfc-editor.org/rfc/rfc9669.html):
+    opcodes, registers and the conformance groups.
+  </WildCard>
+  <WildCard name="Brendan Gregg: BPF Performance Tools">
+    [The book](https://www.brendangregg.com/bpf-performance-tools-book.html),
+    and the overhead methodology section 5 compares against.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="12" cmd="ls ../" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="07 — Syscalls and the kernel boundary">
+    [The 348 ns crossing](/topics/07-syscalls-kernel-boundary), and why I called
+    `syscall(SYS_getppid)` directly instead of trusting libc.
+  </WildCard>
+  <WildCard name="10 — Linux networking">
+    [The path a packet takes](/topics/10-linux-networking) after XDP says
+    `XDP_PASS`: skb allocation, tc, netfilter, sockets.
+  </WildCard>
+  <WildCard name="11 — Containers">
+    [cgroups](/topics/11-containers): where systemd's `sd_fw_*` programs and
+    Cilium's `connect()` hook attach.
+  </WildCard>
+  <WildCard name="13 — Locks">
+    [Cache-line bouncing](/topics/13-locks), the whole argument for a per-CPU
+    counter.
+
+  </WildCard>
+</CardGrid>

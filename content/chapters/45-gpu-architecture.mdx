@@ -1,0 +1,946 @@
+---
+title: GPUs for Systems Engineers
+dek: "A 70B model decoding one token at a time on an H100 uses about a third of one percent of the tensor cores, and nvidia-smi reports 100%. Both numbers are correct. This chapter is about why."
+readingTime: "~26 min"
+versions: "Measured on Apple M4 (10-core GPU) · Metal · macOS 26.5.1 · H100 figures from NVIDIA's datasheet and Hopper docs"
+prereqs: "Chapters 01 and 02"
+updated: "2026-09-25"
+---
+
+I wrote a Metal kernel in which every thread reads exactly one float from a
+256 MiB buffer and does nothing with it. Then I changed which float each thread
+reads, and nothing else. Same number of threads, same bytes read in total,
+every element touched exactly once.
+
+First version: **112 GB/s**. Second version: **6.1 GB/s**.
+
+An eighteen-fold gap from the order in which threads pick their addresses.
+It's the first thing I'd tell someone who's just inherited a GPU fleet. A GPU isn't a fast CPU. It's a machine built on a different bet, and
+code that ignores the bet gets a small fraction of what you paid for. (That
+second version also did something I still can't fully explain. It's in
+section 5.4.)
+
+<SectionHeading n="01" cmd="nvidia-smi -q -d CLOCK,MEMORY" id="contract">A throughput machine</SectionHeading>
+
+Chapter 01 described a CPU core as a machine that works very hard to make one
+thread fast: it predicts branches, reorders instructions, and keeps big caches
+close. Roughly speaking, every transistor that isn't an ALU is there to hide
+**latency** from one thread of control.
+
+A GPU makes the opposite trade. It spends its area on arithmetic units and on a
+huge register file, keeps the control logic simple, and hides latency by having
+something else to do. When one group of threads is waiting hundreds of cycles for
+memory, the hardware switches to another group that isn't, at no cost. It's a
+**throughput machine**: the promise is about the aggregate, never about any
+one thread.
+
+What it promises, if you give it enough independent work:
+
+- **Enormous aggregate arithmetic.** An H100 SXM does 989 dense BF16
+  teraFLOPS on its tensor cores (NVIDIA's [H100 page](https://www.nvidia.com/en-us/data-center/h100/)
+  lists 1,979 with 2:4 sparsity; dense is half).
+- **Enormous memory bandwidth.** 3.35 TB/s from 80 GB of HBM3 on the same
+  datasheet.
+- **Free switches between thread groups**, since their state stays on-chip.
+
+What it explicitly doesn't promise:
+
+- Any order between thread blocks, or that two blocks run at the same time.
+- Anything about how fast a single thread goes. A lone GPU thread is slow.
+- That the host is keeping up. It runs whatever is in its queue and sits idle
+  otherwise, and the queue is your problem.
+
+<Callout label="The bet, in one sentence">
+A CPU core assumes you have one hard thing to do and tries to finish it soon.
+A GPU assumes you have a hundred thousand easy things to do and tries to finish
+all of them soon. Nearly every performance bug in this chapter comes from
+handing a GPU the first kind of problem and expecting the second kind of speed.
+</Callout>
+
+<SectionHeading n="02" cmd="nvidia-smi --query-gpu=name,memory.total --format=csv" id="layout">SMs, warps and registers</SectionHeading>
+
+<Sub n="2.1" title="From GPU down to a thread">
+
+An H100 SXM5 has **132 streaming multiprocessors** (SMs), according to
+NVIDIA's [Hopper architecture post](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/).
+A full GH100 die has 144; the PCIe card has 114. Each SM is split into four partitions, and each partition
+has its own warp scheduler.
+
+<Figure caption="The hierarchy on an H100 SXM5. The unit that matters for performance is the warp: 32 threads that issue one instruction together.">
+<Tree
+  nodeWidth={120}
+  root={{
+    label: "H100 SXM5", sub: "132 SMs, 50 MB L2",
+    children: [
+      { label: "SM", sub: "256 KB registers", accent: true, children: [
+        { label: "partition", sub: "1 warp scheduler", children: [
+          { label: "warp", sub: "32 threads", accent: true },
+          { label: "warp", sub: "…" },
+        ]},
+        { label: "× 3 more", sub: "partitions", dim: true },
+      ]},
+      { label: "× 131 more", sub: "SMs", dim: true },
+    ],
+  }}
+/>
+</Figure>
+
+The programmer's unit is the **thread block** (a CTA in NVIDIA's hardware
+docs): up to 1,024 threads that share an SM's fast memory and can synchronise.
+What the hardware schedules is the <em className="term">warp</em>, 32 consecutive
+threads of a block. NVIDIA's programming guide is blunt about it: "A warp executes one
+common instruction at a time, so full efficiency is realized when all 32
+threads of a warp agree on their execution path."
+
+That model is called **SIMT**, single instruction, multiple threads. Each thread
+has its own registers and (since Volta) its own program counter, so you write
+scalar code. Underneath, 32 of them march in lockstep.
+
+</Sub>
+
+<Sub n="2.2" title="The register file sets your occupancy">
+
+Here's the number that surprised me most when I first looked: an SM's
+**register file is 256 KB**, 65,536 32-bit registers, as big as its L1 and
+shared memory put together. It has to be, because every resident warp's
+registers live there for the warp's whole life. NVIDIA's [programming guide](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-programming-guide/index.html#hardware-multithreading)
+says so directly: the execution context "is maintained on-chip during the
+entire lifetime of the warp. Therefore, switching from one execution context to
+another has no cost."
+
+An SM can hold at most 64 warps (2,048 threads) on compute capability 9.0.
+Whatever fraction of those slots is actually filled is **occupancy**, and registers are
+usually what caps it:
+
+<Estimate
+  rows={[
+    { label: "Registers per SM", math: "Hopper, CC 9.0", value: "65,536" },
+    { label: "Threads for full occupancy", math: "64 warps × 32", value: "2,048" },
+    { label: "Register budget per thread at 100%", math: "65,536 / 2,048", value: "32" },
+    { label: "A kernel that needs 128 registers", math: "65,536 / 128", value: "512 threads" },
+    { label: "Warps resident", math: "512 / 32", value: "16 of 64" },
+  ]}
+  result={{ label: "occupancy for a 128-register kernel", value: "25%" }}
+/>
+
+Is 25% bad? Not necessarily. Occupancy only matters as a way to hide latency:
+you need enough ready warps that, each cycle, a scheduler finds one whose
+operands have arrived. A kernel with lots of independent loads per thread can
+hide latency with few warps, and I think most of the fastest matmul kernels
+run at low occupancy on purpose, trading warps for registers. A kernel that does one
+load and then waits on it needs every warp it can get.
+
+</Sub>
+
+<Sub n="2.3" title="Five kinds of memory, very different sizes">
+
+<Compare
+  cols={["Level", "H100 SXM5 size", "Who sees it", "What lives there"]}
+  rows={[
+    ["Registers", "256 KB per SM", "One thread", "Every live variable of every resident warp"],
+    ["Shared memory / L1", "256 KB per SM, up to 228 KB as shared", "One thread block", "Tiles you load on purpose: FlashAttention's blocks"],
+    ["L2", "50 MB", "Whole GPU", "Whatever the hardware decides"],
+    ["HBM3", "80 GB at 3.35 TB/s", "Whole GPU", "Weights, activations, the KV cache"],
+    ["Host DRAM", "Whatever the server has", "Over PCIe or NVLink-C2C", "Your dataset, pinned staging buffers"],
+  ]}
+/>
+
+Sizes are from the Hopper post and the [CC 9.0 section](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-programming-guide/index.html#compute-capability-9-0)
+of the programming guide.
+
+**Shared memory** is the one with no CPU equivalent: a scratchpad a thread
+block reads and writes explicitly, at on-chip speed. It's how serious GPU
+kernels avoid going to HBM twice for the same bytes, and "IO-aware" usually
+means an algorithm rearranged so its working tile fits there.
+
+</Sub>
+
+<Sub n="2.4" title="What a launch looks like as bytes">
+
+A kernel launch reaches the hardware as a small bit-packed descriptor NVIDIA
+calls a **QMD** (queue meta data). NVIDIA publishes the layout for Hopper's
+compute class in its open documentation repo. These are real field offsets, in
+bits:
+
+<SourceRead
+  file="classes/compute/clcbc0qmd.h (HOPPER_COMPUTE_A, QMD v4)"
+  repo="NVIDIA/open-gpu-doc"
+  tag="9fdf5c4"
+  href="https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/compute/clcbc0qmd.h"
+>
+```c
+#define NVCBC0_QMDV04_00_SHARED_MEMORY_SIZE             MW(601:584)
+#define NVCBC0_QMDV04_00_GRID_WIDTH                     MW(1055:1024)
+#define NVCBC0_QMDV04_00_GRID_HEIGHT                    MW(1071:1056)
+#define NVCBC0_QMDV04_00_GRID_DEPTH                     MW(1103:1088)
+#define NVCBC0_QMDV04_00_CTA_THREAD_DIMENSION0          MW(1167:1152)
+#define NVCBC0_QMDV04_00_CTA_THREAD_DIMENSION1          MW(1183:1168)
+#define NVCBC0_QMDV04_00_CTA_THREAD_DIMENSION2          MW(1199:1184)
+#define NVCBC0_QMDV04_00_REGISTER_COUNT                 MW(1208:1200)
+#define NVCBC0_QMDV04_00_BARRIER_COUNT                  MW(1215:1211)
+#define NVCBC0_QMDV04_00_PROGRAM_ADDRESS_LOWER          MW(1247:1216)
+#define NVCBC0_QMDV04_00_PROGRAM_ADDRESS_UPPER          MW(1272:1248)
+#define NVCBC0_QMDV04_00_OCCUPANCY_MAX_WARP             MW(1295:1288)
+#define NVCBC0_QMDV04_00_OCCUPANCY_MAX_REGISTER         MW(1311:1304)
+#define NVCBC0_QMDV04_00_CONSTANT_BUFFER_ADDR_LOWER_SHIFTED6(i) \
+                                          MW((1567+(i)*64):(1536+(i)*64))
+```
+</SourceRead>
+
+Read it as a checklist for placing your blocks: how many, how big, and
+`REGISTER_COUNT` plus `SHARED_MEMORY_SIZE`, the two numbers that decide how
+many fit on one SM at once. That's 2.2's occupancy arithmetic, done in silicon.
+Kernel arguments go in a constant buffer whose address is in the descriptor.
+
+</Sub>
+
+<SectionHeading n="03" cmd="nsys profile --trace=cuda ./app" id="hot-path">One launch, from cudaLaunchKernel to a warp</SectionHeading>
+
+What happens between `kernel<<<grid, block>>>(args)` and a warp issuing its
+first instruction? Much of it lives in NVIDIA's closed userspace driver. But the
+hardware interface is documented, and an open driver (Mesa's NVK, a Vulkan
+driver for the same GPUs) shows the software side.
+
+<Flow
+  wrap={4}
+  steps={[
+    { label: "cudaLaunchKernel", sub: "runtime API, your thread" },
+    { label: "driver builds QMD", sub: "closed libcuda" },
+    { label: "methods → pushbuffer", sub: "plain memory writes" },
+    { label: "GP entry + GP_PUT", sub: "in USERD" },
+    { label: "ring the doorbell", sub: "one MMIO store, no syscall", accent: true },
+    { label: "Host / PBDMA", sub: "fetches methods" },
+    { label: "block distributor", sub: "places CTAs on SMs" },
+    { label: "warp scheduler", sub: "one instruction per issue slot" },
+  ]}
+/>
+
+<Sub n="3.1" title="No syscall on the launch path">
+
+I expected a kernel launch to be an `ioctl`. Chapter 07 spent a whole section on
+what a syscall costs, and I assumed the GPU driver paid one per launch. It
+doesn't. Work reaches the GPU through memory the process has already mapped,
+and NVIDIA's own reference manual lists the steps:
+
+<SourceRead
+  file="manuals/turing/tu104/dev_usermode.ref.txt"
+  repo="NVIDIA/open-gpu-doc"
+  tag="9fdf5c4"
+  href="https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/manuals/turing/tu104/dev_usermode.ref.txt"
+>
+```text
+NOTIFY_CHANNEL_PENDING - Notify Host that a channel has new work available
+
+     NOTIFY_CHANNEL_PENDING is known as the channel doorbell register.  Writing
+a channel's opaque handle to the NOTIFY_CHANNEL_PENDING register (sometimes
+referred to as "ringing the doorbell") tells Host that new work is available to
+run on that channel.
+...
+     Submitting new work to a channel involves the following steps:
+
+     1. Write methods to a pushbuffer segment
+     2. Construct a new GP entry pointing to that pushbuffer segment
+     3. Update GP_PUT in USERD to indicate the new GP entry is ready
+     4. Request the doorbell handle from RM, given the channel ID
+     5. Write the channel's handle to the NOTIFY_CHANNEL_PENDING register
+```
+</SourceRead>
+
+Step 4 happens once, at channel setup (RM is the kernel-side resource
+manager). Steps 1, 2, 3 and 5 are ordinary stores from your process. A **pushbuffer** is
+a ring of commands ("methods") in memory, the **GPFIFO** is a ring of 8-byte
+entries pointing into it, and `GP_PUT` is the producer index. If that sounds
+like io_uring's submission queue from chapter 07, it's the same idea, older.
+
+This doc is for Turing (TU104), and it warns that the handle format "is subject
+to change in future chips". I'm assuming Hopper keeps the same shape, and I
+haven't found a Hopper manual that confirms it.
+
+</Sub>
+
+<Sub n="3.2" title="What the driver writes into the pushbuffer">
+
+CUDA's userspace driver is closed, so for the method stream I read NVK, which
+drives the same compute class. Its `vkCmdDispatch` path uploads a QMD, then
+pushes two methods: "here's the QMD's address" and "schedule it".
+
+<SourceRead
+  file="src/nouveau/vulkan/nvk_cmd_dispatch.c"
+  repo="mesa/mesa"
+  tag="mesa-25.2.0"
+  href="https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-25.2.0/src/nouveau/vulkan/nvk_cmd_dispatch.c#L288-L333"
+>
+```c
+   uint64_t qmd_addr = 0;
+   VkResult result = nvk_cmd_flush_cs_qmd(cmd, &cmd->state, global_size,
+                                          &qmd_addr, NULL);
+   ...
+   struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
+   ...
+   P_MTHD(p, NVA0C0, SEND_PCAS_A);
+   P_NVA0C0_SEND_PCAS_A(p, qmd_addr >> 8);
+
+   if (nvk_cmd_buffer_compute_cls(cmd) <= TURING_COMPUTE_A) {
+      P_IMMD(p, NVA0C0, SEND_SIGNALING_PCAS_B, {
+            .invalidate = INVALIDATE_TRUE,
+            .schedule = SCHEDULE_TRUE
+      });
+   } else {
+      P_IMMD(p, NVC6C0, SEND_SIGNALING_PCAS2_B,
+             PCAS_ACTION_INVALIDATE_COPY_SCHEDULE);
+   }
+```
+</SourceRead>
+
+NVK reserves seven 32-bit words of pushbuffer for this. The QMD itself sits
+elsewhere in GPU memory, its address shifted right by 8, so presumably
+256-byte aligned. NVK picks the QMD version by compute class: Hopper
+(`HOPPER_COMPUTE_A`) gets version 4, the layout quoted in 2.4, per
+[`nak/qmd.rs`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-25.2.0/src/nouveau/compiler/nak/qmd.rs).
+Does CUDA write exactly these methods? I can't tell you. It targets the same
+class, so it can't be far off.
+
+</Sub>
+
+<Sub n="3.3" title="From the queue to an SM">
+
+After the doorbell, the public detail thins out quickly. The PBDMA (part of
+what NVIDIA calls Host) reads `GP_PUT`, fetches the pushbuffer segment, and forwards compute
+methods to the compute front end, which reads the QMD. NVIDIA's whitepapers
+have described the next piece since Fermi: "The GigaThread global scheduler
+distributes thread blocks to SM thread schedulers"
+([Fermi whitepaper](https://www.nvidia.com/content/PDF/fermi_white_papers/NVIDIA_Fermi_Compute_Architecture_Whitepaper.pdf)).
+
+A block goes onto an SM only if that SM has room for all of it at once: free
+registers, shared memory, and warp slots. Blocks that don't fit wait for
+earlier ones to retire, so a grid of a million blocks runs as waves across the
+132 SMs.
+
+Inside the SM, the [CC 9.0 architecture notes](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-programming-guide/index.html#compute-capability-9-0)
+say an SM "statically distributes its warps among its schedulers. Then, at every
+instruction issue time, each scheduler issues one instruction for one of its
+assigned warps that is ready to execute, if any." Four schedulers, each picking
+one ready warp per issue slot. That's the whole latency-hiding mechanism, and
+there's no more public detail below it that I trust.
+
+</Sub>
+
+<Sub n="3.4" title="The last hop: divergence and coalescing">
+
+Two things happen at warp granularity that decide whether the machine is busy
+or just looks it.
+
+**Divergence.** If threads of one warp take different sides of a branch, the
+warp runs both sides, with the threads not on each path masked off. I measured
+it on the M4, whose GPU also uses 32-wide SIMD groups (Metal reports
+`threadExecutionWidth` = 32). Each thread runs 2,048 dependent FMAs on one of
+two paths:
+
+<TryIt what="Same work, branch split by SIMD-group vs inside every SIMD-group" lang="cpp" toolchain="Metal, Swift 6.3.3 host, Apple M4 10-core GPU, macOS 26.5.1">
+```cpp
+kernel void diverge(device float* out    [[buffer(0)]],
+                    constant uint& mode  [[buffer(1)]],
+                    uint gid [[thread_position_in_grid]]) {
+    // mode 0: all 32 threads of a SIMD-group take the same side
+    // mode 1: odd and even threads split inside every SIMD-group
+    bool odd = mode == 0 ? ((gid >> 5) & 1) : (gid & 1);
+    float x = float(gid) * 1e-7f;
+    if (odd) { for (int i = 0; i < 2048; i++) x = fma(x, 0.999f, 0.001f); }
+    else     { for (int i = 0; i < 2048; i++) x = fma(x, 1.001f, -0.001f); }
+    out[gid] = x;
+}
+// 1,048,576 threads, 256 per threadgroup, GPU timestamps, best of 7
+```
+
+<Output>
+```text
+branch uniform per SIMD-group:   6.10 ms
+branch splits every SIMD-group:  12.50 ms  (2.05x)
+```
+
+Half the threads take each side in both runs. All that changes is whether the
+split falls between SIMD-groups or inside them. Inside, each group executes
+both loops, and the kernel takes almost exactly twice as long. Reproduced on a
+second run: 6.09 and 12.51 ms.
+</Output>
+</TryIt>
+
+**Coalescing.** When the 32 threads of a warp issue a load, the hardware merges
+their addresses into as few memory transactions as it can. NVIDIA's
+[Best Practices Guide](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory)
+states the rule for CC 6.0 and later: accesses "coalesce into a number of
+transactions equal to the number of 32-byte transactions necessary to service
+all of the threads of the warp." Thirty-two threads reading 32 adjacent floats
+need four 32-byte sectors. Thirty-two threads reading floats 128 bytes apart
+need thirty-two, and 28 of every 32 bytes fetched are thrown away. Section 5.4
+measures what that does on the M4.
+
+</Sub>
+
+<SectionHeading n="04" cmd="dmesg | grep 'NVRM: Xid'" id="failure">How GPUs fail</SectionHeading>
+
+<Sub n="4.1" title="Four hundred and nineteen interruptions in 54 days">
+
+Probably the best public data on GPU failure at scale is in Meta's
+[Llama 3 paper](https://arxiv.org/abs/2407.21783), section 3.3.4. Training the
+405B model on up to 16K H100s, they logged 466 job interruptions in a 54-day
+window: 47 planned, 419 unexpected. "Approximately 78% of the unexpected
+interruptions are attributed to confirmed hardware issues ... or suspected
+hardware-related issues like silent data corruption."
+
+<Compare
+  cols={["Root cause (Table 5)", "Count", "Share of unexpected"]}
+  rows={[
+    ["Faulty GPU", "148", "30.1%"],
+    ["GPU HBM3 memory", "72", "17.2%"],
+    ["Software bug", "54", "12.9%"],
+    ["Network switch / cable", "35", "8.4%"],
+    ["Host maintenance, unplanned", "32", "7.6%"],
+    ["GPU SRAM memory", "19", "4.5%"],
+    ["GPU system processor", "17", "4.1%"],
+    ["Silent data corruption", "6", "1.4%"],
+  ]}
+/>
+
+Add the rows up and **GPU issues are 58.7%** of all unexpected interruptions,
+the paper's own figure. HBM alone caused more interruptions than every network
+problem combined. For a training job that's synchronous across every GPU, one
+bad chip stops all 16,000. That's why the paper's headline reliability number
+is effective training time (above 90%) and not uptime.
+
+Two details from that section stick with me. Failures over NVLink "often
+manifest as stalled load/store operations within CUDA kernels without
+returning a clear error code", so a dead link looks like a hang, not an error.
+And they saw a 1–2% diurnal throughput swing from mid-day temperatures pushing
+GPUs to lower clocks.
+
+</Sub>
+
+<Sub n="4.2" title="Xid: the error the driver writes to your kernel log">
+
+When the NVIDIA driver sees a GPU error it prints an **Xid** to the kernel log.
+From NVIDIA's [Xid documentation](https://docs.nvidia.com/deploy/xid-errors/index.html)
+(release 615): Xids indicate "the driver programming the GPU incorrectly or ...
+corruption of the commands sent to the GPU", and can mean a hardware problem, a
+driver bug, or your application. Grep for `NVRM: Xid`. These are the ones I'd
+expect a fleet to see most:
+
+- **Xid 13**, graphics engine exception, and **Xid 31**, GPU memory page fault.
+  Usually your code: an out-of-bounds access in a kernel. Catalog action:
+  restart the application.
+- **Xid 48**, double-bit ECC error. HBM returned data ECC couldn't correct.
+  Catalog action: reset the GPU, or drain and reset if 63 or 64 comes with it.
+- **Xid 63 / 64**, memory row remapping event and remapping failure. 63 is the
+  GPU retiring a bad HBM row and is listed as ignorable; 64 means it couldn't,
+  and the action is reset the GPU and contact support.
+- **Xid 79**, "GPU has fallen off the bus". The host can't reach it over PCIe
+  anymore. Catalog action: restart the machine.
+- **Xid 94 / 95**, contained and uncontained memory errors. 94 means the error
+  was contained to the application that consumed the bad memory; 95 means it
+  wasn't, and the GPU needs a reset.
+
+Your fleet's real policy is a mapping from each Xid to keep serving, restart
+the job, or drain and repair. The catalog is a starting point for it.
+
+</Sub>
+
+<Sub n="4.3" title="Failures that don't log anything">
+
+Plenty of GPU failures are the software kind, and they never produce an Xid:
+
+- **KV cache OOM and fragmentation.** An inference server that reserves a
+  max-length KV buffer per request runs out of HBM long before it runs out of
+  compute. vLLM's authors measured existing systems wasting 60–80% of KV
+  memory to fragmentation and over-reservation
+  ([vLLM blog](https://vllm.ai/blog/2023-06-20-vllm)).
+- **Dataloader starvation.** The GPU waits for the CPU to decode the next
+  batch, and no GPU metric tells you why.
+- **Stragglers.** A GPU that works but runs slow holds every rank back. From
+  the Llama 3 paper: "Even a single straggler can slow down thousands of other GPUs."
+- **Silent data corruption.** Six of Meta's 419 interruptions. Scarier is the
+  kind that doesn't interrupt anything and just produces a wrong gradient.
+
+</Sub>
+
+<SectionHeading n="05" cmd="ncu --section SpeedOfLight ./app" id="cost">Bytes per FLOP</SectionHeading>
+
+<Sub n="5.1" title="The roofline">
+
+A kernel does some number of FLOPs and moves some number of bytes to and from
+HBM. That ratio is its <em className="term">arithmetic intensity</em>, in FLOPs
+per byte. A **roofline model** (Williams, Waterman and Patterson,
+[CACM 2009](https://doi.org/10.1145/1498765.1498785)) says attainable
+throughput is the lower of two ceilings: peak compute, or bandwidth × intensity.
+
+<Estimate
+  rows={[
+    { label: "Peak dense BF16 tensor compute", math: "H100 SXM, datasheet 1,979 sparse ÷ 2", value: "989 TFLOP/s" },
+    { label: "Peak HBM3 bandwidth", math: "H100 SXM datasheet", value: "3.35 TB/s" },
+    { label: "Ridge point", math: "989 × 10¹² / 3.35 × 10¹²", value: "≈ 295 FLOP/byte" },
+  ]}
+  result={{ label: "a kernel below ~295 FLOP/byte is waiting on memory, not math", value: "295" }}
+/>
+
+Below the ridge you're memory-bound, and more tensor cores wouldn't help at
+all. Above it you're compute-bound. An H100's ridge is very high, and it's
+been climbing for generations because FLOPs have grown faster than bandwidth. A matmul of two big square matrices clears it easily. An
+elementwise add (one FLOP per 6 bytes in BF16) is about 1,800 times below it.
+
+**Tensor cores** are why the ceiling is so high. Plain FP32 on the CUDA cores
+is 67 TFLOPS on the same datasheet, roughly a fifteenth of the dense BF16
+tensor rate. Tensor cores only do matrix multiply-accumulate, so
+anything in your model that isn't a matmul (softmax, layernorm, activation
+functions, the attention mask) runs on the slower pipe, and usually at low
+intensity too.
+
+</Sub>
+
+<Sub n="5.2" title="Decoding one token of a 70B model">
+
+Here's the arithmetic I promised in the title. Llama 3 70B has 80 layers,
+model dimension 8,192, 64 attention heads and 8 key/value heads (Table 3 of
+the [Llama 3 paper](https://arxiv.org/abs/2407.21783)). Call it 70 billion
+parameters. In BF16 that's 140 GB, which doesn't fit on one 80 GB H100, so
+the usual deployment splits it over two with tensor parallelism.
+
+Generating one token means reading **every weight once**. Each parameter
+contributes one multiply and one add. At batch size 1:
+
+<Estimate
+  rows={[
+    { label: "Weight bytes read per token", math: "70 × 10⁹ params × 2 B", value: "140 GB" },
+    { label: "FLOPs per token", math: "2 × 70 × 10⁹", value: "140 GFLOP" },
+    { label: "Arithmetic intensity", math: "140 GFLOP / 140 GB", value: "1 FLOP/byte" },
+    { label: "Time to read the weights", math: "140 GB / (2 × 3.35 TB/s)", value: "20.9 ms" },
+    { label: "Time to do the math", math: "140 GFLOP / (2 × 989 TFLOP/s)", value: "0.07 ms" },
+    { label: "Ceiling on tokens per second", math: "1 / 20.9 ms", value: "≈ 48" },
+  ]}
+  result={{ label: "fraction of tensor-core peak used at batch 1", value: "≈ 0.34%" }}
+/>
+
+One FLOP per byte, against a ridge of 295. Tensor cores finish their share
+in 70 microseconds and then wait twenty milliseconds for HBM. That's what
+people mean by **decode is memory-bandwidth-bound**, and it's a property of the
+arithmetic, not of any framework. These are ceilings; real servers reach some
+fraction of peak bandwidth and pay NVLink all-reduce time on top.
+
+Here's a fun corollary: quantise to FP8 and the 70 GB of weights fit on one GPU. One
+H100 reading 70 GB takes the same 20.9 ms as two reading 140 GB. Half the
+hardware, the same per-token latency ceiling, because the only thing that
+mattered was bytes per unit of bandwidth.
+
+</Sub>
+
+<Sub n="5.3" title="Batching fixes the weights, not the KV cache">
+
+Run 32 sequences together and the weights are read once for all of them, so
+intensity on the weight matmuls rises to about 32 FLOP/byte. That's why
+continuous batching is the first thing every inference server does. But each
+sequence also has its own **KV cache**, and attention has to read all of it on
+every step:
+
+<Estimate
+  rows={[
+    { label: "KV bytes per token", math: "2 (K,V) × 80 layers × 8 heads × 128 dim × 2 B", value: "320 KiB" },
+    { label: "32 sequences × 2,000 tokens of context", math: "64,000 × 327,680 B", value: "21 GB" },
+    { label: "Attention intensity per cached token", math: "64 q-heads × 512 FLOP / 4,096 B per layer", value: "8 FLOP/byte" },
+    { label: "Bytes per step", math: "140 GB weights + 21 GB KV", value: "161 GB" },
+    { label: "Step time, 2 × H100", math: "161 GB / 6.7 TB/s", value: "24 ms" },
+  ]}
+  result={{ label: "aggregate ceiling at batch 32 vs 48 tok/s at batch 1", value: "≈ 1,330 tok/s" }}
+/>
+
+Twenty-eight times the throughput for 15% more time per step. But look at the
+attention row: 8 FLOP/byte however big the batch gets, because no two
+sequences share a cache. (Grouped-query attention makes it 8; with full
+multi-head attention it would be 1.)
+
+Then capacity. Two H100s have 160 GB, the weights take 140, and what's left is
+about 20 GB before activations and the CUDA context take their share. At
+320 KiB per token that's **at most ~61,000 tokens of KV in flight** across all
+requests. If 60–80% of that is wasted to fragmentation, you're down to 12,000
+to 24,000, and the batch size you can run (the throughput you're paying for)
+drops with it.
+
+</Sub>
+
+<Sub n="5.4" title="Coalesced against strided, measured on the M4">
+
+<Callout label="The machine" kind="note">
+Apple M4, 10-core GPU, 16 GB unified memory, macOS 26.5.1. Metal compute
+kernels compiled at runtime from a Swift 6.3.3 host (`swiftc -O`), timed with
+command-buffer GPU timestamps, best of 7. Apple quotes 120 GB/s for M4
+([Apple newsroom](https://www.apple.com/newsroom/2024/10/apples-new-mac-mini-is-more-mighty-more-mini-and-built-for-apple-intelligence/)).
+No NVIDIA hardware involved: same principle, different GPU.
+</Callout>
+
+<TryIt what="Every thread reads one float; the stride decides which one" lang="cpp" toolchain="Metal, Swift 6.3.3 host, Apple M4 10-core GPU, macOS 26.5.1">
+```cpp
+kernel void gather(device const float* a [[buffer(0)]],
+                   device float* out     [[buffer(1)]],
+                   constant uint& n      [[buffer(2)]],
+                   constant uint& stride [[buffer(3)]],
+                   uint gid [[thread_position_in_grid]]) {
+    uint rows = n / stride;
+    uint idx = (gid % rows) * stride + gid / rows;   // a permutation of 0..n-1
+    float v = a[idx];
+    if (v == 12345.0f) out[0] = v;                   // never true; keeps the load
+}
+// n = 64M floats (256 MiB), 64M threads, 256 per threadgroup
+```
+
+<Output>
+```text
+stride   1 floats (   4 B apart):    2.40 ms  useful  111.9 GB/s
+stride   2 floats (   8 B apart):    4.81 ms  useful   55.8 GB/s
+stride   4 floats (  16 B apart):    9.82 ms  useful   27.3 GB/s
+stride   8 floats (  32 B apart):   20.12 ms  useful   13.3 GB/s
+stride  16 floats (  64 B apart):   42.25 ms  useful    6.4 GB/s
+stride  32 floats ( 128 B apart):   43.99 ms  useful    6.1 GB/s
+stride  64 floats ( 256 B apart):   45.38 ms  useful    5.9 GB/s
+```
+
+Every run reads each of the 64M floats exactly once. Time doubles with every
+doubling of stride up to 64 bytes, then stops. A second run agreed to within
+6% on every row.
+</Output>
+</TryIt>
+
+<Figure caption="Useful bandwidth against the distance between neighbouring threads' addresses. The curve halves per doubling until 64 bytes and then goes flat.">
+<Plot
+  logY
+  xLabel="bytes between adjacent threads' addresses"
+  yLabel="useful GB/s"
+  xTicks={[4, 64, 128, 256]}
+  series={[{ name: "M4 GPU", points: [[4,111.9],[8,55.8],[16,27.3],[32,13.3],[64,6.4],[128,6.1],[256,5.9]] }]}
+/>
+</Figure>
+
+Stride 1 hits 112 GB/s, 93% of Apple's quoted figure. Each doubling after that
+halves useful bandwidth, as you'd expect if each thread drags in a whole
+transaction for 4 useful bytes.
+
+What I can't explain is where it flattens, and maybe you can. If the hardware fetched in 32-byte
+units, as NVIDIA's do, the curve would go flat at 32 bytes. If it fetched
+whole 128-byte cache lines (the M4's CPU line size, from chapter 02), it would
+keep falling until 128. It stops at 64. My guess is that the M4 GPU's memory
+path moves 64 bytes at a time, but Apple doesn't document it, and I haven't
+proven it. Xcode's GPU counters for bytes read from DRAM would settle it in
+one run, and I haven't done that run.
+
+There's a second surprise on this machine, and it's the reason the Mac can't
+show you what an H100 is for. I ran a plain C++ sum over the same 256 MiB on
+the CPU (`clang++ -O2`, eight accumulators per thread): **55 GB/s** on one
+thread, **106–108 GB/s** on ten. The GPU's 112 is barely ahead. They share one
+pool of DRAM, so neither has more bandwidth to offer. An H100's advantage
+lives in the HBM stacks next to the die, and my laptop doesn't have any.
+
+</Sub>
+
+<Sub n="5.5" title="The host side: launches, PCIe and NVLink">
+
+**Launch overhead.** Each launch costs microseconds of CPU and queue time. In
+NVIDIA's [CUDA Graphs post](https://developer.nvidia.com/blog/cuda-graphs/), a
+V100 kernel that executed in 2.9 µs cost 9.6 µs per kernel with a sync after
+each, 3.8 µs launched back to back on a stream, and 3.4 µs captured into a
+graph. On the M4 I timed an empty 32-thread kernel 2,000 times:
+
+<Cost items={[
+  { what: "Commit and wait for each kernel separately", value: "99.6 µs", source: "Metal, M4, one command buffer per kernel, wall clock" },
+  { what: "All 2,000 encoded into one command buffer", value: "0.83 µs", source: "same kernel, one commit, one wait" },
+  { what: "V100, sync after every kernel", value: "9.6 µs", source: "NVIDIA CUDA Graphs blog, 2.9 µs kernel" },
+  { what: "V100, captured as a CUDA graph", value: "3.4 µs", source: "same post" },
+]} />
+
+Metal's round trip is much slower than CUDA's, and most of those 100 µs
+are probably the CPU thread waking up on completion, not the GPU. The shape is the same on both
+vendors, though: **submission is cheap only when it's batched.** Eighty layers
+at several kernels each is hundreds of launches per token in eager mode. At a
+few microseconds each, that's milliseconds against the 20.9 ms memory floor. So vLLM
+captures decode steps as [CUDA graphs](https://docs.vllm.ai/en/stable/design/cuda_graphs/) unless you pass `enforce_eager`.
+
+**Interconnect.** NVIDIA's datasheet gives each link as a total of both
+directions:
+
+<Compare
+  cols={["Link", "Datasheet figure", "One direction", "Relative to HBM"]}
+  rows={[
+    ["HBM3, on package", "3.35 TB/s", "n/a", "1×"],
+    ["NVLink 4, GPU to GPU", "900 GB/s total", "450 GB/s", "≈ 1/7"],
+    ["PCIe Gen5 x16, to host", "128 GB/s total", "64 GB/s", "≈ 1/52"],
+  ]}
+/>
+
+Loading one GPU's 70 GB half of the model from host memory takes about 1.1 s
+at PCIe line rate, and in practice longer. Moving one 2,000-token request's KV
+cache (655 MB) over NVLink takes roughly 1.5 ms. Anything crossing PCIe inside
+the per-token loop is a mistake.
+
+**Pinned memory.** Copying from pageable memory, the driver first copies into
+a temporary page-locked buffer and DMAs from there, per NVIDIA's
+[data transfer post](https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/).
+Allocating pinned (`cudaMallocHost`, or `pin_memory=True` in a PyTorch
+DataLoader) skips that copy and lets `cudaMemcpyAsync` overlap with compute on
+a **stream**, an independent in-order queue.
+
+**Unified memory** (`cudaMallocManaged`) gives CPU and GPU one pointer and
+migrates pages on fault. Convenient, and a trap on hot paths: each first GPU
+touch is chapter 04's first-touch fault with a PCIe bus in the middle.
+`cudaMemPrefetchAsync` moves pages ahead of time.
+
+</Sub>
+
+<SectionHeading n="06" cmd="dcgmi dmon -e 1002,1003,1004,1005" id="operating">GPU-Util is not what you think</SectionHeading>
+
+<Sub n="6.1" title="What 100% in nvidia-smi measures">
+
+This is probably the most misread number in GPU operations. NVIDIA's
+[nvidia-smi manual](https://docs.nvidia.com/deploy/nvidia-smi/index.html)
+defines GPU utilization as "Percent of time over the past sample period during
+which one or more kernels was executing on the GPU. The sample period may be
+between 1 second and 1/6 second depending on the product."
+
+One or more kernels. Not how many SMs, not how many warps, not whether the
+tensor cores did anything. Work it through for a kernel that launches a single
+block of 32 threads and spins:
+
+- nvidia-smi: **100%**, because a kernel is always running.
+- SMs with any work: 1 of 132, about 0.8%.
+- Warp slots filled on that one SM: 1 of 64.
+
+And batch-1 decode from 5.2 would honestly show close to 100% too, with tensor
+cores at a third of a percent. So what should you look at? DCGM's
+[profiling metrics](https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html)
+are the ones that mean something:
+
+<Compare
+  cols={["DCGM field", "Definition (NVIDIA's words)", "Tells you"]}
+  rows={[
+    ["PROF_SM_ACTIVE (1002)", "fraction of time at least one warp was active on a multiprocessor, averaged over all multiprocessors", "Whether the SMs have work at all"],
+    ["PROF_SM_OCCUPANCY (1003)", "fraction of resident warps on a multiprocessor, relative to the maximum", "Whether latency can be hidden"],
+    ["PROF_PIPE_TENSOR_ACTIVE (1004)", "fraction of cycles the tensor (HMMA / IMMA) pipe was active", "Whether you're using what you paid for"],
+    ["PROF_DRAM_ACTIVE (1005)", "fraction of cycles where data was sent to or received from device memory", "Whether you're memory-bound"],
+  ]}
+/>
+
+For LLM decode, DRAM active high and tensor active low is the expected,
+healthy shape. For training, tensor active low usually means something upstream
+is starving you.
+
+</Sub>
+
+<Sub n="6.2" title="The commands">
+
+```shell
+# What's running, and the (misleading) utilization
+nvidia-smi
+nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu,clocks.sm --format=csv -l 1
+
+# The metrics that mean something: SM active, occupancy, tensor, DRAM
+dcgmi dmon -e 1002,1003,1004,1005
+
+# Hardware errors: Xids, ECC, row remapping
+dmesg -T | grep 'NVRM: Xid'
+nvidia-smi -q -d ECC,ROW_REMAPPER
+
+# Links: are they all up, and at what width?
+nvidia-smi nvlink --status
+nvidia-smi topo -m
+lspci -vv -s <bus-id> | grep -E 'LnkSta|LnkCap'
+
+# Where did the time go? Timeline, then one kernel in depth
+nsys profile --trace=cuda,nvtx,osrt ./app
+ncu --section SpeedOfLight --section Occupancy -k <kernel> ./app
+```
+
+A PCIe link that trained at x8 instead of x16, or at Gen4 instead of Gen5, is a
+classic silent halving; `lspci`'s `LnkSta` shows it.
+
+</Sub>
+
+<Sub n="6.3" title="What to fix, in order">
+
+1. **Is the GPU waiting on the host?** Gaps between kernels in an `nsys`
+   timeline mean dataloader, Python overhead, or synchronous copies. Raise
+   `num_workers`, set `pin_memory=True`.
+2. **Batch launches.** CUDA graphs, fused kernels, `torch.compile`.
+3. **Which side of the roofline?** Memory-bound kernels want fewer bytes
+   (quantisation, fusion, a KV cache that isn't wasted). Compute-bound ones want
+   tensor cores and the right data types.
+4. **Only then look inside kernels**: coalescing, divergence, occupancy. They
+   matter a lot to people writing kernels and very little to people running
+   someone else's.
+
+</Sub>
+
+<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+
+**Draw your own GPU's roofline, and find where decode sits on it.**
+
+- Write the gather kernel from 5.4 in CUDA. Sweep the stride from 4 to 256
+  bytes. On an NVIDIA part it should flatten at 32 bytes, the sector size from
+  the Best Practices Guide. Does it?
+- Write a matrix-vector multiply, then a matrix-matrix multiply with a batch
+  dimension B. Sweep B from 1 to 512 and plot achieved TFLOPS.
+- The curve should rise linearly and then flatten. Where it bends is your
+  ridge point, measured, and it should land near peak FLOPs ÷ peak bandwidth
+  (about 295 on an H100 in BF16).
+- Run the whole thing under `dcgmi dmon -e 1002,1004,1005` and watch
+  nvidia-smi's utilization sit at 100% throughout while tensor active climbs
+  from nearly nothing.
+
+<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
+
+<Compare
+  cols={["You get", "You pay", "When the bill arrives"]}
+  rows={[
+    ["989 dense BF16 TFLOPS", "Only for matmuls, and only above ~295 FLOP/byte", "On every decode step, which runs at 1"],
+    ["3.35 TB/s of HBM", "80 GB of it, shared by weights and every request's KV cache", "When the batch you want doesn't fit"],
+    ["Free switching between warps", "Registers per thread cap how many warps fit", "As a kernel that spills or runs at 25% occupancy"],
+    ["SIMT: write scalar code", "32 threads share one instruction stream", "When a branch splits a warp and runs both sides"],
+    ["A launch path with no syscall", "Microseconds per launch anyway", "In a decode loop with hundreds of kernels per token"],
+    ["A synchronous job across 16K GPUs", "One bad GPU stops all of them", "About eight times a day, going by Llama 3's numbers"],
+  ]}
+/>
+
+<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Meta, Llama 3 405B training" verdict="The only large public breakdown of GPU failure causes. GPUs and their HBM, not the network, dominate it.">
+    419 unexpected interruptions in 54 days on up to 16K H100s, 58.7% of them
+    GPU issues and 17.2% HBM3 alone. Automation handled all but three. They
+    lean on PyTorch's NCCL flight recorder, a ring buffer of collective
+    metadata, to diagnose hangs.
+    ([paper, §3.3.4](https://arxiv.org/abs/2407.21783))
+  </WildCard>
+  <WildCard name="vLLM and PagedAttention" verdict="Chapter 04's virtual memory, applied to the KV cache. The single biggest lever on decode throughput per GPU.">
+    KV cache split into fixed-size blocks addressed through a block table, so
+    memory is allocated on demand and waste is confined to the last block of a
+    sequence, under 4% by the authors' measure. 2–4× throughput over
+    FasterTransformer and Orca in the
+    [SOSP 2023 paper](https://arxiv.org/abs/2309.06180); LMSYS cut its serving
+    GPUs by 50% ([vLLM blog](https://vllm.ai/blog/2023-06-20-vllm)).
+  </WildCard>
+  <WildCard name="FlashAttention" verdict="An IO-aware algorithm: same math, far fewer HBM bytes, because the tile fits in shared memory.">
+    Standard attention writes the N×N score matrix to HBM and reads it back.
+    Dao et al. tile it so each block of Q, K and V stays in on-chip SRAM and
+    the full matrix never exists: exact, faster, and linear in memory. 3× on GPT-2 at 1K tokens, 15% end-to-end on BERT-large.
+    ([paper](https://arxiv.org/abs/2205.14135))
+  </WildCard>
+  <WildCard name="Data stalls in DNN training" verdict="The GPU at 100% utilization might be waiting on JPEG decode most of the time.">
+    Mohan et al. (VLDB 2021) found training time for many vision and audio
+    models "dominated by data stall time: time spent waiting for data to be
+    fetched and preprocessed", and cut training time by up to 5× on one server
+    with a smarter loader. ([paper](https://vldb.org/pvldb/vol14/p771-mohan.pdf))
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="nvidia-smi says 100% GPU utilization. Is the GPU fully used?">
+Not necessarily. That field is the fraction of time at least one kernel was
+running. A single 32-thread kernel spinning forever reads 100% while using one
+SM of 132. Use DCGM's SM active, SM occupancy, tensor pipe active and DRAM
+active fields to see what's happening inside.
+</QA>
+
+<QA level="intermediate" q="Why is LLM decode memory-bound on an H100?">
+Each token reads every weight once and does two FLOPs per parameter, one per
+byte in BF16. An H100's ridge point is about 989 TFLOPS ÷ 3.35 TB/s ≈ 295
+FLOP/byte. At 1 FLOP/byte a 70B model on two H100s needs 20.9 ms to read the
+weights and 0.07 ms to do the math. Batching raises the weight intensity, but
+attention over each sequence's own KV cache stays around 8 FLOP/byte with
+grouped-query attention, however big the batch.
+</QA>
+
+<QA level="intermediate" q="What is occupancy, and is higher always better?">
+Resident warps as a fraction of the SM's maximum (64 on Hopper). It's capped
+by registers, shared memory and block size: a kernel using 128 registers per
+thread fits 512 threads in 65,536 registers, so 25%. Higher isn't always
+better. Occupancy only exists to hide latency, and a kernel with lots of
+independent work per thread can hide it with fewer warps. Many fast GEMM
+kernels deliberately trade occupancy for registers.
+</QA>
+
+<QA level="deep" q="Walk through what happens when you launch a CUDA kernel.">
+Runtime into driver, which builds a launch descriptor (a QMD:
+grid and block dimensions, register count, shared memory size, program and
+constant buffer addresses), writes methods into a pushbuffer, adds a GPFIFO
+entry and advances `GP_PUT`, then rings a doorbell with one MMIO store. No
+syscall. Host fetches the methods; the compute front end
+reads the QMD; a block scheduler places blocks on SMs that have room for their
+registers and shared memory; each SM's four warp schedulers issue one
+instruction per slot from a ready warp.
+</QA>
+
+<QA level="deep" q="A 16K-GPU training job hangs with no error. Where do you look?">
+NVLink failures often show up as stalled loads and stores inside a kernel with
+no error code, per the Llama 3 paper, so a hang is the expected symptom. Look
+for Xids in `dmesg` across the fleet (74 for NVLink, 79 for a GPU off the bus,
+48/94/95 for memory), dump the NCCL flight recorder to see which collective
+and which rank is stuck, and check for a straggler: one slow GPU holds every
+rank at the next collective.
+</QA>
+
+<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="What is the H100 SXM's approximate ridge point in dense BF16?">
+    About 295 FLOP/byte: 989 TFLOPS over 3.35 TB/s. Anything below it is
+    waiting on HBM.
+  </Q>
+  <Q q="Why does FP8 let one H100 match two BF16 H100s on decode latency?">
+    Decode time is weight bytes over bandwidth. 70 GB over 3.35 TB/s equals
+    140 GB over 6.7 TB/s: both 20.9 ms.
+  </Q>
+  <Q q="Half of a warp takes each side of an if. What happens?">
+    The warp executes both sides with the inactive half masked. I measured
+    2.05× on the M4 when the split fell inside SIMD-groups.
+  </Q>
+  <Q q="Which Xid means the host can no longer reach the GPU over PCIe?">
+    79, "GPU has fallen off the bus".
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="NVIDIA — Hopper architecture in depth">
+    SM counts, register file, shared memory, tensor cores, NVLink. The primary
+    source for most of section 2.
+    [developer.nvidia.com](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/)
+  </WildCard>
+  <WildCard name="CUDA C++ Best Practices Guide — memory optimizations">
+    Coalescing, the 32-byte transaction rule, strided access, pinned memory.
+    [docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-best-practices-guide/index.html)
+  </WildCard>
+  <WildCard name="NVIDIA open-gpu-doc">
+    Class headers and reference manuals for the hardware interface: QMDs,
+    GPFIFO entries, the doorbell. Where section 3 comes from.
+    [github.com/NVIDIA/open-gpu-doc](https://github.com/NVIDIA/open-gpu-doc)
+  </WildCard>
+  <WildCard name="Williams, Waterman, Patterson — Roofline (CACM 2009)">
+    The original model, and the only framework you need for the arithmetic in
+    section 5.
+    [doi.org/10.1145/1498765.1498785](https://doi.org/10.1145/1498765.1498785)
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="12" cmd="ls ../" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="01 · CPU Architecture">
+    The latency machine this one is the opposite of.
+    [Read it](/topics/01-cpu-architecture)
+  </WildCard>
+  <WildCard name="02 · Memory Hierarchy">
+    Cache lines and bandwidth versus latency, under coalescing and the roofline.
+    [Read it](/topics/02-memory-hierarchy)
+  </WildCard>
+  <WildCard name="04 · Virtual Memory">
+    Page tables, which PagedAttention borrows for the KV cache.
+    [Read it](/topics/04-virtual-memory)
+  </WildCard>
+  <WildCard name="07 · Syscalls & the Kernel Boundary">
+    Why a doorbell-and-ring launch path looks like io_uring.
+    [Read it](/topics/07-syscalls-kernel-boundary)
+  </WildCard>
+</CardGrid>

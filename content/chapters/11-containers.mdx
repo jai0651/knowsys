@@ -1,0 +1,1081 @@
+---
+title: Containers from Scratch
+dek: "A container is a process the kernel lies to in seven specific ways, plus a cgroup that bills it. Build one with unshare, then in 98 lines of C, and the magic in Docker turns into a list of syscalls."
+readingTime: "~25 min"
+versions: "Built and measured in Docker Desktop's linuxkit 6.10.14 VM (aarch64) on an Apple M4 · util-linux 2.39.3 · gcc 13.3 · runc 1.3.1 · Alpine 3.24.2 rootfs"
+prereqs: "Chapters 06, 07 and 08"
+updated: "2026-09-25"
+---
+
+Partway through building a container by hand, `apt-get` stopped resolving
+DNS. Not inside my container. Inside the Docker container I was
+building it *in*.
+
+It took me longer than it should have to see why. My first script created a veth pair with one end
+called `eth0`, and the create failed with `RTNETLINK answers: File exists`,
+because the Docker container already had an `eth0`. My script didn't stop. Its
+next line was `ip link set eth0 netns $CPID`, and that one worked fine: it took
+Docker's real network interface and moved it into my toy namespace. When the toy
+exited, the namespace was destroyed, and the interface went with it.
+
+I like that bug, because it's probably the best one-line summary of the subject. There's no "inside"
+and "outside" at the kernel level. There are namespaces, a process belongs to
+one of each kind, and root in one of them can hand kernel objects to another.
+"The host" was just the namespace I happened to be standing in.
+
+So this chapter builds a container three ways. First by hand with `unshare`,
+`pivot_root`, overlayfs, a veth pair and a cgroup. Then in 98 lines of C. Then
+by timing what `runc` and `docker run` do on the same machine. Every transcript
+below comes from a `docker run --privileged ubuntu:24.04` container on Docker
+Desktop's linuxkit 6.10.14 kernel, aarch64, on an Apple M4.
+
+<SectionHeading n="01" cmd="man 7 namespaces" id="contract">A process with a different view</SectionHeading>
+
+What a container runtime promises is narrower than most people assume. It
+gives a process its own **view** of certain kernel objects, a **budget** for
+certain resources, and a **filesystem** that looks like an image. It doesn't
+give it its own kernel. Every container on a machine makes syscalls into the
+same kernel, with the same scheduler, the same page cache and the same bugs.
+
+Where does the view come from? Namespaces. Each one hides a single kind of kernel object:
+
+- **pid**: process IDs. Its first process becomes PID 1 and can't see its parent.
+- **mnt**: the mount table. This is what makes a different `/` possible.
+- **uts**: hostname and domain name. Tiny, and roughly the one every tutorial starts with.
+- **ipc**: System V semaphores, message queues and shared memory.
+- **net**: interfaces, routes, iptables rules, sockets, the port space.
+- **user**: UID and GID mappings, and which capabilities mean anything.
+- **cgroup**: which part of the cgroup tree looks like the root.
+
+There's an eighth, the `time` namespace (Linux 5.6), which almost nobody uses.
+Docker doesn't create `user` or `time` namespaces by default either; user
+namespace remapping is [opt-in](https://docs.docker.com/engine/security/userns-remap/).
+
+Budgets come from **cgroups v2**: a tree of directories under
+`/sys/fs/cgroup`, where writing `64M` into `memory.max` means the kernel will
+reclaim, and then OOM-kill something, before that subtree's usage passes 64 MiB.
+
+<Callout label="What the contract leaves out" kind="warn">
+A container isn't a security boundary in the sense a VM is. A VM gives the
+guest its own kernel and exposes a small emulated device interface to the
+host. A container exposes the host kernel's entire syscall surface, filtered
+by seccomp, capabilities and LSMs. A kernel bug reachable from inside one
+container is reachable from inside all of them. That's why Firecracker, gVisor
+and Kata exist, and why [chapter 47](/topics/47-virtualization) is a separate
+chapter.
+</Callout>
+
+<SectionHeading n="02" cmd="ls -l /proc/self/ns" id="layout">Seven pointers, three directories, one tree</SectionHeading>
+
+<Sub n="2.1" title="In the kernel: a struct of pointers">
+
+A task's namespaces live in one `struct nsproxy`, and `unshare(2)` or `clone(2)`
+with `CLONE_NEW*` flags builds a new one. Here's the function that does it, at
+the tag matching the kernel I ran on (the `//` comments are mine):
+
+<SourceRead
+  file="kernel/nsproxy.c"
+  repo="torvalds/linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/kernel/nsproxy.c#L67"
+>
+```c
+static struct nsproxy *create_new_namespaces(unsigned long flags,
+	struct task_struct *tsk, struct user_namespace *user_ns,
+	struct fs_struct *new_fs)
+{
+	new_nsp = create_nsproxy();
+	// each copy_*() takes a reference on the old namespace, or allocates
+	// a new one if its CLONE_NEW* bit is set in flags
+	new_nsp->mnt_ns = copy_mnt_ns(flags, tsk->nsproxy->mnt_ns, user_ns, new_fs);
+	new_nsp->uts_ns = copy_utsname(flags, user_ns, tsk->nsproxy->uts_ns);
+	new_nsp->ipc_ns = copy_ipcs(flags, user_ns, tsk->nsproxy->ipc_ns);
+	new_nsp->pid_ns_for_children =
+		copy_pid_ns(flags, user_ns, tsk->nsproxy->pid_ns_for_children);
+	new_nsp->cgroup_ns = copy_cgroup_ns(flags, user_ns,
+					    tsk->nsproxy->cgroup_ns);
+	new_nsp->net_ns = copy_net_ns(flags, user_ns, tsk->nsproxy->net_ns);
+	new_nsp->time_ns_for_children = copy_time_ns(flags, user_ns,
+					tsk->nsproxy->time_ns_for_children);
+	// error unwinding elided
+	return new_nsp;
+}
+```
+</SourceRead>
+
+Two things in there surprised me. There's no `user_ns` field: the user
+namespace hangs off the task's credentials, not the nsproxy, and it's passed
+*in* as the owner of every namespace created here. And the PID field is called
+`pid_ns_for_children`. Unsharing a PID namespace doesn't move you. It changes
+where your next child lands, and that child becomes PID 1.
+
+</Sub>
+
+<Sub n="2.2" title="On disk: lower, upper, work">
+
+A container's filesystem is an **overlayfs** mount. Its image is a read-only `lowerdir`;
+writes go to an `upperdir`; `workdir` is scratch space the kernel needs for
+atomic renames. Deleting a file that exists only in the lower layer can't
+delete it, so overlayfs writes a **whiteout** instead, a character device with
+device number 0,0:
+
+```shell
+$ rm /ks/merged/etc/motd
+$ stat -c "%n %F %t,%T" /ks/upper/etc/motd
+/ks/upper/etc/motd character special file 0,0
+$ ls /ks/lower/etc/motd
+/ks/lower/etc/motd           # still there, just hidden
+```
+
+That's what a Docker image layer is on disk: a directory of files plus
+whiteouts, stacked. Nothing more exotic.
+
+</Sub>
+
+<Sub n="2.3" title="In /sys/fs/cgroup: a tree of files">
+
+<Figure caption="The cgroup tree I built inside the privileged container. The 'init' leaf exists only because of the no-internal-processes rule: a cgroup that hands controllers to its children can't hold processes itself.">
+<Tree
+  nodeWidth={150}
+  root={{
+    label: "/sys/fs/cgroup", sub: "+memory +cpu +pids",
+    children: [
+      { label: "init", sub: "everything else", dim: true },
+      { label: "box", sub: "memory.max 64M", accent: true, children: [
+        { label: "cpu.max", sub: "50000 100000" },
+        { label: "pids.max", sub: "64" },
+      ]},
+    ],
+  }}
+/>
+</Figure>
+
+</Sub>
+
+<SectionHeading n="03" cmd="unshare --pid --fork --mount --uts --ipc --net --cgroup" id="hot-path">Building one by hand</SectionHeading>
+
+<Sub n="3.1" title="A PID namespace, and the first surprise">
+
+Start with the smallest thing. Ask for a PID namespace and print your PID:
+
+```shell
+$ unshare --pid --fork bash -c 'echo $$; ps -o pid,comm | head -5'
+1
+fatal library error, lookup self
+```
+
+`$$` is 1, as promised. `ps` is broken. It reads `/proc`, and `/proc` is still
+the parent namespace's procfs, so `ps` can't find the process it's running as.
+A PID namespace without a new `/proc` is only half a PID namespace. Add a mount
+namespace and remount it:
+
+```shell
+$ unshare --pid --fork --mount-proc bash -c 'echo $$; ps -o pid,comm'
+1
+  PID COMMAND
+    1 ps
+```
+
+PID 1 is `ps`, not bash. Bash `exec`s the last command of a `-c` string, so
+`ps` inherited the PID. Keep that in mind for section 4, where PID 1 turns out
+to be special in ways that bite.
+
+</Sub>
+
+<Sub n="3.2" title="A root filesystem and a cgroup">
+
+Next a rootfs. `docker export` of an Alpine container gave me an 8.9 MB tar,
+which I unpacked as the lower layer onto a tmpfs:
+
+```shell
+mount -t tmpfs tmpfs /ks
+mkdir -p /ks/lower /ks/upper /ks/work /ks/merged
+tar -xf /w/alpine.tar -C /ks/lower
+mount -t overlay overlay \
+  -o lowerdir=/ks/lower,upperdir=/ks/upper,workdir=/ks/work /ks/merged
+
+cd /sys/fs/cgroup
+mkdir init && for p in $(cat cgroup.procs); do echo $p > init/cgroup.procs; done
+echo "+memory +cpu +pids" > cgroup.subtree_control
+mkdir box
+echo 64M            > box/memory.max
+echo 0              > box/memory.swap.max
+echo "50000 100000" > box/cpu.max      # 50 ms of CPU per 100 ms period
+echo 64             > box/pids.max
+```
+
+The loop moving every process into `init` isn't decoration. cgroup v2 won't
+enable controllers for the children of a cgroup that still holds processes of
+its own (the kernel docs call it the no-internal-process constraint). A real
+root cgroup is exempt, but this "root" is Docker's `/docker/<id>` cgroup seen
+through a cgroup namespace, so the rule applies. On a systemd host you rarely
+meet it, because systemd already keeps processes in leaves.
+
+</Sub>
+
+<Sub n="3.3" title="pivot_root, and a cached path">
+
+Here's what the process that will become the container runs. It starts as PID 1 in
+fresh mount, UTS, IPC, net and cgroup namespaces, but it can still see every
+host file. This is the script, lightly trimmed:
+
+```bash
+#!/bin/bash
+set -e
+hostname box
+mount --make-rprivate /            # stop our mounts leaking back to the host
+cd /ks/merged
+mkdir -p .old
+pivot_root . .old                  # the overlay becomes /, the host moves to /.old
+cd /; hash -r                      # bash cached /usr/bin/mount from the host
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t cgroup2 cgroup2 /sys/fs/cgroup
+mount -t tmpfs -o size=1m,mode=755 tmpfs /dev
+mknod -m 666 /dev/null c 1 3
+umount -l /.old && rmdir /.old     # and now the host is gone
+until ip link show c0 >/dev/null 2>&1; do sleep 0.05; done
+ip link set c0 name eth0
+ip addr add 10.99.0.2/24 dev eth0 && ip link set eth0 up && ip link set lo up
+exec "$@"
+```
+
+The first version didn't have `hash -r`, and it died right after `pivot_root`
+with `/usr/bin/mount: No such file or directory`. Bash had looked up `mount`
+once, before the pivot, and remembered the host's path. Alpine keeps it in
+`/bin`. It's a bit of a trap, and maybe the nicest demonstration I found that `pivot_root`
+really does swap the world out from under a running process.
+
+So why `pivot_root` and not `chroot`? A chroot changes one process's idea of `/`
+and leaves the old root mounted in its namespace; a root process can walk back
+out with the well-known double-chroot trick. After `pivot_root` and a lazy
+unmount of `/.old`, the host tree isn't in the mount namespace at all. There's
+nothing to walk back to.
+
+</Sub>
+
+<Sub n="3.4" title="Wiring the network, and looking inside">
+
+On the host side, the script joins the cgroup first, so the child and its cgroup namespace are
+rooted there, then unshares and plugs in a veth pair. This time the peer is named `c0`, created directly in the child's namespace, so there's nothing to
+collide with:
+
+```bash
+echo $$ > /sys/fs/cgroup/box/cgroup.procs
+unshare --pid --fork --mount --uts --ipc --net --cgroup /w/inner.sh "$@" &
+sleep 0.2
+CPID=$(pgrep -P $!)                     # the container's PID 1, as the host sees it
+ip link add veth-host type veth peer name c0 netns $CPID
+ip addr add 10.99.0.1/24 dev veth-host && ip link set veth-host up
+wait
+```
+
+Then, from outside, `nsenter -a` into it and look around:
+
+<TryIt what="Inside the hand-built container" lang="shell" toolchain="linuxkit 6.10.14 aarch64 · recorded transcript">
+```shell
+$ ping -c2 -W1 10.99.0.2 | tail -1
+rtt min/avg/max/mdev = 0.013/0.020/0.028/0.007 ms
+$ nsenter -t $CPID -a sh -c 'hostname; cat /etc/alpine-release; ps;
+    cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max; mount'
+```
+
+<Output>
+```
+box
+3.24.2
+PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sleep 1000
+   29 root      0:00 sh -c hostname; cat /etc/alpine-release; ps; [...]
+   31 root      0:00 ps
+67108864
+50000 100000
+overlay on / type overlay (rw,relatime,lowerdir=/ks/lower,upperdir=/ks/upper,workdir=/ks/work,uuid=on)
+proc on /proc type proc (rw,relatime)
+sysfs on /sys type sysfs (rw,relatime)
+cgroup2 on /sys/fs/cgroup type cgroup2 (rw,relatime)
+tmpfs on /dev type tmpfs (rw,relatime,size=1024k,mode=755)
+```
+
+Look at the first line of `mount`. Host paths of the layers leak into the
+container. Docker containers do the same thing with `/var/lib/docker/overlay2/...`.
+And the cgroup namespace worked: `/sys/fs/cgroup` inside *is* `box` outside.
+</Output>
+</TryIt>
+
+Is that really a container? Yes. Every piece Docker adds (images, a registry, a bridge, NAT,
+log drivers) sits around this, not inside it.
+
+</Sub>
+
+<Sub n="3.5" title="The same thing in 98 lines of C">
+
+Here's the version without util-linux. It does everything above in one
+program, plus a seccomp filter. I kept `system("ip ...")` for the veth setup,
+because the netlink code to create a veth pair would double the length and
+teach nothing about containers.
+
+<TryIt what="mini.c — clone, a cgroup, overlayfs, pivot_root, a veth, seccomp" lang="c" toolchain="gcc 13.3 -O2 · linux 6.10.14 aarch64 · run as root">
+```c
+// mini.c: a container in about a hundred lines. Linux 5.x+, run as root.
+// usage: ./mini <lowerdir> <cmd> [args...]
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sched.h>
+#include <signal.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define CG "/sys/fs/cgroup/mini"
+#define DIE(what) do { perror(what); exit(1); } while (0)
+static char **argv_; static int sync_pipe[2];
+
+static void put(const char *path, const char *val) {        // echo val > path
+  int fd = open(path, O_WRONLY);
+  if (fd < 0 || write(fd, val, strlen(val)) < 0) DIE(path);
+  close(fd);
+}
+
+static void deny_mount(void) {       // seccomp: mount(2) returns EPERM, even for root
+  struct sock_filter f[] = {
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mount, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 1 /* EPERM */),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  };
+  struct sock_fprog prog = { sizeof f / sizeof f[0], f };
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) ||
+      prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)) DIE("seccomp");
+}
+
+static int child(void *arg) {
+  char c;                                     // wait until the parent has put us
+  close(sync_pipe[1]);                        // in the cgroup and made our veth
+  if (read(sync_pipe[0], &c, 1) != 1) DIE("sync");
+  if (unshare(CLONE_NEWCGROUP)) DIE("cgroupns");   // root it at /mini, not /
+  if (sethostname("mini", 4)) DIE("uts");
+  if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) DIE("private");
+  mkdir("/tmp/mini", 0755);                   // overlay: image read-only, writes to tmpfs
+  if (mount("tmpfs", "/tmp/mini", "tmpfs", 0, NULL)) DIE("tmpfs");
+  mkdir("/tmp/mini/up", 0755); mkdir("/tmp/mini/work", 0755); mkdir("/tmp/mini/root", 0755);
+  char opts[512];
+  snprintf(opts, sizeof opts, "lowerdir=%s,upperdir=/tmp/mini/up,workdir=/tmp/mini/work", (char *)arg);
+  if (mount("overlay", "/tmp/mini/root", "overlay", 0, opts)) DIE("overlay");
+  if (system("ip link set c0 name eth0 && ip addr add 10.99.1.2/24 dev eth0 &&"
+             "ip link set eth0 up && ip link set lo up")) DIE("net");
+  if (chdir("/tmp/mini/root") || mkdir(".old", 0700) < 0) DIE("chdir");
+  if (syscall(SYS_pivot_root, ".", ".old")) DIE("pivot_root");
+  if (chdir("/") || umount2("/.old", MNT_DETACH) || rmdir("/.old")) DIE("old root");
+  if (mount("proc", "/proc", "proc", 0, NULL)) DIE("proc");
+  mount("sysfs", "/sys", "sysfs", MS_RDONLY, NULL);
+  mount("cgroup2", "/sys/fs/cgroup", "cgroup2", 0, NULL);
+  mount("tmpfs", "/dev", "tmpfs", 0, "size=1m,mode=755");
+  mknod("/dev/null", S_IFCHR | 0666, makedev(1, 3));
+  mknod("/dev/zero", S_IFCHR | 0666, makedev(1, 5));
+  deny_mount();
+  execvp(argv_[0], argv_);
+  DIE("exec");
+}
+
+int main(int argc, char **argv) {
+  if (argc < 3) { fprintf(stderr, "usage: %s lowerdir cmd...\n", argv[0]); return 2; }
+  argv_ = argv + 2;
+  mkdir(CG, 0755);                                        // cgroup v2 limits
+  put(CG "/memory.max", "64M"); put(CG "/memory.swap.max", "0");
+  put(CG "/cpu.max", "50000 100000"); put(CG "/pids.max", "64");
+  if (pipe(sync_pipe)) DIE("pipe");
+  static char stack[1 << 20];
+  int flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | SIGCHLD;
+  pid_t pid = clone(child, stack + sizeof stack, flags, argv[1]);
+  if (pid < 0) DIE("clone");
+  char buf[256];
+  snprintf(buf, sizeof buf, "%d", pid); put(CG "/cgroup.procs", buf);
+  snprintf(buf, sizeof buf, "ip link add vm%1$d type veth peer name c0 netns %1$d && "
+           "ip addr add 10.99.1.1/24 dev vm%1$d && ip link set vm%1$d up", pid);
+  if (system(buf)) DIE("veth");
+  close(sync_pipe[0]);
+  if (write(sync_pipe[1], "g", 1) != 1) DIE("release");
+  int status; waitpid(pid, &status, 0);
+  if (rmdir(CG)) perror("rmdir " CG);          // the veth dies with the netns
+  if (WIFSIGNALED(status)) fprintf(stderr, "mini: killed by signal %d\n", WTERMSIG(status));
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+```
+
+```shell
+$ ./mini /ks/lower /bin/sh -c 'echo pid=$$ host=$(hostname); cat /etc/alpine-release;
+    cat /proc/self/cgroup; cat /sys/fs/cgroup/memory.max; ip addr show eth0 | grep inet;
+    ps; mount -t tmpfs x /mnt; echo hello > /hi; cat /hi'
+$ ./mini /ks/lower /bin/grep -E "Seccomp:|CapEff" /proc/self/status
+```
+
+<Output>
+```
+pid=1 host=mini
+3.24.2
+0::/
+67108864
+    inet 10.99.1.2/24 scope global eth0
+    inet6 fe80::dcfc:cbff:fe45:1800/64 scope link tentative
+PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh -c echo pid=$$ host=$(hostname); [...]
+   13 root      0:00 ps
+hello
+mount: permission denied (are you root?)
+
+CapEff:	000001ffffffffff
+Seccomp:	2
+```
+
+Busybox asks "are you root?". It is: UID 0 with every capability. My seccomp
+filter answered `EPERM` before the kernel ever checked. (The `hello` line comes
+first only because stderr and stdout interleave.) And that `CapEff` line is
+the honest weakness of `mini`: it never drops capabilities. A plain
+`docker run alpine` on the same VM shows `CapEff: 00000000a80425fb`, 14 of them.
+</Output>
+</TryIt>
+
+Only one ordering decision really matters, and it's the pipe. `child()` blocks on it
+until the parent has written its PID into `cgroup.procs` and created the veth
+end in its network namespace. Only then does it `unshare(CLONE_NEWCGROUP)`, so
+the cgroup namespace is rooted at `/mini`. Do it in the `clone` flags instead
+and the child's cgroup root is wherever the parent was sitting, and
+`/proc/self/cgroup` shows `0::/../init`, a path climbing out of its own root.
+
+</Sub>
+
+<Sub n="3.6" title="What runc does, and why it's so much longer">
+
+runc solves the same ordering problem with three processes, not two, and
+its authors are candid about how that went:
+
+<SourceRead
+  file="libcontainer/nsenter/nsexec.c"
+  repo="opencontainers/runc"
+  tag="v1.3.1"
+  href="https://github.com/opencontainers/runc/blob/v1.3.1/libcontainer/nsenter/nsexec.c#L772"
+>
+```c
+	/*
+	 * Okay, so this is quite annoying.
+	 *
+	 * [...] if we unshare(2) the user namespace *before* we clone(2), then
+	 * all hell breaks loose.
+	 *
+	 * The parent no longer has permissions to do many things (unshare(2) drops
+	 * all capabilities in your old namespace), and the container cannot be set
+	 * up to have more than one {uid,gid} mapping. This is obviously less than
+	 * ideal. In order to fix this, we have to first clone(2) and then unshare.
+	 *
+	 * Unfortunately, it's not as simple as that. We have to fork to enter the
+	 * PID namespace (the PID namespace only applies to children). Since we'll
+	 * have to double-fork, this clone_parent() call won't be able to get the
+	 * PID of the _actual_ init process [...]
+	 *
+	 * -- Aleksa "what has my life come to?" Sarai
+	 */
+```
+</SourceRead>
+
+The three stages are `STAGE_PARENT`, which writes the child's `uid_map` because
+the child can't; `STAGE_CHILD`, which unshares the user namespace, asks the
+parent for a mapping over a socket, then unshares everything else; and
+`STAGE_INIT`, the grandchild, which is the only one actually inside the new PID
+namespace. `mini` skips all of it by not supporting user namespaces. That's
+the part that makes a real runtime hard.
+
+</Sub>
+
+<SectionHeading n="04" cmd="cat /sys/fs/cgroup/memory.events" id="failure">What goes wrong</SectionHeading>
+
+<Sub n="4.1" title="An OOM test that didn't OOM">
+
+My first memory test inside the box piped 200 MB through `tail` against a
+64 MB limit and exited 0. `memory.events` said `oom_kill 0`. Then I noticed
+what `/proc/self/cgroup` said in the entered shell: `0::/../init`. `nsenter`
+joins namespaces. It doesn't move you into a cgroup. Whatever `tail` was doing
+with memory, it wasn't doing it under my limit. `docker exec` doesn't have
+this problem, because runc writes the exec'd process into the container's
+cgroup; bare `nsenter` doesn't. Joining the cgroup first, and using `dd` with
+a 100 MB buffer so the allocation is certain:
+
+```shell
+$ echo $$ > /sys/fs/cgroup/box/cgroup.procs
+$ nsenter -t $CPID -a sh -c 'dd if=/dev/zero of=/dev/null bs=100M count=1; echo exit=$?;
+    cat /sys/fs/cgroup/memory.events'
+Killed
+exit=137
+low 0
+high 0
+max 37
+oom 1
+oom_kill 1
+oom_group_kill 0
+
+$ dmesg | tail -1          # wrapped here for width
+Memory cgroup out of memory: Killed process 91997 (dd) total-vm:104076kB,
+  anon-rss:63664kB, file-rss:0kB, shmem-rss:844kB, UID:0 pgtables:164kB oom_score_adj:0
+```
+
+Exit 137 is 128 + SIGKILL, the same number Kubernetes shows as `OOMKilled`.
+See the PID in `dmesg`? It's 91997, the VM's view of a process whose PID inside the
+box was two digits long. There were two levels of PID namespace between them:
+the VM's, Docker's, and mine.
+
+Which process gets killed? That's a policy question, and Kubernetes changed its answer. On
+cgroup v2, since 1.28, the kubelet sets **`memory.oom.group=1`** on every
+container, so an OOM kills *every* process in the container, not the one the
+kernel picked. For a web server that's what you want. For a Jupyter kernel
+under a notebook server it isn't. [2i2c hit this](https://2i2c.org/blog/kubernetes-cgroup-changes/)
+when their clusters moved to AL2023 images with cgroup v2: a user who blew
+through memory used to lose one kernel and now lost the whole pod. They fixed
+it with the kubelet's `singleProcessOOMKill` option, added in 1.32.
+
+</Sub>
+
+<Sub n="4.2" title="PID 1 ignores you">
+
+A PID namespace's init gets special treatment from the kernel. Here's `mini`
+running a PID 1 that never calls `wait()`, with two short-lived children:
+
+<TryIt what="Zombies, and a SIGTERM that goes nowhere" lang="shell" toolchain="linuxkit 6.10.14 aarch64 · recorded transcript">
+```shell
+$ ./mini /ks/lower /bin/sh -c '(sleep 0.2 &) ; sleep 0.1 & exec sleep 1000' &
+$ sleep 1; P=$(pgrep -f '^sleep 1000')
+$ nsenter -t $P -a ps -o pid,ppid,stat,comm
+$ kill -TERM $P; sleep 1; ps -o pid,stat,comm -p $P
+$ kill -KILL $P; sleep 0.3; ps -o pid,stat,comm -p $P || echo gone
+```
+
+<Output>
+```
+PID   PPID  STAT COMMAND
+    1     0 S    sleep
+    8     1 Z    sleep
+    9     1 Z    sleep
+   10     0 R    ps
+    PID STAT COMMAND
+  32352 S    sleep
+mini: killed by signal 9
+    PID STAT COMMAND
+gone
+```
+</Output>
+</TryIt>
+
+Two zombies, one orphaned into PID 1 and one its direct child, because
+`sleep` never reaps. And `SIGTERM` from the host did nothing at all. The kernel
+drops it:
+
+<SourceRead
+  file="kernel/signal.c"
+  repo="torvalds/linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/kernel/signal.c#L81"
+>
+```c
+static bool sig_task_ignored(struct task_struct *t, int sig, bool force)
+{
+	void __user *handler;
+
+	handler = sig_handler(t, sig);
+
+	/* SIGKILL and SIGSTOP may not be sent to the global init */
+	if (unlikely(is_global_init(t) && sig_kernel_only(sig)))
+		return true;
+
+	/* a container's init is SIGNAL_UNKILLABLE: with no handler
+	 * installed, a signal is dropped, not given its default action */
+	if (unlikely(t->signal->flags & SIGNAL_UNKILLABLE) &&
+	    handler == SIG_DFL && !(force && sig_kernel_only(sig)))
+		return true;
+```
+</SourceRead>
+
+What happens to a normal process with no SIGTERM handler? It dies. PID 1 with no handler
+ignores it, and only `SIGKILL` from an ancestor namespace gets through. That's
+what `docker stop` hitting its 10-second timeout usually is: your app didn't
+install a handler, so SIGTERM vanished, and Docker waited and then sent SIGKILL.
+
+[tini](https://github.com/krallin/tini) exists for exactly these two jobs:
+forward signals to the real process and reap zombies. It has shipped inside
+Docker since 1.13 as `docker run --init`. I got an unplanned demonstration of
+why: the Docker container I was working in had `sleep infinity` as its PID 1,
+and after a few failed runs `ps` showed a small graveyard of `<defunct>`
+`pkill` and `run.sh` processes reparented onto it.
+
+</Sub>
+
+<Sub n="4.3" title="Breakouts through /proc">
+
+Both famous runc escapes go through the same door: `/proc/self` magic links,
+which let a process reach an object that a path lookup would never find.
+
+- **CVE-2019-5736** ([disclosure](https://www.openwall.com/lists/oss-security/2019/02/11/2)).
+  When runc `exec`s into a container, for a moment the process in the container
+  *is* the host's runc binary. A malicious container could open
+  `/proc/self/exe`, wait for the binary to stop being busy, and overwrite
+  runc on the host. Next `docker exec`, root on the host. Found by Adam
+  Iwaniuk and Borys Popławski, disclosed 11 February 2019.
+- **CVE-2024-21626**, "Leaky Vessels"
+  ([advisory](https://github.com/opencontainers/runc/security/advisories/GHSA-xr7r-f8xq-vfvv)).
+  From 1.0.0-rc93 to 1.1.11, runc leaked an open fd for the host's
+  `/sys/fs/cgroup` into `runc init`. An image with `WORKDIR /proc/self/fd/7`
+  started life with its working directory on the host filesystem. Fixed in
+  1.1.12 on 31 January 2024; found by Rory McNamara at Snyk, plus two others.
+
+That 2019 fix is still in runc, and the current version comments on its own
+cost, which is the kind of number I like finding in source:
+
+<SourceRead
+  file="libcontainer/exeseal/cloned_binary_linux.go"
+  repo="opencontainers/runc"
+  tag="v1.3.1"
+  href="https://github.com/opencontainers/runc/blob/v1.3.1/libcontainer/exeseal/cloned_binary_linux.go"
+>
+```go
+// CloneSelfExe makes a clone of the current process's binary (through
+// /proc/self/exe). This binary can then be used for "runc init" in order to
+// make sure the container process can never resolve the original runc binary.
+// For more details on why this is necessary, see CVE-2019-5736.
+func CloneSelfExe(tmpDir string) (*os.File, error) {
+	// Try to create a temporary overlayfs to produce a readonly version of
+	// /proc/self/exe that cannot be "unwrapped" by the container. [...]
+	//
+	// Based on some basic performance testing, the overlayfs approach has
+	// effectively no performance overhead (it is on par with both
+	// MS_BIND+MS_RDONLY and no binary cloning at all) while memfd copying adds
+	// around ~60% overhead during container startup.
+	overlayFile, err := sealedOverlayfs("/proc/self/exe", tmpDir)
+```
+</SourceRead>
+
+The original fix copied the whole runc binary into a sealed memfd on every
+start. Today's version mounts a throwaway read-only overlay over it and falls
+back to the copy.
+
+</Sub>
+
+<SectionHeading n="05" cmd="hyperfine -N './mini /ks/lower /bin/true'" id="cost">What each layer costs</SectionHeading>
+
+<Callout label="The machine" kind="note">
+Docker Desktop's linuxkit VM, kernel 6.10.14, aarch64, 10 vCPUs and 7.8 GB, on
+an Apple M4. Everything ran inside `docker run --privileged ubuntu:24.04`.
+Other jobs were sharing the same VM while I measured, so treat tails as noisy.
+I ran the namespace benchmark four times: medians for the cheap namespaces
+moved by under a microsecond, and `net` landed anywhere from 240 to 363 µs.
+</Callout>
+
+<Sub n="5.1" title="Creating each namespace">
+
+I forked a fresh child per trial and had it time one `unshare()` call, 400
+trials per kind, compiled with `g++ -std=c++20 -O2`. Second run shown:
+
+<Compare
+  cols={["Namespace", "p50", "p90", "max"]}
+  rows={[
+    ["uts", "1.1 µs", "1.4 µs", "10 µs"],
+    ["pid", "1.2 µs", "2.5 µs", "46 µs"],
+    ["cgroup", "1.1 µs", "1.5 µs", "12 µs"],
+    ["user", "2.5 µs", "3.8 µs", "19 µs"],
+    ["ipc", "6.2 µs", "9.1 µs", "67 µs"],
+    ["mnt", "6.6 µs", "11.2 µs", "48 µs"],
+    ["net", "266 µs", "311 µs", "40.2 ms"],
+    ["all seven at once", "254 µs", "369 µs", "953 µs"],
+  ]}
+/>
+
+Six of the seven are a few microseconds: allocate a struct, copy some state.
+A network namespace is **a hundred times** more, because a new netns runs
+every registered per-namespace init hook: loopback, IPv4 and IPv6 tables,
+netfilter, and the fallback tunnel devices you can see in `ip link` inside my
+box (`tunl0`, `gre0`, `sit0`, `ip6tnl0`...), created because those modules were
+loaded. Kubernetes pods share one netns across containers for many reasons, and
+this is probably a small one.
+
+Teardown is **asynchronous**. After `mini` exits, its host-side veth lingers
+(about 75 ms in the one run I timed) while the kernel's cleanup work runs. My
+first `hyperfine` run of `mini` aborted on a non-zero exit, and the fixed veth
+name was the likely culprit: the previous run's `veth-mini` still existed, so
+`ip link add` failed. Naming it after the PID made the benchmark run clean.
+
+</Sub>
+
+<Sub n="5.2" title="Starting a whole container">
+
+<Compare
+  cols={["Command, median of 200 runs", "Median", "Min", "Max"]}
+  rows={[
+    ["/bin/true (fork + exec baseline)", "0.15 ms", "0.13 ms", "0.32 ms"],
+    ["unshare, six namespaces, /bin/true", "0.76 ms", "0.60 ms", "16.1 ms"],
+    ["mini (veth, overlay, cgroup, seccomp)", "6.66 ms", "4.35 ms", "64.7 ms"],
+    ["runc 1.3.1 run, default spec", "47.8 ms", "20.1 ms", "190 ms"],
+    ["docker run --rm alpine true, from macOS (n=20)", "440 ms", "264 ms", "544 ms"],
+  ]}
+/>
+
+`strace -f -r` on `mini` shows where its 6.7 ms goes: seven fork-and-exec
+rounds of `/usr/sbin/ip`, each 2–7 ms under strace. Mounts and
+`pivot_root` cost a few hundred microseconds each. A runtime that spoke netlink
+directly should land much closer to the `unshare` row.
+
+runc is seven times slower than `mini` and does much more: parses the OCI
+spec, drops to the spec's capability set, masks and read-only-mounts parts of
+`/proc`, sets up `/dev` properly, seals its own binary (section 4.3), and runs
+the three-stage dance. `docker
+run` from the Mac adds the API round trip, containerd, a shim, image
+resolution and the VM boundary, and lands near half a second.
+
+</Sub>
+
+<Sub n="5.3" title="Copy-up: the first write to a big file">
+
+The first time a container opens a lower-layer file for writing, overlayfs
+copies **the whole file** into the upper layer, inside the `open()` call. I
+timed a single `open(path, O_WRONLY)` on a fresh overlay, caches dropped:
+
+<Compare
+  cols={["File in lower layer", "tmpfs upper", "ext4 upper (loop file)", "Second open"]}
+  rows={[
+    ["1 MiB", "0.2–0.4 ms", "8.5–10.9 ms", "—"],
+    ["64 MiB", "13–37 ms", "141–167 ms", "—"],
+    ["256 MiB", "59–85 ms", "477–937 ms", "—"],
+    ["1 GiB", "166–392 ms", "3.93–4.15 s", "0.002–0.023 ms"],
+  ]}
+/>
+
+Four seconds, inside one `open()`, to get write access to a 1 GiB file. Would you have guessed that from the one
+line of code that triggers it? Each
+range is three fresh overlays. My ext4 upper was a loop-mounted file on the
+VM's virtual disk, so a real NVMe drive will do better, but not free. After that the file lives in the upper layer and
+opens take microseconds. This is how a container that "just updates a SQLite
+file" shipped in its image has a very slow first request.
+
+Even `chmod` triggers it, unless you mount with `metacopy=on`:
+
+```shell
+metacopy=off  chmod 1 GiB file: 1.55 s     upper layer afterwards: 1.1G
+metacopy=on   chmod 1 GiB file: 0.00 s     upper layer afterwards: 8.0K
+```
+
+</Sub>
+
+<Sub n="5.4" title="What a CPU limit feels like">
+
+`cpu.max = 50000 100000` means 50 ms of CPU per 100 ms period. A busy loop for
+3 seconds:
+
+```shell
+real 0m 3.00s   user 0m 1.51s
+cpu.stat delta: nr_periods 30   nr_throttled 30   throttled_usec 1,488,738
+```
+
+Every single period throttled. On average that's "half a core"; the reality is
+50 ms of running then 50 ms of being frozen, which for a request handler means
+a 50 ms stall appears in your tail latency whenever a request straddles the
+boundary. [Chapter 16](/topics/16-contention-tail-latency) has more on why the
+average hides this.
+
+</Sub>
+
+<Sub n="5.5" title="The thing I can't explain">
+
+That netns `max` column is ugly: 17 to 40 ms in every run, against a 266 µs
+median. And the first batch of netns creations in each run was consistently
+slower (319–363 µs) than a second identical batch later in the same process
+(244–261 µs), which is also why "all seven" beats "net" alone in the table.
+
+My guess, and it's only a guess, is contention with the asynchronous cleanup of the namespaces I'd
+just destroyed: `cleanup_net` runs from a workqueue and takes `rtnl_lock`,
+and so does registering the new namespace's devices. That would explain both
+the tail and a warm-up effect if the backlog drains. I haven't proven it. What would
+settle it is an off-CPU profile of `copy_net_ns` with
+bpftrace, run once with a 20 ms gap between creations and once without. My
+attempt at the gapped run was cut short when the Docker VM went away mid-run.
+
+</Sub>
+
+<SectionHeading n="06" cmd="lsns; cat /proc/$PID/status" id="operating">Operating it</SectionHeading>
+
+<Sub n="6.1" title="Seeing inside a running container">
+
+```shell
+lsns -p $PID                          # which namespaces, by inode
+readlink /proc/$PID/ns/*              # same, raw; equal inodes = shared namespace
+nsenter -t $PID -a sh                 # enter all of them (but NOT its cgroup)
+grep -E 'Seccomp|CapEff|NoNewPrivs' /proc/$PID/status
+cat /proc/$PID/cgroup                 # 0::/kubepods.slice/...
+
+cd /sys/fs/cgroup/<container>
+cat memory.events                     # max, oom, oom_kill counters
+cat memory.pressure cpu.pressure      # PSI: time stalled waiting for the resource
+grep throttled cpu.stat               # nr_throttled, throttled_usec
+cat memory.stat | grep -E '^(anon|file) '   # is it heap or page cache?
+```
+
+Three things I'd look at first when a container is slow and nobody knows why:
+`cpu.stat` for throttling, `memory.pressure` for reclaim stalls (a container
+near `memory.max` spends its time evicting its own page cache long before any
+OOM), and `Seccomp` in `/proc/PID/status`. On my privileged container that
+field was `0`. `--privileged` switches off seccomp, keeps every capability and
+exposes host devices. It's the right tool for writing this chapter and the
+wrong one for anything else.
+
+</Sub>
+
+<Sub n="6.2" title="cgroup v1 to v2">
+
+cgroup v1 gave every controller its own hierarchy, so a process could be in
+`/a` for memory and `/b` for CPU, and nobody could reason about the result. v2
+has one tree, the no-internal-process rule from 3.2, pressure
+stall information, and `memory.high` as a soft limit that throttles before it
+kills. The migration took years, and it's now pretty much over:
+
+- **Kubernetes 1.25** (August 2022) took cgroup v2 support to [GA](https://kubernetes.io/blog/2022/08/31/cgroupv2-ga-1-25/).
+- **systemd 258** removed v1 support entirely ([NEWS](https://github.com/systemd/systemd/blob/v258/NEWS)).
+- **Kubernetes 1.35** kubelets refuse to start on a v1 host unless you set
+  `failCgroupV1: false` ([KEP-5573](https://github.com/kubernetes/enhancements/blob/master/keps/sig-node/5573-remove-cgroup-v1/README.md)).
+
+Where does this bite on a Monday morning? Usually the JVM. OpenJDK before
+11.0.16 and 8u372 can't read v2 limits, so on a v2 node it sizes its heap from
+the host's memory and can get OOM-killed ([JDK-8230305](https://bugs.openjdk.org/browse/JDK-8230305)).
+Kubernetes' [cgroup v2 page](https://kubernetes.io/docs/concepts/architecture/cgroups/)
+lists the minimum versions for Java, Node and other runtimes. Check before the
+node image changes under you, not after.
+
+</Sub>
+
+<Sub n="6.3" title="Rootless, and user namespaces">
+
+User namespaces are the one piece that changes what root inside means. As an
+unprivileged user `u1`, in the same Ubuntu container:
+
+```shell
+$ id
+uid=1001(u1) gid=1001(u1) groups=1001(u1)
+$ unshare --user --map-root-user --mount --pid --fork --mount-proc sh
+# id; cat /proc/self/uid_map
+uid=0(root) gid=0(root) groups=0(root)
+         0       1001          1
+# touch /etc/owned-by-host-root
+touch: cannot touch '/etc/owned-by-host-root': Permission denied
+# mount -t tmpfs x /mnt && echo mounted a tmpfs
+mounted a tmpfs
+# ls -ln /etc/shadow
+-rw-r----- 1 65534 65534 526 Sep 25 13:13 /etc/shadow
+```
+
+Root inside, UID 1001 outside. It can mount a tmpfs, because it has
+`CAP_SYS_ADMIN` over its own mount namespace. It can't touch host-root files,
+which show up as 65534, the overflow ID for anything unmapped.
+
+What that **fixes**: CVE-2019-5736's own disclosure says the attack fails when
+host root isn't mapped into the container, since overwriting runc needs host
+root. Kubernetes [enabled user namespaces for pods](https://kubernetes.io/blog/2025/04/25/userns-enabled-by-default/)
+(`hostUsers: false`) by default in 1.33; it needs Linux 6.3+ and runc 1.2+.
+
+What it **doesn't** fix: the shared kernel. It makes it bigger. An unprivileged
+user can now reach code paths that used to require real root. CVE-2022-0185, a
+heap overflow in filesystem-context parsing, was exploitable by an
+unprivileged user precisely because user namespaces handed them a namespaced
+`CAP_SYS_ADMIN` ([Ubuntu's notice](https://ubuntu.com/security/CVE-2022-0185)).
+That's why Ubuntu added an AppArmor restriction on unprivileged user namespaces
+([opt-in in 23.10](https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces), on by default from 24.04),
+and why I think the honest summary is: rootless containers remove the "root in the
+container is root on the host" class of bug, and make the "kernel bug" class
+slightly more reachable.
+
+</Sub>
+
+<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+
+**Make `mini` into something you'd let a stranger run code in, then attack it.**
+
+- Add user namespace support: clone with `CLONE_NEWUSER`, have the parent write
+  `uid_map` and `gid_map`, and discover for yourself why runc has three stages.
+- Drop capabilities to Docker's default 14 with `capset`, and replace the
+  one-rule seccomp filter with a real allowlist.
+- Make PID 1 a 20-line init that reaps with `waitpid(-1, ..., WNOHANG)` and
+  forwards SIGTERM. Rerun the zombie transcript from 4.2.
+- Then try to escape: write the Leaky Vessels bug on purpose by leaking a
+  host directory fd without `O_CLOEXEC`, and `chdir("/proc/self/fd/N")` from
+  inside. It's a short program, and it's alarming how well it works.
+
+<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
+
+<Compare
+  cols={["You get", "You pay", "When the bill arrives"]}
+  rows={[
+    ["Millisecond startup, no guest kernel", "Every container shares one kernel", "At the next kernel CVE reachable through the syscall surface"],
+    ["Cheap image layers via overlayfs", "Whole-file copy-up on first write", "As a multi-second first request on a big image file"],
+    ["A hard memory limit", "SIGKILL, not an error, when it's hit", "As exit 137 and a lost in-flight request"],
+    ["A CPU quota", "Throttling in 100 ms periods", "In p99, invisible in averages"],
+    ["Your app as PID 1", "Signals dropped without a handler, zombies unreaped", "On every docker stop that takes 10 seconds"],
+    ["Rootless via user namespaces", "More kernel code reachable by unprivileged users", "When the next CVE-2022-0185 lands"],
+  ]}
+/>
+
+<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
+
+<CardGrid>
+  <WildCard name="runc, CVE-2019-5736" verdict="The reason your runtime seals its own binary on every container start.">
+    A container overwrote the host's runc through `/proc/self/exe` and got
+    root on the next `exec`. Default AppArmor policies didn't stop it; SELinux
+    in enforcing mode and user namespaces did.
+    [oss-security disclosure](https://www.openwall.com/lists/oss-security/2019/02/11/2).
+  </WildCard>
+  <WildCard name="runc, CVE-2024-21626 (Leaky Vessels)" verdict="One missing O_CLOEXEC, and an image's WORKDIR became a host path.">
+    A leaked fd to the host's `/sys/fs/cgroup`, reachable as `/proc/self/fd/7`.
+    CVSS 8.6, runc 1.0.0-rc93 through 1.1.11.
+    [GitHub advisory](https://github.com/opencontainers/runc/security/advisories/GHSA-xr7r-f8xq-vfvv).
+  </WildCard>
+  <WildCard name="2i2c and memory.oom.group" verdict="The same OOM, a different victim, after a node image change nobody thought of as a behaviour change.">
+    Moving to cgroup v2 nodes turned "the notebook kernel died" into "the
+    whole pod died", because Kubernetes 1.28+ kills the entire container
+    cgroup. Fixed with `singleProcessOOMKill`.
+    [2i2c's write-up](https://2i2c.org/blog/kubernetes-cgroup-changes/).
+  </WildCard>
+  <WildCard name="tini and docker --init" verdict="If docker stop takes exactly ten seconds, look at PID 1 first.">
+    A container init that reaps zombies and forwards signals, built into Docker
+    since 1.13. Kubernetes has no `--init` flag, so images bake in tini or
+    dumb-init, or rely on the pause container when the pod shares a PID namespace.
+    [krallin/tini](https://github.com/krallin/tini).
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What's the difference between a container and a VM?">
+A VM runs its own kernel on virtual hardware; a container is a set of host
+processes in namespaces and a cgroup, making syscalls to the host kernel. So a
+container starts in milliseconds (I measured 6.7 ms for a hand-built one) and
+a kernel bug is shared by every container on the host. See
+[chapter 47](/topics/47-virtualization) for the other side.
+</QA>
+
+<QA level="beginner" q="Your container exits with code 137. What happened?">
+It got SIGKILL: 128 + 9. Almost always the cgroup's `memory.max` was hit and
+the kernel OOM-killed it. Confirm with `oom_kill` in `memory.events` or
+`dmesg`, which shows `CONSTRAINT_MEMCG` and the cgroup path. The other common
+source is `docker stop` escalating after its timeout.
+</QA>
+
+<QA level="intermediate" q="Why does docker stop sometimes take exactly ten seconds?">
+It sends SIGTERM to the container's PID 1, waits 10 seconds, then sends
+SIGKILL. A PID namespace's init is `SIGNAL_UNKILLABLE`: with no handler
+installed, the kernel drops SIGTERM without applying the default action. So an
+app that never installs a handler ignores it. Fix it with a handler, or
+`--init`/tini.
+</QA>
+
+<QA level="intermediate" q="Why pivot_root and not chroot?">
+chroot changes one process's root directory but leaves the old root mounted
+in its namespace, and a root process can escape with the double-chroot trick.
+pivot_root swaps the root mount of the whole mount namespace; after a lazy
+unmount of the old root, the host tree isn't reachable by any path.
+</QA>
+
+<QA level="intermediate" q="A container's first request after deploy takes four seconds, later ones take milliseconds. Where do you look?">
+Overlayfs copy-up. The first open-for-write of a lower-layer file copies the
+whole file into the upper layer inside `open()`. I measured 4 seconds for a
+1 GiB file on an ext4 upper. Put mutable data on a volume, not in the image.
+</QA>
+
+<QA level="deep" q="Why does creating a network namespace cost 100× more than a UTS namespace?">
+A UTS namespace is a struct copy, about a microsecond. A netns runs every
+registered pernet init: loopback, IPv4/IPv6 state, netfilter, and fallback
+tunnel devices for loaded modules. I measured 266 µs median, with a
+multi-millisecond tail, and teardown is asynchronous, so the veth lingers ~75 ms.
+</QA>
+
+<QA level="deep" q="What do rootless containers protect against, and what don't they?">
+With a user namespace, container root maps to an unprivileged host UID, so
+bugs that give "root in container" (CVE-2019-5736 overwriting runc) don't give
+host root. They don't shrink the shared kernel; they widen it, since
+unprivileged users gain namespaced capabilities that reach code like the
+CVE-2022-0185 overflow.
+</QA>
+
+<QA level="deep" q="How did CVE-2024-21626 let a container reach the host filesystem?">
+runc leaked a file descriptor for the host's `/sys/fs/cgroup` into `runc
+init`, without close-on-exec. An image with `WORKDIR /proc/self/fd/7` started
+with its cwd on the host mount, outside the pivot_root. Fixed in runc 1.1.12
+by making sure the fd is closed before the container process runs, plus
+checks on the working directory.
+</QA>
+
+<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="You enter a container with nsenter -a and run a memory hog. It exceeds the limit and isn't killed. Why?">
+    nsenter joins namespaces, not cgroups. Your process is still in the cgroup
+    you started in. Write your PID to the container's cgroup.procs first.
+  </Q>
+  <Q q="Why does ps fail after unshare --pid --fork without --mount-proc?">
+    /proc is still the parent's procfs, so ps can't find itself by PID. A
+    PID namespace needs its own /proc mount.
+  </Q>
+  <Q q="Why can't you enable controllers in cgroup.subtree_control on a cgroup with processes in it?">
+    cgroup v2's no-internal-processes rule: controllers apply to leaves, so
+    move the processes into a child cgroup first.
+  </Q>
+  <Q q="What is a whiteout?">
+    A 0,0 character device in the upper layer that hides a lower-layer file,
+    because overlayfs can't delete from the read-only lower.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Michael Kerrisk — Namespaces in operation (LWN series)">
+    Kerrisk's LWN series from 2013, still the clearest walk through each
+    namespace with runnable code. [lwn.net/Articles/531114](https://lwn.net/Articles/531114/).
+  </WildCard>
+  <WildCard name="Documentation/admin-guide/cgroup-v2.rst">
+    The cgroup v2 spec, including `memory.oom.group`, PSI and the
+    no-internal-processes rule. [v6.10](https://github.com/torvalds/linux/blob/v6.10/Documentation/admin-guide/cgroup-v2.rst).
+  </WildCard>
+  <WildCard name="Documentation/filesystems/overlayfs.rst">
+    Copy-up, whiteouts, `metacopy` and what changing the lower layer under a
+    mounted overlay does (don't). [v6.10](https://github.com/torvalds/linux/blob/v6.10/Documentation/filesystems/overlayfs.rst).
+  </WildCard>
+  <WildCard name="runc — libcontainer/nsenter/nsexec.c">
+    runc's three-stage clone, in C, with comments that explain every dead end.
+    [v1.3.1](https://github.com/opencontainers/runc/blob/v1.3.1/libcontainer/nsenter/nsexec.c).
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="12" cmd="ls ../" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="47 · Virtualization">
+    What a VM isolates that a container can't, and what Firecracker and gVisor
+    put between a guest and the host kernel. [Read it](/topics/47-virtualization).
+  </WildCard>
+  <WildCard name="07 · Syscalls & the kernel boundary">
+    What seccomp filters, and what each crossing costs.
+    [Read it](/topics/07-syscalls-kernel-boundary).
+  </WildCard>
+  <WildCard name="08 · Filesystems">
+    Page cache, dentries and inodes, the layer overlayfs is built on.
+    [Read it](/topics/08-filesystems).
+  </WildCard>
+  <WildCard name="12 · systemd & process supervision">
+    cgroup delegation and why systemd keeps every process in a leaf.
+    [Read it](/topics/12-systemd).
+  </WildCard>
+</CardGrid>

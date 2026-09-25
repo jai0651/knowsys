@@ -1,0 +1,1066 @@
+---
+title: Linking, Loading & How a Process Starts
+dek: "Between execve and main, a dynamically linked hello world opens one library, applies 1,214 relocations, runs code you didn't write, and makes 32 syscalls to a static binary's 15. Here's every step, and what each one costs."
+readingTime: "~26 min"
+versions: "Measured on Ubuntu 24.04 · glibc 2.39 · gcc 13.3 · kernel 6.10.14-linuxkit aarch64 (shared 4-CPU container) · macOS 26.5.1 on Apple M4 for the interposition test"
+prereqs: "Chapters 04 and 07"
+updated: "2026-09-25"
+---
+
+My first timing said the statically linked hello world was *slower* than the
+dynamic one. 320 µs against 186 µs at the minimum, over 2,000 runs. A static
+binary skips the dynamic loader entirely, so that's backwards, and I spent a
+while convinced I'd mislabelled the files.
+
+I hadn't. Both binaries sat on a bind mount from the Mac host, so every page the
+kernel faulted in for the 640 KB static file came over the VM's file-sharing
+layer. My dynamic one is 70 KB, and the libc it pulls in lives on the
+container's own disk, already in page cache. Copy both into `/tmp` and the
+order flips: **103 µs static, 132 µs dynamic** at p10.
+
+So the loader's cost is real, roughly 30 µs for hello, and it's also easy to
+mismeasure by a factor of three. This chapter follows `./hello` from `execve` to
+`main` and shows where the time goes. One question about lazy binding, in section
+5, I still can't fully close.
+
+<SectionHeading n="01" cmd="man 8 ld.so" id="contract">What you're promised at main</SectionHeading>
+
+When control reaches `main`, the kernel and `ld.so` between them have promised
+you a few things:
+
+- **Every undefined symbol will resolve.** Either it's already bound, or it'll be
+  bound on first call. If some symbol can't be found at all, the process dies
+  before `main`, not halfway through a request.
+- **Constructors have run**, libraries' before yours, dependencies before
+  their dependents.
+- **The stack holds `argc`, `argv`, `envp` and the auxiliary vector**, the
+  kernel's note to userspace about what it just did.
+- **With full RELRO, the tables of resolved addresses are read-only.**
+
+What it won't promise is a longer list, and probably more interesting. It won't
+promise *which* definition of `malloc` you get: the first object in search
+order that exports the name wins, and `LD_PRELOAD` puts itself first. It won't
+promise that the glibc on the machine is the one you built against. And it
+promises nothing about how long any of this takes.
+
+<Callout label="The name you call isn't bound to the code you wrote">
+In a normal ELF shared library, a call from `f1` to `f2` inside the *same*
+library still goes through a table lookup, because some other object might
+define `f2` first and the rules say it wins. That's **symbol interposition**. It
+costs a relocation per call target at startup, and it's why `-fvisibility=hidden`
+cut startup by 700 µs in section 5.
+</Callout>
+
+<SectionHeading n="02" cmd="readelf -lW ./hello" id="layout">Two maps of one file</SectionHeading>
+
+<Sub n="2.1" title="The header, and the 64 bytes the kernel reads first">
+
+Every ELF file opens with a fixed 64-byte header (on 64-bit targets). Linux
+checks the magic, the type and the machine, then uses two offsets to find
+everything else.
+
+<Figure caption="The ELF64 header, proportional to field width. The kernel reads e_entry and the program header table; it never looks at the section header table.">
+<MemoryLayout
+  unit="bytes"
+  fields={[
+    { name: "e_ident", bits: 16, note: "7f 45 4c 46 = \\x7fELF" },
+    { name: "type/machine/version", bits: 8, note: "DYN, AArch64" },
+    { name: "e_entry", bits: 8, note: "0x680", accent: true },
+    { name: "e_phoff", bits: 8, note: "program headers @64", accent: true },
+    { name: "e_shoff", bits: 8, note: "sections @68520", dim: true },
+    { name: "flags", bits: 4 },
+    { name: "sizes & counts", bits: 12, note: "9 phdrs, 28 sections" },
+  ]}
+/>
+</Figure>
+
+Those numbers are from my `hello`, built with plain `gcc -O2` on Ubuntu 24.04.
+Its `Type` is `DYN`, not `EXEC`. A default Ubuntu build is a position-independent
+executable. Linux treats that almost exactly like a shared library.
+
+</Sub>
+
+<Sub n="2.2" title="Program headers are for loading, section headers are for tools">
+
+An ELF file describes itself twice. **Program headers** (segments) say what
+to map and with which permissions. **Section headers** say what the bytes mean:
+`.text`, `.dynsym`, `.rela.plt`. Kernel and `ld.so` only need segments. The
+linker, `objdump` and `gdb` use sections.
+
+```text
+$ readelf -lW hello          # trimmed
+  Type           Offset   VirtAddr           FileSiz  MemSiz   Flg Align
+  PHDR           0x000040 0x0000000000000040 0x0001f8 0x0001f8 R   0x8
+  INTERP         0x000238 0x0000000000000238 0x00001b 0x00001b R   0x1
+      [Requesting program interpreter: /lib/ld-linux-aarch64.so.1]
+  LOAD           0x000000 0x0000000000000000 0x0008b4 0x0008b4 R E 0x10000
+  LOAD           0x00fd90 0x000000000001fd90 0x000280 0x000288 RW  0x10000
+  DYNAMIC        0x00fda0 0x000000000001fda0 0x0001f0 0x0001f0 RW  0x8
+  GNU_STACK      0x000000 0x0000000000000000 0x000000 0x000000 RW  0x10
+  GNU_RELRO      0x00fd90 0x000000000001fd90 0x000270 0x000270 R   0x1
+```
+
+Two `LOAD` segments, one executable, one writable, and never a segment
+that's both. `INTERP` names the program that'll actually run first.
+`GNU_RELRO` marks the part of the writable segment that goes read-only once
+relocation is done.
+
+That `0x10000` alignment is why this file is 70 KB for 2 KB of code. The
+aarch64 toolchain aligns segments to 64 KB so the same binary works on kernels
+with 4 KB, 16 KB or 64 KB pages, and the file is padded to match.
+
+</Sub>
+
+<Sub n="2.3" title=".dynamic, relocations, and the GOT">
+
+`PT_DYNAMIC` points at `.dynamic`, an array of tag/value pairs that is the
+loader's table of contents. My hello has 27 entries. Those that matter:
+
+- `NEEDED libc.so.6`: the dependency list, by soname.
+- `SYMTAB`, `STRTAB`, `GNU_HASH`: the dynamic symbol table, its strings, and
+  the hash table for looking names up.
+- `RELA` and `JMPREL`: two relocation tables, `.rela.dyn` for data and
+  `.rela.plt` for function calls.
+- `PLTGOT`: the address of the **GOT**, the Global Offset Table.
+- `FLAGS BIND_NOW` and `FLAGS_1 NOW PIE`. Hold that thought.
+
+A relocation is an instruction to the loader: *at this offset, write the
+address of that symbol, plus this addend.* `readelf -r` on a lazily linked
+build of the same hello:
+
+```text
+Relocation section '.rela.dyn' at offset 0x480 contains 8 entries:
+    Offset             Type               Symbol's Name + Addend
+000000000001fdc8  R_AARCH64_RELATIVE                        790
+000000000001ffc8  R_AARCH64_GLOB_DAT     __cxa_finalize@GLIBC_2.17 + 0
+...
+Relocation section '.rela.plt' at offset 0x540 contains 5 entries:
+0000000000020000  R_AARCH64_JUMP_SLOT    __libc_start_main@GLIBC_2.34 + 0
+0000000000020020  R_AARCH64_JUMP_SLOT    puts@GLIBC_2.17 + 0
+```
+
+Three kinds, three costs. `RELATIVE` needs no lookup at all: add the load base
+and store. `GLOB_DAT` and `JUMP_SLOT` need a symbol lookup: a hash, a
+walk over every loaded object, and a string compare. The `JUMP_SLOT`s are the
+ones that can be deferred.
+
+</Sub>
+
+<Sub n="2.4" title="GNU hash: a Bloom filter in front of every lookup">
+
+A symbol lookup asks each loaded object in turn, "do you define `puts`?" Most
+say no. `DT_GNU_HASH` makes "no" cheap with a Bloom filter checked before any
+bucket is touched. Here's the lookup in glibc 2.39:
+
+<SourceRead
+  file="elf/dl-lookup.c"
+  repo="bminor/glibc"
+  tag="glibc-2.39"
+  href="https://github.com/bminor/glibc/blob/glibc-2.39/elf/dl-lookup.c#L408-L440"
+>
+```c
+const ElfW(Addr) *bitmask = map->l_gnu_bitmask;
+if (__glibc_likely (bitmask != NULL))
+  {
+    ElfW(Addr) bitmask_word
+      = bitmask[(new_hash / __ELF_NATIVE_CLASS)
+                & map->l_gnu_bitmask_idxbits];
+
+    unsigned int hashbit1 = new_hash & (__ELF_NATIVE_CLASS - 1);
+    unsigned int hashbit2 = ((new_hash >> map->l_gnu_shift)
+                             & (__ELF_NATIVE_CLASS - 1));
+    /* Two bits must both be set, or this object can't define the name. */
+    if (__glibc_unlikely ((bitmask_word >> hashbit1)
+                          & (bitmask_word >> hashbit2) & 1))
+      {
+        Elf32_Word bucket = map->l_gnu_buckets[new_hash % map->l_nbuckets];
+        if (bucket != 0)
+          {
+            const Elf32_Word *hasharr = &map->l_gnu_chain_zero[bucket];
+            do
+              /* Compare 31 bits of hash before any strcmp. */
+              if (((*hasharr ^ new_hash) >> 1) == 0)
+                { /* ... check_match(): the actual string compare ... */ }
+            while ((*hasharr++ & 1u) == 0);   /* low bit ends the chain */
+          }
+      }
+```
+</SourceRead>
+
+Note the `__glibc_unlikely` on the Bloom test. glibc's authors expect most
+objects to answer "no", and they're right: a lookup for `puts` from hello
+checks the executable first, then libc. In a C++ program with a dozen
+libraries, I'd guess most of those probes end at one 64-bit load and two shifts. Why
+bother with a filter for hello's two objects? You wouldn't; it pays off at forty.
+
+</Sub>
+
+<SectionHeading n="03" cmd="strace ./hello" id="hot-path">From execve to main, one step at a time</SectionHeading>
+
+<Figure caption="The whole path for a dynamically linked program. Everything in the middle four boxes runs inside ld.so, before a single line of your code.">
+<Flow
+  wrap={4}
+  steps={[
+    { label: "execve", sub: "kernel: load_elf_binary" },
+    { label: "PT_INTERP", sub: "map ld.so, build auxv" },
+    { label: "ld.so _start", sub: "relocate itself" },
+    { label: "load NEEDED", sub: "openat, mmap libc" },
+    { label: "relocate", sub: "1,116 relative + 98 symbol", accent: true },
+    { label: "IFUNC, RELRO", sub: "resolvers, then mprotect" },
+    { label: "constructors", sub: "DT_INIT_ARRAY" },
+    { label: "__libc_start_main", sub: "→ main" },
+  ]}
+/>
+</Figure>
+
+<Sub n="3.1" title="The kernel: load_elf_binary">
+
+`execve` walks a list of binary formats until one claims the file. For ELF that's
+`load_elf_binary` in `fs/binfmt_elf.c`. It reads the program headers, and the
+first thing it hunts for is `PT_INTERP`:
+
+<SourceRead
+  file="fs/binfmt_elf.c"
+  repo="torvalds/linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/fs/binfmt_elf.c#L860-L897"
+>
+```c
+for (i = 0; i < elf_ex->e_phnum; i++, elf_ppnt++) {
+    char *elf_interpreter;
+    ...
+    if (elf_ppnt->p_type != PT_INTERP)
+        continue;
+
+    retval = -ENOEXEC;
+    if (elf_ppnt->p_filesz > PATH_MAX || elf_ppnt->p_filesz < 2)
+        goto out_free_ph;
+
+    retval = -ENOMEM;
+    elf_interpreter = kmalloc(elf_ppnt->p_filesz, GFP_KERNEL);
+    ...
+    retval = elf_read(bprm->file, elf_interpreter, elf_ppnt->p_filesz,
+                      elf_ppnt->p_offset);
+    ...
+    interpreter = open_exec(elf_interpreter);   /* the path from .interp */
+    kfree(elf_interpreter);
+    retval = PTR_ERR(interpreter);
+    if (IS_ERR(interpreter))
+        goto out_free_ph;                        /* ENOENT comes from here */
+```
+</SourceRead>
+
+So the path inside `.interp` gets opened *by the kernel*, from the kernel's view of the
+filesystem. Keep that last comment in mind for section 4.
+
+Next it maps each `PT_LOAD` segment at a random base (a PIE is `ET_DYN`, so it
+gets ASLR), maps the interpreter the same way, and picks where to jump:
+
+<SourceRead
+  file="fs/binfmt_elf.c"
+  repo="torvalds/linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/fs/binfmt_elf.c#L1189-L1243"
+>
+```c
+e_entry = elf_ex->e_entry + load_bias;          /* your program's entry */
+...
+if (interpreter) {
+    elf_entry = load_elf_interp(interp_elf_ex, interpreter,
+                                load_bias, interp_elf_phdata, &arch_state);
+    if (!IS_ERR_VALUE(elf_entry)) {
+        interp_load_addr = elf_entry;
+        elf_entry += interp_elf_ex->e_entry;    /* ...but we start in ld.so */
+    }
+    ...
+} else {
+    elf_entry = e_entry;                        /* static: straight to _start */
+}
+...
+retval = create_elf_tables(bprm, elf_ex, interp_load_addr,
+                           e_entry, phdr_addr);
+...
+START_THREAD(elf_ex, regs, elf_entry, bprm->p);
+```
+</SourceRead>
+
+So there are two entry points. The CPU starts in `ld.so`, and your program's own
+entry goes on the stack as `AT_ENTRY` for `ld.so` to jump to later.
+`create_elf_tables` writes that auxiliary vector, and glibc will print it for you:
+
+```text
+$ LD_SHOW_AUXV=1 ./hello        # trimmed
+AT_SYSINFO_EHDR:      0xffffbc9dc000      # the vDSO from chapter 07
+AT_HWCAP:             efb3ffff            # CPU features, for IFUNC resolvers
+AT_PAGESZ:            4096
+AT_PHDR:              0xaaaac8e80040      # where your program headers ended up
+AT_BASE:              0xffffbc99f000      # where ld.so was mapped
+AT_ENTRY:             0xaaaac8e80680      # 0x680 from the header, plus the bias
+AT_RANDOM:            0xffffe499fd78      # 16 bytes: stack canary, pointer guard
+```
+
+`ld.so` doesn't have to parse your ELF file again. Linux already did, and
+this is it handing over its notes.
+
+</Sub>
+
+<Sub n="3.2" title="ld.so: map the libraries, apply the relocations">
+
+Here's the complete `strace` of the dynamic hello. I trimmed only
+arguments:
+
+```text
+execve("./hello", ["./hello"], 0xffffc129ca80 /* 6 vars */) = 0
+brk(NULL)                               = 0xaaaadd59a000
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, ...)
+faccessat(AT_FDCWD, "/etc/ld.so.preload", R_OK) = -1 ENOENT
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+fstat(3, ...); mmap(NULL, 10999, PROT_READ, MAP_PRIVATE, 3, 0); close(3)
+openat(AT_FDCWD, "/lib/aarch64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0\267\0..., 832) = 832
+mmap(NULL, 1892240, PROT_NONE, ...)     # reserve the whole span first
+mmap(0xffffb6ca0000, 1826704, PROT_READ|PROT_EXEC, MAP_FIXED, 3, 0)
+munmap(...); munmap(...); mprotect(..., PROT_NONE)
+mmap(0xffffb6e4d000, 20480, PROT_READ|PROT_WRITE, MAP_FIXED, 3, 0x19d000)
+mmap(0xffffb6e52000, 49040, PROT_READ|PROT_WRITE, MAP_FIXED|MAP_ANONYMOUS)
+close(3)
+set_tid_address(...); set_robust_list(...); rseq(...)
+mprotect(0xffffb6e4d000, 12288, PROT_READ)    # libc's RELRO
+mprotect(0xaaaad2a2f000, 4096, PROT_READ)     # hello's RELRO
+mprotect(0xffffb6eaa000, 8192, PROT_READ)     # ld.so's RELRO
+...
+write(1, "hello\n", 6)                  = 6
+exit_group(0)                           = ?
+```
+
+A few things surprised me a bit. Nobody opens `hello` or `ld.so`, because the kernel
+mapped both already. Next, the loader checks `/etc/ld.so.preload` before anything
+else, a system-wide `LD_PRELOAD` that persists across reboots (it's also a
+favourite of rootkits). And it reserves libc's whole address range as
+`PROT_NONE` first, then maps the segments into it with `MAP_FIXED`, so nothing
+else can land in the gap between them.
+
+32 syscalls in total. A static build makes 15.
+
+Between the last `close(3)` and the first `mprotect` is where relocations get
+applied, with no syscalls to see. `LD_DEBUG=statistics` counts them:
+
+```text
+$ LD_DEBUG=statistics ./hello
+      3992:	                 number of relocations: 98
+      3992:	      number of relocations from cache: 7
+      3992:	        number of relative relocations: 1116
+```
+
+Almost all of the 1,116 relative ones are probably libc fixing up its own pointers. The 98
+symbol relocations are what cost lookups. glibc can print a cycle count here
+too, but not on this aarch64 build; the line simply isn't there.
+
+</Sub>
+
+<Sub n="3.3" title="Lazy binding, and why I couldn't see it at first">
+
+The textbook version: calls to `puts` go through a PLT stub. It jumps
+through a GOT slot that initially points back into the loader. That first
+call resolves `puts` and patches the slot; every call after that goes straight
+to libc.
+
+I went to watch it in `gdb`, and the slot was already filled before `main`. Had I
+broken something? The
+`FLAGS BIND_NOW` in section 2.3 is why: **Ubuntu 24.04's gcc links with
+`-z now` by default**, so every `JUMP_SLOT` is resolved at startup and the GOT
+becomes read-only. To see lazy binding at all, I had to ask for it with
+`-Wl,-z,lazy`. Here's the PLT from that build, `objdump -d` on aarch64:
+
+```text
+00000000000005d0 <.plt>:                    # PLT0: the path into the loader
+ 5d0:	stp	x16, x30, [sp, #-16]!
+ 5d4:	adrp	x16, 1f000
+ 5d8:	ldr	x17, [x16, #4088]            # GOT[2]: _dl_runtime_resolve
+ 5dc:	add	x16, x16, #0xff8
+ 5e0:	br	x17
+
+0000000000000630 <puts@plt>:
+ 630:	adrp	x16, 20000                   # page of .got.plt
+ 634:	ldr	x17, [x16, #32]              # load the puts slot
+ 638:	add	x16, x16, #0x20              # x16 = &slot, for the resolver
+ 63c:	br	x17                          # jump wherever it points
+
+0000000000000640 <main>:
+ ...
+ 650:	bl	630 <puts@plt>
+```
+
+Four instructions per stub. On the first call the slot holds `0x5d0`, the
+address of PLT0, so the `br x17` lands in PLT0. PLT0 pushes `x16` (the slot
+address) and jumps into the loader. I stopped on the `bl` and stepped over it:
+
+```text
+puts slot before the call:
+0xaaaaaaac0020 <puts@got.plt>:	0x0000aaaaaaaa05d0      # PLT0, rebased
+puts slot after the call:
+0xaaaaaaac0020 <puts@got.plt>:	0x0000fffff7e619d0      # __GI__IO_puts in libc
+```
+
+In between, `_dl_runtime_resolve` saved every argument register (x0 to x9 and q0 to
+q7, 208 bytes of stack), turned the slot address back into a relocation index,
+and called this:
+
+<SourceRead
+  file="elf/dl-runtime.c"
+  repo="bminor/glibc"
+  tag="glibc-2.39"
+  href="https://github.com/bminor/glibc/blob/glibc-2.39/elf/dl-runtime.c#L41-L163"
+>
+```c
+_dl_fixup (struct link_map *l, ElfW(Word) reloc_arg)
+{
+  const ElfW(Sym) *const symtab = (const void *) D_PTR (l, l_info[DT_SYMTAB]);
+  const char *strtab = (const void *) D_PTR (l, l_info[DT_STRTAB]);
+  const uintptr_t pltgot = (uintptr_t) D_PTR (l, l_info[DT_PLTGOT]);
+
+  const PLTREL *const reloc                 /* which .rela.plt entry? */
+    = (const void *) (D_PTR (l, l_info[DT_JMPREL])
+                      + reloc_offset (pltgot, reloc_arg));
+  const ElfW(Sym) *sym = &symtab[ELFW(R_SYM) (reloc->r_info)];
+  void *const rel_addr = (void *)(l->l_addr + reloc->r_offset);  /* the slot */
+  ...
+      result = _dl_lookup_symbol_x (strtab + sym->st_name, l, &sym, l->l_scope,
+                                    version, ELF_RTYPE_CLASS_PLT, flags, NULL);
+  ...
+  if (sym != NULL
+      && __builtin_expect (ELFW(ST_TYPE) (sym->st_info) == STT_GNU_IFUNC, 0))
+    value = elf_ifunc_invoke (DL_FIXUP_VALUE_ADDR (value));   /* see 3.4 */
+  ...
+  /* Finally, fix up the plt itself.  */
+  return elf_machine_fixup_plt (l, result, refsym, sym, reloc, rel_addr, value);
+}
+```
+</SourceRead>
+
+`LD_DEBUG=bindings` shows the order in which the bindings happen. On the lazy
+build, `__libc_start_main` binds after libc's constructors run, and `puts`
+binds after the loader prints `transferring control`, i.e. inside `main`:
+
+```text
+calling init: /lib/aarch64-linux-gnu/libc.so.6
+binding file ./hello-lazy [0] to libc.so.6 [0]: normal symbol `__libc_start_main' [GLIBC_2.34]
+initialize program: ./hello-lazy
+transferring control: ./hello-lazy
+binding file ./hello-lazy [0] to libc.so.6 [0]: normal symbol `puts' [GLIBC_2.17]
+```
+
+There's also an odd pair in that output: `hello-lazy` appears to bind `malloc`,
+`calloc`, `realloc` and `free`, even though it never calls them. That's `ld.so`
+itself. It runs on a tiny internal allocator until libc is relocated, then looks
+up the real `malloc` through the main program's scope. That's also how
+`LD_PRELOAD` gets to replace the loader's allocator.
+
+</Sub>
+
+<Sub n="3.4" title="IFUNC: code that runs during relocation">
+
+`memcpy` in glibc isn't one function. `readelf --dyn-syms` on this libc marks it
+`IFUNC`, along with `memmove`, `memset`, `memchr`, `strlen` and
+`gettimeofday`. An IFUNC symbol points at a **resolver**, and the loader
+*calls* it and uses the return value as the symbol's address. A resolver typically
+checks CPU features and picks the SVE, SIMD or generic version.
+
+That means arbitrary code, from any library, runs inside the loader while it's
+still patching tables. I wrote one to check exactly when:
+
+```c
+static int resolver_ran_before_main = 0;
+static unsigned long hwcap_seen;
+
+// Runs inside ld.so, while it processes this executable's relocations.
+// On aarch64 the loader hands the resolver AT_HWCAP as its first argument.
+static int (*resolve_sum(unsigned long hwcap))(const int *, int) {
+    resolver_ran_before_main = 1;
+    hwcap_seen = hwcap;
+    return (hwcap & HWCAP_ASIMD) ? sum_simd : sum_generic;
+}
+int sum(const int *a, int n) __attribute__((ifunc("resolve_sum")));
+
+__attribute__((constructor)) static void ctor(void) {
+    printf("constructor: resolver already ran? %d\n", resolver_ran_before_main);
+}
+```
+
+```text
+$ ./ifunc
+constructor: resolver already ran? 1
+main: sum=10, hwcap=0x40000000efb3ffff, ASIMD=yes
+```
+
+My resolver ran before any constructor, as an `R_AARCH64_IRELATIVE` relocation.
+Bit 62 in that hwcap is glibc's flag saying a second argument with more feature
+words follows. Resolvers run this early by design, before RELRO makes the
+GOT read-only. Section 4.4 is about what happened when someone noticed.
+
+</Sub>
+
+<Sub n="3.5" title="Constructors, __libc_start_main, and finally main">
+
+After relocation `ld.so` runs each library's `DT_INIT_ARRAY` (libc's first,
+because the executable depends on it), then jumps to `AT_ENTRY`. That's your
+`_start`: a few instructions from `crt1.o` that call
+`__libc_start_main`. Those strings from the `LD_DEBUG` output above are right
+there in the source:
+
+<SourceRead
+  file="csu/libc-start.c"
+  repo="bminor/glibc"
+  tag="glibc-2.39"
+  href="https://github.com/bminor/glibc/blob/glibc-2.39/csu/libc-start.c#L336-L361"
+>
+```c
+#ifdef SHARED
+  if (__builtin_expect (GLRO(dl_debug_mask) & DL_DEBUG_IMPCALLS, 0))
+    GLRO(dl_debug_printf) ("\ninitialize program: %s\n\n", argv[0]);
+
+  if (init != NULL)
+    /* This is a legacy program which supplied its own init routine.  */
+    (*init) (argc, argv, __environ MAIN_AUXVEC_PARAM);
+  else
+    /* This is a current program.  Use the dynamic segment to find
+       constructors.  */
+    call_init (argc, argv, __environ);      /* your DT_INIT_ARRAY */
+  ...
+  if (__glibc_unlikely (GLRO(dl_debug_mask) & DL_DEBUG_IMPCALLS))
+    GLRO(dl_debug_printf) ("\ntransferring control: %s\n\n", argv[0]);
+#endif
+  __libc_start_call_main (main, argc, argv MAIN_AUXVEC_PARAM);
+}
+```
+</SourceRead>
+
+`__libc_start_call_main` calls `main` and passes its return value to `exit`.
+That `init != NULL` branch is also where the most common deployment error on
+Linux comes from.
+
+</Sub>
+
+<SectionHeading n="04" cmd="ldd ./app" id="failure">When the loader says no</SectionHeading>
+
+<Sub n="4.1" title="'No such file or directory', for a file that's right there">
+
+I patched the `.interp` string in a copy of hello to point at musl's loader, the
+path an Alpine binary would ask for, and ran it on Ubuntu:
+
+```text
+$ ls -l hello-badinterp
+-rwxr-xr-x 1 root root 70312 Sep 25 13:26 hello-badinterp
+$ ./hello-badinterp
+bash: line 2: ./hello-badinterp: cannot execute: required file not found
+$ strace ./hello-badinterp
+execve("./hello-badinterp", ...) = -1 ENOENT (No such file or directory)
+```
+
+That file exists. `ENOENT` is about the interpreter, straight out of the
+`open_exec` failure in 3.1. Bash 5.2 at least says "required file", and older
+shells just print "No such file or directory". That's how Julia Evans
+[ran into it](https://jvns.ca/blog/2021/11/17/debugging-a-weird--file-not-found--error/)
+with a glibc binary in an Alpine container. Fix: check `readelf -l | grep
+interpreter` before believing the error message.
+
+</Sub>
+
+<Sub n="4.2" title="version `GLIBC_2.34' not found">
+
+Look at what my hello world requires:
+
+```text
+$ objdump -T hello | grep GLIBC
+0000000000000000      DF *UND*	0000000000000000 (GLIBC_2.34) __libc_start_main
+0000000000000000  w   DF *UND*	0000000000000000 (GLIBC_2.17) __cxa_finalize
+0000000000000000      DF *UND*	0000000000000000 (GLIBC_2.17) abort
+0000000000000000      DF *UND*	0000000000000000 (GLIBC_2.17) puts
+```
+
+A program that calls one function needs glibc 2.34 or later, because of
+`_start`, code you didn't write. In 2.34, `__libc_start_main` stopped using
+the `init` argument, and the glibc source says so:
+
+> Starting with glibc 2.34, the init parameter is always NULL. Older libcs are
+> not prepared to handle that. The macro DEFINE_LIBC_START_MAIN_VERSION creates
+> GLIBC_2.34 alias, so that newly linked binaries reflect that dependency.
+> ([csu/libc-start.c](https://github.com/bminor/glibc/blob/glibc-2.39/csu/libc-start.c#L363-L368))
+
+So anything built on Ubuntu 22.04 or newer won't start on a glibc 2.31 or 2.28
+system, and the error lands at exec time. Two working rules:
+
+- **Build on the oldest system you ship to.** glibc versioning is
+  backward-compatible only, old binaries run on new glibc, never the reverse.
+  Python's manylinux wheels are this rule turned into a standard
+  ([PEP 600](https://peps.python.org/pep-0600/)).
+- **Or don't depend on the host's libc at all**: static linking, or a
+  container that brings its own.
+
+</Sub>
+
+<Sub n="4.3" title="Interposition working exactly as designed">
+
+`LD_PRELOAD` puts an object at the front of the search order, so its `malloc`
+beats libc's for every lookup in the process, libc's own included. A
+working malloc counter is 30 lines of C++:
+
+```cpp
+// mallocount.cpp: count every malloc the program makes, print the total at exit.
+#include <dlfcn.h>
+#include <atomic>
+#include <cstddef>
+#include <cstdio>
+#include <unistd.h>
+
+using malloc_fn = void *(*)(size_t);
+static malloc_fn real_malloc = nullptr;
+static std::atomic<unsigned long> calls{0};
+
+// dlsym can itself allocate. Serve those early requests from a static arena.
+alignas(16) static char arena[4096];
+static size_t arena_used = 0;
+
+extern "C" void *malloc(size_t n) {
+    if (!real_malloc) {
+        static bool resolving = false;
+        if (resolving) {                       // re-entered from inside dlsym
+            void *p = arena + arena_used;
+            arena_used += (n + 15) & ~size_t(15);
+            return p;
+        }
+        resolving = true;
+        real_malloc = reinterpret_cast<malloc_fn>(dlsym(RTLD_NEXT, "malloc"));
+        resolving = false;
+    }
+    calls.fetch_add(1, std::memory_order_relaxed);
+    return real_malloc(n);
+}
+
+__attribute__((destructor)) static void report() {
+    char buf[64];
+    int len = std::snprintf(buf, sizeof buf, "[mallocount] %lu calls\n",
+                            calls.load(std::memory_order_relaxed));
+    if (write(2, buf, len) < 0) {}              // not stdio: it may already be torn down
+}
+```
+
+```text
+$ g++ -std=c++20 -O2 -shared -fPIC -o mallocount.so mallocount.cpp
+$ LD_PRELOAD=$PWD/mallocount.so ./allocs          # pushes 1,000 std::strings
+[mallocount] 1013 calls
+$ LD_PRELOAD=$PWD/mallocount.so python3 -c 'print(1)'
+[mallocount] 3167 calls
+$ LD_PRELOAD=$PWD/mallocount.so ./hello-static
+hello
+$ LD_PRELOAD=$PWD/mallocount.so ls /
+$
+```
+
+Those last two are the interesting ones. A static binary ignores `LD_PRELOAD`
+completely, since there's no loader to read it. And `ls` printed nothing.
+`strace` explains it: coreutils closes fd 2 in its exit handler, and my
+destructor runs after that.
+
+```text
+close(2)                                = 0
+write(2, "[mallocount] 35 calls\n", 22) = -1 EBADF (Bad file descriptor)
+```
+
+On macOS the same shim counted **zero** calls, with or without
+`DYLD_FORCE_FLAT_NAMESPACE`. macOS binds each import to a named library (the
+two-level namespace), so defining `malloc` somewhere else doesn't change
+anything. You have to say what you're replacing in a `__DATA,__interpose`
+section. With that version, the same C++ program on an M4 counted 1,038 calls.
+
+</Sub>
+
+<Sub n="4.4" title="The xz backdoor, an IFUNC resolver doing too much">
+
+On 29 March 2024 Andres Freund
+[posted to oss-security](https://www.openwall.com/lists/oss-security/2024/03/29/4)
+that xz-utils 5.6.0 and 5.6.1 contained a backdoor, now CVE-2024-3094. He'd
+noticed ssh logins on Debian sid taking a lot of CPU plus valgrind errors, and
+measured a login going from 0.299 s to 0.807 s. Everything after that is loader
+mechanics:
+
+1. **OpenSSH doesn't use liblzma.** But Debian and several other distributions
+   patch `sshd` to call libsystemd for service notification, and **libsystemd
+   depends on liblzma**. So liblzma gets loaded into `sshd`.
+2. A malicious build step, present in release tarballs and absent from git,
+   **replaced liblzma's IFUNC resolvers** `crc32_resolve()` and `crc64_resolve()`.
+   Those run during relocation, before `main`, before RELRO.
+3. From inside the resolver, the payload parsed the loader's data structures and
+   **installed an audit hook in the dynamic linker**. When the loader resolved
+   `RSA_public_decrypt@....plt`, the hook swapped in its own code.
+4. It only activated under narrow conditions, per Freund: x86-64 Linux, built
+   by gcc and the GNU linker as a Debian or RPM package, `argv[0]` equal to
+   `/usr/sbin/sshd`, `TERM` unset, `LANG` set, and `LD_DEBUG` and `LD_PROFILE`
+   unset.
+
+<Callout label="Why full RELRO didn't stop it">
+RELRO makes the GOT read-only *after* relocation. IFUNC resolvers run *during*
+relocation. So full RELRO couldn't have helped here: the attacker's code ran at a
+point when the tables it went after were still writable by design. That the detection trigger was slower logins, measured in hundreds
+of milliseconds, is the other lesson of this chapter.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="05" cmd="./spawnbench ./hello-static ./hello" id="cost">What 30 microseconds buys</SectionHeading>
+
+<Callout label="The machine" kind="note">
+Ubuntu 24.04, glibc 2.39, gcc 13.3, kernel 6.10.14-linuxkit on aarch64,
+in a shared 4-CPU container on an Apple M4. Binaries in the container's own
+`/tmp`, not on the bind mount. Each row is `posix_spawn` + `waitpid` timed
+with `steady_clock`, 5,000 runs interleaved across all rows, three repeats; the
+table shows the median of the three medians. Absolute numbers are noisy on a
+shared box. But the deltas held across every repeat.
+</Callout>
+
+<Sub n="5.1" title="Static, dynamic, C++, Python">
+
+<Compare
+  cols={["Program", "Median", "p10", "What's in it"]}
+  rows={[
+    ["hello, -static", "125 µs", "103 µs", "15 syscalls, no loader"],
+    ["hello, dynamic (-z now)", "154 µs", "133 µs", "32 syscalls, 98 symbol + 1,116 relative relocations"],
+    ["hello, dynamic, -z lazy", "152 µs", "132 µs", "Same, 5 slots deferred. No difference"],
+    ["hello with std::cout", "398 µs", "346 µs", "libstdc++, libm, libgcc_s. 1,794 symbol + 2,183 relative relocations"],
+    ["python3 -S -c pass", "3.4 ms", "3.2 ms", "hyperfine, 5,000 runs, earlier unshared container"],
+    ["python3 -c pass", "4.5 ms", "4.0 ms", "hyperfine, 5,000 runs, earlier unshared container"],
+  ]}
+/>
+
+Dynamic linking costs hello about 30 µs, maybe a little less. Swapping `puts` for `std::cout`
+costs another 240, most of it likely loading and relocating libstdc++. Python's
+3–4 ms is mostly Python itself, the interpreter's own init and imports, and
+`-S` (skip `site`) takes a millisecond off.
+
+Thirty microseconds sounds like nothing, and for a long-lived server it probably is. A build that runs the compiler 20,000 times
+pays it several times per file, since `gcc` execs `cc1`, `as` and `ld`.
+A shell script calling `grep` in a loop does it every iteration.
+
+</Sub>
+
+<Sub n="5.2" title="Lazy versus now: a crossover, measured">
+
+To make relocation cost visible I generated a shared library with 20,000
+functions, `f0` calling `f1` calling `f2` all the way to `f20000`. With default
+visibility every one of those internal calls goes through the PLT, since any of
+them could be interposed. `readelf -r` counts **20,002 `JUMP_SLOT`s**.
+With `-fvisibility=hidden` and only `f0` exported: **2**.
+
+<Compare
+  cols={["Library build, what main calls", "Binding", "Median", "Symbol relocations"]}
+  rows={[
+    ["default visibility, calls f19999 (2 functions run)", "lazy", "216 µs", "103"],
+    ["default visibility, calls f19999", "LD_BIND_NOW=1", "763 µs", "20,105"],
+    ["default visibility, calls f0 (all 20,000 run)", "lazy", "1,469 µs", "20,102, by the end"],
+    ["default visibility, calls f0", "LD_BIND_NOW=1", "1,184 µs", "20,105"],
+    ["-fvisibility=hidden, calls f0", "either", "488 µs", "104"],
+  ]}
+/>
+
+<Estimate
+  rows={[
+    { label: "Eager binding, 20,000 extra symbols", math: "763 − 216 µs", value: "547 µs" },
+    { label: "Per symbol relocation", math: "547 µs ÷ 20,000", value: "≈ 27 ns" },
+    { label: "Lazy, all 20,000 called, over eager", math: "1,469 − 1,184 µs", value: "285 µs" },
+    { label: "Extra per lazily bound call", math: "285 µs ÷ 20,000", value: "≈ 14 ns" },
+  ]}
+  result={{ label: "Hidden visibility vs eager, same work", value: "−696 µs, 2.4× faster" }}
+/>
+
+So which wins? Lazy binding wins by 3.5× when you call a handful of what you link, and loses
+by 24% when you call everything. Most real programs call a small fraction of
+libc and a large fraction of their own code, so that argues for lazy. Full
+RELRO needs eager binding, though, and that's why distributions pay anyway.
+
+<Callout label="The number that makes visibility matter">
+`-fvisibility=hidden` beat *both* binding modes by a wide margin: 488 µs against
+1,184 for the same 20,000 calls. Nothing is deferred and nothing is looked up,
+because the calls were resolved by the static linker into plain `bl`
+instructions. And the library shrank from 3.7 MB to 2.0 MB, since 20,000
+dynamic symbols, their strings and their hash entries all disappear.
+</Callout>
+
+What I can't fully explain is the 14 ns. `_dl_runtime_resolve` stores and
+reloads 208 bytes of registers on every first call. That should cost maybe a few
+nanoseconds, and the lookup is the same one eager binding does. I'd guess it's
+the page faults: eager binding writes the GOT in one sequential pass, and lazy
+binding writes one slot at a time scattered through execution. I didn't
+separate the two. `perf stat -e page-faults,dTLB-load-misses` on both variants
+would settle it, and this container doesn't expose those counters.
+
+</Sub>
+
+<Sub n="5.3" title="The history of trying to make this cheaper">
+
+Big C++ programs are where this used to hurt, and you're probably running the result of
+the fixes:
+
+- **prelink** (Jakub Jelinek, Red Hat, [paper](https://people.redhat.com/jakub/prelink.pdf))
+  computed relocations ahead of time for a fixed library layout. Fedora and RHEL
+  ran it by default, and Jelinek reported "an order of magnitude difference" in
+  relocation time for OpenOffice.org Writer
+  ([LWN, 2009](https://lwn.net/Articles/341244/)). It's fundamentally at odds
+  with ASLR, since the whole point is that addresses stay put.
+- **Firefox's elfhack** (Mike Hommey, 2010) rewrote libxul's relative relocations
+  into a compact form to cut startup I/O
+  ([glandium.org](https://glandium.org/blog/?p=1177)).
+- **RELR** (`DT_RELR`) standardised the idea. Chrome OS carried patches from
+  2018, Android and Fuchsia adopted it, and it landed in glibc 2.36
+  ([MaskRay](https://maskray.me/blog/2021-10-31-relative-relocations-and-relr)).
+  Linkers emit it with `-z pack-relative-relocs`, and Hommey retired elfhack for
+  it in 2023 ([glandium.org](https://glandium.org/blog/?p=4297)).
+
+</Sub>
+
+<SectionHeading n="06" cmd="LD_DEBUG=help ./hello" id="operating">Seeing inside the loader</SectionHeading>
+
+<Sub n="6.1" title="The commands">
+
+```shell
+# What will run first, and what does this need?
+readelf -lW ./app | grep -A1 INTERP
+readelf -dW ./app | grep -E 'NEEDED|RUNPATH|RPATH|FLAGS'
+objdump -T ./app | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1   # minimum glibc
+
+# RELRO status: GNU_RELRO present + BIND_NOW = full RELRO
+readelf -lW ./app | grep GNU_RELRO
+readelf -dW ./app | grep -E 'BIND_NOW|FLAGS_1'
+
+# The loader's own diagnostics
+LD_DEBUG=libs ./app          # search paths, which file each soname became
+LD_DEBUG=bindings ./app      # every symbol, who asked, who answered
+LD_DEBUG=statistics ./app    # relocation counts
+LD_DEBUG=help ./app          # the list
+LD_SHOW_AUXV=1 ./app         # what the kernel handed over
+
+# Startup syscalls
+strace -f -e trace=openat,mmap,mprotect ./app
+```
+
+**Don't run `ldd` on a binary you don't trust.** The `ldd(1)` man page warns
+that some versions may execute the program to get the answer. `readelf -d` and
+`LD_DEBUG=libs` on a trusted loader give you the same information.
+
+</Sub>
+
+<Sub n="6.2" title="What to change, roughly in order">
+
+1. **Build shared libraries with `-fvisibility=hidden`** and export an explicit
+   API. Smaller file, fewer lookups, faster calls. It was the biggest single win
+   measured here.
+2. **Keep full RELRO** (`-z relro -z now`). Ubuntu's default already does. It
+   costs eager binding, and in exchange an attacker can't overwrite GOT entries
+   after startup.
+3. **Link RELR** with `-z pack-relative-relocs` if your toolchain and target
+   glibc (2.36 or newer) support it.
+4. **Count your libraries.** Each `NEEDED` is an `openat`, several `mmap`s,
+   relocations and its constructors. `ldd` on a large C++ service can easily list
+   dozens.
+5. **Go static for tools you exec a lot**, if you can live with the
+   consequences in section 8.
+
+</Sub>
+
+<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+
+**Write an `LD_AUDIT` library that times every binding in a real program.**
+
+glibc's [rtld-audit(7)](https://man7.org/linux/man-pages/man7/rtld-audit.7.html)
+interface calls your `la_objopen` for every library loaded and `la_symbind64`
+for every symbol bound. That's more or less the same machinery the xz payload hooked.
+
+- Implement `la_version`, `la_objopen` and `la_symbind64`, and log object name,
+  symbol name and a `clock_gettime` timestamp for each.
+- Run it on `python3 -c pass` and on a C++ service you own. Count bindings per
+  library.
+- Then rebuild one of your own libraries with `-fvisibility=hidden` and watch its
+  bindings disappear from the log.
+
+Your first run will probably show you a library you didn't know was loaded. On
+Debian and Ubuntu, liblzma in `sshd` was exactly that.
+
+<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
+
+<Compare
+  cols={["Choice", "You get", "You pay"]}
+  rows={[
+    ["Dynamic linking", "Shared pages, security fixes without rebuilds, LD_PRELOAD", "~30 µs per exec for hello, far more for C++; GLIBC_x.y errors"],
+    ["Static linking", "One file, no loader, no version skew", "No LD_PRELOAD, rebuild for every libc CVE, and glibc's NSS/dlopen features break"],
+    ["Lazy binding", "3.5× faster startup when few symbols are called", "Writable GOT for the process lifetime; failure is a crash mid-run"],
+    ["Full RELRO (-z now)", "Read-only GOT after startup", "Every symbol bound up front, used or not"],
+    ["-fvisibility=hidden", "Fewer relocations, direct calls, smaller file", "You must mark the API explicitly; nobody can interpose internals"],
+    ["musl (Alpine)", "Small, simple, static-friendly", "No lazy binding, dlclose is a no-op, DNS over TCP only since 1.2.4"],
+  ]}
+/>
+
+<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
+
+<CardGrid>
+  <WildCard name="CVE-2024-3094, xz-utils" verdict="The loader runs third-party code before main, with the tables writable. Every library in your process is part of your attack surface.">
+    A backdoor in liblzma 5.6.0 and 5.6.1 hijacked IFUNC resolvers and used a
+    dynamic-linker audit hook to redirect `RSA_public_decrypt` in `sshd`. That process
+    loaded liblzma only through a distro patch that linked libsystemd. Found
+    because logins got half a second slower
+    ([oss-security](https://www.openwall.com/lists/oss-security/2024/03/29/4)).
+  </WildCard>
+  <WildCard name="Go binaries and DNS" verdict="If a Go service resolves names differently from curl on the same box, check which resolver it's using.">
+    With cgo off, a Go binary is fully static and has no `PT_INTERP`, so it runs
+    in a `scratch` container. It also can't use glibc's resolver. The
+    [net package](https://pkg.go.dev/net) prefers its pure-Go resolver on Unix
+    and falls back to cgo for nsswitch or resolv.conf features it doesn't
+    implement. `GODEBUG=netdns=go` or `=cgo` forces one; `netdns=1` logs the choice.
+  </WildCard>
+  <WildCard name="Alpine and musl" verdict="A glibc binary on Alpine fails with ENOENT. A musl binary that resolves fine on your laptop can behave differently under a big DNS answer.">
+    musl's [documented differences](https://wiki.musl-libc.org/functional-differences-from-glibc.html)
+    include no lazy binding at all, `dlclose` as a no-op, and a resolver that
+    didn't support DNS over TCP until
+    [1.2.4 in May 2023](https://www.openwall.com/lists/musl/2023/05/02/1),
+    so truncated UDP answers used to just fail.
+  </WildCard>
+  <WildCard name="Firefox, Chrome OS, Android: RELR" verdict="Startup relocations were big enough that three browser and OS teams each rebuilt the format.">
+    Firefox's elfhack packed libxul's relocations in 2010. Chrome OS shipped
+    `DT_RELR` patches from 2018, Android and Fuchsia followed, and glibc 2.36
+    added support. MaskRay measured relative relocations at 7.9% of total file
+    size across Arch's `/usr/bin`
+    ([post](https://maskray.me/blog/2021-10-31-relative-relocations-and-relr)).
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What's the difference between program headers and section headers?">
+Program headers describe segments: what to map, where, with which permissions.
+That's all the kernel and the dynamic loader read. Section headers describe
+the file for tools like the linker, `objdump` and `gdb`: `.text`, `.dynsym`,
+`.rela.plt`. Linux never looks at them, so a binary can run with its
+section header table stripped.
+</QA>
+
+<QA level="beginner" q="A binary exists and is executable, and running it says 'No such file or directory'. Why?">
+Almost always the interpreter named in `PT_INTERP` doesn't exist, typically a
+glibc binary in an Alpine container asking for `/lib/ld-linux-*.so`. Linux
+opens that path inside `load_elf_binary` and returns its `ENOENT` from
+`execve`. `readelf -l ./bin | grep interpreter` shows what it wants.
+</QA>
+
+<QA level="intermediate" q="Walk through the first call to puts in a lazily bound program.">
+`main` calls `puts@plt`. That stub loads the `puts` slot from `.got.plt`. It
+still points at PLT0, and jumps there. PLT0 pushes the slot address and jumps to
+`_dl_runtime_resolve`. That saves the argument registers and calls `_dl_fixup`.
+That finds the `.rela.plt` entry, looks `puts` up through the GNU hash tables of
+each loaded object, writes the address into the slot, and returns it. The
+trampoline restores registers and jumps to `puts`. Later calls skip all of it.
+</QA>
+
+<QA level="intermediate" q="Why does a program built on Ubuntu 24.04 fail with GLIBC_2.34 not found on an older box?">
+glibc versions its symbols, and a program records the version it linked
+against. Even a hello world references `__libc_start_main@GLIBC_2.34`, from
+`crt1.o`, because 2.34 changed how that function handles constructors. Older
+glibc doesn't have that version node, so the loader refuses before `main`.
+Build on the oldest target, use a manylinux-style build image, or link
+statically.
+</QA>
+
+<QA level="intermediate" q="What does full RELRO protect, and what does it cost?">
+It makes the GOT and other relocated data read-only once the loader finishes, so
+a memory-corruption bug can't redirect a function pointer in the GOT. It
+requires binding every symbol at startup (`-z now`). In my 20,000-symbol
+test cost 547 µs against lazy binding when only two functions were called.
+</QA>
+
+<QA level="deep" q="How did the xz backdoor get code running inside sshd, and why didn't RELRO help?">
+Distro-patched `sshd` links libsystemd, which links liblzma. That malicious
+liblzma replaced its IFUNC resolvers. The loader calls those during relocation,
+before `main` and before RELRO is applied. From there it installed a
+dynamic-linker audit hook and redirected `RSA_public_decrypt` when that symbol
+was bound. RELRO locks tables after relocation, and the attack happened during it.
+</QA>
+
+<QA level="deep" q="Why does -fvisibility=hidden make a shared library start faster?">
+Default visibility means every exported function can be interposed by an
+earlier object, so even internal calls go through the PLT and need a
+`JUMP_SLOT` relocation. Hidden symbols can't be interposed, so the static
+linker emits direct branches and drops them from `.dynsym`. In my test that took
+a library from 20,002 jump slots to 2, from 3.7 MB to 2.0 MB, and cut startup
+from 1,184 µs to 488.
+</QA>
+
+<QA level="deep" q="Your LD_PRELOAD malloc shim deadlocks or crashes at startup. What's the likely cause?">
+Probably recursion during bootstrap. Your shim's `malloc` calls `dlsym(RTLD_NEXT, "malloc")`
+to find the real one, and `dlsym` itself can allocate, and that re-enters the shim
+before the pointer is set. Usual fix: is a static arena for re-entrant calls
+during resolution, or a glibc-specific entry point. Printing from a destructor
+has its own trap: some programs close stderr before destructors run.
+</QA>
+
+<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Where does the CPU start executing after execve of a dynamic PIE?">
+    In ld.so, at the interpreter's entry point. The program's own entry goes on
+    the stack as AT_ENTRY and ld.so jumps there after relocation.
+  </Q>
+  <Q q="Why did LD_PRELOAD do nothing to the static binary?">
+    There's no dynamic loader to read the variable. Static binaries have no
+    PT_INTERP and resolve everything at link time.
+  </Q>
+  <Q q="Lazy binding or BIND_NOW: which starts faster?">
+    It depends on how much you call. Lazy was 3.5× faster when two of 20,000
+    functions ran, and 24% slower when all of them did.
+  </Q>
+  <Q q="Your hello world was built on Ubuntu 24.04 with gcc -O2. Is it lazily bound?">
+    No. Ubuntu's toolchain links with -z now by default, so FLAGS shows BIND_NOW
+    and the GOT is read-only before main.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Ulrich Drepper — How To Write Shared Libraries">
+    [The paper](https://www.akkadia.org/drepper/dsohowto.pdf) on relocation
+    cost, visibility and GNU hash, from glibc's former maintainer. Old and
+    still correct on every mechanism in section 2.
+  </WildCard>
+  <WildCard name="fs/binfmt_elf.c at v6.10">
+    [load_elf_binary](https://github.com/torvalds/linux/blob/v6.10/fs/binfmt_elf.c#L819)
+    and create_elf_tables. About 500 lines, and all of section 3.1.
+  </WildCard>
+  <WildCard name="glibc elf/ at 2.39">
+    [dl-runtime.c](https://github.com/bminor/glibc/blob/glibc-2.39/elf/dl-runtime.c),
+    [dl-lookup.c](https://github.com/bminor/glibc/blob/glibc-2.39/elf/dl-lookup.c)
+    and the aarch64
+    [dl-trampoline.S](https://github.com/bminor/glibc/blob/glibc-2.39/sysdeps/aarch64/dl-trampoline.S).
+    Read `_dl_fixup` first.
+  </WildCard>
+  <WildCard name="MaskRay — Relative relocations and RELR">
+    [The history](https://maskray.me/blog/2021-10-31-relative-relocations-and-relr)
+    from elfhack to DT_RELR, with size measurements across a whole distribution.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="12" cmd="ls ../" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="04 — Virtual Memory & Page Tables">
+    [Chapter 04](/topics/04-virtual-memory). Every `mmap` in the strace above
+    creates a mapping whose pages fault in on first touch. That's why a
+    bind-mounted binary started three times slower.
+  </WildCard>
+  <WildCard name="07 — Syscalls & the Kernel Boundary">
+    [Chapter 07](/topics/07-syscalls-kernel-boundary). `execve` is the
+    heaviest syscall most programs make, and `AT_SYSINFO_EHDR` in the auxv is
+    where the vDSO from that chapter gets handed over.
+  </WildCard>
+  <WildCard name="05 — Allocators">
+    [Chapter 05](/topics/05-allocators). What you're actually replacing when an
+    `LD_PRELOAD` of jemalloc or tcmalloc interposes `malloc`.
+  </WildCard>
+  <WildCard name="06 — Processes & Scheduling">
+    [Chapter 06](/topics/06-processes-scheduling). The `fork` half of
+    fork-and-exec, and what the new process inherits before the loader runs.
+  </WildCard>
+</CardGrid>

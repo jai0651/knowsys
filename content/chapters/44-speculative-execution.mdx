@@ -1,0 +1,630 @@
+---
+title: Speculative Execution, Spectre & the Mitigation Tax
+dek: "The CPU runs code you never called, then pretends it didn't. What it forgets to undo is a cache footprint, and closing that leak taxes every syscall you make."
+readingTime: "~24 min"
+versions: "Measured on Apple M4 · macOS 26.5.1 · clang 21 -O2 · Linux vulnerability data via Docker (linuxkit 6.10.14, aarch64) · x86 mitigation costs attributed"
+prereqs: "Chapters 01 and 07"
+updated: "2026-09-25"
+---
+
+I typed out the textbook Spectre proof of concept, the one from the appendix of
+Kocher's paper that leaks a string out of its own process, compiled it on my M4,
+and it recovered **0 of 40 bytes**. Every one of the 256 cache lines it probed
+came back looking equally fast. No signal at all.
+
+That failure took me a day to understand, and it turned out to be the most
+interesting thing in this chapter. The attack is real, the CPU really does run
+the out-of-bounds read speculatively, and the secret really does leave a trace.
+What I couldn't do from a normal user process on this machine was *read the
+trace back* — because the clock I'm allowed to call ticks once every 42
+nanoseconds, and a cache hit and a cache miss both fit inside one tick.
+
+So this is a chapter about a leak you can prove exists and then can't quite
+photograph, and about what the fixes for it cost you on a path you care about:
+the syscall.
+
+<SectionHeading n="01" cmd="./pattern | ./channel" id="observe">Two things you can watch</SectionHeading>
+
+Spectre needs two ingredients, and both are observable on their own before you
+ever combine them into an attack. Chapter 01 showed the first as sorted versus
+shuffled data. Here's the sharper version.
+
+<Sub n="1.1" title="The predictor memorises, it doesn't just lean">
+
+A branch predictor that only tracked "which way does this branch usually go"
+would be beaten by a coin flip. Modern ones keep *history*, and quite a bit of it. Feed a branch a
+fixed but random-looking pattern that repeats, and the predictor learns the
+whole sequence, not the average.
+
+I built a buffer of 2<sup>20</sup> branches, filled it by tiling a period-N
+pattern, and measured cost per branch with both arms doing identical work. Only
+the period changes, so the only variable is how often the predictor guesses
+wrong.
+
+<Figure caption="Apple M4, clang 21 -O2, both branch arms noinline and equal-cost. A period-2 pattern (strict alternation, a 50/50 bias) predicts perfectly at 0.75 ns. The M4 keeps learning fixed patterns out past period 1024 — still 2.6x faster than unlearnable random data at 3.24 ns/branch.">
+<Plot
+  xLabel="pattern period (branches)"
+  yLabel="ns per branch"
+  xTicks={[2, 32, 128, 512, 1024]}
+  series={[{ name: "period learned", points: [[2, 0.746], [8, 0.929], [32, 0.990], [64, 1.013], [128, 1.136], [256, 1.167], [1024, 1.227]] }]}
+/>
+</Figure>
+
+Strict alternation is a 50/50 branch, no bias whatsoever, and the M4 nails it at
+**0.746 ns**. That's not a coin being called; that's a state machine that has
+seen `taken, not-taken, taken, not-taken` and extrapolated. Push the period to
+1024 and it still runs at **1.227 ns**, well under the **3.239 ns** of data that
+has no learnable pattern at all. That predictor is a small, trainable memory, maybe a few thousand entries,
+sitting in front of your instruction stream.
+
+That trainability is the attack surface. If you can train it, so can code that
+runs just before yours.
+
+</Sub>
+
+<Sub n="1.2" title="A cache hit and a cache miss are different sizes in time">
+
+Spectre's second ingredient is older, and duller: a load that hits L1 is
+much faster than one that misses to DRAM. I measured the gap on the M4 with a
+randomised pointer chase, dependent loads so each one's latency lands on the
+critical path.
+
+<Compare
+  cols={["Working set", "ns per dependent load", "Where it lives"]}
+  rows={[
+    ["16 KB", "1.02", "L1 data cache"],
+    ["1 MB", "5.32", "L2"],
+    ["8 MB", "8.26", "L2 / SLC edge"],
+    ["256 MB", "93.60", "DRAM"],
+  ]}
+/>
+
+Ninety-odd nanoseconds against one. **That 90x ratio is the whole covert
+channel.** If a piece of code touches memory at an address that depends on a
+secret, and you can tell afterward which cache line is warm, you've read the
+secret without anyone handing it to you. Nothing here is exotic yet. A warm line
+is just faster, and faster is measurable. Usually. So what turns two dull
+ingredients into a read of someone else's memory?
+
+</Sub>
+
+<SectionHeading n="02" cmd="objdump -d ./victim" id="mechanism">Why the CPU runs code you never called</SectionHeading>
+
+<Sub n="2.1" title="The window where nothing is real yet">
+
+A modern core doesn't execute your program in order. It fetches far ahead,
+issues instructions as their inputs become ready, and holds the results in a
+<em className="term">reorder buffer</em> (the ROB) until it's sure they should have
+happened. On Apple's M-series the ROB is hundreds of entries deep, so hundreds
+of instructions can be in flight, none of them yet *architecturally* real.
+
+Retirement is the moment of truth. Instructions leave the ROB in program order,
+and only then do their effects become official: registers commit, stores drain,
+exceptions fire. Anything the core did speculatively and shouldn't have gets
+squashed here, cleanly, as if it never ran.
+
+Cleanly in the *architectural* state, that is. Registers roll back. Flags roll back too. What does not roll back is the cache — a line that got pulled in
+during the speculative detour stays pulled in. So the core forgets it did the work
+but not that it touched the memory.
+
+<Callout label="Why the rollback isn't a rollback">
+Speculation was always understood to be invisible, and for correctness it is:
+architectural state is restored perfectly on a bad guess. Spectre's whole
+insight is that <strong>microarchitectural state is not architectural
+state</strong>. Cache occupancy survives the squash. The CPU cleans up
+everything it promised to clean up, and the one thing it never promised — which
+lines are warm — is exactly the thing that leaks.
+</Callout>
+
+</Sub>
+
+<Sub n="2.2" title="Spectre v1, the bounds check that gets skipped">
+
+Put the two ingredients together. Here's the victim, straight from the pattern
+every writeup uses:
+
+```cpp
+uint8_t array1[16];              // the "public" array, size 16
+uint8_t array2[256 * 512];       // the covert channel, one page per byte value
+
+void victim(size_t x) {
+    if (x < array1_size)                       // the guard
+        temp &= array2[array1[x] * 512];       // read, then use as an index
+}
+```
+
+Call `victim` with `x` in range many times, and the predictor learns the guard is
+taken. Now call it with `x` huge, pointing at a secret somewhere past
+`array1`. That guard should stop you — and architecturally it does, the load
+never officially happens. So how does the byte get out? But the predictor already bet the branch is taken, so
+the core speculatively reads `array1[x]` (out of bounds, a secret byte), then
+uses that byte to index `array2` and pulls one line of it into cache.
+
+Now the guard resolves, the speculation unwinds, `temp` is untouched. One line of
+`array2` is now warm, and *which* line encodes the secret byte. Time the 256
+lines, find the fast one, read the byte. No rule was broken at the architectural
+level. That leak lives entirely in the timing.
+
+</Sub>
+
+<Sub n="2.3" title="One idea, many doors">
+
+Spectre v1 mistrains a conditional branch. Once researchers saw that
+speculation leaves footprints, they found other ways to steer it and other
+buffers to sample. This family is large, and the dates matter because the
+mitigation each one forced is still running on your machine today.
+
+<Compare
+  cols={["Name", "CVE", "Public", "What speculates wrongly"]}
+  rows={[
+    ["Meltdown (v3)", "CVE-2017-5754", "Jan 2018", "A faulting load reads kernel memory before the fault retires"],
+    ["Spectre v1", "CVE-2017-5753", "Jan 2018", "A mistrained bounds check is skipped speculatively"],
+    ["Spectre v2", "CVE-2017-5715", "Jan 2018", "An indirect branch is steered to an attacker's gadget"],
+    ["Spectre v4 (SSB)", "CVE-2018-3639", "May 2018", "A load runs before an aliasing store resolves, reading stale data"],
+    ["L1TF / Foreshadow", "CVE-2018-3615", "Aug 2018", "A terminal page fault leaks L1D through a non-present PTE"],
+    ["MDS (RIDL etc.)", "CVE-2018-12130", "May 2019", "Internal line-fill and store buffers are sampled across threads"],
+    ["Retbleed", "CVE-2022-29900", "Jul 2022", "Return targets come from the BTB, defeating retpoline"],
+    ["Downfall (GDS)", "CVE-2022-40982", "Aug 2023", "AVX gather transiently exposes stale vector-register data"],
+    ["Inception (SRSO)", "CVE-2023-20569", "Aug 2023", "Phantom recursive calls overflow the return stack buffer"],
+  ]}
+/>
+
+Two things to read off that table. That gap from 2019 to 2022 wasn't quiet — it
+was researchers realising every predictor and every internal buffer is fair
+game, and vendors patching microcode faster than the papers came out. And the
+mitigations don't retire when the next bug lands. They stack. A 2024 kernel
+carries the fixes for all nine rows, and section 4 is about what they cost.
+
+</Sub>
+
+<Sub n="2.4" title="The ones that name this exact laptop">
+
+Most of that table is Intel and AMD. Apple silicon has its own, and they're the
+freshest material there is because two landed while these chapters were being
+written.
+
+- <strong>GoFetch</strong> (March 2024, no CVE assigned). Apple's
+  <em className="term">data memory-dependent prefetcher</em> (DMP) looks at values in
+  memory, decides some of them look like pointers, and prefetches them. Feed it
+  crypto key material shaped like a pointer and it leaks the key through the
+  cache. Demonstrated on M1, M2 and M3. Its authors never tested M4 — it didn't
+  exist yet — so I honestly don't know where this one stands on the machine I'm
+  typing on.
+- <strong>SLAP and FLOP</strong> (January 2025, no CVEs). SLAP abuses the load
+  *address* predictor on M2 and later; FLOP abuses the load *value* predictor on
+  M3 and later. Both were shown stealing data out of Safari, and FLOP out of
+  Chrome. These are prediction mechanisms newer than branch prediction, doing the
+  same trick one level down: guessing a load's result and speculating on the
+  guess.
+
+This pattern holds across a decade, roughly. Any structure that predicts, to run ahead of
+certainty, is a structure you can mistrain into running ahead into somebody
+else's data.
+
+</Sub>
+
+<SectionHeading n="03" cmd="cat /sys/devices/system/cpu/vulnerabilities/*" id="controls">The knobs, and which you can reach</SectionHeading>
+
+<Sub n="3.1" title="What the kernel already did on your behalf">
+
+These mitigations divide by which prediction they break. None of them is free, and
+that's what the next section adds up.
+
+- <strong>KPTI / PTI</strong> (kernel page-table isolation). Meltdown's fix.
+  The kernel stops mapping most of itself into your process's page tables, so a
+  speculative load can't reach kernel memory that isn't mapped. First shipped in
+  mainline Linux 4.15 on 28 January 2018. Every syscall now swaps page tables on
+  the way in and out.
+- <strong>Retpoline</strong>. Spectre v2's original fix, invented by Paul Turner
+  at Google — "return" plus "trampoline". It replaces an indirect branch with a
+  return sequence that steers speculation into a dead `pause` loop, so the CPU
+  can't be tricked into speculating to an attacker's address.
+- <strong>eIBRS / IBRS / STIBP / SSBD</strong>. Hardware controls, all
+  acronyms. IBRS is Indirect Branch Restricted Speculation; eIBRS is the
+  enhanced, always-on form. STIBP (Single Thread Indirect Branch Predictors)
+  stops one SMT sibling training the other's predictor. SSBD (Speculative Store
+  Bypass Disable) turns off the reordering behind Spectre v4.
+
+Retbleed, in 2022, showed retpoline wasn't enough on some Intel and AMD parts —
+return instructions could still take their target from the branch predictor.
+ETH Zürich, who found it, put the mitigation cost at **12 to 28%**. That's probably not a rounding error.
+
+</Sub>
+
+<Sub n="3.2" title="Reading the state from inside a container">
+
+Linux exposes what's mitigated at `/sys/devices/system/cpu/vulnerabilities/`,
+added in 4.15 alongside KPTI. I read it from a plain Ubuntu container on this
+M4. That kernel is Docker Desktop's linuxkit VM, aarch64, so this is Linux
+looking at an Apple core:
+
+```shell
+docker run --rm ubuntu:24.04 sh -c \
+  'for f in /sys/devices/system/cpu/vulnerabilities/*; do
+     printf "%-22s %s\n" "$(basename $f):" "$(cat $f)"; done'
+```
+
+<Panel label="linuxkit 6.10.14, aarch64, on Apple M4">
+```text
+gather_data_sampling:  Not affected
+l1tf:                  Not affected
+mds:                   Not affected
+meltdown:              Not affected
+retbleed:              Not affected
+spec_store_bypass:     Vulnerable
+spectre_v1:            Mitigation: __user pointer sanitization
+spectre_v2:            Not affected
+srbds:                 Not affected
+```
+</Panel>
+
+Read that top to bottom and you get a free lesson in which bugs were an x86
+problem. Meltdown, L1TF, MDS, Downfall, Retbleed — all "Not affected", because
+they were Intel or AMD microarchitecture, not this ARM core. Spectre v1 gets a
+software fix (`__user pointer sanitization`, a barrier the kernel sprinkles on
+untrusted array indices). Spectre v2 is "Not affected". And `spec_store_bypass`
+reads <strong>Vulnerable</strong> here — the kernel decided the fix wasn't worth
+the cost on this part in this configuration. On a bare-metal Intel Xeon that same
+file is a wall of `Mitigation:` lines, and every one of them is spending time.
+
+</Sub>
+
+<Sub n="3.3" title="The browser did the other half">
+
+Kernels handle process boundaries. Your browser has a harder job: it runs
+attacker JavaScript on purpose, all day. Its defence is two-pronged, and the
+second prong is exactly why my M4 attack failed.
+
+- <strong>Site isolation.</strong> Chrome puts each site in its own process, so
+  a Spectre read inside a tab hits only that site's own memory. Cross-origin data
+  isn't in the address space to leak.
+- <strong>Take away the clock.</strong> Spectre needs a fine timer to tell a hit
+  from a miss. Browsers coarsened `performance.now()` to microseconds and, after
+  2018, disabled `SharedArrayBuffer` by default — a second thread incrementing a
+  counter is a home-made nanosecond timer, and that's the loophole. Getting it
+  back now requires <strong>COOP and COEP</strong> headers, which force a page
+  into its own isolated browsing context first.
+
+Reduced timer precision is a strange mitigation. It doesn't fix the leak; it
+blinds the reader. I got to reproduce that blinding by accident, and that's the
+next section.
+
+</Sub>
+
+<SectionHeading n="04" cmd="./spectre; ./bench --syscall" id="measurements">The attack I couldn't photograph, and the tax I can</SectionHeading>
+
+<Sub n="4.1" title="Zero of forty bytes, and why">
+
+Here's my run of the classic proof of concept on the M4, the full Kocher
+appendix logic, mistraining the branch and timing all 256 channel lines:
+
+<Panel label="Apple M4, macOS 26.5.1, clang 21 -O2">
+```text
+[diag] of 256 channel lines, 256 scored >=900/999 -- no line stands out
+  byte  0: got 0xff  score 999/999  weak  (want 'T')
+  byte  1: got 0xff  score 999/999  weak  (want 'h')
+  byte  2: got 0xff  score 999/999  weak  (want 'e')
+  ...
+recovered 0/40 bytes correctly
+```
+</Panel>
+
+Every line scores 999 out of 999. That receiver thinks all 256 are cache hits.
+Did the attack fail? Not exactly. It isn't that speculation didn't happen — the
+timer just can't see the result. I checked the clock directly:
+
+<Cost items={[
+  { what: "mach_absolute_time granularity", value: "41.67 ns", source: "M4, 24 MHz counter — smallest non-zero back-to-back delta is one tick" },
+  { what: "L1 hit", value: "~1 ns", source: "dependent-load measurement, section 1.2" },
+  { what: "DRAM miss", value: "~93 ns", source: "same measurement, 256 MB working set" },
+]} />
+
+What I need to read is the gap between 1 ns and 93 ns. My ruler has ticks 42 ns
+apart. A DRAM miss is barely two ticks; an L1 hit is
+zero. Worse, from a normal user process on macOS there's no cache-flush
+instruction, so I evicted lines by streaming a 24 MB buffer, slow
+enough that the timing probably washes out further. The x86 proof of concept works
+because `rdtsc` resolves single cycles and `clflush` is a user instruction.
+Neither holds here.
+
+<Callout label="The blinding is the mitigation" kind="teach">
+This is the same defence browsers ship, met from the other side. Real M4
+attacks — GoFetch, SLAP, FLOP — don't rely on the coarse system clock; they
+build their own timing primitives and amplify a weak signal over many trials. My
+naive port didn't, so it saw nothing. <strong>The leak is real and my inability
+to read it is the exact effect a coarsened timer is designed to produce.</strong>
+I can't prove from this experiment that a patient attacker fails. I can only show
+that the easy version does.
+</Callout>
+
+That's the honest state of it. I reproduced the *cause* — speculation past a
+bounds check — and could not reproduce the *read*, and the reason I couldn't is
+one of the deployed mitigations doing its job on me.
+
+</Sub>
+
+<Sub n="4.2" title="What the fixes cost a syscall">
+
+I can't toggle mitigations on Docker's shared kernel — `mitigations=off` is a
+boot parameter, and I don't own that VM's boot. So the with-and-without numbers
+here are attributed, and the baseline is mine.
+
+A real `getpid` syscall under that linuxkit kernel on the M4 costs **132 ns** in
+my measurement (5M calls, the actual `SYS_getpid` trap, not the libc wrapper).
+On the mitigation cost itself, the best source I could find is probably still
+Brendan Gregg's 2018 analysis for Netflix:
+
+<Compare
+  cols={["Measured / reported", "Overhead", "Source"]}
+  rows={[
+    ["getpid syscall, M4, linuxkit 6.10.14", "132 ns (my baseline)", "my Docker run, 5M iterations"],
+    ["KPTI at ~50k syscalls/sec/CPU", "~2%", "Gregg, Netflix, 2018"],
+    ["KPTI, Netflix production range", "0.1–6%", "Gregg, depends on syscall rate"],
+    ["KPTI + PCID, 100 MB working set", "2.1% → 0.5%", "Gregg — PCID cuts the TLB cost"],
+    ["Retbleed mitigation", "12–28%", "ETH Zürich, 2022"],
+  ]}
+/>
+
+Here's the shape of it. The tax tracks how often you cross the boundary, roughly linearly.
+Gregg's headline is that Netflix expected "between 0.1% and 6% overhead with
+KPTI due to our syscall rates" — the spread is entirely about rate. A service
+doing 5k syscalls/sec/CPU barely notices, maybe half a percent; one doing 500k pays real money. PCID
+(process-context identifiers) softens the worst of it by letting the TLB survive
+the page-table swap, so Gregg's 2.1% falls to 0.5% once it's on.
+
+</Sub>
+
+<Sub n="4.3" title="Turning the tax into dollars">
+
+Chapter 07 measured a `write` to `/dev/null` at 348 ns on this Mac and showed a
+busy service can burn 17% of a core just crossing the boundary. Layer the
+mitigation tax on top and the arithmetic is unforgiving for syscall-heavy work.
+
+<Estimate
+  rows={[
+    { label: "Syscalls/sec on one hot core", math: "a proxy or a database", value: "300,000" },
+    { label: "Time crossing, unmitigated", math: "300k × ~120 ns", value: "36 ms/s" },
+    { label: "KPTI tax on that path", math: "≈ 5% of crossing cost", value: "1.8 ms/s" },
+    { label: "Across a 64-core fleet node", math: "1.8 ms × 64", value: "115 ms/s" },
+  ]}
+  result={{ label: "Fleet CPU spent purely on Meltdown's fix", value: "≈ 0.12 of a core, per node" }}
+/>
+
+A tenth of a core per node sounds small until it's multiplied by ten thousand
+nodes and a power bill. That's the calculation behind every "should we turn
+mitigations off" argument, and section 5 is where it gets decided.
+
+</Sub>
+
+<SectionHeading n="05" cmd="grep mitigations /proc/cmdline" id="act">What to actually do</SectionHeading>
+
+Two levers exist. Turn mitigations off, or make the taxed path shorter. Most
+people should reach for the second and leave the first alone.
+
+<Sub n="5.1" title="When mitigations=off is defensible, and when it's negligence">
+
+`mitigations=off` disables every optional CPU mitigation in one boot flag — no
+PTI, no retpoline, no MDS clearing. It's a real lever with a narrow, honest use.
+
+<Compare
+  cols={["Situation", "mitigations=off?", "Why"]}
+  rows={[
+    ["Single-tenant box, no untrusted code, ever", "Defensible", "No attacker shares the hardware; the leak has no reader"],
+    ["HPC / batch node you own end to end", "Often yes", "Trusted code only, and the tax hits tight syscall loops hard"],
+    ["Anything running other people's code", "No", "That's the whole threat model — a tenant, a Lambda, a browser tab"],
+    ["Kubernetes multi-tenant nodes", "No", "A pod is untrusted code by definition"],
+    ["A laptop with a browser", "No", "JavaScript is untrusted code you invite in hourly"],
+  ]}
+/>
+
+That single-tenant case is real. So why not flip it everywhere and reclaim the
+tax? Because most hardware isn't single-tenant. If your box runs one trusted workload and never
+touches a hostile instruction, the mitigations defend against a threat that
+can't reach you, and turning them off is a rational reclaim of that 2–28%. The
+mistake is doing it on shared hardware because a benchmark looked slow. On a
+multi-tenant node, `mitigations=off` converts a hardware bug into a data breach,
+and the person who flips it usually isn't the person who gets paged.
+
+</Sub>
+
+<Sub n="5.2" title="Make the boundary rare instead">
+
+This tax is per-crossing, so the highest-leverage move isn't removing the tax —
+it's crossing less. Everything chapter 07 says about syscall reduction pays
+double once mitigations are in the price. Ranked by what it returns:
+
+1. <strong>Buffer.</strong> One `write` per 4 KB instead of per line. Forty
+   crossings become one, and each one now carries the KPTI tax too, so the win
+   is bigger than it was in 2017.
+2. <strong>Batch.</strong> `writev`, `sendmmsg`, `recvmmsg` — many items, one
+   crossing.
+3. <strong>Amortise with shared memory.</strong> io_uring moves submission and
+   completion into rings both sides read, so a busy server can run the data path
+   with almost no syscalls, and a path you don't cross pays no tax at all.
+4. <strong>Keep PCID on</strong> (it is, by default, on anything modern). If you
+   run a custom kernel, don't disable it to "simplify" — it's most of what makes
+   KPTI affordable.
+
+The second and the fourth are the ones people forget. A syscall you didn't make
+is the only one that's reliably free, mitigations or not.
+
+</Sub>
+
+<SectionHeading n="06" cmd="make && ./spectre" id="reproduce">Reproduce it yourself</SectionHeading>
+
+**Get it wrong the way I did — the failure is the lesson.**
+
+- Take the Kocher Appendix C proof of concept and compile it on an Apple Mac
+  with `clang++ -O2`. Swap `_mm_clflush` for a big eviction loop and `rdtsc`
+  for `mach_absolute_time`.
+- Run it. Expect **0 bytes** and every channel line scoring alike. You didn't
+  break the attack; you hit the timer wall.
+- Prove the wall is real. Read `mach_absolute_time` twice back to back in a
+  tight loop and look at the smallest non-zero delta. You'll find one tick,
+  about 42 ns, wider than the whole hit-versus-miss gap.
+- Now watch the *cause* work anyway: a randomised dependent pointer-chase across
+  16 KB versus 256 MB gives you the 1 ns / 93 ns gap the attack depends on. The
+  ingredient is there; only the reader is blind.
+
+What I haven't done, and would need to, is build the counter-thread timer and
+amplify over many trials the way the real Apple-silicon papers do. I tried a
+naive counter thread and it was throttled by cross-core coherency — macOS gives
+no thread-affinity API, so I couldn't pin it. That's the open thread I'm leaving
+here: I believe a patient attacker recovers the byte on this M4, and I did not
+manage to.
+
+<SectionHeading n="07" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
+
+<CardGrid>
+  <WildCard name="GoFetch, March 2024" verdict="The first Spectre-class break that names Apple silicon specifically. No microcode fix exists for M1/M2; the DMP can't be disabled from software there.">
+    Boru Chen and colleagues showed Apple's data memory-dependent prefetcher
+    leaking cryptographic keys on M1, M2 and M3 by disguising key bytes as
+    pointers. M3 lets software set the DIT bit to disable the prefetcher; M1 and
+    M2 don't expose the switch, so the mitigation lands in the crypto library
+    instead.
+  </WildCard>
+  <WildCard name="SLAP & FLOP, January 2025" verdict="Load prediction is the new branch prediction. Same trick, one layer deeper, and demonstrated against shipping browsers.">
+    Georgia Tech's team abused the load-address predictor (M2+) and the
+    load-value predictor (M3+) to read data out of Safari and Chrome. The
+    predictors guess a load's address or result and speculate on the guess —
+    exactly the mistrainable structure Spectre needs.
+  </WildCard>
+  <WildCard name="KPTI at Netflix, 2018" verdict="If a pre-2018 syscall benchmark won't reproduce, page-table isolation is the usual reason.">
+    Brendan Gregg measured Meltdown's fix across production and found overhead
+    tracking syscall rate: 0.1% to 6%, about 2% at 50k syscalls/sec per CPU. The
+    write-up is still the clearest public account of the tax landing on real
+    traffic.
+  </WildCard>
+  <WildCard name="Chrome Site Isolation" verdict="The industrial response to a bug that can't be fully patched in silicon: make the leak read only your own site's memory.">
+    After Spectre, Chrome moved every site into its own renderer process and
+    coarsened its timers. It's expensive in memory, and it shipped anyway,
+    because the browser runs hostile code by design and can't trust the CPU to
+    keep secrets across a boundary inside one process.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="08" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Speculation is supposed to be invisible. How does Spectre see it?">
+Architectural state is invisible — registers and flags roll back perfectly on a
+bad guess. Microarchitectural state doesn't. A cache line pulled in during the
+speculative detour stays warm after the squash.
+
+Spectre reads that warmth. The secret never appears in any register you can name;
+it appears as which cache line is fast, and a timer recovers it. The rollback is
+complete for everything the CPU promised to undo, and cache occupancy was never
+on that list.
+</QA>
+
+<QA level="beginner" q="What's the difference between Meltdown and Spectre v1?">
+Meltdown (CVE-2017-5754) reads kernel memory from user space: a faulting load
+grabs privileged data before the fault retires. Its fix is KPTI — unmap the
+kernel from user page tables.
+
+Spectre v1 (CVE-2017-5753) stays within one privilege level and mistrains a
+bounds check so the CPU speculatively reads past an array. No page-table trick
+stops it; the fix is a barrier on untrusted indices. Meltdown was mostly Intel;
+Spectre v1 hits nearly every speculating core.
+</QA>
+
+<QA level="intermediate" q="Why did syscalls get slower in 2018, and by how much?">
+KPTI. Meltdown's fix stops mapping the kernel into your process, so every
+syscall swaps page tables entering and leaving the kernel, and that costs TLB
+work on top of the trap.
+
+Brendan Gregg measured 0.1% to 6% at Netflix, roughly 2% at 50k syscalls/sec per
+CPU, scaling with syscall rate. PCID cuts it substantially — his 2.1% case fell
+to 0.5% with PCID on — because the TLB no longer flushes on every crossing.
+</QA>
+
+<QA level="intermediate" q="You ran the textbook Spectre PoC on an M4 and it recovered nothing. Bug or defence?">
+Defence, mostly. The out-of-bounds read still happens speculatively; the problem
+is reading the cache footprint back. macOS gives user code a 42 ns timer and no
+flush instruction, and a cache hit versus miss is a sub-100 ns gap — below the
+ruler's resolution.
+
+That's the same coarse-timer mitigation browsers ship, met from the attacker's
+side. A serious attack builds a finer timer (a counter thread) and averages many
+trials; the naive port doesn't, so it's blind.
+</QA>
+
+<QA level="deep" q="When is mitigations=off a reasonable choice?">
+When no untrusted code shares the hardware. A single-tenant box running one
+trusted workload, or an HPC node you own end to end, gets no protection from
+mitigations against an attacker who can't reach it — so reclaiming the 2–28% is
+rational.
+
+It stops being reasonable the instant someone else's code runs on that silicon:
+a Kubernetes pod, a Lambda, a browser tab. There the flag turns a hardware bug
+into a data breach. The threat model is "shared hardware", and the flag is only
+safe where that's false.
+</QA>
+
+<QA level="deep" q="Retpoline mitigated Spectre v2. Why did Retbleed need more?">
+Retpoline replaces indirect branches with a return sequence that steers
+speculation into a safe loop. It assumes the return predictor is trustworthy.
+
+Retbleed (2022) broke that assumption: on some Intel and AMD parts, return
+instructions could take their speculative target from the branch target buffer,
+not the return stack, so a poisoned BTB defeats the trampoline. The fix moved to
+hardware controls (IBRS/eIBRS), and ETH measured the cost at 12–28% — much
+steeper than retpoline, and that's why it was contentious.
+</QA>
+
+<SectionHeading n="09" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="A secret never lands in a register the attacker can read. How does the byte escape?">
+    As a cache line. The speculative load uses the secret to pick which line of a
+    probe array to touch; that line stays warm after the squash, and its access
+    time reveals the byte. The channel is timing, not data.
+  </Q>
+  <Q q="Your Spectre PoC scores every channel line as a hit. What's the first thing to check?">
+    Timer resolution. If a single hit and a single miss both fit inside one clock
+    tick, the receiver is blind. On the M4 that tick is ~42 ns and the gap is
+    ~90 ns — right at the edge, and a naive single-shot read loses.
+  </Q>
+  <Q q="Two identical single-tenant boxes; one has mitigations=off. Is that a bug?">
+    Not necessarily. With no untrusted code on the hardware, the mitigations
+    defend against an attacker who can't reach it, so turning them off to reclaim
+    syscall throughput is defensible. The same flag on a multi-tenant node is a
+    breach waiting to happen.
+  </Q>
+  <Q q="Why did browsers disable SharedArrayBuffer after Spectre?">
+    Because a second thread incrementing a counter is a home-made high-resolution
+    timer, and Spectre needs one. Coarsening performance.now() is pointless if
+    you can build your own clock. COOP/COEP isolation is now required to get it
+    back.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Kocher et al. — Spectre Attacks (spectreattack.com)">
+    The original paper, and Appendix C is the proof of concept everyone ports.
+    Read it next to the Meltdown paper; the split between architectural and
+    microarchitectural state is the whole idea.
+  </WildCard>
+  <WildCard name="Project Zero — Reading privileged memory with a side-channel">
+    Jann Horn's 3 January 2018 write-up, the disclosure that started it. Longer
+    and more concrete than the academic papers, and it shows the reasoning in
+    the order he found it.
+  </WildCard>
+  <WildCard name="Brendan Gregg — KPTI/KAISER Meltdown performance">
+    The 2018 Netflix analysis. Where the 0.1–6% figures come from, with the
+    syscall-rate dependence and the PCID recovery laid out on real workloads.
+  </WildCard>
+  <WildCard name="GoFetch (gofetch.fail) and predictors.fail">
+    The two Apple-silicon writeups — GoFetch's DMP attack and the SLAP/FLOP
+    predictor attacks. The material for the machine you're most likely holding.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="10" cmd="ls ../" id="related">Related</SectionHeading>
+
+- [Chapter 01 — CPU Architecture](/topics/01-cpu-architecture): where branch
+  prediction and out-of-order execution are the *feature*. This chapter is the
+  bill for that speed.
+- [Chapter 07 — Syscalls & the Kernel Boundary](/topics/07-syscalls-kernel-boundary):
+  the path the mitigation tax lands on, and every technique for crossing it less.
+- [Chapter 02 — Memory Hierarchy](/topics/02-memory-hierarchy): the cache timing
+  gap the covert channel is built from, measured properly.

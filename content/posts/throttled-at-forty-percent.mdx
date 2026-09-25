@@ -1,0 +1,548 @@
+---
+title: "You paid for four CPUs and got throttled at 40%"
+dek: "The dashboard says the pod is using 1.6 of its 4 cores. The kernel says it was throttled in 118 of the last 300 periods. Both are right. They just measure different things."
+date: "2026-09-24"
+readingTime: "~14 min"
+kicker: "Incident"
+tags: ["linux", "cgroups", "kubernetes", "latency", "scheduling"]
+related: ["06-processes-scheduling", "11-containers", "16-contention-tail-latency"]
+---
+
+Here's a graph most people who run services on Kubernetes have stared at. A
+pod with a CPU limit of 4. Usage hovering around 1.6 cores, never touching the
+line. Each request is about a millisecond of work. And p99 is
+sitting at 40-something milliseconds, with no deploy, no traffic change and no
+slow dependency to blame.
+
+I built one of those on purpose while writing this, in a Docker container on my
+laptop, and the numbers came out like this:
+
+<Cost items={[
+  { what: "p99 with no CPU limit", value: "7.0 ms", source: "Docker Desktop, linuxkit 6.10, aarch64, 10 vCPUs · 6,061 requests" },
+  { what: "p99 with --cpus=4, same work", value: "43.5 ms", source: "same machine, same seed, avg usage 1.79 CPUs" },
+  { what: "Periods throttled", value: "118 / 300", source: "nr_throttled / nr_periods from cpu.stat" },
+  { what: "Average CPU as a share of the limit", value: "45%", source: "usage_usec over wall time" },
+]} />
+
+Six times worse at p99, while the average said there was more than half the
+limit left over. This post is about why that's not a contradiction, the two
+separate reasons it happens (one is a design choice and one was a kernel bug),
+and what the runtimes you actually deploy do to make it worse.
+
+## The first three theories
+
+The usual first explanations go roughly in this order, and each one survives
+longer than it should.
+
+**"The node is busy."** A noisy neighbour stealing cycles is the natural
+suspect for tail latency on shared hardware. But a noisy neighbour shows up as
+the pod getting *less* CPU than it asked for across the board, and you'd expect
+p50 to move too. In my run p50 barely changed (1.86 ms to 2.05 ms). Only the
+tail blew up. That's a hint that something is happening in bursts, not all the
+time.
+
+**"It's the application: GC, a lock, a slow path."** Closer. There often is a
+burst inside the process: a GC cycle, a cache refresh, a fan-out query. But in
+my program the burst is 800 ms of CPU spread over ten threads: 80 ms of
+wall time on ten cores. With no limit, that burst costs the handlers almost
+nothing (p99 7 ms). Put the same burst under a limit and it costs them 36 ms
+more. So the burst is probably the trigger, but it can't be the delay. Where
+do the other 36 ms come from?
+
+**"We can't be hitting the limit, we're at 45%."** This is the one that holds
+out longest, because the dashboard really does say 45%. Why would you
+suspect a limit you're nowhere near? It's also, I think, the wrong mental
+model of what a CPU limit is.
+
+## What "4 CPUs" means to the kernel
+
+Chapter 06 [covers the basics of the quota](/topics/06-processes-scheduling#failure),
+so here's only the part that matters for this story.
+
+A Kubernetes CPU limit of 4 becomes a line in the pod's cgroup:
+
+```shell
+$ cat /sys/fs/cgroup/cpu.max
+400000 100000
+```
+
+That's **400 ms of CPU time per 100 ms period**. It's not four cores. It's a
+budget of time, and any number of threads can spend it at once. Ten threads on
+ten cores burn through 400 ms in 40 ms of wall clock. Then every thread in the
+cgroup is taken off the run queue until the period timer fires and refills the
+budget, 60 ms later.
+
+Budget is handed out in slices. Each CPU that runs a thread from the
+group pulls a slice (5 ms by default, `sched_cfs_bandwidth_slice_us`) from a
+global pool, and when the pool is empty, that CPU's queue is throttled. Here's
+the refill, run once per period from an hrtimer (the comments are mine):
+
+<SourceRead
+  file="kernel/sched/fair.c — __refill_cfs_bandwidth_runtime"
+  repo="torvalds/linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/kernel/sched/fair.c#L5596"
+>
+```c
+void __refill_cfs_bandwidth_runtime(struct cfs_bandwidth *cfs_b)
+{
+	s64 runtime;
+
+	if (unlikely(cfs_b->quota == RUNTIME_INF))
+		return;
+
+	cfs_b->runtime += cfs_b->quota;           /* the period's 400 ms  */
+	runtime = cfs_b->runtime_snap - cfs_b->runtime;
+	if (runtime > 0) {                        /* we dipped into burst */
+		cfs_b->burst_time += runtime;
+		cfs_b->nr_burst++;
+	}
+
+	/* cap: never carry more than quota + burst into a period */
+	cfs_b->runtime = min(cfs_b->runtime, cfs_b->quota + cfs_b->burst);
+	cfs_b->runtime_snap = cfs_b->runtime;
+}
+```
+</SourceRead>
+
+Look at that last `min`. With `cpu.max.burst` at its default of 0, unused time
+doesn't carry over. A period where you idled doesn't buy you anything in the
+next one. So the quota constrains the *average* over each 100 ms window, and
+says nothing at all about how many cores you use inside it.
+
+<Callout label="Why the average can't see it">
+Usage is averaged over seconds, or over a 15 s scrape interval if you're on
+Prometheus. Throttling happens at 100 ms granularity. A pod that uses ten cores
+for 40 ms and zero for the next 460 averages 0.8 CPUs, and it spent 60 ms of
+every burst frozen. A graph that says "45%" and a counter that says
+"throttled in 118 of 300 periods" are both correct. You're just reading the one
+that can't resolve the problem.
+</Callout>
+
+A request that arrives during those 60 ms waits for the refill, even though its
+own work is a millisecond and the handler threads were idle. That's most of the
+extra 36 ms of p99.
+
+## Reproducing it
+
+My program is a toy service. Four handler threads take requests from a queue;
+requests arrive open-loop (Poisson, 200 a second) and each burns 1 ms of CPU. A
+separate thread starts a parallel phase every 500 ms, spread across `par`
+threads, as a stand-in for a GC cycle or a cache rebuild. I sized that phase at
+ten threads because `nproc` inside the container says 10, and that's what a
+runtime that counts CPUs would pick.
+
+Two details matter more than they look. Work is measured on each thread's own
+CPU clock, so throttling can't make a request do less work. It can only make it
+wait. And latency is measured from the *scheduled* arrival time, so a stalled
+generator can't hide the stall (the coordinated-omission trap).
+
+<TryIt what="A 1 ms handler next to a bursty parallel phase" lang="cpp" toolchain="g++ 13.3 -O2 -pthread, linuxkit 6.10 aarch64">
+```cpp
+static double thread_cpu_ms() {
+  timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+  return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+static void burn_cpu(double ms) {          // spin until THIS thread used `ms` of CPU
+  double end = thread_cpu_ms() + ms;
+  volatile unsigned long x = 0;
+  while (thread_cpu_ms() < end) for (int i = 0; i < 1000; ++i) x += i;
+}
+
+// 4 handlers: pop a scheduled-arrival timestamp, burn 1 ms, record now - arrival
+// 1 driver:   every 500 ms, spawn `par` threads that each burn burst_ms / par
+ts.emplace_back([&] {
+  for (auto next = t0; (next += 500ms) < until;) {
+    std::this_thread::sleep_until(next);
+    std::vector<std::thread> w;
+    for (int i = 0; i < par; ++i) w.emplace_back(burn_cpu, burst_ms / par);
+    for (auto& t : w) t.join();
+  }
+});
+
+// generator: Poisson arrivals at 200/s, pushed with their *scheduled* time
+for (auto next = t0; next < until;) {
+  next += exp_gap(rng);
+  std::this_thread::sleep_until(next);
+  { std::lock_guard g(m); q.push_back(next); }
+  cv.notify_one();
+}
+```
+
+```shell
+$ docker run --rm --privileged -v "$PWD":/w -w /w throttle-lab ./lab 10 800 500 30
+$ docker run --rm --privileged --cpus=4 -v "$PWD":/w -w /w throttle-lab ./lab 10 800 500 30
+```
+
+<Output>
+Docker Desktop, linuxkit 6.10.14, aarch64, 10 vCPUs in the VM. Each line is one 30 s run.
+
+```text
+cpu.max=max 100000     nproc=10
+par=10 burst=800ms/500ms  n=6061  avg CPU 1.79  periods 0    throttled 0    throttled_usec 0
+  p50 1.86  p90 3.38   p99 6.99   p99.9 15.53  max 21.20  (ms)
+
+cpu.max=400000 100000  nproc=10
+par=10 burst=800ms/500ms  n=6061  avg CPU 1.79  periods 300  throttled 118  throttled_usec 27530287
+  p50 2.05  p90 18.86  p99 43.54  p99.9 53.15  max 63.36  (ms)
+```
+
+Same work, same arrival sequence (the RNG is seeded), same average usage. The
+only change is the `cpu.max` line.
+</Output>
+</TryIt>
+
+That 118 lines up almost exactly with the arithmetic. There are 60 bursts in 30
+seconds, and each one needs 800 ms against a 400 ms budget, so it spans two
+periods and gets throttled in both. That's 120.
+
+Then there's `throttled_usec`, which I misread the first time. It says 27.5
+seconds of throttling in a 30-second run. That can't be wall time: 118
+throttled periods of at most 100 ms each is 11.8 s, tops. It turns out the
+counter is summed over CPUs. Each per-CPU run queue adds its own frozen time
+when it's unthrottled:
+
+<SourceRead
+  file="kernel/sched/fair.c — unthrottle_cfs_rq"
+  repo="torvalds/linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/kernel/sched/fair.c#L5852"
+>
+```c
+	raw_spin_lock(&cfs_b->lock);
+	if (cfs_rq->throttled_clock) {
+		/* one cfs_rq per CPU, all adding into one group-wide total */
+		cfs_b->throttled_time += rq_clock(rq) - cfs_rq->throttled_clock;
+		cfs_rq->throttled_clock = 0;
+	}
+```
+</SourceRead>
+
+So 27.5 s across roughly ten CPUs is about 23 ms per CPU per throttled period.
+If you've ever graphed `container_cpu_cfs_throttled_seconds_total` from
+cAdvisor and seen it exceed wall time, that's probably why. A ratio of
+`container_cpu_cfs_throttled_periods_total` to
+`container_cpu_cfs_periods_total` is a much easier number to reason about.
+
+## The fixes, measured
+
+Partway through writing this, my Linux setup changed to a single shared
+container, capped at 4 CPUs, that a dozen other jobs were also using. I reran
+the experiment there with the limit at 2 CPUs (a scaled-down version of the same shape: 300 ms bursts every 500 ms, so
+the average lands at 0.8 CPUs, or 40% of the limit). Each cgroup was a
+transient systemd scope with `CPUQuota=200%`. Other people's load leaks into the
+tails here, so each row is the median of five 30-second runs.
+
+<Compare
+  cols={["Setup", "Throttled periods", "throttled_usec", "p99 (range of 5)", "p99.9"]}
+  rows={[
+    ["No limit, 10 burst threads", "0 / 0", "0 s", "11.3 ms (6.0–16.2)", "21.3 ms"],
+    ["2 CPUs, 10 burst threads", "59 / 300", "36.9 s", "65.8 ms (39.7–83.2)", "75.2 ms"],
+    ["2 CPUs, 4 burst threads", "59 / 300", "16.7 s", "42.1 ms (5.7–54.0)", "48.3 ms"],
+    ["2 CPUs, 2 burst threads", "59 / 300", "1.2 s", "6.7 ms (5.9–9.0)", "13.4 ms"],
+    ["3 CPUs, 10 burst threads", "59 / 300", "4.5 s", "19.2 ms (10.4–50.6)", "42.9 ms"],
+    ["2 CPUs + cpu.max.burst 200 ms, 10 threads", "0 / 300", "0 s", "6.8 ms (6.6–7.0)", "13.0 ms"],
+  ]}
+/>
+
+The no-limit row is noisier than the first run was. With nothing capping
+it, my process plus everyone else's occasionally pushed the whole container
+past its own 4-CPU cap, and the box-level `cpu.stat` recorded between 1 and 47
+throttled periods per run. Keep that in mind when reading its 11 ms.
+
+Three things in that table I didn't expect.
+
+- **`nr_throttled` barely moves while the latency changes 10x.** Every limited
+  row without burst says 59 of 300. With two burst threads the handlers plus
+  the burst ask for about 2.2 CPUs for 150 ms, so the group still runs dry at
+  the tail end of each burst period. It just runs dry for a millisecond or two
+  instead of 80. The counter counts periods, not damage. `throttled_usec` (36.9
+  s down to 1.2 s) is the one that tracks the pain.
+- **Fewer threads is the cheapest fix, and it's all or nothing.** Four threads
+  for a 2-CPU limit still throttles, because four threads burn 200 ms in 50.
+  Only matching the thread count to the quota made the tail go away. The burst
+  takes longer in wall time (150 ms instead of 30), but it barely stalls.
+- **Raising the limit by 50% helped less than I'd have guessed.** At 3 CPUs
+  the 300 ms burst alone equals the budget, so the handlers' share tips the
+  group over right at the end of the burst, and whatever's left waits out the
+  period. p99 drops to 19 ms, but one run out of five still hit 50 ms.
+
+Burst was the clear winner: zero throttled periods, and the tightest spread of
+any row, including the unlimited one. With 200 ms of banked quota, a 300 ms
+burst fits inside a single period, and the average is still enforced over the
+longer window. Kernel 5.14 or later only, and there's a catch for Kubernetes
+users I'll come back to.
+
+## The other reason: throttled while under quota
+
+Everything above is the quota working as designed. There was also a period,
+roughly 2018 to 2020, when it didn't, and that's the part most of the
+"remove your CPU limits" posts were really reacting to.
+
+Ivan Babrou at Cloudflare [reported it to LKML in December
+2017](https://lkml.iu.edu/1712.0/07072.html): services that weren't burning
+through their quota got throttled anyway, on 4.4, 4.9 and 4.14. He opened
+[kubernetes#67577, "CFS quotas can lead to unnecessary
+throttling"](https://github.com/kubernetes/kubernetes/issues/67577), in August
+2018 as a heads-up to Kubernetes.
+
+Then 4.18 made it much worse. Dave Chiluk at Indeed [traced the
+regression](https://engineering.indeedblog.com/blog/2019/12/cpu-throttling-regression-fix/)
+to commit 512ac999d275, which fixed clock drift in how per-CPU slices expired.
+Remember the slices: each CPU pulls 5 ms from the global pool, and when its
+threads go idle it hands back everything but 1 ms. Before 4.18, a clock-skew
+bug meant that leftover 1 ms mostly never expired. After the fix, it expired
+correctly at the end of every period, on every CPU the group had touched.
+
+On one CPU that's noise. On Indeed's 88-core machines it could strand 87 ms of
+quota per period, in Chiluk's words "87ms or 870 millicores or .87 CPU that
+could potentially be unusable." The workloads hit hardest were the ones you'd
+least suspect: highly threaded, mostly idle, waking briefly on lots of
+different cores. In Indeed's case, Java web services.
+
+His fix removed the expiry entirely:
+[de53fd7aedb1](https://github.com/torvalds/linux/commit/de53fd7aedb100f03e5d2231cfce0e4993282425),
+"sched/fair: Fix low cpu usage with high throttling by removing expiration of
+cpu-local slices", reviewed by Ben Segall and Phil Auld and merged for 5.4. The
+commit message is honest about the trade: quota is no longer strictly enforced
+per period, and a group can overrun by whatever slice is left on each CPU,
+typically 1 ms or less. It's accurate over longer windows, and highly threaded
+apps stop getting throttled for time they never used. Indeed reports a
+worst-case latency on one application going [from over two seconds to 30
+ms](https://engineering.indeedblog.com/blog/2019/12/unthrottled-fixing-cpu-limits-in-the-cloud/).
+
+It went back to the stable trees. Here's the list worth checking against
+your fleet:
+
+- linux-stable **4.14.154+, 4.19.84+, 5.3.9+**
+- Ubuntu **4.15.0-67+, 5.3.0-24+**
+- RHEL 7 **3.10.0-1062.8.1.el7+**, RHEL 8 **4.18.0-147.2.1.el8_1+**
+- CoreOS **4.19.84+**
+
+(Those versions are from Indeed's write-up; I haven't checked each changelog
+myself.) I can't reproduce this one on the box I have. It's 6.10, and the code
+that expired slices is gone. If you want to see it, you'd need a 4.18 to 5.3
+kernel without the backport, a high core count, and a thread pool that wakes
+briefly on many CPUs.
+
+## Runtimes that count the wrong CPUs
+
+Here's a detail from my own run that I skipped past. Inside the container with
+`--cpus=4`, `nproc` printed **10**. A cgroup limit doesn't change what
+`sched_getaffinity` returns, so anything that sizes itself from the CPU count
+sees the whole machine. On a 64-core node with a 4-CPU limit, that's 64 GC
+threads, 64 worker threads, a 64-way fork-join pool, all sharing 400 ms.
+
+**Go** is the clearest case. Before 1.25, `GOMAXPROCS` defaulted to the number
+of logical CPUs, and the GC's background mark workers target 25% of
+`GOMAXPROCS` ([`gcBackgroundUtilization = 0.25`](https://github.com/golang/go/blob/go1.25.0/src/runtime/mgcpacer.go#L39)).
+On that 64-core node a GC cycle wants 16 cores at once. Uber's
+[automaxprocs](https://github.com/uber-go/automaxprocs) README has the best
+single table on this, from one of their services with a 2-CPU quota:
+
+<Compare
+  cols={["GOMAXPROCS", "RPS", "p50", "p99.9"]}
+  rows={[
+    ["1", "28,893", "1.46 ms", "19.70 ms"],
+    ["2 (equal to quota)", "44,715", "0.84 ms", "26.38 ms"],
+    ["4", "41,071", "0.57 ms", "42.94 ms"],
+    ["8", "33,112", "0.43 ms", "64.32 ms"],
+    ["24 (the default, host CPUs)", "22,191", "0.45 ms", "76.19 ms"],
+  ]}
+/>
+
+Notice p50 keeps *improving* as GOMAXPROCS goes up, while throughput halves and
+p99.9 triples. If you only watch the median you'd tune this in exactly the wrong
+direction.
+
+Go 1.25 fixed the default. Its runtime now reads the cgroup's `cpu.max` and uses
+the smaller of that and the CPU count, and it re-checks periodically, since
+limits can change under a running pod ([release
+notes](https://go.dev/doc/go1.25), [design
+post](https://go.dev/blog/container-aware-gomaxprocs)). Rounding rules are in
+the source:
+
+<SourceRead
+  file="src/runtime/cgroup_linux.go — defaultGOMAXPROCS"
+  repo="golang/go"
+  tag="go1.25.0"
+  href="https://github.com/golang/go/blob/go1.25.0/src/runtime/cgroup_linux.go#L85"
+>
+```go
+func defaultGOMAXPROCS(ncpu int32) int32 {
+	// GOMAXPROCS is the minimum of:
+	//
+	// 1. Total number of logical CPUs available from sched_getaffinity.
+	//
+	// 2. The average CPU cgroup throughput limit (average throughput =
+	// quota/period). A limit less than 2 is rounded up to 2, and any
+	// fractional component is rounded up.
+```
+</SourceRead>
+
+I checked it on the shared box with a four-line program that prints
+`runtime.NumCPU()` and `runtime.GOMAXPROCS(0)`, built with the go1.25.0
+toolchain, once with `go 1.25.0` in `go.mod` and once with `go 1.24`. Each run
+is its own systemd scope:
+
+```shell
+$ systemd-run --scope -p CPUQuota=200% ./gmp125
+$ systemd-run --scope -p CPUQuota=200% ./gmp124
+```
+
+```text
+shared 4-CPU container, linuxkit 6.10.14 aarch64, go1.25.0 linux/arm64
+CPUQuota=200%  nproc=10  gmp125: NumCPU 10 GOMAXPROCS 2
+CPUQuota=200%  nproc=10  gmp124: NumCPU 10 GOMAXPROCS 10
+CPUQuota=250%  nproc=10  gmp125: NumCPU 10 GOMAXPROCS 3
+CPUQuota=250%  nproc=10  gmp124: NumCPU 10 GOMAXPROCS 10
+no quota       nproc=10  gmp125: NumCPU 10 GOMAXPROCS 10
+```
+
+That last line surprised me. The whole container is capped at 4 CPUs (its
+root cgroup's `cpu.max` reads `400000 100000`), yet Go picked 10. It turns out
+the runtime opens `cpu.max` for the process's *own* cgroup and nothing above
+it ([`OpenCPU` in
+internal/runtime/cgroup](https://github.com/golang/go/blob/go1.25.0/src/internal/runtime/cgroup/cgroup_linux.go#L96)).
+In a plain `docker run --cpus` container, or a Kubernetes container, the limit
+sits on the process's own cgroup and this is fine. If the limit lives on a
+parent (a systemd slice with `CPUQuota=`, or this box), Go can't see it.
+
+Two catches. It only kicks in when your `go.mod` says `go 1.25` or later, so
+upgrading the toolchain alone doesn't change behaviour. And it reads the
+*limit*, not the request. Go's reasoning is that a pod with no limit
+is allowed to use idle CPU beyond its request, so capping it at the request
+would waste that. That's defensible. It also means that the day you delete the
+CPU limit on the advice below, GOMAXPROCS silently goes back to the node's core
+count.
+
+**The JVM** went through the same thing earlier.
+[JDK-8146115](https://bugs.openjdk.org/browse/JDK-8146115) taught HotSpot to
+read cgroup quotas in JDK 10 (on by default as `-XX:+UseContainerSupport`,
+backported to 8u191), so `availableProcessors()` returns quota divided by
+period, rounded up. It also used to treat `cpu.shares` as a CPU count, so a pod
+with a small *request* and no limit saw one CPU.
+[JDK-8281181](https://bugs.openjdk.org/browse/JDK-8281181) stopped that in
+18.0.2, 17.0.5 and 11.0.17. If you're on something older, or you pin
+`-XX:ActiveProcessorCount` to `$(nproc)` (Cloud Foundry's buildpack
+[used to](https://github.com/cloudfoundry/java-buildpack/issues/993)), you get
+the host count and the throttling that comes with it.
+
+Anything else that calls `nproc`, reads `/proc/cpuinfo`, or uses
+`std::thread::hardware_concurrency()` is in the same boat. How many of the
+thread pools in your service were sized by a line like that at startup?
+
+## "Just remove the limits"
+
+This advice has a real pedigree. Tim Hockin, one of the original Kubernetes
+engineers, [tweeted in 2019](https://twitter.com/thockin/status/1134193838841401345):
+"Always set memory limit == request. Never set CPU limit (for locally adjusted
+values of 'always' and 'never')." That parenthetical is doing a lot of work,
+and it usually gets dropped when the tweet is quoted.
+
+Case studies people cite:
+
+- **Zalando.** Henning Jacobs opened [an issue in May
+  2018](https://github.com/zalando-incubator/kubernetes-on-aws/issues/1026)
+  proposing `--cpu-cfs-quota=false` on the kubelet across their clusters, which
+  turns off quota enforcement for every pod on the node.
+- **Buffer.** Eric Khun's [August 2020
+  write-up](https://erickhun.com/posts/kubernetes-faster-services-no-cpu-limits/)
+  reports buffer.com's landing page getting 22x faster after dropping limits on
+  user-facing services. Read the caveats, though: he says to prefer a kernel
+  upgrade over removing limits, sets requests to peak usage plus 20%, and
+  moves the unlimited services onto tainted nodes so they can't starve the rest.
+- **Omio.** Fayiz Musthafa's [post on aggressive
+  throttling](https://engineering.omio.com/cpu-limits-and-aggressive-throttling-in-kubernetes-c5b20bd8a718)
+  describes stalls that surfaced as failed readiness probes and dropped
+  connections, and recommends removing limits (or disabling quota in the
+  kubelet) if you're on a kernel without the fix.
+- **Twitter.** Dan Luu's [The container throttling
+  problem](https://danluu.com/cgroup-throttling/) is the most careful of the
+  lot. He found it common to see applications with about 50% waste from thread
+  pools that weren't tuned for the quota they ran under.
+
+Zalando's and Buffer's are from the 2018 to 2020 window, when a lot of fleets
+were on a kernel that throttled under quota, and Buffer and Omio both point at
+that kernel bug directly. That's a different problem
+from the one in my reproduction, and it has a cleaner fix: upgrade.
+
+What removing the limit costs is predictability. Without a limit, a pod's
+latency depends on how busy its neighbours are, so it's fast in staging and
+slower in production on the busiest node. Requests still protect you under
+contention (they become `cpu.weight`), but they protect a share, not a latency.
+And as above, Go 1.25 and a modern JVM size themselves from the limit, so
+deleting it widens every thread pool at the same time.
+
+My own read, and it's only that: for a latency-sensitive service, the default
+should be no limit, a request sized to real peak usage, and runtime thread
+counts pinned explicitly. For batch jobs and anything multi-tenant, keep the
+limit and size the threads to it.
+
+## Burst, and why it's not in your pod spec
+
+Linux 5.14 added a third option. [Huaixin Chang's
+patch](https://github.com/torvalds/linux/commit/f4183717b370ad28dd0c0d74760142b20e6e7931)
+from Alibaba lets a group bank unused quota up to `cpu.max.burst`
+microseconds and spend it later. That's the `quota + burst` cap in the refill
+function above. Its [kernel
+documentation](https://docs.kernel.org/scheduler/sched-bwc.html) describes the
+trade plainly: it "borrows time now against our future underrun, at the cost of
+increased interference against the other system users."
+
+It's exactly the right shape for a bursty service that's under quota on
+average. Kubernetes doesn't expose it.
+[kubernetes#104516](https://github.com/kubernetes/kubernetes/issues/104516),
+opened in August 2021, is still open. People set it by writing the file from a
+DaemonSet, through Koordinator's pod annotations, or with Alibaba ACK's CPU
+Burst policy. Outside Kubernetes, on cgroup v2, you can write it yourself:
+
+```shell
+# the cgroup of a systemd-managed service
+echo 200000 > /sys/fs/cgroup/system.slice/myapp.service/cpu.max.burst
+cat /sys/fs/cgroup/system.slice/myapp.service/cpu.stat   # nr_bursts, burst_usec
+```
+
+## What I can't explain
+
+Look at the spread in the 2-CPU, ten-thread row. Five runs, same binary, same
+seed, and each one throttled in exactly 59 or 60 periods. But p99 ranged from
+39.7 ms to 83.2 ms, and `throttled_usec` from 22.2 s to 46.3 s, moving together.
+The first `--cpus=4` run has the same smell: it predicts about 600 ms of
+per-CPU throttling for each throttled period (ten CPUs, 60 ms each), and it
+measured 233.
+
+My best guess is phase. The burst fires every 500 ms from the start of the
+program, the period timer fires every 100 ms from whenever the group first ran,
+and since 500 is a multiple of 100 the offset between them is fixed for a whole
+run and random between runs. A burst that starts just after a refill gets
+throttled for most of the period; one that starts late spills into the next
+refill and barely stalls. That would explain both numbers. I haven't proven it.
+The experiment that would settle it is jittering the burst start inside each
+run, or logging `throttle_cfs_rq` and `unthrottle_cfs_rq` with bpftrace next
+to the burst timestamps. If it's right, it means the same service on two pods
+can have very different tails from the same limit, for reasons nobody will
+ever find in a dashboard.
+
+## What to do on Monday
+
+- **Read `cpu.stat`, not the CPU graph.** Alert on
+  `rate(container_cpu_cfs_throttled_periods_total[5m]) / rate(container_cpu_cfs_periods_total[5m])`.
+  Anything persistently above a few percent on a latency-sensitive service is
+  worth a look. Don't compare `throttled_seconds_total` to wall time; it's
+  summed over CPUs.
+- **Check the kernel.** Anything from 4.18 up to 5.3 without the backports
+  listed above throttles highly threaded services under quota. `uname -r` on
+  your nodes, against that list.
+- **Ask every runtime what it thinks the CPU count is.** Log
+  `runtime.GOMAXPROCS(0)`, `Runtime.availableProcessors()`, or
+  `hardware_concurrency()` at startup. For Go, set `go 1.25` in `go.mod` or use
+  automaxprocs; for the JVM, confirm you're past 11.0.17 or 17.0.5.
+- **Size parallel phases to the limit, not the host.** GC threads, fork-join
+  pools, fan-out concurrency. Under a 4-CPU limit, a burst on four threads for 100 ms
+  costs the same CPU as one on 40 threads for 10 ms, and only one of them gets
+  frozen.
+- **If you drop limits, keep honest requests,** set them near real peak, and
+  pin thread counts explicitly so they don't grow to the node's core count.
+- **If you own the cgroups, try `cpu.max.burst`** at about one period's quota
+  and watch `nr_bursts`.

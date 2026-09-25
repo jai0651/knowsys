@@ -1,0 +1,505 @@
+---
+title: "The 40-millisecond tax"
+dek: "Your request takes 41 ms on loopback, every time but the first. Two timers from the early 1980s are waiting for each other, and neither one is wrong."
+date: "2026-09-25"
+readingTime: "~13 min"
+kicker: "Reproduction"
+tags: ["tcp", "linux", "latency"]
+related: ["10-linux-networking", "07-syscalls-kernel-boundary", "16-contention-tail-latency"]
+---
+
+Here's the output that started this. It's a client and a server in one C++
+program, talking over a single persistent TCP connection on `127.0.0.1`. The
+client sends a request, waits for a 128-byte reply, and does it again. No disk,
+no database, no network card. Numbers are microseconds per round trip, and
+the last column is the first twelve requests in the order they happened:
+
+```
+default  n=200  p50  41103.0 us  p90  42293.3 us  p99  44192.9 us | first 12: 29 41232 40763 41708 40238 42087 ...
+```
+
+The first request took 29 µs. Every request after it took about 41,000. Not a
+spread from 30 µs to 80 ms, the way a noisy system looks. A cliff, then a flat
+line at 41 ms, three runs in a row, to within a millisecond.
+
+If you've been paged for this, you've probably seen it as a latency histogram
+with a spike parked at 40 ms (or 200 ms, on some systems), and a p50 that makes
+no sense next to a ping time of a fraction of a millisecond. Before getting to
+what it is, it's worth walking through what it isn't, because the wrong
+theories are the ones everyone reaches for first. I reached for two of them.
+
+## Theory one: it's GC, or the scheduler
+
+A flat 41 ms smells like a pause. In a Java or Go service the first suspect is a
+collector, and in anything else it's a thread that got descheduled.
+
+Neither fits. This program is C++ with no allocator in the loop, so there's
+nothing to collect. And pauses don't behave like this. A GC pause lands on some
+requests and not others, and its length depends on the heap. Scheduler delays
+are jittery, and at 41 ms you'd be looking at a machine so overloaded that
+`top` would tell you before any histogram did. This is *every* request, the
+same length each time. Something is counting to 40.
+
+## Theory two: it's DNS, or connection setup
+
+This is the one I half-believed for a minute, because the first request is the
+odd one out. Maybe the first request is special because it's the only one that
+got something for free?
+
+That has it backwards, though. DNS, TCP handshakes and TLS all make the *first*
+request slow and the rest fast. Here the connection is set up once, before the
+timer starts, and the first request is the fast one. Whatever this is, it's a
+property of a connection that has been alive for a little while.
+
+## Theory three: it's the network
+
+Is it the network? On loopback there isn't one, honestly.
+`ss -tin` on the live connection reports a smoothed RTT of 0.03 ms on the
+server side and a minimum RTT of 0.003 ms on the client. A round trip on this
+path costs microseconds. You can't get 41 ms out of it by waiting on wires.
+
+What you *can* get is 41 ms of waiting on a timer. And once the question is
+"which timer in the TCP stack is 40 ms long?", the list is short.
+
+## The shape of the request
+
+My client doesn't send its request in one piece. It does what almost every
+HTTP client with a naive send path does: headers in one `write()`, body in a
+second one, then a `read()` for the response.
+
+```cpp
+write(c, hdr, 64);     // write #1: headers
+write(c, body, 256);   // write #2: body
+read_full(c, resp, 128);
+```
+
+On the other end, the server reads until it has all 320 bytes of the request, then sends one
+128-byte response. That's all it does. This is the **write-write-read**
+pattern, and it's the entire bug.
+
+Two mechanisms meet here, and each is reasonable alone:
+
+- **Nagle's algorithm**, on the sender. Don't send a small segment while an
+  earlier small segment is still unacknowledged. Wait for the ACK, then send
+  everything that piled up in one go. It was designed in 1984 (RFC 896) to stop
+  one-byte Telnet keystrokes each costing a 41-byte packet.
+- **Delayed ACKs**, on the receiver. Don't ACK a segment immediately. Wait a
+  little in case you're about to send data back, so the ACK can ride along on
+  that for free. RFC 1122 allows up to 500 ms of it.
+
+Now run the pattern through both. Headers go out at once, because nothing
+is in flight. Then the body: it's small, and the header hasn't been ACKed, so Nagle
+holds it. Meanwhile the server has 64 bytes of a 320-byte request, so it has nothing to
+reply with. Its stack is betting that a reply is coming, so it holds the ACK.
+Each side is waiting for the other, and the only thing that breaks the tie is
+the delayed-ACK timer expiring.
+
+<Figure caption="Every request after the first. The client's body sits in its own send queue for the entire delayed-ACK timeout, waiting for an ACK the server is deliberately holding back.">
+<Sequence
+  actors={["client", "kernel (loopback)", "server"]}
+  gap={{ from: 1, to: 2, label: "~41 ms: both sides waiting" }}
+  messages={[
+    { from: 0, to: 2, label: "headers, 64 B", note: "sent: nothing in flight" },
+    { from: 0, to: 0, label: "body, 256 B", dashed: true, note: "Nagle: held, headers unACKed" },
+    { from: 2, to: 2, label: "delayed ACK", dashed: true, note: "no reply yet to ride on" },
+    { from: 2, to: 0, label: "pure ACK", accent: true, note: "delack timer fires" },
+    { from: 0, to: 2, label: "body, 256 B", note: "released" },
+    { from: 2, to: 0, label: "response, 128 B" },
+  ]}
+/>
+</Figure>
+
+## Watching it happen
+
+I ran the reproduction in `docker run --privileged ubuntu:24.04` on Docker
+Desktop (linuxkit 6.10.14 on aarch64, an Apple M4 underneath),
+g++ 13.3 `-O2`, with `tcpdump -i lo -ttt` running alongside. `-ttt` prints the
+time since the previous packet, and that's exactly the view you want:
+
+```
+.000015  client > server  [P.] seq 1:65      length 64    # request 1: headers
+.000002  server > client  [.]  ack 65        length 0     #   ACKed at once
+.000004  client > server  [P.] seq 65:321    length 256   #   body
+.000027  server > client  [P.] seq 1:129     length 128   #   response
+.000006  client > server  [P.] seq 321:385   length 64    # request 2: headers
+.042416  server > client  [.]  ack 385       length 0     #   42 ms later: pure ACK
+.000016  client > server  [P.] seq 385:641   length 256   #   body, finally
+.000018  server > client  [P.] seq 129:257   length 128   #   response
+.000042  client > server  [P.] seq 641:705   length 64    # request 3: headers
+.042573  server > client  [.]  ack 705       length 0     #   and again
+```
+
+(I replaced the addresses with `client` and `server`, dropped the TCP options and added the comments. No packets were removed.)
+
+There it is on the wire. Request one's headers get ACKed in 2 µs. Request two's
+headers sit unacknowledged for 42.4 ms, the body doesn't leave the client until
+the ACK lands, and the pattern repeats for every request after that. On the same
+connection `ss -tin` shows `ato:40`. That's the kernel's current
+acknowledgement timeout for this socket, in milliseconds.
+
+## So what is the Linux delayed-ACK timer, exactly?
+
+It isn't a sysctl. It's a pair of constants in `include/net/tcp.h`, in jiffies:
+
+<SourceRead
+  file="include/net/tcp.h"
+  repo="linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/include/net/tcp.h#L136-L145"
+>
+```c
+#define TCP_DELACK_MAX	((unsigned)(HZ/5))	/* maximal time to delay before sending an ACK */
+static_assert((1 << ATO_BITS) > TCP_DELACK_MAX);
+
+#if HZ >= 100
+#define TCP_DELACK_MIN	((unsigned)(HZ/25))	/* minimal time to delay before sending an ACK */
+#define TCP_ATO_MIN	((unsigned)(HZ/25))
+#else
+#define TCP_DELACK_MIN	4U
+#define TCP_ATO_MIN	4U
+#endif
+```
+</SourceRead>
+
+`HZ/25` is **40 ms** and `HZ/5` is **200 ms**, whatever `CONFIG_HZ` is (this
+kernel runs `CONFIG_HZ=1000`). Each socket carries its own `ato`. It starts at
+`TCP_ATO_MIN` and can grow when the kernel misses a chance to piggyback. So on
+Linux the delay you pay is somewhere from 40 to 200 ms. My loopback case sits on
+the floor. GoCardless hit the ceiling: every internal POST in their Ruby stack
+carried about [200 ms of it](https://gocardless.com/blog/in-search-of-performance-how-we-shaved-200ms-off-every-post-request)
+until they upgraded HAProxy.
+
+Why is the loopback case stuck at 40 when the RTT is 30 µs? You'd hope the kernel
+would scale the delay down on a fast path, and it does try. Just not here:
+
+<SourceRead
+  file="net/ipv4/tcp_output.c — tcp_send_delayed_ack()"
+  repo="linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/net/ipv4/tcp_output.c#L4182-L4222"
+>
+```c
+	int ato = icsk->icsk_ack.ato;
+
+	if (ato > TCP_DELACK_MIN) {
+		...
+		/* If some rtt estimate is known, use it to bound delayed ack. */
+		if (tp->srtt_us) {
+			int rtt = max_t(int, usecs_to_jiffies(tp->srtt_us >> 3),
+					TCP_DELACK_MIN);
+			if (rtt < max_ato)
+				max_ato = rtt;
+		}
+		ato = min(ato, max_ato);
+	}
+
+	ato = min_t(u32, ato, tcp_delack_max(sk));
+	timeout = jiffies + ato;
+```
+</SourceRead>
+
+That RTT bound only kicks in when `ato` is *above* the minimum, and even then it's
+clamped to be no lower than `TCP_DELACK_MIN`. At the floor, 40 ms is the answer
+regardless of how fast the path is. The extra millisecond in my 41 ms is
+probably timer slop plus the actual work, though I didn't try to break it down.
+
+On the sender, the code is just as short. Linux implements Minshall's variant of Nagle:
+hold a partial segment only if an earlier *partial* segment is still unacked.
+
+<SourceRead
+  file="net/ipv4/tcp_output.c — tcp_nagle_check()"
+  repo="linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/net/ipv4/tcp_output.c#L1963-L1997"
+>
+```c
+static bool tcp_minshall_check(const struct tcp_sock *tp)
+{
+	return after(tp->snd_sml, tp->snd_una) &&
+		!after(tp->snd_sml, tp->snd_nxt);
+}
+
+static bool tcp_nagle_check(bool partial, const struct tcp_sock *tp,
+			    int nonagle)
+{
+	return partial &&
+		((nonagle & TCP_NAGLE_CORK) ||
+		 (!nonagle && tp->packets_out && tcp_minshall_check(tp)));
+}
+```
+</SourceRead>
+
+On loopback the MSS is 32,768 bytes (it's in the `ss` output), so a 64-byte
+header is as partial as a segment gets. `snd_sml` is the end of the last small
+segment sent. While it's past `snd_una`, the next small write waits.
+
+## Why the first request was fast
+
+This is the part that took me longest, and I think it's the most interesting piece of
+the story. Linux doesn't delay ACKs on every connection. It delays them
+once it has decided the connection is **interactive**. It calls that
+*pingpong mode*, and the decision happens when the socket sends data:
+
+```c
+/* net/ipv4/tcp_output.c, tcp_event_data_sent() */
+	if ((u32)(now - icsk->icsk_ack.lrcvtime) < icsk->icsk_ack.ato)
+		inet_csk_inc_pingpong_cnt(sk);
+```
+
+"If I'm sending data back within `ato` of receiving some, this looks like
+request and response, so delaying ACKs will pay off." On request one the server
+hasn't replied to anything yet, so it's still in quick-ACK mode and ACKs the
+headers at once. Its reply to request one bumps the pingpong count past the
+threshold, and from request two onwards every ACK is delayed.
+
+Then it gets stranger. When the delayed-ACK timer fires in pingpong mode, the
+kernel concludes it bet wrong and backs off:
+
+<SourceRead
+  file="net/ipv4/tcp_timer.c — tcp_delack_timer_handler()"
+  repo="linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/net/ipv4/tcp_timer.c#L334-L347"
+>
+```c
+	if (inet_csk_ack_scheduled(sk)) {
+		if (!inet_csk_in_pingpong_mode(sk)) {
+			/* Delayed ACK missed: inflate ATO. */
+			icsk->icsk_ack.ato = min_t(u32, icsk->icsk_ack.ato << 1, icsk->icsk_rto);
+		} else {
+			/* Delayed ACK missed: leave pingpong mode and
+			 * deflate ATO.
+			 */
+			inet_csk_exit_pingpong_mode(sk);
+			icsk->icsk_ack.ato      = TCP_ATO_MIN;
+		}
+		tcp_send_ack(sk);
+```
+</SourceRead>
+
+So it *does* learn. It leaves pingpong mode and resets `ato` to 40 ms. And then
+the server sends its response within `ato` of receiving the
+body, so the count goes up again and pingpong mode is back before the next
+request arrives. So the kernel learns its lesson and unlearns it about 20 µs later,
+once per request.
+
+How fast it re-learns is a sysctl, `net.ipv4.tcp_pingpong_thresh`, default 1
+([ip-sysctl docs](https://github.com/torvalds/linux/blob/v6.10/Documentation/networking/ip-sysctl.rst)).
+I changed it inside the container and reran the same client:
+
+| `tcp_pingpong_thresh` | p50 | first 12 requests (µs) |
+| --- | --- | --- |
+| 1 | 41,004 µs | 21 40356 41219 40806 40979 40990 ... |
+| 2 | 3,008 µs | 29 34 40132 31 41017 37 40952 41 ... |
+| 3 | 92 µs | 73 94 61 40174 50 47 42135 ... |
+| 5 | 52 µs | 49 57 41 73 90 40664 36 36 40 49 40818 ... |
+
+With a threshold of *n*, roughly one request in *n* pays the 40 ms. With 2 you
+get a sawtooth, and a p50 of 3 ms that corresponds to no request that
+ever happened. That's a nice trap for anyone who only looks at percentiles.
+Raising the threshold makes the median look fine and leaves the tax on the tail.
+That's the textbook way for [contention to hide in a p99](/chapters/16-contention-tail-latency).
+
+<Callout label="Two correct heuristics, each waiting for the other">
+Nagle holds the body until the headers are ACKed. The receiver holds that ACK
+until it has a reply to piggyback it on. It can't reply until it has the body.
+Neither side is broken: each is doing what it was built to do, on a traffic
+pattern neither was built for. All that breaks the tie is a
+constant, `TCP_DELACK_MIN = HZ/25`, and that's why the number is always 40.
+</Callout>
+
+## The fixes, measured
+
+Same program, same container, 500 requests per mode, three runs. The microsecond
+numbers bounce around by a factor of three between runs. That's Docker
+Desktop's VM, more or less, doing what it does to anything this short. Milliseconds don't move at all.
+
+<TryIt what="One process, two threads, one persistent loopback connection" lang="cpp" toolchain="g++ 13.3 -O2 -pthread, linuxkit 6.10 aarch64">
+```cpp
+// server thread
+for (;;) {
+    read_full(s, req, 64 + 256, mode == "quickack-loop"); // whole request
+    if (mode == "quickack")                               // once, after reading
+        setsockopt(s, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof one);
+    write(s, resp, 128);
+}
+
+// read_full: with quick=true, re-arm TCP_QUICKACK before every read() call
+while (n) {
+    if (quick) setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof one);
+    ssize_t r = read(fd, p, n); p += r; n -= r;
+}
+
+// client
+if (mode == "nodelay") setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+for (int i = 0; i < iters; i++) {
+    if (mode == "writev") {
+        iovec v[2] = {{hdr, 64}, {body, 256}};
+        writev(c, v, 2);                 // one syscall, one segment
+    } else {
+        write(c, hdr, 64);
+        write(c, body, 256);
+    }
+    read_full(c, resp, 128);
+}
+```
+
+<Output>
+| mode | p50, three runs | p99, three runs |
+| --- | --- | --- |
+| default | 41.0 / 41.0 / 41.0 ms | 43.6 / 50.7 / 51.4 ms |
+| `TCP_NODELAY` on the client | 20 / 28 / 31 µs | 70 / 753 / 88 µs |
+| one `writev` | 7 / 29 / 16 µs | 31 / 35 / 61 µs |
+| `TCP_QUICKACK` once, after the read | 41.0 / 41.0 / 41.0 ms | 45.6 / 45.9 / 45.1 ms |
+| `TCP_QUICKACK` before every `read()` | 17 / 6 / 32 µs | 39 / 17 / 63 µs |
+
+Three things fix it and one doesn't. And the one that doesn't is what Nagle
+himself recommends, set in the obvious place.
+</Output>
+</TryIt>
+
+`TCP_NODELAY` removes the sender's half of the deadlock. `writev` removes the
+pattern itself: one syscall and one segment, so there's no second small write
+for Nagle to hold. It's also one fewer kernel crossing per request, and that
+matters on its own when [a syscall costs hundreds of nanoseconds](/chapters/07-syscalls-kernel-boundary).
+Of the three, it's the one I'd reach for first.
+
+`TCP_QUICKACK` is the subtle one. `tcp(7)` says so, if you read to the end of the
+entry: "This flag is not permanent, it only enables a switch to or from quickack
+mode. Subsequent operation of the TCP protocol will once again enter/leave
+quickack mode." Set it after the read, and by the time the next request's
+headers arrive, the reply you just sent has put the socket back into pingpong
+mode. Set it *before each read*, when you're holding a partial request, and it
+works. That's exactly what HAProxy 1.4.19 did for GoCardless: when a packet
+holds only the first part of a POST, it enables `TCP_QUICKACK` and ACKs
+immediately.
+
+## What John Nagle thinks of this
+
+Julia Evans wrote about this exact bug on 21 November 2015, in
+[Why you should understand (a little) about TCP](https://jvns.ca/blog/2015/11/21/why-you-should-understand-a-little-about-tcp/).
+Someone at work was publishing messages to NSQ on localhost and each one took
+40 ms. Ruby's `Net::HTTP` split each POST across two packets, headers then
+body, with Nagle on. She set `TCP_NODELAY`, and "all of the 40ms delays
+instantly disappeared."
+
+The same day, on the Hacker News thread for her post, John Nagle
+[showed up](https://news.ycombinator.com/item?id=10608356) (he posts as
+Animats):
+
+> That still irks me. The real problem is not tinygram prevention. It's ACK
+> delays, and that stupid fixed timer. They both went into TCP around the same
+> time, but independently. I did tinygram prevention (the Nagle algorithm) and
+> Berkeley did delayed ACKs, both in the early 1980s. The combination of the
+> two is awful.
+
+He explains that delayed ACKs made sense for Berkeley's Telnet traffic from
+terminal rooms, that "a delayed ACK is a bet that the other end will reply to
+what you just sent almost immediately," and that outside some RPC protocols the
+bet keeps losing. His short version is "set TCP_QUICKACK." My table above is
+a footnote to that: set it, but on Linux, set it again before every read.
+
+He's also careful about the other fix. With `TCP_NODELAY`, a loop of one-byte
+`write()` calls becomes one packet per byte, "a factor of 40" more traffic. So
+`TCP_NODELAY` doesn't excuse small writes; it just stops the kernel from
+papering over them. Marc Brooker's 2024 post,
+[It's always TCP_NODELAY. Every damn time.](https://brooker.co.za/blog/2024/05/09/nagle.html),
+takes the opposite default: check `TCP_NODELAY` first, and turn Nagle off for
+modern systems.
+
+## Who already turned it off
+
+A lot of the software you run has made this call for you. That's probably why you
+mostly meet the bug in older or hand-rolled clients:
+
+- **Go** sets `TCP_NODELAY` on every TCP connection. `newTCPConn` in
+  [`net/tcpsock.go`](https://github.com/golang/go/blob/go1.23.0/src/net/tcpsock.go#L289-L290)
+  calls `setNoDelay(fd, true)`, and the `SetNoDelay` doc says "the default is
+  true (no delay)."
+- **Redis** enables it on every client connection in `createClient`
+  ([`src/networking.c`, 7.4.0](https://github.com/redis/redis/blob/7.4.0/src/networking.c#L119-L120)).
+- **libpq**, the Postgres client library, calls `connectNoDelay()` on every
+  non-Unix socket it opens ([`fe-connect.c`, REL_17_0](https://github.com/postgres/postgres/blob/REL_17_0/src/interfaces/libpq/fe-connect.c#L2033-L2050)).
+- **curl** changed `CURLOPT_TCP_NODELAY` to default on in 7.50.2
+  ([docs](https://curl.se/libcurl/c/CURLOPT_TCP_NODELAY.html)).
+- **Node.js** made `noDelay` default to `true` for `http.createServer` in v18.0.0
+  ([PR #42163](https://github.com/nodejs/node/pull/42163)).
+
+If your stack isn't on that list, it's worth ten minutes with `strace -e setsockopt`
+to find out what it does.
+
+## And on macOS?
+
+I ran the same program natively on the Mac (Apple M4, macOS 26.5.1,
+clang `-O2`), and it didn't reproduce:
+
+```
+default   n=1000  p50  35.9 us  p90  52.7 us  p99  64.2 us  max  94.7 us
+nodelay   n=200   p50  40.8 us  p90  43.1 us  p99  47.5 us  max  49.8 us
+writev    n=200   p50  37.7 us  p90  41.1 us  p99  49.7 us  max  53.6 us
+```
+
+No cliff. XNU does delay ACKs (`net.inet.tcp.delayed_ack` is 3 here), and its
+timer is longer than Linux's: `tcp_delack = TCP_RETRANSHZ / 10`, with a comment
+saying it "will fire some where between 100 and 200 ms"
+([`bsd/netinet/tcp_timer.c`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/netinet/tcp_timer.c#L336-L341)).
+So if it were holding these ACKs, I'd have seen 100 ms, not 36 µs.
+
+XNU's decision lives in `tcp_cc_delay_ack()` in
+[`bsd/netinet/tcp_cc.c`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/netinet/tcp_cc.c#L142-L201).
+Mode 3 delays only when seven conditions all hold. One is that the
+receive buffer holds more than its low-water mark. My guess is that a server
+thread already blocked in `read()` empties the buffer fast enough that the
+condition fails, so the ACK goes straight out. I haven't confirmed it.
+Packet capture on macOS needs root for `/dev/bpf`. I didn't have that for this
+run, and the per-protocol counters in `netstat -s` read zero for delayed ACKs
+before and after. So this stays open: Linux on loopback reproduces every time,
+macOS on loopback doesn't, and I can point at the code but not at the packet
+that proves why.
+
+There's a second loose end in the Linux capture. After the timer-driven ACK
+releases the body, the server sends *another* pure ACK for the body about 20 µs
+before its response, where I expected the ACK to ride on the response. My best
+reading is that leaving pingpong mode makes the ACK go out as soon as the
+application drains the buffer, before the `write()` gets there. I haven't traced
+it.
+
+## What to do on Monday
+
+- **Find the pattern.** Any client that does write, write, read on a persistent
+  connection with Nagle on is exposed: headers then body, a length prefix then
+  a payload, a command then its arguments. `strace -f -e trace=write,writev,sendmsg,setsockopt`
+  on one request shows the writes and whether `TCP_NODELAY` was ever set.
+- **Coalesce the writes.** Build the request in one buffer, or use `writev` /
+  `sendmsg` with an iovec. It fixes this, and it saves a syscall per request.
+- **Set `TCP_NODELAY` on request/response sockets**, and then make sure you're
+  not doing byte-sized writes, because nothing will batch them for you any more.
+- **On a server you own**, if you must support clients you can't fix, set
+  `TCP_QUICKACK` *before each read* while a request is incomplete, as HAProxy
+  1.4.19 does. Once per connection does nothing, as the table shows.
+- **Look for it in your metrics.** A latency histogram with a spike at 40 ms, or
+  at 200 ms, is this until proven otherwise. On the host, `nstat -az TcpExtDelayedACKs`
+  counts delayed ACKs that fired. In a fresh network namespace, three runs of
+  300 requests left it at exactly 897, which is 3 × 299: one per request, minus
+  the fast first one. A counter climbing in step with request rate is a strong hint.
+- **Whole-route options exist, if you can't touch the code.** Linux honours a
+  per-route `quickack` metric (`tcp_in_quickack_mode()` checks `RTAX_QUICKACK`
+  first). I tried it later on a shared 4-CPU container (same linuxkit 6.10
+  kernel), inside a private network namespace so nobody else's loopback changed:
+
+  ```
+  ip route replace local 127.0.0.1 dev lo table local \
+      proto kernel scope host src 127.0.0.1 quickack 1
+  ```
+
+  Same binary, no code change: p50 went from 41.0 ms (three runs) to 42, 29 and
+  35 µs. On a real host the equivalent is something like
+  `ip route change 10.0.0.0/8 via <gw> dev eth0 quickack 1`, which I haven't
+  run. A BPF sock_ops program can also lower the ceiling per socket with
+  `TCP_BPF_DELACK_MAX` (it accepts 2 jiffies up to `TCP_DELACK_MAX`, per
+  [`net/core/filter.c`](https://github.com/torvalds/linux/blob/v6.10/net/core/filter.c#L5256-L5262));
+  I haven't measured that one either.
+
+In design review, the question is just: "how many writes does one request
+take, and is Nagle on?" If the answer is "more than one" and "yes", you've found
+your 40 ms before anyone gets paged for it.

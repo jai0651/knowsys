@@ -1,0 +1,447 @@
+---
+title: "fsyncgate: the fsync that returned 0 the second time"
+dek: "Postgres retried a failed fsync, the kernel said yes, and the data was already gone. I broke a disk on purpose to watch it happen on Linux 6.10."
+date: "2026-09-22"
+readingTime: "~15 min"
+kicker: "Incident"
+tags: ["postgres", "linux", "durability", "filesystems"]
+related: ["08-filesystems", "09-storage-devices"]
+---
+
+At 02:23 on 28 March 2018, Craig Ringer sent a message to pgsql-hackers with
+a subject line that doesn't bury anything: [PostgreSQL's handling of fsync()
+errors is unsafe and risks data loss at least on
+XFS](https://www.postgresql.org/message-id/CAMsr+YHh+5Oq4xziwwoEfhoTZgr07vdGG+hu=1adXx59aTeaoQ@mail.gmail.com).
+A user of his had hit a storage error and ended up with a corrupt database, and
+he'd traced Postgres's part in it. His TL;DR:
+
+> Pg should PANIC on fsync() EIO return. Retrying fsync() is not OK at least on
+> Linux. When fsync() returns success it means "all writes since the last fsync
+> have hit disk" but we assume it means "all writes since the last SUCCESSFUL
+> fsync have hit disk".
+
+Here's the sequence he described. Postgres writes some blocks, and they
+sit in the kernel's page cache as dirty pages. Background writeback tries to put
+them on the disk and the disk says no. At the next checkpoint Postgres calls
+`fsync()`, gets `EIO`, marks the checkpoint as failed, and doesn't advance the
+redo pointer. That's all correct so far. Then it retries the checkpoint, which
+retries the `fsync()`, which returns 0. The checkpoint completes, the WAL that
+held the only other copy of those blocks becomes recyclable, and in Ringer's
+words, "we completed the checkpoint, and merrily carried on our way. Whoops,
+data loss."
+
+An hour and a half later Tom Lane replied. His first line was "Surely you jest."
+
+## "Surely the kernel wouldn't"
+
+It's worth sitting with Lane's reaction, because it was everyone's reaction,
+and he's not a person who's often wrong about Postgres. His argument was that
+if Ringer was right, "fsync would be completely useless," and anyway "POSIX is
+entirely clear that successful fsync means all preceding writes for the file
+have been completed, full stop." You can see the whole
+[thread archived on one page](https://danluu.com/fsyncgate/) by Dan Luu, and
+it's a good read if you like watching smart people's priors get taken apart
+slowly.
+
+Disbelief came in a few flavours, roughly in this order:
+
+- **POSIX must forbid it.** Ringer went and read the spec. It says `fsync()`
+  "shall not return until the system has completed that action or until an
+  error is detected." It says nothing at all about what state you're in
+  *after* an error, or whether the next call has to report it again.
+- **Other kernels don't do this, so Linux can't.** Thomas Munro went to FreeBSD's
+  `vfs_bio.c` and found a comment reading "Failed write, redirty." FreeBSD
+  really does keep the pages dirty and try again. A few days later he'd widened
+  the survey and had to walk it back: "Linux, OpenBSD, NetBSD: retrying fsync()
+  after EIO lies. FreeBSD, Illumos: retrying fsync() after EIO tells the truth."
+- **Fine, but that's a bug and they'll fix it.** Robert Haas, a few days in:
+  "Like other people here, I think this is 100% unreasonable ... I think it's
+  always unreasonable to throw away the user's data."
+
+Kernel developers had been saying this in public for a while, though. Munro dug
+up a comment Jeff Layton had made on LWN a year earlier: "The stackoverflow
+writeup seems to want a scheme where pages stay dirty after a writeback failure
+so that we can try to fsync them again. Note that that has never been the case
+in Linux after hard writeback failures, AFAIK, so programs should definitely not
+assume that behavior."
+
+And the kernel people had a reason that isn't crazy. Jonathan Corbet's LWN
+write-up, [PostgreSQL's fsync()
+surprise](https://lwn.net/Articles/752063/), quotes Ted Ts'o: the most common
+cause of I/O errors "by far, is a user pulling out a USB drive at the wrong
+time." If a failed page stays dirty forever, a large copy to a yanked stick
+pins memory that can never be written anywhere. Christophe Pettus put the same
+point in the thread: without it "a large copy operation to a yanked USB drive
+could result in the system having no more allocatable memory." So the kernel
+drops it. That's a defensible policy for a laptop, and a terrible one for a
+database on a SAN that hiccupped for four seconds.
+
+## What the page cache actually does with your write
+
+If you've read [chapter 08](/topics/08-filesystems) you know the outline: a
+`write()` copies into the page cache and marks the page dirty, and writeback
+puts it on the device later. What matters here is *when* the dirty
+bit goes away. It's cleared when the page is handed to the block layer for I/O,
+not when the I/O succeeds. On success nothing more needs to happen. On failure
+the filesystem's completion handler records an error on the file's mapping, ends
+writeback on the page, and doesn't dirty it again. Now the page is clean,
+up to date as far as the cache is concerned, and different from what's on the
+disk.
+
+So a retried `fsync()` has nothing to do. There are no dirty pages. It checks
+for a recorded error, finds none (someone already collected it), and returns 0.
+That's the whole bug, and it isn't in `fsync()` at all.
+
+Then there's the question of *who* collects the error. Before Linux 4.13 the
+error was a single bit on the inode's `address_space`, and reporting it cleared
+it:
+
+<SourceRead
+  file="mm/filemap.c: filemap_check_errors()"
+  repo="linux"
+  tag="v4.12"
+  href="https://github.com/torvalds/linux/blob/v4.12/mm/filemap.c#L298"
+>
+```c
+int filemap_check_errors(struct address_space *mapping)
+{
+	int ret = 0;
+	/* Check for outstanding write errors */
+	if (test_bit(AS_ENOSPC, &mapping->flags) &&
+	    test_and_clear_bit(AS_ENOSPC, &mapping->flags))
+		ret = -ENOSPC;
+	if (test_bit(AS_EIO, &mapping->flags) &&
+	    test_and_clear_bit(AS_EIO, &mapping->flags))
+		ret = -EIO;
+	return ret;
+}
+```
+</SourceRead>
+
+That's `test_and_clear_bit` on a flag that belongs to the **inode**, not to your
+file descriptor. Whoever calls it first wins, and it wasn't only `fsync` that
+called it. Layton's commit message for the replacement says so bluntly: "If I
+get -EIO on a stat() call, there is no reason for me to assume that it is
+because some previous writeback failed. The fact that it also clears out the
+error such that a subsequent fsync returns 0 is a bug, and a nasty one since
+that's potentially silent data corruption."
+
+## errseq_t: what 4.13 fixed, and what it broke
+
+Layton's fix,
+[5660e13d2fd6](https://github.com/torvalds/linux/commit/5660e13d2fd6af1903d4b0b98020af95ca2d638a)
+("fs: new infrastructure for writeback error handling and reporting"), landed
+in 4.13 in 2017, before anyone at Postgres had noticed a problem. It replaces the
+bit with an `errseq_t`: a 32-bit value holding the last error code, a "seen"
+flag, and a counter. Each mapping holds the current value. Every `struct file`
+holds the value it last saw, sampled at `open()`. An `fsync()` compares the two,
+reports the error if they differ, and catches up.
+
+That's a real improvement. Errors become **per file descriptor**, not per inode.
+Two processes with the file open both hear about a failure, and a stray `stat()`
+can't eat it. What it doesn't do is change the page state. Pages are still
+clean, so the second `fsync()` on the *same* descriptor still returns 0. It
+wasn't designed to fix that and it didn't.
+
+It also broke Postgres in a new way. Postgres backends write data files and
+close them; the checkpointer opens the file later and calls `fsync()`. An open
+after the error samples the current value, so the checkpointer sees nothing.
+Before 4.13 that late opener would at least have caught the flag if nobody else
+had. Matthew Wilcox's fix,
+[b4678df184b3](https://github.com/torvalds/linux/commit/b4678df184b314a2bd47d2329feca2c2534aa12b)
+("errseq: Always report a writeback error once", in 4.17 and tagged for stable),
+calls it what it was: "This turns out to be a regression for some applications,
+notably Postgres." Here's the sampling function after that change:
+
+<SourceRead
+  file="lib/errseq.c: errseq_sample()"
+  repo="linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/lib/errseq.c#L123"
+>
+```c
+errseq_t errseq_sample(errseq_t *eseq)
+{
+	errseq_t old = READ_ONCE(*eseq);
+
+	/* If nobody has seen this error yet, then we can be the first. */
+	if (!(old & ERRSEQ_SEEN))
+		old = 0;
+	return old;
+}
+```
+</SourceRead>
+
+If nobody's reported the error yet, a new opener pretends it sampled zero and
+will see it. If somebody already has, the new opener gets nothing.
+
+Where does `mapping->wb_err` live, though? In the `address_space`, which is
+embedded in the in-memory inode. If the inode gets evicted between the failed
+writeback and the checkpointer's `open()`, the error goes with it.
+
+That was the state of things when Andres Freund took it to LSF/MM in April 2018.
+Jake Edge's [PostgreSQL visits LSFMM](https://lwn.net/Articles/752952/) covers
+the session. Freund said that Postgres couldn't keep "at least one file
+descriptor that stays open from the earliest write," which is the one thing that
+would make per-fd reporting reliable. Kernel developers' near-term answer
+was Wilcox's patch plus, from Jan Kara, a suggestion to "keep inodes with errors
+in memory." A separate LSF/MM session on [error
+reporting](https://lwn.net/Articles/752613/) floated putting an `errseq_t` on
+the superblock so `syncfs()` could report too. That one landed in 5.8 as
+[735e4ae5ba28](https://github.com/torvalds/linux/commit/735e4ae5ba28c886d249ad04d3c8cc097dad6336).
+
+## Breaking a disk on purpose
+
+I wanted to see all of that with my own eyes on a current kernel, not take it on
+trust from 2018. This ran on **Docker Desktop, linuxkit 6.10.14, aarch64**,
+in a privileged Ubuntu 24.04 container. That kernel has device-mapper with the
+`linear` and `error` targets (no `flakey`, which I'd have preferred), and that's
+enough.
+
+Setup: a 512 MB file on a loop device, wrapped in a dm-linear device, with
+ext4 on top. Write an 8 KB file of `A`s and sync it. Ask `filefrag` which
+physical block holds the first 4 KB. Then, while a test program is paused, swap
+the device-mapper table for one where exactly those 16 sectors return `EIO` and
+everything else, journal included, works normally.
+
+<TryIt what="Write, fail, retry, and ask the disk what it really has" lang="c" toolchain="gcc -O2, linuxkit 6.10.14 aarch64">
+```c
+int a = open(path, O_RDWR);      // the writer
+int b = open(path, O_RDONLY);    // opened before the error, never writes
+memset(buf, 'B', 4096);
+pwrite(a, buf, 4096, 0);
+getchar();                       // harness swaps in the "error" table here
+
+try_fsync("a", a);
+try_fsync("a", a);               // the retry
+try_fsync("b", b);
+int c = open(path, O_RDONLY);    // opened after a has seen the error
+try_fsync("c", c);
+pread(a, buf, 16, 0);            // what the page cache says
+
+// then: heal the disk (back to the plain linear table),
+//       syncfs the mount, and read block 0 with O_DIRECT
+```
+
+<Output>
+```
+== ext4 on /dev/loop0 via dm; data at 4K block 33280 (sector 266240)
+pwrite(a, 'BBBB...') = 4096
+fsync(a) = -1  errno=Input/output error
+fsync(a) = 0
+fsync(b) = -1  errno=Input/output error
+fsync(c) = 0
+read back through the page cache: BBBBBBBB
+sync: error syncing '/mnt/fsyncgate/data': Input/output error
+syncfs after the disk is healed: rc=1
+read back with O_DIRECT (4096 bytes): AAAAAAAA
+EXT4-fs warning (device dm-0): ext4_end_bio:342: I/O error 10 writing to inode 12 starting block 33280)
+Buffer I/O error on device dm-0, logical block 33280
+```
+
+Everything Ringer described is in there. Retrying on `a` succeeds. `b`, open
+before the failure, hears about it once, which is errseq_t doing its job. `c`
+hears nothing, because `a` already saw it. Anybody reading gets `B`s from the page
+cache, and the device still has `A`s. Healing the disk changes
+nothing, because there's no dirty page left to write.
+</Output>
+</TryIt>
+
+My full harness is a 50-line shell script around `dmsetup suspend`, `load` and
+`resume`. I ran it three times on ext4 and once on XFS, all on that kernel, and
+got the same four `fsync` results each time. XFS logs it differently: `dm-0: writeback error on
+inode 131, offset 0, sector 104`.
+
+<Callout label="Why the second fsync is telling the truth">
+It isn't lying, strictly. `fsync()` promises that dirty data has been written
+and that errors since *your last check* are reported. After the first failure
+there's no dirty data, and you've been told about the error. Both conditions hold,
+so it returns 0. Your data didn't disappear on the retry. It disappeared when
+the first writeback failed, and the first `EIO` was the only notice you'll ever get.
+</Callout>
+
+One more line in that output surprised me. After healing the disk, `syncfs()`
+on the mount still returned `EIO`. That's the 5.8 superblock `errseq_t`: `a`'s
+`fsync()` consumed the per-file error, but nobody had consumed the per-superblock
+one. So on 6.10 the filesystem as a whole remembers something went wrong even
+after every file-level check has gone quiet.
+
+### The checkpointer's view
+
+In the first experiment the writer holds the file open. Postgres doesn't
+work like that, so I wrote a second one that does it the Postgres way. One
+process writes and closes. Nobody has the file open while background writeback
+runs (I waited 40 seconds, past the 30-second dirty expiry, and the kernel log
+showed the failure about 25 seconds in). Then a fresh process opens the file and
+calls `fsync()`, then `syncfs()`.
+
+```
+                                         late fsync()   syncfs()
+inode still in memory                    EIO            EIO
+drop_caches (echo 3) before the open     0              EIO
+umount + mount before the open           0              0
+```
+
+Row one is Wilcox's 4.17 fix working. Row two is the hole Kara's
+suggestion was meant to close: the inode was evicted, the per-file error went
+with it, and the late `fsync()` returned 0 over a block that was never written.
+Only the superblock remembered. Row three is what you'd expect from a
+remount, since the superblock is new too. (The `drop_caches` row comes from two
+earlier runs in fresh containers on the same kernel, where I kicked writeback
+with a plain `sync` instead of waiting. I left it out of the final run because
+`drop_caches` empties every cache on the machine, and the container was shared
+with other experiments. Treat it as two runs, not a median.)
+
+## What Postgres did
+
+Postgres took Ringer's advice nearly word for word. Thomas Munro's commit
+[9ccdd7f66e33](https://github.com/postgres/postgres/commit/9ccdd7f66e3324d2b6d3dec282cfa9ff084083f1),
+"PANIC on fsync() failure," shipped in **11.2 and in 10.7, 9.6.12, 9.5.16 and
+9.4.21 on 14 February 2019** ([11.2 release
+notes](https://www.postgresql.org/docs/release/11.2/)). It's a minor-release
+change, not a Postgres 12 feature, which surprised me when I checked. Every
+error from `fsync()` and its relatives now goes through one function:
+
+<SourceRead
+  file="src/backend/storage/file/fd.c: data_sync_elevel()"
+  repo="postgres"
+  tag="REL_17_0"
+  href="https://github.com/postgres/postgres/blob/REL_17_0/src/backend/storage/file/fd.c#L3918"
+>
+```c
+/*
+ * Return the passed-in error level, or PANIC if data_sync_retry is off.
+ *
+ * Failure to fsync any data file is cause for immediate panic, unless
+ * data_sync_retry is enabled.  Data may have been written to the operating
+ * system and removed from our buffer pool already, and if we are running on
+ * an operating system that forgets dirty data on write-back failure, there
+ * may be only one copy of the data remaining: in the WAL.  A later attempt to
+ * fsync again might falsely report success.  Therefore we must not allow any
+ * further checkpoints to be attempted.
+ */
+int
+data_sync_elevel(int elevel)
+{
+	return data_sync_retry ? elevel : PANIC;
+}
+```
+</SourceRead>
+
+Why is crashing the right answer? Because the checkpoint that failed never
+advanced the redo pointer, so the WAL from that point is still there. Crash
+recovery replays it, which rewrites the lost blocks from the log. It's a
+restart you didn't want, but it's the one path that doesn't depend on the
+kernel's page state.
+
+`data_sync_retry` defaults to off. Turning it on restores the old retry
+behaviour, and the docs say to do that "only ... after investigating the
+operating system's treatment of buffered data in case of write-back failure."
+I can't think of a Linux deployment where that investigation comes back in
+your favour. Oddly, the checkpointer's loop in
+[`sync.c`](https://github.com/postgres/postgres/blob/REL_17_0/src/backend/storage/sync/sync.c#L443)
+still has a retry in it, by the way. That one only exists for a file that was
+dropped mid-checkpoint (`ENOENT`) and still panics on anything else.
+
+## Everyone else had the same bug
+
+Two years later Anthony Rebello and colleagues at Wisconsin asked the obvious
+next question in [Can Applications Recover from fsync
+Failures?](https://www.usenix.org/conference/atc20/presentation/rebello)
+(USENIX ATC 2020). They injected single-block write faults with their own
+device-mapper target under ext4, XFS and Btrfs on Linux 5.2.11, then built a
+FUSE filesystem, CuttleFS, to replay each filesystem's failure behaviour under
+five applications.
+
+On the filesystems:
+
+- **All three mark pages clean after a failed `fsync`.** Their words: this
+  renders "techniques such as application-level retry ineffective."
+- **ext4 and XFS keep the new data in memory; Btrfs reverts to the old
+  state.** My `BBBB` in the page cache and `AAAA` on disk is the ext4/XFS
+  behaviour exactly.
+- **ext4 with `data=journal` sometimes doesn't fail the `fsync` at all,**
+  "instead (oddly) failing the subsequent call." Their lesson #3 is titled "Ext4
+  data mode provides a false sense of durability."
+- **A failed journal-block write takes the filesystem read-only.** That's why
+  I aimed my error target at one data block and nothing else.
+
+On the applications, none handled it perfectly, even after Postgres's fix:
+
+- **Redis 5.0.7** didn't check the return code. The line in
+  [`aof.c`](https://github.com/redis/redis/blob/5.0.7/src/aof.c#L503) with
+  `appendfsync always` is `redis_fsync(server.aof_fd); /* Let's try to get this
+  data on the disk */`. By [6.2.0](https://github.com/redis/redis/blob/6.2.0/src/aof.c)
+  that path logs "Can't persist AOF for fsync error" and calls `exit(1)`.
+- **LMDB** reported false failures: it told the caller a write failed when the
+  data on disk was fine.
+- **LevelDB and SQLite** reverted in-memory state on failure, but recovered from
+  files still sitting in the page cache. Their page cache held data the disk
+  didn't, so recovery could accept log entries that weren't durable. SQLite in
+  rollback mode could corrupt its own buffers by reading its journal back out of
+  the cache.
+- **PostgreSQL** crashed as designed, and still showed lost or old values under
+  ext4 `data=journal`, because there the error arrives one `fsync` late.
+
+The paper's most useful line for anyone writing a storage engine is buried in
+the intro: "application recovery techniques often rely upon the file-system page
+cache, which does not reflect the persistent state of the system."
+
+## The directory is a file too
+
+Everything above applies to the directory entry as much as to the data. The
+rename-for-atomic-replace dance (temp file, `fsync`, `rename`, `fsync` the
+directory) is in [chapter 08](/topics/08-filesystems), so I won't rewrite it.
+What fsyncgate adds is that the final directory `fsync` can fail as well, and
+it's subject to exactly the same "reported once, then forgotten" rule. Postgres's
+`durable_rename()` in
+[`fd.c`](https://github.com/postgres/postgres/blob/REL_17_0/src/backend/storage/file/fd.c#L762)
+fsyncs the old file, the target, then the directory, and routes the errors
+through `data_sync_elevel()`, so a failed directory flush panics like any other.
+
+Dan Luu's [Files are hard](https://danluu.com/file-consistency/) (December 2015)
+is the best tour of how much of this was known before 2018 and ignored. It
+covers the OSDI '14 crash-consistency study that found bugs in "LevelDB, HDFS,
+Zookeeper, and git," and the older finding that ext3 "ignored write failures in
+most cases." Reading it next to the fsyncgate thread is a bit depressing,
+honestly. The warnings were public for years.
+
+## What to do on Monday
+
+If you own code that calls `fsync()`:
+
+1. **Treat `fsync` failure as fatal for everything written since your last
+   successful `fsync`.** Don't retry. Crash, and recover from a copy you trust:
+   a WAL, a replica, the client's retry. If you don't have such a copy, you
+   can't tell the client the write succeeded.
+2. **Don't recover from the page cache.** After a failed `fsync`, a `read()` of
+   that file returns data the disk doesn't have. Recovery code should read with
+   `O_DIRECT`, or after a restart that's guaranteed to have dropped the cache.
+3. **Keep the file descriptor open from first write to `fsync`** if you can. It's
+   the only arrangement where errseq_t's guarantees don't depend on inode
+   eviction. If you can't (Postgres can't), call `syncfs()` as a backstop on
+   5.8 or later: in my run it caught an error that a late `fsync()` missed.
+4. **Consider `O_DIRECT` if you already own a buffer pool.** Errors come back on
+   the write itself, not on a later flush. It's a lot of work to do well:
+   Postgres 16 added `debug_io_direct` and the docs still say it "reduces
+   performance, and is intended for developer testing only."
+5. **Checksum your pages and log records.** Checksums don't prevent the loss;
+   they turn a silent old version into a loud one. LevelDB's log CRCs are what
+   saved it in several of the paper's cases, and Postgres 18's `initdb` [enables
+   data checksums by default](https://www.postgresql.org/docs/release/18.0/).
+6. **Alert on the kernel log.** Both runs above left a line in `dmesg`
+   (`Buffer I/O error on device`, `writeback error on inode`). That line is
+   often the only record of which block was lost.
+
+And in design review, ask one question: "What happens the first time `fsync`
+returns `EIO`?" If the answer involves the word "retry," you've found the bug.
+
+## What I still don't know
+
+Kara's LSF/MM 2018 idea, keeping inodes with unreported errors in memory, would
+close the second row of my late-opener table. I couldn't find that it was ever
+merged, and my 6.10 result is consistent with it not having been. But I'm
+inferring eviction from the result changing, not observing it directly. The
+experiment that would settle it is a bpftrace probe on `evict()` for that inode
+number during the `drop_caches`, and I didn't run it. If you have, I'd like to
+know what you saw.

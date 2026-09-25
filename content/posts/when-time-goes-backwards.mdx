@@ -1,0 +1,568 @@
+---
+title: "The hour with 3,601 seconds in it"
+dek: "Twice in five years a single extra second took down large parts of the internet. Once it made Linux spin at 100% CPU, once it made Go measure a negative round trip. Both bugs are still easy to write."
+date: "2026-09-21"
+readingTime: "~14 min"
+kicker: "Incident"
+tags: ["time", "linux", "clocks", "distributed-systems"]
+related: ["07-syscalls-kernel-boundary", "13-locks", "26-time-and-ordering"]
+---
+
+Between 23:00 UTC on 31 December 2016 and midnight, there were 3,601 seconds.
+Ask a computer and it'll tell you there were 3,600. I tried three ways, in an
+Ubuntu 24.04 container, and got three different kinds of refusal:
+
+```shell
+$ python3 -c "import calendar; print(calendar.timegm((2017,1,1,0,0,0)) - calendar.timegm((2016,12,31,23,0,0)))"
+3600
+$ python3 -c "import datetime; datetime.datetime(2016,12,31,23,59,60)"
+ValueError: second must be in 0..59
+$ date -u -d "2016-12-31 23:59:60"
+date: invalid date '2016-12-31 23:59:60'
+```
+
+Only the `right/` time zones will admit the second exists. They count leap
+seconds (Ubuntu ships them in the `tzdata-legacy` package now):
+
+```shell
+$ for t in 1483228825 1483228826 1483228827; do TZ=right/UTC date -d @$t; done
+Sat Dec 31 23:59:59 UTC 2016
+Sat Dec 31 23:59:60 UTC 2016
+Sun Jan  1 00:00:00 UTC 2017
+```
+
+That extra second was 23:59:60. POSIX time has no name for it, so on most Linux
+machines the kernel handled it the old way: it let 23:59:59 happen twice.
+
+For one
+second, the wall clock ran backwards. At Cloudflare, a Go program subtracted two
+timestamps across that second, got a negative number, and panicked. Four and a
+half years earlier a different leap second had pinned Reddit's servers at 100%
+CPU, and the bug there was a clock that jumped the other way inside the kernel.
+
+This post is about both, and about why the fix for each is the same boring line
+of code.
+
+## 30 June 2012: a second that made everything spin
+
+It was the first leap second in three and a half years, and it landed at the end
+of Saturday, UTC. Within minutes, Java and MySQL hosts across the internet were burning a full core each
+doing nothing. [Reddit went down](https://www.computerworld.com/article/1530120/linux-is-culprit-in-leap-second-lapses-says-cassandra-exec.html),
+as did [Gawker](https://techcrunch.com/2012/07/01/saturdays-leap-second-added-more-heat-to-this-weekends-tech-meltdowns),
+and LinkedIn and the Qantas reservation system had trouble too.
+
+Mozilla's metrics team filed [bug 769972](https://bugzilla.mozilla.org/show_bug.cgi?id=769972),
+"Java is choking on leap second", covering Hadoop, HBase and Elasticsearch. MySQL
+got its own ticket ([bug 65778](https://bugs.mysql.com/bug.php?id=65778)), and
+Ubuntu got [one for the kernel](https://bugs.launchpad.net/bugs/1020285).
+
+First theory: the obvious one. Reddit's engineers, according to
+Computerworld, "had initially assumed that Cassandra, along with Java, was source
+of its leap-second related outage". Java was the common factor on the graphs, so
+Java got the blame. But MySQL isn't Java, and neither is Firefox, which the Ubuntu
+bug lists as spinning on desktops.
+
+DataStax's Jonathan Ellis put it plainly: the real problem
+was "a kind of livelock in the Linux system calls responsible for timers".
+
+Second theory: NTP had stepped the clock and something choked on the
+step. Closer, but not it. What people found worked was stranger: run
+
+```shell
+date -s "$(date)"
+```
+
+and the CPU dropped straight back to idle. Setting the clock to the time it
+already was fixed the machine. Why would that do anything?
+
+John Stultz [explained it on LKML the next day](https://lwn.net/Articles/504658/).
+When the kernel inserts a leap second, "CLOCK_REALTIME is set back one second".
+Every timer on the box is fired by the hrtimer subsystem, and hrtimer keeps its own cached
+offset for converting realtime to its internal clock, and it only refreshes that
+offset when someone calls `clock_was_set()`. Nothing on the leap-second path called it.
+So:
+
+> "the hrtimer base.offset value for CLOCK_REALTIME is not updated, thus its sense
+> of wall time is one second ahead."
+
+Now think about what a Java thread or a MySQL worker does while it's idle. It
+waits on a condition variable with a deadline a few hundred milliseconds out,
+wakes up, checks for work, and waits again.
+
+`pthread_cond_timedwait` takes an
+**absolute CLOCK_REALTIME deadline** by default, and that turns into a futex wait
+with an absolute realtime timer. With hrtimer a full second ahead, every deadline
+less than one second away had already passed. So the wait returned `ETIMEDOUT`
+immediately, the thread computed a new deadline 100 ms out (also already
+passed), and went round again, as fast as the CPU would let it.
+
+<Callout label="Why setting the clock to itself fixed it">
+Nothing was slow and no clock was wrong. Two parts of the kernel
+disagreed about what time it was by exactly one second, and every sub-second
+realtime timeout fell into the gap. `date -s` goes through `settimeofday()`,
+and that calls `clock_was_set()`: the one notification the leap second had
+skipped. It didn't change the time. It told hrtimer what the time already was.
+</Callout>
+
+Stultz's fix, [commit 4873fa07](https://github.com/torvalds/linux/commit/4873fa070ae84a4115f0b3c9dfabc224f1bc7c51)
+("timekeeping: Fix leapsecond triggered load spike issue"), adds the missing call
+and defers it to softirq context, since the SMP function call it needs can't run
+from a hard interrupt.
+
+It was tagged for stable and it cites the workaround,
+with a typo that's survived in the kernel's history ever since: "The reported
+immediate workaround - $ data -s "\`date\`" - is causing a call to
+clock_was_set()".
+
+Stultz came back to the same edge in 2015. [Commit 833f32d7](https://github.com/torvalds/linux/commit/833f32d763028c1bb371c64f457788b933773b3e)
+notes that realtime timers set for just after the leap second could still fire a
+second early, and adds, in brackets, the sentence I'd frame: "one should note that
+all applications using CLOCK_REALTIME timers should always be careful, since they
+are prone to quirks from settimeofday() disturbances."
+
+## 1 January 2017: a negative round trip
+
+Cloudflare's resolver, RRDNS, is written in Go. When a customer's DNS record is a
+CNAME, RRDNS sometimes has to look up the origin itself, and it picks an upstream
+resolver with a weighted random choice based on how fast each one has been. The
+[postmortem](https://blog.cloudflare.com/how-and-why-the-leap-second-affected-cloudflare-dns/)
+quotes the code that recorded those speeds:
+
+```go
+if !start.IsZero() {
+	rtt := time.Now().Sub(start)
+	if success && rcode != dns.RcodeServerFailure {
+		s.updateRTT(rtt)
+	}
+}
+```
+
+Looks fine, doesn't it? It's how everyone measured elapsed time in Go in 2016.
+At midnight the wall clock repeated a second, `time.Now()` came back earlier than
+`start`, and `rtt` went negative. Those weights went into `rand.Int63n()`, and
+that function, in Cloudflare's words, "promptly panics if its argument is negative".
+
+Impact started at 00:00 UTC. It was escalated at 00:10, a fix was rolling out by
+01:48, and it was over at 06:45. At peak about **0.2% of DNS queries** failed, on
+a small number of machines across 102 data centres. Their fix stopped negative
+values reaching the server selection code.
+
+What I didn't know until I went looking is how directly this changed Go.
+Russ Cox's [monotonic time proposal](https://go.googlesource.com/proposal/+/master/design/12914-monotonic.md),
+dated 26 January 2017, explains that Go was designed for Google's servers, where
+the wall clock is set before any Go code runs and leap seconds are smeared, so it
+never resets.
+
+"In 2011, I hoped that the trend toward reliable, reset-free
+computer clocks would continue and that Go programs could safely use the system
+wall clock to measure elapsed times. I was wrong." The very next paragraph cites
+Cloudflare.
+
+[Go 1.9](https://go.dev/doc/go1.9) shipped the result. Every `time.Time` from
+`time.Now()` now carries two readings, wall and monotonic, and `Sub`, `Since` and
+`Until` use the monotonic one when both sides have it. That's the `m=+0.000021959`
+you've probably seen at the end of a printed time and wondered about.
+
+## Six clocks, one page of memory
+
+Linux gives you several clocks through `clock_gettime(2)`, and the
+[man page](https://man7.org/linux/man-pages/man2/clock_gettime.2.html) is precise
+about how each one behaves when the world changes under it:
+
+- **`CLOCK_REALTIME`** is wall time, seconds since 1970 minus leap seconds. It can
+  be stepped by `settimeofday`, by NTP, by an admin, by a VM agent. It's the only
+  one that goes backwards.
+- **`CLOCK_MONOTONIC`** never goes backwards and never jumps. NTP can still slew
+  its *rate* by up to 500 parts per million, so a second on it is very nearly,
+  not exactly, an SI second. It stops while the machine is suspended.
+- **`CLOCK_MONOTONIC_RAW`** is the hardware counter with no NTP rate correction at
+  all. Good for comparing against the raw counter, bad for timeouts, since it
+  drifts at whatever rate the crystal does.
+- **`CLOCK_BOOTTIME`** is `CLOCK_MONOTONIC` plus time spent suspended. It's what you
+  want for "has this lease expired" on a laptop or a phone.
+- **`CLOCK_TAI`** is realtime plus the current TAI offset, so in principle it
+  doesn't repeat during a leap second. In principle.
+
+On macOS the names line up differently, and that'll bite anyone porting code. Its
+`CLOCK_MONOTONIC` *does* count sleep (it's closer to Linux `CLOCK_BOOTTIME`) and
+`CLOCK_UPTIME_RAW` is the one that stops. You can use that difference to ask a
+Mac how long it's been asleep:
+
+<TryIt what="How long has this Mac been asleep?" lang="cpp" toolchain="clang++ 21 -O2, Apple M4, macOS 26.5.1">
+```cpp
+#include <time.h>
+#include <cstdio>
+int main() {
+  double mono = clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e9;    // counts sleep
+  double up   = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;   // doesn't
+  std::printf("awake %.0f s, asleep %.0f s\n", up, mono - up);
+}
+```
+
+<Output>
+```
+awake 1328069 s, asleep 4040044 s
+```
+
+About 15 days awake and 47 days asleep since this laptop last booted.
+
+Inside the
+Docker Desktop VM on the same machine, `CLOCK_BOOTTIME - CLOCK_MONOTONIC` came out
+at **0.000 s**. As far as the Linux guest knows, it has never seen a suspend, however many times the
+lid closed.
+
+That's the mechanism behind Docker for Mac's long-running
+[issue #17](https://github.com/docker/for-mac/issues/17): after the host sleeps,
+the VM's clock resumes from where it paused and has to be stepped forward later,
+and that's precisely the kind of jump this post is about.
+</Output>
+</TryIt>
+
+Now the `CLOCK_TAI` surprise. Linux only knows the TAI offset if something
+tells it, and that something is `chronyd` or `ntpd` passing it in through
+`adjtimex`. Out of the box, nobody does. In the Docker VM:
+
+```
+TAI - REALTIME = 0 s
+```
+
+It should be 37. Unless your NTP daemon is configured to set it (chrony has a
+`leapsectz` directive for this), `CLOCK_TAI` on a stock box is just
+`CLOCK_REALTIME` with a more confident name.
+
+### What a clock read costs
+
+All of these are cheap because none of them normally enters the kernel. The
+kernel maps a page of timekeeping data into every process, the vDSO, and
+`clock_gettime` reads it in userspace (the full story is in
+[chapter 07](/topics/07-syscalls-kernel-boundary)). Here's the read loop from
+[`lib/vdso/gettimeofday.c`](https://github.com/torvalds/linux/blob/v6.10/lib/vdso/gettimeofday.c)
+at the kernel version the Docker VM runs:
+
+<SourceRead file="lib/vdso/gettimeofday.c" repo="torvalds/linux" tag="v6.10" href="https://github.com/torvalds/linux/blob/v6.10/lib/vdso/gettimeofday.c#L130-L179">
+```c
+do {
+	while (unlikely((seq = READ_ONCE(vd->seq)) & 1)) {
+		if (IS_ENABLED(CONFIG_TIME_NS) &&
+		    vd->clock_mode == VDSO_CLOCKMODE_TIMENS)
+			return do_hres_timens(vd, clk, ts);
+		cpu_relax();
+	}
+	smp_rmb();
+
+	if (unlikely(!vdso_clocksource_ok(vd)))
+		return -1;
+
+	cycles = __arch_get_hw_counter(vd->clock_mode, vd);
+	if (unlikely(!vdso_cycles_ok(cycles)))
+		return -1;
+	ns = vdso_calc_ns(vd, cycles, vdso_ts->nsec);
+	sec = vdso_ts->sec;
+} while (unlikely(vdso_read_retry(vd, seq)));
+```
+</SourceRead>
+
+It's a seqlock: read the sequence number, read the counter, scale it with the
+kernel's current multiplier, check the sequence didn't change.
+
+An odd sequence
+means the kernel is mid-update, so spin. `vdso_ts` is `&vd->basetime[clk]`, one
+slot per clock. So REALTIME, MONOTONIC, BOOTTIME and TAI all cost the
+same: they're the same code reading a different row. A step of the wall clock is
+just the kernel rewriting one of those rows.
+
+I measured each clock, 10 million calls, best of five runs:
+
+<TryIt what="clock_gettime cost per clock" lang="cpp" toolchain="clang++ 21 -O2 (macOS) · g++ 13.3 -O2 (Linux)">
+```cpp
+#include <time.h>
+#include <cstdio>
+#include <cstdint>
+
+static uint64_t ns(clockid_t c) {
+  timespec t; clock_gettime(c, &t);
+  return uint64_t(t.tv_sec) * 1'000'000'000 + t.tv_nsec;
+}
+
+static void bench(const char* name, clockid_t c) {
+  constexpr int N = 10'000'000;
+  timespec t; volatile long sink = 0;
+  uint64_t best = UINT64_MAX;
+  for (int rep = 0; rep < 5; rep++) {
+    uint64_t t0 = ns(CLOCK_MONOTONIC);
+    for (int i = 0; i < N; i++) { clock_gettime(c, &t); sink = sink + t.tv_nsec; }
+    uint64_t dt = ns(CLOCK_MONOTONIC) - t0;
+    if (dt < best) best = dt;
+  }
+  std::printf("%-22s %6.1f ns/call\n", name, double(best) / N);
+}
+
+int main() {
+  bench("CLOCK_REALTIME", CLOCK_REALTIME);
+  bench("CLOCK_MONOTONIC", CLOCK_MONOTONIC);
+  bench("CLOCK_MONOTONIC_RAW", CLOCK_MONOTONIC_RAW);
+#ifdef __linux__
+  bench("CLOCK_BOOTTIME", CLOCK_BOOTTIME);
+  bench("CLOCK_TAI", CLOCK_TAI);
+  bench("CLOCK_REALTIME_COARSE", CLOCK_REALTIME_COARSE);
+#else
+  bench("CLOCK_UPTIME_RAW", CLOCK_UPTIME_RAW);
+#endif
+}
+```
+
+<Output>
+Apple M4, macOS 26.5.1:
+
+```
+CLOCK_REALTIME           12.5 ns/call
+CLOCK_MONOTONIC          16.8 ns/call
+CLOCK_MONOTONIC_RAW      12.8 ns/call
+CLOCK_UPTIME_RAW         12.9 ns/call
+```
+
+Docker Desktop, linuxkit 6.10.14, aarch64, clocksource `arch_sys_counter`
+(second of two runs; the first was 1–4 ns slower across the board):
+
+```
+CLOCK_REALTIME           16.1 ns/call
+CLOCK_MONOTONIC          14.7 ns/call
+CLOCK_MONOTONIC_RAW      14.5 ns/call
+CLOCK_BOOTTIME           14.7 ns/call
+CLOCK_TAI                15.0 ns/call
+CLOCK_REALTIME_COARSE     2.3 ns/call
+```
+
+Under `strace`, the Linux run made **zero** `clock_gettime` syscalls, so every one
+of those went through the vDSO. Forcing the same call through
+`syscall(SYS_clock_gettime, ...)` cost 120–147 ns, and `CLOCK_PROCESS_CPUTIME_ID`,
+which the vDSO can't answer, cost about 140 ns. A coarse clock is cheap because
+it skips the hardware counter and returns the last tick's value.
+</Output>
+</TryIt>
+
+So the safe clock costs the same as the unsafe one, within a nanosecond or two.
+There's no performance argument for measuring durations with the wall clock, and
+there never was.
+
+One number I can't explain: on macOS, `CLOCK_MONOTONIC` is consistently about
+4 ns slower than the other three, run after run. My guess is that it's the
+sleep-inclusive clock, so libc has to add a separately maintained sleep offset
+to the raw counter, and that costs another shared-memory read. I haven't
+disassembled `libsystem_c` to check, so treat that as a guess.
+
+## Reproducing it without touching the clock
+
+An honest reproduction would step the system clock back and watch.
+Don't. On a Mac, Docker's containers all share one Linux VM, and that VM shares
+one clock; setting it inside a `--privileged` container changes it for every
+container on the machine, including anyone else's.
+
+So I injected the jump
+instead. This program uses one deadline, measured two ways, and steps its
+own view of the wall clock back one hour half a second in, the kind of
+correction a VM makes after resuming:
+
+<TryIt what="One 2-second timeout, two clocks, one injected step" lang="cpp" toolchain="clang++ 21 -O2, Apple M4, macOS 26.5.1">
+```cpp
+#include <time.h>
+#include <cstdio>
+#include <cstdint>
+#include <thread>
+#include <chrono>
+
+static int64_t read_ns(clockid_t c) {
+  timespec t; clock_gettime(c, &t);
+  return int64_t(t.tv_sec) * 1'000'000'000 + t.tv_nsec;
+}
+
+static int64_t wall_offset = 0;                     // the injected "NTP step"
+static int64_t wall() { return read_ns(CLOCK_REALTIME) + wall_offset; }
+static int64_t mono() { return read_ns(CLOCK_MONOTONIC); }
+
+int main() {
+  constexpr int64_t S = 1'000'000'000;
+  const int64_t w0 = wall(), m0 = mono();
+  const int64_t wall_deadline = w0 + 2 * S;         // "time out in 2 seconds"
+  const int64_t mono_deadline = m0 + 2 * S;
+  bool wall_fired = false, mono_fired = false;
+
+  for (int tick = 1; tick <= 50; tick++) {          // 50 x 100 ms = 5 s real time
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (tick == 5) wall_offset = -3600 * S;         // at 0.5 s, step back 1 h
+
+    if (!mono_fired && mono() >= mono_deadline) {
+      mono_fired = true;
+      std::printf("monotonic timeout fired after %.2f s\n", (mono() - m0) / 1e9);
+    }
+    if (!wall_fired && wall() >= wall_deadline) {
+      wall_fired = true;
+      std::printf("wall timeout fired after %.2f s\n", (mono() - m0) / 1e9);
+    }
+  }
+  std::printf("after %.2f s of real time:\n", (mono() - m0) / 1e9);
+  std::printf("  elapsed by wall clock  %+.2f s\n", (wall() - w0) / 1e9);
+  std::printf("  elapsed by monotonic   %+.2f s\n", (mono() - m0) / 1e9);
+  if (!wall_fired)
+    std::printf("  wall timeout still pending, %.1f s to go\n",
+                (wall_deadline - wall()) / 1e9);
+}
+```
+
+<Output>
+```
+monotonic timeout fired after 2.06 s
+after 5.14 s of real time:
+  elapsed by wall clock  -3594.86 s
+  elapsed by monotonic   +5.14 s
+  wall timeout still pending, 3596.9 s to go
+```
+
+A 2-second timeout that's now due in an hour. Flip the sign of the step and you
+get the 2012 shape: every wall-clock deadline is already in the past, and a loop
+that waits on one never waits at all. (The 60 ms overshoot is macOS
+`sleep_for` granularity, not the clock.)
+</Output>
+</TryIt>
+
+Go makes the Cloudflare version easy to reproduce, because `Round(0)` strips the
+monotonic reading off a `time.Time`. That's also what happens to any timestamp
+that's been through a string, a database column or a protobuf. Keep that in
+mind the next time you compute a duration from a stored start time. I moved the
+wall-only start forward by a second (same arithmetic as the clock repeating a
+second):
+
+<TryIt what="Cloudflare's panic, on purpose" lang="go" toolchain="go 1.23.12, Docker Desktop, linuxkit 6.10.14, aarch64">
+```go
+start := time.Now()
+fmt.Println(start)                       // note the m=+0.000... suffix
+wallOnly := start.Round(0).Add(1 * time.Second)
+
+time.Sleep(10 * time.Millisecond)
+now := time.Now()
+fmt.Println("with monotonic:   ", now.Sub(start))
+fmt.Println("wall clock only:  ", now.Sub(wallOnly))
+
+rtt := now.Sub(wallOnly)
+defer func() { fmt.Println("recovered:", recover()) }()
+fmt.Println(rand.Int63n(int64(rtt)))
+```
+
+<Output>
+```
+2026-09-25 13:13:05.282656837 +0000 UTC m=+0.000021959
+with monotonic:    10.764083ms
+wall clock only:   -989.235875ms
+recovered: invalid argument to Int63n
+```
+
+`-989 ms` for a 10 ms sleep is almost exactly the example in Russ Cox's design
+doc, where he describes a leap second producing "−990 ms instead of +10 ms".
+</Output>
+</TryIt>
+
+### And with libfaketime
+
+If you'd rather move the clock under an unmodified binary,
+[libfaketime](https://github.com/wolfcw/libfaketime) intercepts `clock_gettime`
+through `LD_PRELOAD`. Point it at a file with `FAKETIME_NO_CACHE=1`, rewrite the
+file mid-run, and the process sees a step while the real clock doesn't move. I ran
+a small C loop that prints elapsed wall and monotonic time once a second, with
+the file changed from `+0` to `-1h` after 2.5 seconds (libfaketime 0.9.10, same
+container):
+
+```
+wall     +1.00 s   monotonic     +1.00 s
+wall     +2.00 s   monotonic     +2.00 s
+wall  -3597.00 s   monotonic     +3.00 s
+wall  -3596.00 s   monotonic     +4.00 s
+```
+
+Two caveats. It can't touch most Go binaries on Linux, because Go calls the vDSO
+itself and never goes through libc. And it broke Python in a way I didn't expect:
+`faketime -f "-1h" python3 -c "import time; time.sleep(1)"` fails with
+`OSError: [Errno 22] Invalid argument`. `strace` shows why, if not how:
+
+```
+clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, {tv_sec=-1790282849, ...}) = -1 EINVAL
+```
+
+Python 3.12 sleeps until an absolute monotonic deadline, and by the time that
+deadline reached the kernel it was about minus 56.7 years. That's suspiciously
+close to minus the current Unix time. It fails the same way with
+`FAKETIME_DONT_FAKE_MONOTONIC=1`. I haven't read libfaketime's
+`clock_nanosleep` wrapper closely enough to say which conversion goes wrong.
+
+## Smearing, and the end of leap seconds
+
+Google stopped letting its clocks repeat a second back in 2008. Its public NTP
+servers now do a [24-hour linear smear](https://developers.google.com/time/smear),
+noon to noon UTC, where each second is about 11.6 µs longer than an SI second
+(roughly 11.6 ppm).
+
+By the end of the day the extra second has been absorbed and
+nobody's clock went backwards. Google used a 20-hour window before switching to
+the noon-to-noon one that other people had settled on, and Amazon uses the same
+smear in AWS.
+
+AWS's [EC2 time docs](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html)
+say that both the local Amazon Time Sync Service and `time.aws.com` smear, but the
+PTP hardware clock doesn't: it inserts the leap second by the book. So they say
+they "do not recommend using both smeared and non-smeared time sources in your
+time client configuration during a leap second event."
+
+Mix them and your NTP
+client spends a day watching its sources disagree by up to a second, and has to
+decide who's lying.
+
+And then the problem is going away, slowly. In November 2022 the General
+Conference on Weights and Measures adopted [Resolution 4](https://www.bipm.org/en/cgpm-2022/resolution-4):
+"the maximum value for the difference (UT1-UTC) will be increased in, or before,
+2035". In practice that means no more leap seconds by 2035.
+
+What replaces the
+±0.9 s limit was left for the 2026 conference to settle. There hasn't been a leap
+second since the one that broke Cloudflare.
+
+None of which retires the bug. Leap seconds were the rare, scheduled, announced
+case. Wall clocks also move when NTP first syncs on a box that booted with a
+bad RTC, when a VM resumes, when a container host wakes up from sleep, when
+someone runs `date -s` to fix a certificate error. Those don't give six months'
+notice.
+
+## Where this bites you now
+
+Where I'd look first:
+
+- **Timeouts.** `pthread_cond_timedwait` takes a realtime deadline unless you call
+  `pthread_condattr_setclock(&attr, CLOCK_MONOTONIC)`. C++'s `wait_until` with a
+  `system_clock` time point has the same problem; use `steady_clock`.
+- **Rate limiters.** A token bucket refills by `rate × (now − last)`. Step the wall
+  clock back an hour and that's an hour of negative tokens, so the limiter blocks
+  everything. Step it forward and it hands out a full burst at once.
+- **Leases and locks.** A leader that checks "is my lease still valid?" against the
+  wall clock can keep acting after the lease expired everywhere else. Martin
+  Kleppmann's [critique of Redlock](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)
+  walks through exactly this failure with a clock jump on one Redis node. Across
+  machines, no clock saves you: you want fencing tokens, and
+  [chapter 13](/topics/13-locks) picks up from there.
+- **Latency metrics.** A negative duration in a histogram is either dropped,
+  clamped to zero, or cast to an unsigned and recorded as 584 years. Which one does
+  yours do?
+
+## Monday
+
+- `grep` for `time.time()`, `System.currentTimeMillis()`, `Date.now()`,
+  `gettimeofday` and `system_clock` anywhere a duration or deadline is computed.
+  Replace with `time.monotonic()`, `System.nanoTime()`, `performance.now()`,
+  `CLOCK_MONOTONIC` or `steady_clock`.
+- In Go, compute durations from `time.Time` values that came from `time.Now()` in
+  the same process. Anything deserialised has lost its monotonic reading.
+- Anything that has to survive suspend (laptops, phones, a VM that gets paused)
+  wants `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`.
+- Clamp negative durations where they enter your code, and count how often you
+  clamp. That counter is a clock-step alarm you get for free.
+- Check whether your fleet mixes smeared and unsmeared NTP sources. Check whether
+  `CLOCK_TAI` is actually TAI on your boxes before anything relies on it.
+- Wall time is for timestamps humans read and for comparing with other machines.
+  It isn't for measuring anything.

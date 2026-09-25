@@ -1,0 +1,477 @@
+---
+title: "The dashboard said 60%. The OOM killer disagreed."
+dek: "Your container has at least five different memory numbers, they disagree by hundreds of megabytes, and the kernel, the kubelet and your Grafana panel each trust a different one."
+date: "2026-09-23"
+readingTime: "~16 min"
+kicker: "Field guide"
+tags: ["linux", "memory", "cgroups", "kubernetes"]
+related: ["04-virtual-memory", "05-allocators", "08-filesystems", "11-containers"]
+---
+
+In November 2022 someone put a 500 MiB limit on a single-container deployment,
+and it started getting OOMKilled. Prometheus and K9s both said the container
+sat around 300 MiB and never got near the limit. So they SSH'd into the node,
+found the pod's cgroup, and read the kernel's own counter:
+`memory.usage_in_bytes` said 501,346,304, and `max_usage_in_bytes` said
+524,292,096. Its limit was 524,288,000. That's
+[kubernetes/kubernetes#114142](https://github.com/kubernetes/kubernetes/issues/114142),
+and it was closed two and a half years later with a suggestion to ask AWS
+support.
+
+A dashboard at 60% and a kernel at 100% aren't a contradiction. They're two
+different questions, and most of us have only ever asked one of them. I spent a
+couple of days reproducing each way the numbers split apart, on Docker Desktop's
+Linux VM (**linuxkit 6.10.14, aarch64**), with `docker run --memory=256m` for
+the early runs and a child cgroup with `memory.max` set by hand for the later
+ones. One of the reproductions I still can't fully explain. It's near the end.
+
+## First theory: it's a leak, and the scrape missed the spike
+
+This is what everyone reaches for, and sometimes it's right. Prometheus
+scrapes every 15 or 30 seconds; an allocation burst that lasts two seconds
+won't show up in any graph, and the kernel kills in microseconds. If your
+process holds a big transient buffer while parsing a request, you can die
+between two points on a graph that looks flat.
+
+But look at what #114142 actually shows. That cgroup counter wasn't spiking. It
+sat at the limit, steadily, while the dashboard sat at 300. A spike doesn't
+explain a gap that stays open for hours, so whatever the dashboard is measuring,
+it's missing something that's there all the time.
+
+## Second theory: RSS is the truth, and the dashboard is wrong
+
+Next, people `kubectl exec` in and run `ps` or `top`, and both report RSS. If RSS
+agrees with the dashboard, people conclude the kernel is confused. It isn't.
+**RSS is the wrong ruler for a cgroup**, and it's wrong in both directions.
+
+It over-counts shared memory. I mapped the same 200 MB tmpfs file into two
+processes and read `/proc/PID/smaps_rollup` for each:
+
+```text
+pid 12: Rss: 205612 kB  Pss: 102600 kB  Pss_Shmem: 102400 kB
+pid 14: Rss: 205608 kB  Pss: 102640 kB  Pss_Shmem: 102400 kB
+cgroup memory.current = 239M   (shmem=200M)
+```
+
+Sum the RSS column and you get 401 MB for 200 MB of actual pages.
+<em className="term">PSS</em> (proportional set size) splits each shared page among
+the processes that map it, so the two PSS values sum to about 200 MB. That's
+right. Postgres is where you meet this: every backend maps `shared_buffers`, and
+a per-process RSS view of a Postgres pod can add up to several times the machine.
+
+It also under-counts, badly. RSS only sees pages mapped into a process's page
+tables. Page cache from `read()`, files in a tmpfs nobody has mapped, and kernel
+memory are all invisible to it. Your cgroup sees all of them, and the next few
+sections are each one of those.
+
+## What the cgroup is actually adding up
+
+Linux's [cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+lists what `memory.current` charges, and it's broader than most people assume:
+
+- **Anonymous memory.** Heap, stacks, anything `malloc` touched. This is the
+  part RSS roughly agrees with.
+- **Page cache.** Every file page your cgroup read or wrote, clean or dirty.
+- **Shmem.** tmpfs, `/dev/shm`, memory-backed `emptyDir` volumes, and
+  `MAP_SHARED|MAP_ANONYMOUS` regions. It's reported inside `file`, but it
+  can't be dropped like file pages can.
+- **Kernel memory.** Dentries, inodes, other slab objects, page tables, kernel
+  stacks and TCP socket buffers.
+
+One rule in that document explains a lot of weirdness on shared nodes: "A memory
+area is charged to the cgroup which instantiated it and stays charged to the
+cgroup until the area is released." First touch wins. If your sidecar reads a
+2 GB log file first, it owns those cache pages, and your main container gets them
+for free.
+
+## Page cache: charged, and usually harmless
+
+My first reproduction is the one that's supposed to be scary. I wrote a 1 GB
+file outside the limit, dropped caches, and `cat`'d it to `/dev/null` from a
+container limited to 256 MB. `working_set` here is the Kubernetes definition,
+`memory.current - inactive_file` (more on that in a minute).
+
+```text
+start                  current=   2M working_set=   1M | file=2M   inactive_file=1M
+1 GB file, read once   current= 255M working_set=   4M | file=253M inactive_file=251M
+1 GB file, read again  current= 255M working_set=   5M | file=251M inactive_file=250M
+memory.events: low 0 high 0 max 7196 oom 0 oom_kill 0
+```
+
+Nothing died. `memory.current` hit the limit 7,196 times and every time the
+kernel evicted clean cache pages and carried on. This is the healthy case, and
+it's why "usage at 100%" by itself tells you almost nothing about a
+file-reading workload. Chapter 08 has [the page cache itself](/topics/08-filesystems),
+and why it's worth 87× on reads; here it's just a tenant that pays rent on
+demand.
+
+That's the metric that lies high. Working set lies in a direction I didn't
+expect.
+
+## container_memory_working_set_bytes, and the LRU underneath it
+
+Kubelet doesn't evict on `memory.current`, because that would evict every pod
+that ever read a file. It uses the **working set**, and cAdvisor computes it like
+this ([`container/libcontainer/handler.go` at v0.49.1](https://github.com/google/cadvisor/blob/v0.49.1/container/libcontainer/handler.go#L832-L845)):
+
+```go
+inactiveFileKeyName := "total_inactive_file"
+if cgroups.IsCgroup2UnifiedMode() {
+	inactiveFileKeyName = "inactive_file"
+}
+
+workingSet := ret.Memory.Usage
+if v, ok := s.MemoryStats.Stats[inactiveFileKeyName]; ok {
+	if workingSet < v {
+		workingSet = 0
+	} else {
+		workingSet -= v
+	}
+}
+ret.Memory.WorkingSet = workingSet
+```
+
+Usage minus inactive file pages. Everything else counts, including
+`active_file`: page cache the kernel has seen used more than once and
+will reclaim second. The [node-pressure eviction docs](https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/)
+say kubelet excludes `inactive_file` "as it assumes that memory is reclaimable
+under pressure." The implication is that active page cache is treated as if it
+weren't. [kubernetes/kubernetes#43916](https://github.com/kubernetes/kubernetes/issues/43916),
+"kubelet counts active page cache against memory.available (maybe it
+shouldn't?)", was opened in March 2017 and is still open.
+
+So I read a 150 MB file three times. That should promote it to the active list
+and inflate the working set, probably. It didn't:
+
+```text
+lru_gen=0x0001
+read() x3              current= 153M working_set=   1M | inactive_file=151M active_file=0M
+mmap touch x3          current= 153M working_set= 152M | inactive_file=1M   active_file=150M
+lru_gen=0x0000
+read() x3              current= 153M working_set= 152M | inactive_file=0M   active_file=151M
+mmap touch x3          current= 153M working_set=   2M | inactive_file=150M active_file=1M
+```
+
+This kernel runs with <strong>MGLRU</strong> on (`/sys/kernel/mm/lru_gen/enabled`
+is `0x0001`). Under MGLRU, repeated `read()` calls left the file "inactive" and
+the working set at 1 MB, while touching the same file through `mmap` made all
+of it "active". Then I switched MGLRU off and ran it again, and the two access
+patterns swapped. Same file, same kernel, same 153 MB in `memory.current`, and a
+working set of either 1 MB or 152 MB depending on the LRU implementation and on
+whether your process uses `read()` or `mmap`. 152 of 256 is 59%.
+
+I don't have a full account of why each implementation classifies these the way
+it does; roughly, the classic LRU promotes on a second `read()` and only notices
+mapped accesses during a reclaim scan, and MGLRU does close to the opposite. What
+matters on Monday is that <strong>working set is a heuristic about an LRU, and
+the LRU changed</strong>. If your nodes moved to a kernel with MGLRU on by
+default (a build option, `CONFIG_LRU_GEN_ENABLED`), your eviction behaviour for
+mmap-heavy workloads like Prometheus's own TSDB or anything using LMDB may have
+moved with it.
+
+## Dirty pages: the case where cache does kill you
+
+Here's the reproduction that surprised me most. Before the read test, I created
+the 1 GB file from *inside* the 256 MB container with `dd if=/dev/zero of=/big
+bs=1M count=1024`. It died with exit 137. Here's the kernel's report
+from `dmesg`, trimmed:
+
+```text
+dd invoked oom-killer: gfp_mask=0x101cca(GFP_HIGHUSER_MOVABLE|__GFP_WRITE), order=0
+  ...
+  ext4_da_write_begin+0xac/0x298
+memory: usage 262144kB, limit 262144kB, failcnt 2357
+Memory cgroup stats for /docker/1d9d1984b96e...:
+anon 1638400
+file 257724416
+file_dirty 257642496
+file_writeback 0
+[  pid  ]   uid  tgid total_vm      rss rss_anon rss_file ... name
+[ 118400]     0 118400      975      586       32      554 ... bash
+[ 118417]     0 118417      843      525      256      269 ... dd
+Memory cgroup out of memory: Killed process 118400 (bash) total-vm:3900kB, anon-rss:128kB ...
+```
+
+Read it slowly. Anonymous memory is 1.6 MB. File pages are 257.7 MB and 257.6 MB
+of those are dirty, with **zero** under writeback. Clean page cache can be
+dropped instantly; dirty pages have to reach disk first, and nothing had started
+writing them. The OOM killer then picked the process with the largest footprint,
+which was `bash` at 586 pages, not `dd` at 525. `bash` was PID 1, so the whole
+container went. It reproduced on overlayfs and on a plain named volume.
+
+This isn't new. [Kernel bugzilla 207273](https://bugzilla.kernel.org/show_bug.cgi?id=207273),
+filed in April 2020, is titled "cgroup with 1.5GB limit and 100MB rss usage
+OOM-kills processes due to page cache usage after upgrading to kernel 5.4." The
+reporter's database containers were dying while restoring backups with
+`xtrabackup`, and "all the memory is consumed by file_dirty." Michal Hocko's
+reply suggested cgroup v2, since it "has much better memcg aware dirty throttling
+implementation so such a large amount of dirty pages doesn't accumulate in the
+first place."
+
+<Callout label="The one I can't explain" kind="warn">
+This box *is* cgroup v2, on 6.10, with the io controller enabled in the parent's
+`subtree_control`, and 257 MB of dirty pages accumulated anyway, with none of
+them in writeback when the killer ran. Global `vm.dirty_ratio` is 20% of an
+8 GB VM, so the global limit alone would allow 1.6 GB of dirt. My guess is that
+the memcg-aware throttling in `balance_dirty_pages` never engaged for this
+writer, but I haven't proven it. What would settle it is tracing
+`balance_dirty_pages` and the writeback tracepoints during the `dd`, and
+repeating with `vm.dirty_bytes` set to something small.
+</Callout>
+
+If you run database restores, log shippers or anything that streams large files
+to disk inside a tight limit, this is your OOM. RSS is flat, and so is
+`anon`.
+
+## /dev/shm: memory that outlives its owner
+
+tmpfs pages are charged like page cache and can't be dropped, because there's no
+file behind them to reload from. Without swap they're as permanent as heap. I
+wrote to `/dev/shm` (with `--shm-size=1g`, so tmpfs itself wouldn't fill) in
+1 MB chunks, printing my own RSS alongside the cgroup's shmem counter:
+
+```text
+wrote   64 MB  my RSS  1928 kB  cgroup shmem   64 MB
+wrote  128 MB  my RSS  2056 kB  cgroup shmem  128 MB
+wrote  192 MB  my RSS  2056 kB  cgroup shmem  192 MB
+Killed
+-rw------- 1 root root 264892416 Sep 25 13:12 /dev/shm/blob
+after the kill   current= 255M working_set= 255M | anon=0M file=253M shmem=252M inactive_file=0M
+memory.events:   max 168 oom 1 oom_kill 1
+dmesg: Memory cgroup out of memory: Killed process 141129 (shmw) anon-rss:1024kB, file-rss:1032kB
+```
+
+That process had 2 MB of RSS. After it died, the cgroup was still at
+255 MB, because the file was still there, and killing processes can't delete a
+file. Anything else that allocated in that container would've been the next
+victim. Notice also that `working_set` equals `current`: shmem lives on the
+anon LRU, so `inactive_file` doesn't subtract any of it.
+
+In my first attempt at this I'd set the shell's `oom_score_adj` to -1000 and
+forgot that children inherit it. With nothing killable, the kernel logged nine
+OOM events and zero kills, and `write()` simply came back short. That's a
+different failure mode worth knowing about: an unkillable cgroup at its limit
+turns allocations into errors.
+
+Where you meet this for real:
+
+- **Postgres parallel query** allocates dynamic shared memory in `/dev/shm`.
+  Docker's default 64 MB `/dev/shm` produces "could not resize shared memory
+  segment ... No space left on device"
+  ([docker-library/postgres#416](https://github.com/docker-library/postgres/issues/416)).
+  The usual fix on Kubernetes is an `emptyDir` with `medium: Memory`, and the
+  [volumes docs](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir)
+  are blunt about it: "files you write count against the memory limit of the
+  container that wrote them."
+- **Anything that uses tmpfs as scratch space** (test fixtures, ML
+  dataloaders passing tensors through shared memory, a build cache). If the
+  process crashes without cleaning up, the memory stays charged to the pod.
+
+## Kernel memory nobody's process owns
+
+Last category: the kernel's own objects. I ran a program that called
+`stat()` on a million paths that don't exist, inside a child cgroup:
+
+```text
+before              current=  0M | slab_reclaimable=0M
+1M failed stat()s   current= 18M | slab_reclaimable=17M
+kernel 18812928   slab 18773376
+```
+
+Each failed lookup leaves a **negative dentry**, the kernel's cached "no such
+file" answer. After the program exited there were no processes in the cgroup at
+all, and it still held 18 MB. It's reclaimable, but `working_set` counts it
+anyway since it isn't `inactive_file`. Anything that probes for files along a
+search path, like an interpreter resolving imports, can grow this steadily.
+TCP socket buffers are charged the same way and show up as `sock` in
+`memory.stat`, so a proxy holding lots of slow connections carries some too.
+
+## memory.high, memory.max, and three different killers
+
+Everything so far has been about `memory.max`, the hard limit. Reach it, fail to
+reclaim, and the cgroup OOM killer runs:
+
+```text
+ 208 MB touched  t=0.05s
+ 224 MB touched  t=0.07s
+ 240 MB touched  t=0.07s
+exit 137
+memory.events: max 40 oom 1 oom_kill 1
+dmesg: oom-kill:constraint=CONSTRAINT_MEMCG ... task=anon
+```
+
+`constraint=CONSTRAINT_MEMCG` is how you tell this apart from the global OOM
+killer: that one shows `CONSTRAINT_NONE` and runs when the whole machine is out of
+memory. They don't choose from the same pool. A cgroup killer only looks
+inside the cgroup that hit its limit, and a global one looks at every process on
+the node, and a pod well under its own limit can still die when a neighbour
+without one exhausts the node.
+
+`memory.high` is the other knob. Kernel docs say going over it means
+processes "are throttled and put under heavy reclaim pressure," and that it
+"never invokes the OOM killer." I set `memory.high=64M` and `memory.max=128M`
+and allocated 96 MB of anonymous memory, with no swap:
+
+```text
+  48 MB touched  t=0.00s
+  64 MB touched  t=0.00s
+  80 MB touched  t=27.30s
+exit 124            (killed by my 60 s timeout, not by the kernel)
+memory.events:   high 537 max 0 oom 0 oom_kill 0
+memory.pressure: some avg10=91.76 avg60=53.88 ...  full avg10=91.76 avg60=53.88 ...
+```
+
+Those first 64 MB took no measurable time. Another 16 MB took 27.3 seconds, and
+28.1 seconds on a repeat; a third run didn't get past 64 MB within 40 seconds
+(these are on a shared 4-CPU container, so treat the spread as noise). Anonymous
+memory can't be reclaimed without swap, so all the throttling can do is make the
+process wait. It's probably the right tool when there's something to reclaim, and a
+very slow hang when there isn't. Kubernetes' Memory QoS feature, alpha since 1.22
+and [reworked in 1.27](https://kubernetes.io/blog/2023/05/05/qos-memory-resources/),
+sets `memory.high` from your limits, so this isn't hypothetical if you've turned
+it on.
+
+Look at that pressure line. <em className="term">PSI</em> (pressure stall
+information, [documented here](https://docs.kernel.org/accounting/psi.html))
+reports the share of time tasks were stalled on memory. `some` means at least
+one task was waiting; `full` means all of them were. 91.76% over ten seconds is
+a process doing almost nothing but waiting for memory. My page cache test, by
+contrast, read 1 GB through a full cgroup and PSI stayed at 0.00. That's the
+difference between a cgroup that's full and a cgroup that's in trouble, and
+it's the number [`systemd-oomd`](https://www.freedesktop.org/software/systemd/man/latest/systemd-oomd.service.html) and Meta's `oomd` act on.
+
+Then there's a third killer, and it isn't the kernel at all. Kubelet evicts
+pods when node-level `memory.available`, computed from the working set, crosses
+its threshold. It works in userspace, and it's why a pod can be evicted with
+the reason "The node was low on resource: memory" while the kernel never logged
+an OOM. And since Kubernetes 1.28 set `memory.oom.group` on cgroup v2, a kernel
+OOM kills *every* process in the container, not just the biggest.
+[Preferred Networks wrote up](https://preferred.jp/en/blog/tech/kubernetes-single-process-oom-kill/)
+how that broke their ML platform and how they got `singleProcessOOMKill` into
+kubelet in 1.32 to opt back out.
+
+## Allocators hold on to what you freed
+
+Everything above is the kernel counting correctly. This part is user space
+keeping memory the program thinks it gave back ([chapter 05](/topics/05-allocators)
+covers it in general). Two runtimes deserve a specific look.
+
+**glibc** gives each thread its own arena under contention, up to a limit it
+computes from the CPU count ([`malloc/arena.c`, glibc 2.39](https://github.com/bminor/glibc/blob/glibc-2.39/malloc/arena.c#L828-L842)):
+
+```c
+if (mp_.arena_max != 0)
+  narenas_limit = mp_.arena_max;
+else if (narenas > mp_.arena_test)
+  {
+    int n = __get_nprocs ();
+
+    if (n >= 1)
+      narenas_limit = NARENAS_FROM_NCORES (n);
+```
+
+`NARENAS_FROM_NCORES(n)` is `n * 8` on 64-bit. `__get_nprocs()` counts CPUs the
+kernel reports as online, and a CFS quota doesn't change that. My shared lab
+container I used has a `cpu.max` of `400000 100000` (4 CPUs), and `nproc` still
+says 10. glibc will let a 4-CPU pod grow 80 arenas.
+
+Each arena returns memory to the kernel only from its top. So I wrote a program
+where eight threads take turns: each allocates 32 MB in 4 KB chunks, frees all
+of them except the last one, and hands over. At the end, 32 KB is allocated:
+
+```text
+default:            still allocated: 32 KB   RSS  258 MB
+MALLOC_ARENA_MAX=2: still allocated: 32 KB   RSS   66 MB
+MALLOC_ARENA_MAX=1: still allocated: 32 KB   RSS   33 MB
+default:            still allocated: 32 KB   RSS  258 MB   after malloc_trim(0): 2 MB
+```
+
+Identical three times (glibc 2.39, same shared container). One pinned 4 KB chunk
+per arena holds its 32 MB hostage, eight times over. Heroku saw this across Ruby
+apps and, [as of September 24th, 2019](https://devcenter.heroku.com/articles/tuning-glibc-memory-behavior),
+sets `MALLOC_ARENA_MAX=2` by default on new apps. Nate Berkopec's
+[write-up](https://www.speedshop.co/2017/12/04/malloc-doubles-ruby-memory.html)
+quotes Heroku's test at 1.73× memory with default arenas against 0.87× with the
+limit, and he ends up recommending jemalloc outright for Puma and Sidekiq.
+
+**Go** has a different problem: by default the heap is allowed to grow to twice
+the live set before the collector runs (`GOGC=100`), and the runtime has no idea
+there's a cgroup limit. [Go 1.19](https://go.dev/doc/gc-guide) added
+`GOMEMLIMIT`, a soft limit that makes the GC work harder as the runtime's total
+memory approaches it. On the Mac (Apple M4, Go 1.25.4, since this is runtime
+behaviour, not kernel), a program holding 64 MB live and churning 2 GB of
+garbage:
+
+```text
+default:          peak held  151 MB  GCs   65
+GOMEMLIMIT=90MiB: peak held   88 MB  GCs  262
+```
+
+Three runs each; the default ranged 151–159 MB and the limited one 88–90 MB.
+Put that program in a 128 MB container and the default run dies while the
+limited one doesn't. The GC guide says to leave "an additional 5-10% of headroom
+to account for memory sources the Go runtime is unaware of," and it caps GC CPU
+at roughly 50%, so a limit set too low slows you down about 2× instead of
+spinning forever.
+
+**The JVM** went through this in public. Before container support, it sized
+its default max heap as a quarter of the *host's* RAM, so a 1 GB container on a
+64 GB node got a 16 GB heap ceiling and a kernel OOM long before any
+`OutOfMemoryError`. Here's how it got fixed:
+
+1. **JDK 9, backported to 8u131:** experimental `-XX:+UseCGroupMemoryLimitForHeap`
+   ([JDK-8170888](https://bugs.openjdk.org/browse/JDK-8170888)), off by default.
+2. **JDK 10, backported to 8u191:** `-XX:+UseContainerSupport`, on by default
+   ([JDK-8146115](https://bugs.openjdk.org/browse/JDK-8146115)), plus
+   `MaxRAMPercentage` ([JDK-8186248](https://bugs.openjdk.org/browse/JDK-8186248)).
+   The experimental flag was deprecated, then removed.
+3. **JDK 15, backported to 11.0.16 and 8u372:** cgroup v2 support
+   ([JDK-8230305](https://bugs.openjdk.org/browse/JDK-8230305)). An older JDK on
+   a cgroup v2 node can quietly go back to sizing itself from host memory.
+
+`MaxRAMPercentage` still defaults to 25.0
+([`gc_globals.hpp` at jdk-21-ga](https://github.com/openjdk/jdk/blob/jdk-21-ga/src/hotspot/share/gc/shared/gc_globals.hpp#L327)),
+so a JVM in a 2 GB pod gets a 512 MB heap unless you tell it otherwise.
+And the heap isn't the whole process: metaspace, thread stacks, the code cache,
+direct buffers and glibc arenas all sit outside it.
+
+## So what does "memory usage" mean?
+
+<Callout label="Four numbers, four owners">
+**RSS** is what one process has mapped. **PSS** is RSS with shared pages split
+fairly. **memory.current** is everything the cgroup has been charged for, and
+it's what the kernel compares to `memory.max`. **Working set** is
+`memory.current - inactive_file`, a guess at what can't be reclaimed, and it's
+what kubelet evicts on and what most Grafana panels plot. None of them is
+wrong. They answer different questions, and an OOM kill is always about
+`memory.current` and the part of it that couldn't be reclaimed: anon, shmem,
+dirty pages, and allocator retention that looks like anon.
+</Callout>
+
+So the dashboard at 60% is usually plotting working set or RSS while
+`memory.current` runs at the limit, filled with things no process claims.
+Whether that ends in an OOM depends entirely on how much of it is clean page
+cache. [Chapter 04](/topics/04-virtual-memory) has the lower layer: why touching
+memory, not allocating it, is what makes these numbers move.
+
+## What to do on Monday
+
+- **Graph `memory.current` next to working set,** per container, and alert on
+  the gap. On Kubernetes that's `container_memory_usage_bytes` against
+  `container_memory_working_set_bytes`.
+- **Alert on `memory.pressure`,** not usage. A `full avg10` above a few percent
+  means real stalls; 100% usage with zero pressure is a healthy cache.
+- **Watch `oom_kill` in `memory.events`** and `constraint=` in `dmesg`, so you
+  know which killer fired. If there's no kernel OOM, check kubelet's events for
+  an eviction.
+- **Break down `memory.stat`** when something dies: `anon`, `shmem`,
+  `file_dirty`, `slab`, `sock`. Whichever one is big is your story.
+- **Set `MALLOC_ARENA_MAX=2`** for threaded glibc services, or switch to
+  jemalloc. Set `GOMEMLIMIT` to about 90% of the container limit for Go.
+  Set `-XX:MaxRAMPercentage` explicitly, and check the JDK is at least
+  11.0.16 or 8u372 on cgroup v2 nodes.
+- **Size memory-backed `emptyDir` and `/dev/shm`** as part of the memory limit,
+  and clean them up in your crash path.
+- **For large writes in small limits,** pace them: `fdatasync` periodically,
+  or use `O_DIRECT` if the software supports it. Don't count on the kernel to
+  throttle dirty pages for you, given the reproduction above.

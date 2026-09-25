@@ -1,0 +1,998 @@
+---
+title: Virtualization, Hypervisors & microVMs
+dek: "A guest runs at full speed until it touches something it doesn't own. Then it stops, the hypervisor answers, and the guest resumes, about 700 nanoseconds later on an M4. Everything in this chapter is about how often that happens."
+readingTime: "~26 min"
+versions: "Measured on Apple M4 · macOS 26.5.1 · Hypervisor.framework · Docker Desktop's linuxkit 6.10.14 guest · Linux KVM source at v6.12"
+prereqs: "Chapters 04 and 07"
+updated: "2026-09-25"
+---
+
+The first thing I did for this chapter was look for `/dev/kvm` inside Docker
+on this Mac, because I wanted to run the classic KVM example program and time
+its exits.
+
+```shell
+$ ls -l /dev/kvm
+ls: cannot access '/dev/kvm': No such file or directory
+```
+
+Obvious in hindsight: Docker Desktop's Linux is already a guest, under Apple's
+Virtualization.framework, and it doesn't pass virtualization down. So I went a
+level lower and wrote the smallest VM I could against Hypervisor.framework:
+one vCPU, 16 KB of guest RAM, a guest two or three instructions long.
+
+Two numbers came out of it. A billion-iteration loop took **246 ms** inside the
+guest and **245 ms** on the host. And one trip out of the guest and back,
+triggered by a single `hvc` instruction, cost **~670 ns**. Hold both of those
+in your head; the rest of this chapter is the machinery between them.
+
+<SectionHeading n="01" cmd="systemd-detect-virt" id="contract">What a virtual machine promises</SectionHeading>
+
+In 1974 Gerald Popek and Robert Goldberg wrote down what a virtual machine
+monitor has to provide, in
+[a CACM paper](https://dl.acm.org/doi/10.1145/361011.361073) that still
+reads well. Three properties:
+
+- **Equivalence.** A program in the VM behaves as it would on the real
+  machine, apart from timing and resource availability.
+- **Resource control.** The monitor stays in charge of all the hardware, and
+  a guest can't grab memory or devices it wasn't given.
+- **Efficiency.** Most instructions run directly on the CPU, with no
+  monitor involvement.
+
+Their theorem is the part people cite. A machine can be virtualized by plain
+<em className="term">trap-and-emulate</em> if every *sensitive* instruction
+(one that reads or changes machine state the monitor owns) is also
+*privileged*, meaning it traps when run outside the most privileged mode. Run
+the guest kernel deprivileged, let every sensitive instruction trap, emulate
+it, resume. My loop above is the efficiency property in action: 246 ms
+against 245 ms, because nothing in that loop is sensitive.
+
+<Sub n="1.1" title="Where the boundary sits, compared with a container">
+
+Containers and VMs both claim to isolate a workload, and they draw the line in
+very different places. [Chapter 11](/topics/11-containers) has the container
+side: a process with namespaces and cgroups, talking to the *same* kernel as
+its neighbours.
+
+<Compare
+  cols={["", "Container", "Virtual machine"]}
+  rows={[
+    ["What the workload talks to", "The host kernel's full syscall interface", "Virtual hardware: a vCPU, guest-physical memory, a few devices"],
+    ["Kernel", "Shared with every other container", "Its own, one per VM"],
+    ["A kernel bug in the syscall path", "Reachable from every container on the host", "Reachable only inside that guest"],
+    ["What the attacker must break to escape", "One kernel", "The hypervisor's exit handling or a device emulator"],
+    ["Startup", "Milliseconds (a fork and some setup)", "Firecracker: under 125 ms to guest init (NSDI 2020)"],
+    ["Memory overhead", "Near zero", "Firecracker: about 3 MB per microVM (NSDI 2020)"],
+  ]}
+/>
+
+That fourth row is the whole argument for VMs in multi-tenant systems. A
+container's attack surface is the Linux syscall table plus everything behind
+it: filesystems, networking, the page cache. A VM's attack surface is the set
+of things that cause an *exit* and whatever code handles them.
+
+</Sub>
+
+<Callout label="The boundary is a list of exits">
+"How isolated is this VM?" really means "what can the guest make the
+hypervisor do?" Every answer is an exit: a trapping instruction, a fault in
+the second-level page table, a device register write. A short, well-tested
+list is a strong boundary. A large C device model from 2004 is how VENOM
+happened (section 4).
+</Callout>
+
+What a VM doesn't promise is timing. Popek and Goldberg exempted it
+explicitly, and it's probably the part tenants notice first: stolen CPU,
+jittery I/O.
+
+
+<SectionHeading n="02" cmd="grep -o -E 'vmx|svm' /proc/cpuinfo | sort -u" id="layout">Getting x86 and ARM to trap</SectionHeading>
+
+<Sub n="2.1" title="Seventeen instructions that did not trap">
+
+x86 failed the Popek and Goldberg test. In 2000, John Robin and Cynthia Irvine
+went through the Pentium instruction set and
+[found seventeen](https://www.usenix.org/legacy/events/sec00/full_papers/robin/robin_html/)
+sensitive instructions that run in user mode without trapping. Everyone's
+favourite is `popf`. In kernel mode it can change the interrupt flag. Run the same guest
+kernel at ring 3 and `popf` silently ignores the IF bit, so the monitor never
+learns the guest tried to disable interrupts. In the words of VMware's Keith
+Adams and Ole Agesen
+([ASPLOS 2006](https://pdos.csail.mit.edu/6.828/2018/readings/adams06vmware.pdf)):
+"a deprivileged popf, like any user-mode popf, simply suppresses attempts to
+modify IF; no trap happens."
+
+Three workarounds followed, roughly in order:
+
+1. **Binary translation** (VMware, 1999). Rewrite guest kernel code just
+   before it runs, swapping the problem instructions for calls into the
+   monitor, and cache the result. User code ran unmodified.
+2. **Paravirtualization** (Xen,
+   [SOSP 2003](https://dl.acm.org/doi/10.1145/945445.945462)). Modify the
+   guest kernel so it calls the hypervisor directly (a *hypercall*) instead of
+   executing sensitive instructions. Fast, but you need the guest source, so
+   no unmodified Windows.
+3. **Hardware assist.** Intel VT-x (2005) and AMD-V (2006) add a new mode so
+   the guest kernel can run at ring 0 and the CPU itself decides what exits.
+
+Here's the surprise in the Adams and Agesen paper: first-generation VT-x lost
+to binary translation on real workloads. Their table has a VM entry at 2,409
+cycles on a 3.8 GHz Pentium 4. Worse, VT-x did nothing for the MMU, so every
+guest page table write still had to be tracked in software, now with an
+expensive exit attached. Hardware only won once the MMU got help too (2.4).
+
+</Sub>
+
+<Sub n="2.2" title="VMX root, non-root, and the VMCS">
+
+VT-x doesn't add a ring. It adds a second copy of all of them. A hypervisor
+runs in **VMX root mode**, a guest in **VMX non-root mode**, and each has its
+own rings 0 to 3. So a guest kernel sits in non-root ring 0 and believes it
+owns the machine.
+
+Switching between them is governed by an in-memory structure per vCPU, the
+<em className="term">VMCS</em> (virtual machine control structure). You don't
+read it with loads; you use `VMREAD` and `VMWRITE`. It has four parts:
+
+- **Guest state.** Registers saved on exit, loaded on entry: RIP, CR3, segments.
+- **Host state.** Where the CPU lands in root mode on an exit.
+- **Execution controls.** What exits: `HLT`? `CPUID` (always)? Which ports,
+  which MSRs?
+- **Exit information.** Why the last exit happened, and a qualification
+  (which port, which address).
+
+
+`VMLAUNCH` and `VMRESUME` enter the guest. An exit is the CPU saving guest
+state into the VMCS and jumping to the host RIP. KVM's exit dispatch is a plain
+array indexed by the exit reason:
+
+<SourceRead
+  file="arch/x86/kvm/vmx/vmx.c"
+  repo="torvalds/linux"
+  tag="v6.12"
+  href="https://github.com/torvalds/linux/blob/v6.12/arch/x86/kvm/vmx/vmx.c#L6110"
+>
+```c
+static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+	[EXIT_REASON_EXCEPTION_NMI]           = handle_exception_nmi,
+	[EXIT_REASON_EXTERNAL_INTERRUPT]      = handle_external_interrupt,
+	[EXIT_REASON_IO_INSTRUCTION]          = handle_io,      /* in/out */
+	[EXIT_REASON_CR_ACCESS]               = handle_cr,
+	[EXIT_REASON_CPUID]                   = kvm_emulate_cpuid,
+	[EXIT_REASON_MSR_READ]                = kvm_emulate_rdmsr,
+	[EXIT_REASON_MSR_WRITE]               = kvm_emulate_wrmsr,
+	[EXIT_REASON_HLT]                     = kvm_emulate_halt,
+	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
+	[EXIT_REASON_EPT_VIOLATION]	      = handle_ept_violation,
+	[EXIT_REASON_EPT_MISCONFIG]           = handle_ept_misconfig, /* MMIO */
+	[EXIT_REASON_PAUSE_INSTRUCTION]       = handle_pause,   /* spinning guest */
+	/* ... 52 entries in all at v6.12 ... */
+};
+```
+</SourceRead>
+
+Excerpted, comments mine. It's the attack surface from section 1, written as a
+table. `EPT_MISCONFIG` is how KVM spots guest MMIO cheaply: MMIO pages get a
+deliberately invalid EPT entry, so an access exits with a reason KVM can
+recognise without walking anything.
+
+</Sub>
+
+<Sub n="2.3" title="ARM: a separate exception level, and VHE">
+
+ARMv8 was designed with this in mind. There's a dedicated exception level for
+the hypervisor, **EL2**, below the kernel's EL1 and user EL0. A trap from the
+guest lands at EL2 with a syndrome register (`ESR_EL2`) saying what happened.
+My Mac test reads exactly that field: exception class `0x16` for `hvc`, `0x24`
+for a data abort from a lower level.
+
+KVM itself was the awkward part. Linux is a normal kernel that runs at EL1, so
+original KVM/arm64 had to bounce between a small EL2 stub and the kernel for
+every exit. ARMv8.1 added the **Virtualization Host Extensions (VHE)**: set
+`HCR_EL2.E2H` and the host kernel runs directly at EL2, with EL1 register
+accesses redirected to their EL2 twins. Linux gained
+[VHE support](https://lwn.net/Articles/650524/) in 2016, and KVM on ARM
+became what it is on x86: pretty much a kernel module.
+
+</Sub>
+
+<Sub n="2.4" title="Two page tables at once">
+
+[Chapter 04](/topics/04-virtual-memory) walked one 4-level page table. A guest
+has its own page tables, mapping guest-virtual to *guest-physical* addresses.
+Guest-physical isn't real either. A second table owned by the hypervisor maps
+it to host-physical: **EPT** on Intel, **NPT** on AMD, **stage-2** on ARM.
+
+Before this existed (Intel added EPT with Nehalem in 2008), hypervisors kept
+*shadow page tables*: a merged guest-virtual to host-physical table, rebuilt
+by trapping every guest page table write. That's the software MMU tracking
+that made early VT-x slow.
+
+With nested paging the hardware walks both. Here's the catch: every pointer in
+the guest's table is a guest-physical address, so each one needs its own trip
+through the host's table before it can be dereferenced.
+
+<Estimate
+  rows={[
+    { label: "Guest CR3 → gPA of level-4 table", math: "walk host table: 4 reads", value: "4" },
+    { label: "Read guest level-4 entry", math: "1 read, yields gPA of level 3", value: "1" },
+    { label: "Levels 3, 2, 1: same again", math: "3 × (4 host + 1 guest)", value: "15" },
+    { label: "Final gPA of the data → hPA", math: "walk host table: 4 reads", value: "4" },
+  ]}
+  result={{ label: "Worst-case references per TLB miss, 4-level on 4-level", value: "24" }}
+/>
+
+In general it's (n + 1)(m + 1) − 1 for n guest levels and m host levels,
+the shape Bhargava and colleagues at AMD analysed in
+[ASPLOS 2008](https://dl.acm.org/doi/10.1145/1346281.1346286). Native is 4.
+Five-level on five-level is 35. Page-walk caches and TLB tags (VPID on Intel,
+VMID on ARM) exist so this is rare. Huge pages cut it from both ends: a 2 MB
+guest page removes a guest level, (3 + 1)(4 + 1) − 1 = 19, and a 1 GB host
+page removes two host levels, (3 + 1)(2 + 1) − 1 = 11.
+
+</Sub>
+
+<Sub n="2.5" title="A virtqueue, as bytes">
+
+Emulating a real NIC register by register means an exit per register access,
+and a real NIC driver touches a lot of registers. **virtio** (Rusty Russell,
+[2008](https://dl.acm.org/doi/10.1145/1400097.1400108), now an
+[OASIS standard](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html))
+replaces that with shared memory the guest and host both read. Its unit is
+the <em className="term">virtqueue</em>, and in the split layout that's three
+arrays in guest memory.
+
+<Figure caption="One descriptor from include/uapi/linux/virtio_ring.h, widths to scale. The guest writes these; the device reads them. `next` chains descriptors so one packet can span several buffers.">
+<MemoryLayout
+  unit="bits"
+  fields={[
+    { name: "addr", bits: 64, note: "guest-physical address of the buffer", accent: true },
+    { name: "len", bits: 32, note: "bytes" },
+    { name: "flags", bits: 16, note: "NEXT, WRITE, INDIRECT" },
+    { name: "next", bits: 16, note: "index of the next descriptor" },
+  ]}
+/>
+</Figure>
+
+- **Descriptor table.** 16 bytes per entry, above.
+- **Available ring.** `flags`, `idx`, then chain heads the guest has offered.
+  Only the guest writes it.
+- **Used ring.** `(id, len)` pairs the device has finished. Only the device
+  writes it.
+
+
+Each side owns exactly one ring's write side, so there's no lock. What's left
+is telling the other side something changed, and that's where the exits come
+back.
+
+</Sub>
+
+<SectionHeading n="03" cmd="perf kvm stat live" id="hot-path">One packet, one exit, end to end</SectionHeading>
+
+<Sub n="3.1" title="The guest's side of a transmit">
+
+Say the guest's network stack hands virtio-net one packet. Its driver fills a
+descriptor, publishes its index in the available ring, bumps `avail->idx`, and
+then has to decide whether to wake the device at all:
+
+<SourceRead
+  file="drivers/virtio/virtio_ring.c"
+  repo="torvalds/linux"
+  tag="v6.12"
+  href="https://github.com/torvalds/linux/blob/v6.12/drivers/virtio/virtio_ring.c#L734"
+>
+```c
+static bool virtqueue_kick_prepare_split(struct virtqueue *_vq)
+{
+	...
+	/* We need to expose available array entries before checking avail
+	 * event. */
+	virtio_mb(vq->weak_barriers);
+
+	old = vq->split.avail_idx_shadow - vq->num_added;
+	new = vq->split.avail_idx_shadow;
+	vq->num_added = 0;
+	...
+	if (vq->event) {
+		needs_kick = vring_need_event(virtio16_to_cpu(_vq->vdev,
+					vring_avail_event(&vq->split.vring)),
+					      new, old);
+	} else {
+		needs_kick = !(vq->split.vring.used->flags &
+					cpu_to_virtio16(_vq->vdev,
+						VRING_USED_F_NO_NOTIFY));
+	}
+	...
+	return needs_kick;
+}
+```
+</SourceRead>
+
+This is the most important optimisation in virtio and it's a few lines long.
+If the device is already busy draining the ring, it says so (`NO_NOTIFY`, or an
+*event index* further ahead), and the guest skips the kick. Under load a
+thousand packets can go out on one exit. When a kick is needed, it's one
+16-bit store:
+
+<SourceRead
+  file="drivers/virtio/virtio_pci_common.c"
+  repo="torvalds/linux"
+  tag="v6.12"
+  href="https://github.com/torvalds/linux/blob/v6.12/drivers/virtio/virtio_pci_common.c#L51"
+>
+```c
+bool vp_notify(struct virtqueue *vq)
+{
+	/* we write the queue's selector into the notification register to
+	 * signal the other end */
+	iowrite16(vq->index, (void __iomem *)vq->priv);
+	return true;
+}
+```
+</SourceRead>
+
+That `iowrite16` targets an address with no RAM behind it in the second-level
+table. So the store can't complete, and the CPU exits.
+
+</Sub>
+
+<Sub n="3.2" title="From the store to the host, and back">
+
+<Figure caption="A transmit kick with vhost-net on KVM/x86. The dashed return is the completion interrupt. Without vhost, the middle two lanes collapse into one: KVM returns from KVM_RUN and the VMM's own thread does the device work.">
+<Sequence
+  actors={["guest driver", "CPU", "KVM", "vhost-net thread"]}
+  messages={[
+    { from: 0, to: 0, label: "fill descriptor, bump avail->idx" },
+    { from: 0, to: 1, label: "iowrite16 to notify register", accent: true },
+    { from: 1, to: 2, label: "VM exit: EPT_MISCONFIG", accent: true },
+    { from: 2, to: 3, label: "ioeventfd match → signal eventfd" },
+    { from: 2, to: 0, label: "VMRESUME: guest carries on", dashed: true },
+    { from: 3, to: 3, label: "read ring, copy to tap, write used ring" },
+    { from: 3, to: 2, label: "irqfd: raise guest interrupt" },
+    { from: 2, to: 0, label: "inject interrupt on next entry", dashed: true },
+  ]}
+/>
+</Figure>
+
+Step by step, for KVM on x86:
+
+1. **The exit.** The store hits an EPT entry KVM marked invalid for MMIO.
+   Guest state goes into the VMCS and the CPU lands in `vmx_handle_exit`,
+   which indexes the table in 2.2 and calls `handle_ept_misconfig`.
+2. **The fast match.** The address was registered as an
+   [ioeventfd](https://docs.kernel.org/virt/kvm/api.html) by the VMM. KVM
+   doesn't decode anything further. It signals an eventfd and resumes the
+   guest, and the vCPU never leaves the kernel.
+3. **The data plane.** A `vhost-net` kernel thread (in
+   [drivers/vhost/net.c](https://github.com/torvalds/linux/blob/v6.12/drivers/vhost/net.c))
+   is waiting on that eventfd. It reads the descriptors from guest memory
+   (it has the same mapping the VMM does), pushes the packet into a tap
+   device, and writes the used ring.
+4. **The interrupt.** vhost signals an *irqfd*, which KVM turns into a guest
+   interrupt at the next entry. Posted interrupts on newer Intel parts can
+   deliver it without an exit at all.
+
+Without vhost, the eventfd wakes a thread in the VMM process instead.
+Firecracker works this way: it registers an ioeventfd and an irqfd per queue
+([device_manager/mmio.rs](https://github.com/firecracker-microvm/firecracker/blob/v1.10.0/src/vmm/src/device_manager/mmio.rs#L198))
+and does the device work in its own process. Any *other* MMIO access, a config
+register read for instance, returns from `KVM_RUN` with
+`exit_reason = KVM_EXIT_MMIO` and lands here, the userspace mirror of KVM's
+table:
+
+<SourceRead
+  file="src/vmm/src/vstate/vcpu/mod.rs"
+  repo="firecracker-microvm/firecracker"
+  tag="v1.10.0"
+  href="https://github.com/firecracker-microvm/firecracker/blob/v1.10.0/src/vmm/src/vstate/vcpu/mod.rs#L522"
+>
+```rust
+fn handle_kvm_exit(
+    peripherals: &mut Peripherals,
+    emulation_result: Result<VcpuExit, errno::Error>,
+) -> Result<VcpuEmulation, VcpuError> {
+    match emulation_result {
+        Ok(run) => match run {
+            VcpuExit::MmioRead(addr, data) => {
+                if let Some(mmio_bus) = &peripherals.mmio_bus {
+                    let _metric = METRICS.vcpu.exit_mmio_read_agg.record_latency_metrics();
+                    mmio_bus.read(addr, data);
+                    METRICS.vcpu.exit_mmio_read.inc();
+                }
+                Ok(VcpuEmulation::Handled)
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                if let Some(mmio_bus) = &peripherals.mmio_bus {
+                    let _metric = METRICS.vcpu.exit_mmio_write_agg.record_latency_metrics();
+                    mmio_bus.write(addr, data);
+                    METRICS.vcpu.exit_mmio_write.inc();
+                }
+                Ok(VcpuEmulation::Handled)
+            }
+            VcpuExit::Hlt => {
+                info!("Received KVM_EXIT_HLT signal");
+                Ok(VcpuEmulation::Stopped)
+            }
+            ...
+```
+</SourceRead>
+
+Notice the latency metric wrapped around every MMIO exit. Firecracker
+records exit timing for every microVM, which is probably the cheapest
+observability anyone ever got.
+
+</Sub>
+
+<Sub n="3.3" title="The KVM API, the whole of it">
+
+Under that Rust sit about six ioctls. Josh Triplett's
+[Using the KVM API](https://lwn.net/Articles/658511/) (LWN, 2015) builds a
+complete VM in one short C file; its guest adds two numbers and writes the
+result to a serial port. Condensed, and quoted from the article (I couldn't run
+it here, there's no `/dev/kvm`):
+
+```c
+kvm    = open("/dev/kvm", O_RDWR | O_CLOEXEC);
+ioctl(kvm, KVM_GET_API_VERSION, NULL);             /* must return 12 */
+vmfd   = ioctl(kvm, KVM_CREATE_VM, 0);             /* new EPT, no vCPUs yet */
+
+struct kvm_userspace_memory_region region = {
+    .slot = 0, .guest_phys_addr = 0x1000,
+    .memory_size = 0x1000, .userspace_addr = (uint64_t)mem,
+};
+ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &region); /* guest RAM = our mmap */
+
+vcpufd = ioctl(vmfd, KVM_CREATE_VCPU, 0);
+run    = mmap(NULL, ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, NULL),
+              PROT_READ | PROT_WRITE, MAP_SHARED, vcpufd, 0);
+/* ...KVM_SET_SREGS / KVM_SET_REGS: rip = 0x1000, rax = rbx = 2 ... */
+
+while (1) {
+    ioctl(vcpufd, KVM_RUN, NULL);                  /* returns on an exit */
+    switch (run->exit_reason) {
+    case KVM_EXIT_HLT: return 0;
+    case KVM_EXIT_IO:                              /* the guest's out to 0x3f8 */
+        putchar(*(((char *)run) + run->io.data_offset));
+        break;
+    }
+}
+```
+
+Guest RAM is memory the VMM `mmap`ed. A vCPU is a file descriptor. `KVM_RUN`
+is a syscall that returns when the guest does something the kernel won't
+handle alone. QEMU, Firecracker and crosvm are, at the bottom, this loop.
+
+</Sub>
+
+<Sub n="3.4" title="The same loop on a Mac, and what one exit costs">
+
+Hypervisor.framework has the same shape: `hv_vm_create`, `hv_vm_map`,
+`hv_vcpu_create`, then `hv_vcpu_run` in a loop. So I timed it. My guest is
+two instructions, an `hvc` or a store to an unmapped guest-physical address,
+followed by a branch back. It's a bit of a toy, and that's the point.
+
+<TryIt what="Time a guest exit round trip with Hypervisor.framework" lang="cpp" toolchain="Apple clang 21 -O2, Apple M4, macOS 26.5.1">
+```cpp
+// Build: clang++ -std=c++20 -O2 hvexit.cpp -framework Hypervisor -o hvexit
+//        codesign -s - --entitlements ent.plist -f hvexit   (com.apple.security.hypervisor)
+const uint32_t hvc_loop[]  = {0xd4000002, 0x17ffffff};  // hvc #0      ; b .-4
+const uint32_t mmio_loop[] = {0xf9000020, 0x17ffffff};  // str x0,[x1] ; b .-4
+
+hv_vm_create(nullptr);
+hv_vm_map(mem, 0x10000, 16384, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+hv_vcpu_create(&vcpu, &exit, nullptr);
+hv_vcpu_set_reg(vcpu, HV_REG_PC, 0x10000);
+hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c5);      // EL1h, interrupts masked
+hv_vcpu_set_reg(vcpu, HV_REG_X1, 0x100000);     // nothing mapped here
+
+for (int i = 0; i < 200000; i++) {
+    hv_vcpu_run(vcpu);                          // enter guest, return on exit
+    uint64_t ec = exit->exception.syndrome >> 26;   // 0x16 hvc, 0x24 data abort
+    if (advance_pc) {                           // "emulate" the store: skip it
+        uint64_t pc; hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
+        hv_vcpu_set_reg(vcpu, HV_REG_PC, pc + 4);
+    }
+}
+```
+
+<Output>
+```
+hypercall (hvc) round trip:      661 ns
+MMIO store round trip:           733 ns
+hypercall (hvc) round trip:      656 ns
+MMIO store round trip:           727 ns
+hypercall (hvc) round trip:      644 ns
+MMIO store round trip:           749 ns
+```
+
+Six runs across two sessions ranged 644 to 706 ns for `hvc` and 727 to 803 ns
+for the MMIO store. MMIO costs about 80 ns more, probably the two extra
+register calls to move the PC. Both are full round trips to *userspace*,
+the equivalent of `KVM_RUN` returning, not an exit the kernel absorbs.
+</Output>
+</TryIt>
+
+About 670 ns is roughly 2,700 cycles, if the opening's billion-iteration loop
+really ran one iteration per clock (245 ms implies about 4.1 GHz). It's almost
+exactly twice a `write()` syscall on the same Mac (chapter 07 measured
+348 ns). That seems about right if you count crossings. As I understand it,
+XNU on Apple silicon runs at EL2 itself, so an exit is guest to kernel, kernel
+up to my process, then both of those again in reverse: two kernel crossings
+where a syscall has one.
+
+
+</Sub>
+
+<SectionHeading n="04" cmd="grep -E '^cpu ' /proc/stat" id="failure">Escapes, stolen time, and memory nobody owns</SectionHeading>
+
+<Sub n="4.1" title="VENOM: the floppy drive nobody had">
+
+In May 2015 Jason Geffner at CrowdStrike disclosed
+[VENOM, CVE-2015-3456](https://venom.crowdstrike.com/), a buffer overflow in
+QEMU's emulated floppy disk controller. A guest with enough privilege to talk
+to the FDC's I/O ports could overflow a buffer in the host's QEMU process and,
+per [Red Hat's advisory](https://access.redhat.com/articles/1444903),
+potentially run code there. That code had been in QEMU since 2004, and it
+was reachable on KVM and Xen setups using QEMU's device model.
+
+Nobody uses a floppy drive. That's the point. It was reachable because it was
+*emulated*, and emulation is code that parses attacker-controlled input on
+every exit. Firecracker's paper names the result: QEMU is over 1.4 million
+lines and "can require up to 270 unique syscalls", while Firecracker emulates
+virtio-net, virtio-block, a serial port and a partial i8042, in about 50,000
+lines of Rust. Its whole virtio block implementation is "around 1400 lines".
+Fewer devices is fewer exits is fewer places for the next VENOM.
+
+</Sub>
+
+<Sub n="4.2" title="Steal time, and when %st lies">
+
+When the host runs something else on the physical CPU your vCPU was using,
+your guest's clock keeps advancing and its work doesn't. KVM tells a
+cooperating guest how long it was descheduled through a shared page
+([`MSR_KVM_STEAL_TIME`](https://docs.kernel.org/virt/kvm/x86/msr.html) on
+x86, the SMCCC PV-time interface on arm64), and Linux reports it as **steal**:
+the `st` column in `top`, the eighth number on the `cpu` line of `/proc/stat`.
+
+A rising `%st` is the one signal inside a guest that says "your neighbour is
+busy". Firecracker's rate limiters exist partly for "preventing a small number
+of busy MicroVMs on a server from affecting the performance of other
+MicroVMs", in the paper's words.
+
+Here's the catch I hit. In Docker Desktop's guest, two days up, steal was zero:
+
+```shell
+$ grep '^cpu ' /proc/stat        # 8th number is steal
+cpu  36035 0 20977 27010020 998 0 13880 0 0 0
+$ dmesg | grep -c arm-pv
+0
+```
+
+Linux prints `arm-pv: using stolen time PV` at boot
+([arch/arm64/kernel/paravirt.c](https://github.com/torvalds/linux/blob/v6.10/arch/arm64/kernel/paravirt.c#L173))
+when the hypervisor offers stolen-time accounting. This guest never did. Zero
+here doesn't mean nothing was stolen; it means nobody's counting. So before you
+trust `%st = 0` on a cloud VM, check the interface exists.
+
+</Sub>
+
+<Sub n="4.3" title="Two kernels managing the same memory">
+
+A guest kernel thinks its free memory is free. Meanwhile the host sees a
+process with gigabytes of anonymous memory it can reclaim, compress or swap.
+Neither can see the other's decisions, and that's where the strangest numbers
+in this chapter came from.
+
+I timed first-touch faults over 512 MB inside Docker's VM (source in 5.2). On
+the VM that had been up for two days, while the Mac was tight on memory
+(`vm_stat` showed about 4,000 free 16 KB pages and over a million in the
+compressor), the first pass over fresh memory cost **600 to 1,150 ns per 4 KB**.
+A second pass in the same process, over memory the guest had just freed and
+re-used: **45 to 100 ns**. Ten to twenty times apart.
+
+After Docker Desktop was restarted, the same binary on the fresh VM gave 44 to
+48 ns on *every* pass, first included.
+
+My guess is host-side reclaim. Maybe the macOS compressor had squeezed pages
+the guest considered free, so each "fresh" guest frame cost a host fault and a
+decompression. I haven't proven it. Host faults on the VM process moved by
+roughly the right amount on some runs and not on others, and a dozen other
+people's containers were sharing that VM. Settling it is simple and I couldn't
+do it cleanly: one VM, nothing else in it, and the host's fault count on the
+VM process sampled before and after each pass.
+
+Free-page reporting in the balloon driver exists to close this gap. This
+guest's balloon doesn't negotiate it (bit 5 is clear in
+`/sys/bus/virtio/devices/virtio11/features`).
+
+
+</Sub>
+
+<Sub n="4.4" title="Nested virtualization">
+
+Running a hypervisor inside a VM (CI runners, Kata on a cloud VM) multiplies
+every exit. A guest hypervisor's `VMRESUME` is itself a
+sensitive instruction that the real hypervisor must emulate, so one nested
+exit is really several. IBM's
+[Turtles project](https://www.usenix.org/conference/osdi10/turtles-project-design-and-implementation-nested-virtualization)
+(OSDI 2010) got nested KVM within 6 to 8% of single-level virtualization for
+common workloads.
+Google's own documentation is blunter:
+[expect "a 10% or greater decrease"](https://docs.cloud.google.com/compute/docs/instances/nested-virtualization/overview)
+for CPU-bound workloads and possibly more for I/O-bound ones.
+
+</Sub>
+
+<SectionHeading n="05" cmd="./hvexit && ./bench" id="cost">What an exit costs, and what doesn't exit at all</SectionHeading>
+
+<Callout label="The machines" kind="note">
+**Mac:** Apple M4, macOS 26.5.1, Apple clang 21 `-O2`, 16 KB pages.
+**Guest:** Docker Desktop 28.4's Linux VM on the same Mac, kernel
+6.10.14-linuxkit aarch64, Virtualization.framework, g++ 13.3 `-O2`, 4 KB pages
+with THP set to `always`. Guest numbers were taken twice: on a VM two days old
+under host memory pressure, and on a freshly restarted one via a shared 4-CPU
+container. Both are listed where they differ.
+</Callout>
+
+<Sub n="5.1" title="Things that exit, and things that don't">
+
+<Cost items={[
+  { what: "1e9-iteration loop inside a Hypervisor.framework guest", value: "246 ms", source: "host: 245 ms, same loop. Three runs each, all 244 to 248 ms" },
+  { what: "hvc round trip to my userspace loop", value: "~670 ns", source: "M4, 6 runs, 644 to 706 ns" },
+  { what: "Guest read of one virtio device register (fresh VM)", value: "~1.0 µs", source: "3 runs, 994 to 1,018 ns; 200k loads each" },
+  { what: "Same read on the two-day-old, busy VM", value: "1.4–2.0 µs", source: "6 runs, 1,367 to 1,972 ns" },
+  { what: "clock_gettime inside the guest", value: "14 ns", source: "fresh VM 13.9 to 14.3; macOS native 16.6 to 16.7" },
+  { what: "Creating a VM and one vCPU", value: "55–204 µs", source: "hv_vm_create through hv_vcpu_create, first call slowest" },
+]} />
+
+Look at the register read. It's a plain 16-bit load of `num_queues` from the
+virtio RNG's config space (harmless to read), through an `mmap` of
+`/sys/bus/pci/devices/0000:00:0e.0/resource0`. A RAM load in the same loop
+took 0.3 ns. This one took a microsecond, **about three thousand times
+slower**, because each load is a stage-2 fault handled by Apple's device model
+in a host process. It's slower than my bare `hvc` too, which is roughly what
+you'd expect from a real VMM doing real decoding.
+
+`clock_gettime` is the counterexample. On arm64 the guest reads the virtual
+counter `CNTVCT_EL0` directly, with no exit, so it costs the same in a VM as
+out of one.
+
+</Sub>
+
+<Sub n="5.2" title="A syscall inside the guest is not a VM exit">
+
+<TryIt what="The same benchmark, native macOS and inside the Linux guest" lang="cpp" toolchain="clang 21 / g++ 13.3, -O2, M4 host and linuxkit 6.10 guest">
+```cpp
+for (long i = 0; i < 5'000'000; i++) clock_gettime(CLOCK_MONOTONIC, &ts);
+for (long i = 0; i < 1'000'000; i++) write(fd_devnull, &c, 1);
+
+// first touch vs second touch: 512 MB anonymous, one write per page
+char* p = (char*)mmap(nullptr, 512ul << 20, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+for (size_t off = 0; off < len; off += pagesize) p[off] = 1;    // faults
+for (size_t off = 0; off < len; off += pagesize) p[off] += 1;   // no faults
+```
+
+<Output>
+| | macOS native | Linux guest (fresh VM) |
+| --- | --- | --- |
+| `clock_gettime` | 16.7 ns | 14.1 ns |
+| `write(/dev/null)` | 351 ns | 108 ns |
+| First touch, per 4 KB of memory | ~195 ns (16 KB pages, ~780 ns each) | 45 ns with THP, 375 ns without |
+
+Medians of three runs each. THP-off used `prctl(PR_SET_THP_DISABLE)`.
+</Output>
+</TryIt>
+
+So the guest's `write` is **three times faster** than the host's? That isn't
+virtualization making anything faster. A syscall inside a guest goes from
+guest EL0 to guest EL1 without the hypervisor knowing, so you're comparing
+Linux 6.10's syscall path against XNU's. Adams and Agesen saw it in 2006:
+under VT-x, "system calls execute without VMM intervention".
+
+Fault numbers hide the same trap. With THP on, the guest takes one fault per
+2 MB (about 23 µs, spread over 512 small pages), so it looks eight times
+cheaper per byte. None of that is about stage-2; the fresh VM's memory was
+presumably already backed by the host. Only the old VM's runs in 4.3 look
+like stage-2 costs to me.
+
+</Sub>
+
+<Sub n="5.3" title="One ping through virtio-net">
+
+From inside the shared container, `ping` to Docker Desktop's host-side
+address 192.168.65.254 crosses the virtio-net queue in both directions:
+container veth, the VM's bridge and NAT, a kick, the host's network stack,
+and an injected interrupt on the way back. Loopback never leaves the guest
+kernel. Three runs of 500 pings each:
+
+<Compare
+  cols={["Target", "p50", "p99", "max"]}
+  rows={[
+    ["127.0.0.1 (guest loopback)", "4–5 µs", "16–27 µs", "57 µs"],
+    ["192.168.65.254 (through virtio-net to the host)", "108–192 µs (median run 121)", "0.25–6.5 ms", "13.3 ms"],
+  ]}
+/>
+
+About 25× at the median, and the tail is where the shared machine shows: p99
+moved by 26× between runs while p50 barely changed. A few microseconds of that
+is exits. I'd guess most of the rest is the packet being handled by a
+userspace network stack in a Mac process (Docker's own logs call it
+`com.docker.backend.gvisor`), which is exactly the hop vhost exists to remove.
+
+</Sub>
+
+<Sub n="5.4" title="Firecracker's numbers">
+
+From the [NSDI 2020 paper](https://www.usenix.org/conference/nsdi20/presentation/agache)
+(Agache et al., measured on EC2 `m5d.metal`, Linux 4.14 guest):
+
+<Compare
+  cols={["What", "Firecracker", "For comparison"]}
+  rows={[
+    ["Boot to guest init", "under 125 ms; p99 146 ms with 50 booting at once (pre-configured)", "QEMU about twice as slow; stock Ubuntu 18.04 kernel adds ~900 ms"],
+    ["Memory overhead per VM", "about 3 MB", "Cloud Hypervisor ~13 MB, QEMU ~131 MB"],
+    ["Creation rate", "up to 150 microVMs per second per host", "density target: up to 8,000 128 MB functions per 1 TB host"],
+    ["iperf3, one TCP stream, RX", "15.6 Gb/s", "host tap loopback 44.1 Gb/s"],
+    ["4 KB read latency (p99, QD1)", "49 µs slower than native", "large blocks more than double native latency"],
+  ]}
+/>
+
+Those last two rows are the honest part. The paper says outright that virtio
+"will not yield the near-bare-metal performance offered by PCI pass-through".
+Density and boot time, bought with I/O throughput, on purpose.
+
+
+</Sub>
+
+<SectionHeading n="06" cmd="bpftrace -e 'tracepoint:kvm:kvm_exit { @[args->exit_reason] = count(); }'" id="operating">Counting exits on a real host</SectionHeading>
+
+<Sub n="6.1" title="Where am I, and what can I see">
+
+Inside a guest, find out what you're running on before you trust any number:
+
+```shell
+systemd-detect-virt                 # kvm, amazon, microsoft, none...
+lscpu | grep -i hypervisor          # x86: "Hypervisor vendor: KVM"
+ls -l /dev/kvm                      # can *this* machine run VMs?
+grep -E '^cpu ' /proc/stat          # 8th field is steal, in USER_HZ ticks
+dmesg | grep -i -E 'arm-pv|kvm-clock|steal'   # is steal even reported?
+grep virtio /proc/interrupts        # which CPU takes the device interrupts
+```
+
+That last one surprised me in Docker's VM: all twelve virtio devices use
+level-triggered INTx, and every interrupt landed on CPU 0. On a busy network
+guest that's a hot CPU you'd want to find early.
+
+On a KVM host, the exit counters are the tool. I haven't run these here, since
+there's no KVM to point them at:
+
+```shell
+perf kvm stat live                  # exits by reason, with time spent in each
+perf kvm stat record -p $QEMU_PID   # then: perf kvm stat report
+bpftrace -e 'tracepoint:kvm:kvm_exit { @[args->exit_reason] = count(); }'
+cat /sys/kernel/debug/kvm/*/exits   # per-VM exit counters (debugfs)
+```
+
+</Sub>
+
+<Sub n="6.2" title="What to do on Monday">
+
+When a workload is slower in a VM than on metal, look at exits before you look
+at anything else:
+
+1. **Count exits by reason.** If `EPT_MISCONFIG` or `IO_INSTRUCTION`
+   dominates, an emulated device is on the hot path.
+2. **Move I/O to virtio, then to vhost.** An emulated e1000 or IDE disk exits
+   per register. virtio exits per batch, and vhost keeps the exit in the
+   kernel.
+3. **Look for spinning.** A guest spinning on a lock whose holder's vCPU was
+   descheduled burns its slice. High `PAUSE_INSTRUCTION` counts usually mean
+   overcommitted CPUs.
+4. **Use huge pages on both sides.** Section 2.4's arithmetic: 24 references
+   per miss becomes 11 with 2 MB guest and 1 GB host pages.
+5. **Pass the device through** (SR-IOV) when the exit budget is gone. A NIC
+   exposes *virtual functions*, the IOMMU maps one into the guest, and the
+   guest driver talks to hardware with no hypervisor on the data path. You
+   lose easy live migration.
+
+</Sub>
+
+<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+
+**Write a VM monitor with one device, and time its exits.**
+
+- On a Linux box with `/dev/kvm` (a bare-metal cloud instance, or a VM with
+  nested virtualization enabled), type in the program from LWN's
+  [Using the KVM API](https://lwn.net/Articles/658511/). Get it printing `4`.
+- Wrap `KVM_RUN` in `clock_gettime` and make the guest loop on `out` to port
+  `0x3f8`. That's your exit round-trip cost. Compare it with my ~670 ns on
+  Apple silicon.
+- Add a fake MMIO device: pick an unmapped guest-physical address, handle
+  `KVM_EXIT_MMIO`, return a counter on reads. Now you've written the
+  `handle_kvm_exit` from section 3.2.
+- Then register that address with `KVM_IOEVENTFD` and see how much faster a
+  write gets when it never leaves the kernel.
+
+On a Mac, Hypervisor.framework works too, and the code in 3.4 is most of it.
+Sign it with the entitlement. Without it `hv_vm_create` returns `0xfae94007`
+(`HV_DENIED`), and since my code above doesn't check, the unsigned binary just
+segfaults.
+
+
+<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
+
+<Compare
+  cols={["You get", "You pay", "When the bill arrives"]}
+  rows={[
+    ["A separate kernel per tenant", "A second kernel's memory and boot time", "At density: QEMU's 131 MB overhead vs Firecracker's 3 MB"],
+    ["Guest code at native speed", "~0.7–1 µs every time the guest touches a device", "In I/O-heavy guests with emulated devices"],
+    ["Hardware-walked nested page tables", "Up to 24 memory references per TLB miss", "Random access over large memory with 4 KB pages"],
+    ["virtio batching", "A paravirtual driver in the guest", "When the guest OS doesn't ship one"],
+    ["SR-IOV near-metal I/O", "Live migration and overcommit get hard", "The first host maintenance window"],
+    ["A small device model (Firecracker)", "No BIOS, no USB, no GPU, no Windows", "The day someone needs one"],
+  ]}
+/>
+
+<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
+
+<CardGrid>
+  <WildCard name="AWS Lambda and Fargate on Firecracker" verdict="VM isolation at container density, paid for in I/O throughput.">
+    Lambda used to run each customer's functions in containers inside that
+    customer's own VM. Firecracker replaced that, and per the
+    [NSDI paper](https://www.usenix.org/conference/nsdi20/presentation/agache)
+    "powers millions of workloads and trillions of requests per month". Its
+    jailer allows the VMM 24 syscalls and 30 ioctls.
+  </WildCard>
+  <WildCard name="AWS Nitro" verdict="If exits are the cost, take the I/O off the host CPU entirely.">
+    Starting with C5 in 2017, AWS
+    [removed Xen's dom0](https://docs.aws.amazon.com/whitepapers/latest/security-design-of-aws-nitro-system/the-nitro-system-journey.html)
+    and moved network, EBS and instance storage onto dedicated Nitro cards,
+    leaving a minimal KVM-based hypervisor. Brendan Gregg
+    [measured its overhead](https://www.brendangregg.com/blog/2017-11-29/aws-ec2-virtualization-2017.html)
+    as "miniscule, often less than 1% (it's hard to measure)".
+  </WildCard>
+  <WildCard name="VENOM, CVE-2015-3456" verdict="The emulated device you forgot about is still attack surface.">
+    QEMU's virtual floppy controller, overflowable from a privileged guest
+    since 2004. [CrowdStrike](https://venom.crowdstrike.com/) disclosed it on
+    13 May 2015.
+  </WildCard>
+  <WildCard name="gVisor and Kata Containers" verdict="Two ways to give a container a boundary that isn't the host kernel.">
+    gVisor's Sentry reimplements Linux syscalls in Go, catching them with
+    seccomp on its default
+    [systrap platform](https://gvisor.dev/docs/architecture_guide/platforms/).
+    Kata runs each pod in a lightweight VM on one of
+    [five VMMs](https://github.com/kata-containers/kata-containers/blob/main/docs/hypervisors.md).
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Why does a guest run CPU-bound code at native speed?">
+Because nothing in it exits. Arithmetic, branches and loads from mapped memory
+run directly on the CPU; the hypervisor only runs when the guest does
+something the VMCS or `HCR_EL2` says to trap. My billion-iteration loop took
+246 ms in a guest, 245 ms on the host.
+</QA>
+
+<QA level="beginner" q="What's the isolation difference between a container and a VM?">
+A container shares the host kernel, so its boundary is the whole syscall
+interface. A VM has its own kernel, and its boundary is the set of exits plus
+the device emulation behind them: much smaller, though VENOM shows it isn't
+zero.
+</QA>
+
+<QA level="intermediate" q="Why was x86 not virtualizable before VT-x, in Popek and Goldberg's sense?">
+Every sensitive instruction must be privileged, so it traps when run
+deprivileged. x86 had seventeen that didn't (Robin and Irvine, 2000). In ring 3
+`popf` silently ignores changes to the interrupt flag, so a deprivileged guest
+kernel's attempt to disable interrupts was invisible. VMware answered with
+binary translation, Xen by modifying the guest.
+</QA>
+
+<QA level="intermediate" q="Derive the worst-case memory references for a TLB miss with 4-level guest and 4-level EPT tables.">
+Each of the four guest entries sits at a guest-physical address needing a
+4-reference host walk, plus the entry read: 4 × 5 = 20. The data's final
+guest-physical address needs one more host walk: 24. In general
+(n+1)(m+1) − 1.
+</QA>
+
+<QA level="intermediate" q="Your syscall benchmark is faster inside a VM than on the host. Did virtualization speed it up?">
+No. A syscall in a guest goes from guest user mode to guest kernel mode
+without any exit, so you're comparing the guest kernel's syscall path with the
+host's. On my Mac, Linux 6.10 in Docker's VM did `write()` in 108 ns and macOS
+did it in 351 ns. That's Linux against XNU, and the VM isn't in the picture.
+</QA>
+
+<QA level="deep" q="Walk through what happens when a virtio-net guest transmits a packet on KVM with vhost-net.">
+Descriptor into the available ring; check whether the device wants a kick; if
+so, a 16-bit MMIO store to the notify register. That exits (`EPT_MISCONFIG`),
+KVM matches an ioeventfd and resumes the guest without visiting userspace. A
+vhost thread reads the ring, sends to a tap, writes the used ring and raises an
+irqfd, which KVM injects as an interrupt.
+</QA>
+
+<QA level="deep" q="%st is 0 on your VM but latency suggests a noisy neighbour. How can both be true?">
+Steal only exists if the hypervisor publishes it (`MSR_KVM_STEAL_TIME` on x86
+KVM, SMCCC PV time on arm64). Without that, the guest reports zero whatever
+happens. Docker Desktop's arm64 guest is like this: no `arm-pv` line in dmesg,
+steal zero after two days up.
+</QA>
+
+<QA level="deep" q="Why did AWS move I/O onto Nitro cards?">
+Under Xen, device models ran in dom0 on the same CPUs customers paid for, and
+every I/O went through that software. Nitro put network and storage
+virtualization on dedicated cards and left a minimal KVM-based hypervisor with
+little to do: host CPU freed, dom0's attack surface gone, and overhead Brendan
+Gregg measured as often under 1%.
+</QA>
+
+<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Which of these exit on arm64: clock_gettime, write(), a load from a virtio register?">
+    Only the register load, about 1 µs in Docker's VM. The other two never
+    leave the guest.
+  </Q>
+  <Q q="Guest uses 2 MB pages, host uses 4 KB pages, both otherwise 4-level. Worst-case references per TLB miss?">
+    (3 + 1)(4 + 1) − 1 = 19.
+  </Q>
+  <Q q="What stops a virtio guest from exiting once per packet?">
+    Notification suppression: a device that's already draining says so, and
+    `virtqueue_kick_prepare` returns false.
+  </Q>
+  <Q q="Why was first-generation VT-x often slower than VMware's binary translation?">
+    No hardware MMU help. Shadow paging still trapped guest page table
+    writes, now with a costly exit each time.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Agache et al. — Firecracker (NSDI 2020)">
+    [The paper](https://www.usenix.org/conference/nsdi20/presentation/agache).
+    Section 2 for why Lambda rejected containers and QEMU; 5.3 for the I/O
+    numbers.
+  </WildCard>
+  <WildCard name="Adams and Agesen — Software vs hardware x86 virtualization (ASPLOS 2006)">
+    [PDF](https://pdos.csail.mit.edu/6.828/2018/readings/adams06vmware.pdf).
+    Still the clearest account of binary translation, with early VT-x losing
+    in measured numbers.
+  </WildCard>
+  <WildCard name="Josh Triplett — Using the KVM API (LWN)">
+    [lwn.net/Articles/658511](https://lwn.net/Articles/658511/). A whole VM
+    in one file. Do the build project from this.
+  </WildCard>
+  <WildCard name="Linux — Documentation/virt/kvm/api.rst">
+    [The KVM API reference](https://docs.kernel.org/virt/kvm/api.html):
+    ioeventfd, irqfd, every exit reason.
+  </WildCard>
+  <WildCard name="OASIS — virtio 1.2 specification">
+    [The standard](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html).
+    Section 2.7 is the split virtqueue; 2.8 the packed one.
+  </WildCard>
+  <WildCard name="AWS — The Security Design of the Nitro System">
+    [Whitepaper](https://docs.aws.amazon.com/whitepapers/latest/security-design-of-aws-nitro-system/security-design-of-aws-nitro-system.html).
+    How dom0 was taken apart into cards.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="12" cmd="ls ../" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="04 — Virtual memory">
+    [One page table](/topics/04-virtual-memory), before this chapter doubled
+    it.
+
+  </WildCard>
+  <WildCard name="07 — Syscalls and the kernel boundary">
+    [The 348 ns crossing](/topics/07-syscalls-kernel-boundary), half an exit.
+  </WildCard>
+  <WildCard name="11 — Containers">
+    [Namespaces and cgroups](/topics/11-containers): the other boundary.
+  </WildCard>
+  <WildCard name="06 — Processes and scheduling">
+    [The scheduler](/topics/06-processes-scheduling) that decides when your
+    vCPU thread runs.
+  </WildCard>
+</CardGrid>

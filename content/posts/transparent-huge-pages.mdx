@@ -1,0 +1,451 @@
+---
+title: "The optimisation every database tells you to turn off"
+dek: "Transparent Huge Pages cut random-access latency by a quarter on my test box and made one page fault in a hundred take up to 22 milliseconds. The advice has flipped twice because both numbers are true."
+date: "2026-09-20"
+readingTime: "~15 min"
+kicker: "Myth"
+tags: ["linux", "memory", "databases", "latency"]
+related: ["04-virtual-memory", "05-allocators", "22-redis"]
+---
+
+If you've run Redis 5 on a stock Linux box you've seen this line in the log,
+probably more than once, probably at 2am while looking for something else:
+
+```text
+WARNING you have Transparent Huge Pages (THP) support enabled in your kernel.
+This will create latency and memory usage issues with Redis. To fix this issue
+run the command 'echo never > /sys/kernel/mm/transparent_hugepage/enabled' as root
+```
+
+That's from [`src/server.c` on the 5.0 branch](https://github.com/redis/redis/blob/5.0/src/server.c).
+Redis isn't alone. Go looking and you'll find the same instruction from half the
+storage industry:
+
+- **MongoDB**, through 7.0: "When running MongoDB on Linux, THP should be
+  disabled for best performance" ([docs, v7.0](https://www.mongodb.com/docs/v7.0/tutorial/transparent-huge-pages/)).
+- **Oracle Database**: "Oracle recommends that you disable Transparent HugePages
+  on all Oracle Database servers" ([18c install guide](https://docs.oracle.com/en/database/oracle/oracle-database/18/ladbi/disabling-transparent-hugepages.html)).
+- **Couchbase**: "THP must be disabled in order for Couchbase Server to function
+  correctly on Linux", and leaving it on can "possibly lead to an OOM kill" ([docs](https://docs.couchbase.com/server/current/install/thp-disable.html)).
+- **Splunk** reports "a minimum of a 30% degradation in indexing and search
+  performance" with THP active ([known issues](https://help.splunk.com/en/splunk-enterprise/release-notes-and-updates/release-notes/10.4/known-issues-for-this-release/transparent-huge-memory-pages-and-splunk-performance)).
+- **Cloudera** says it "interacts poorly with Hadoop workloads" ([docs](https://docs.cloudera.com/cdp-private-cloud-base/7.1.8/managing-clusters/topics/cm-disabling-transparent-hugepages.html)).
+  Percona's TokuDB simply "will refuse to start if transparent huge pages
+  are enabled" ([docs](https://docs.percona.com/percona-server/8.0/tokudb-troubleshooting.html)).
+
+That's a strange consensus for a feature whose whole pitch is free speed. Then
+MongoDB 8.0 turned around and said the opposite: "ensure that THP is
+enabled before `mongod` starts" ([docs, v8.0](https://www.mongodb.com/docs/v8.0/administration/tcmalloc-performance/)).
+Oracle's current guide now says to set it to `madvise` "and not disable
+Transparent HugePages as was recommended in prior releases" ([26ai guide](https://docs.oracle.com/en/database/oracle/oracle-database/26/ladbi/disabling-transparent-hugepages.html)).
+
+So which is it? I wanted to know what actually goes wrong, so I built each
+failure mode in a Linux VM and measured it. One of the famous explanations
+didn't reproduce at all.
+
+## What you're being offered
+
+[Chapter 04](/topics/04-virtual-memory) covers TLB reach properly, so here's
+the one-line version. A TLB with around 1,500 entries covers about 6 MB of
+4 KiB pages and about 3 GB of 2 MiB pages. A database doing random lookups
+across a multi-gigabyte heap misses the TLB on nearly every access with small
+pages, and each miss is a page-table walk.
+
+**Transparent Huge Pages** (THP) is the kernel's attempt to hand out 2 MiB
+pages without the application asking. There's an older, explicit mechanism
+(hugetlbfs, what Postgres's `huge_pages` setting uses) where you reserve huge
+pages up front. THP is the automatic one, and it's the one everyone disables.
+
+Three knobs decide how it behaves, all under `/sys/kernel/mm/transparent_hugepage/`:
+
+- `enabled`: `always`, `madvise` (only regions that call `madvise(MADV_HUGEPAGE)`)
+  or `never`.
+- `defrag`: what a page fault may do when no free 2 MiB block exists. More on
+  this below, because it's most of the story.
+- `khugepaged/*`: a kernel thread that later scans memory and **collapses**
+  runs of small pages into huge ones.
+
+## Two machines, one kernel
+
+Most of what follows ran in **Docker Desktop, linuxkit 6.10.14, aarch64**: a
+10-vCPU VM with 7.8 GB of RAM and 4 KiB base pages, g++ 13.3 at `-O2`. Other
+jobs were running in that VM too. When it went away mid-way I reran the
+chase and fork tests on a **shared 4-CPU container** on the same 6.10.14
+kernel, five interleaved runs each, and those medians are what I quote for
+them. I'd half expected THP to be compiled out of a small VM kernel. It wasn't:
+
+```text
+$ cat /sys/kernel/mm/transparent_hugepage/enabled
+[always] madvise never
+$ cat /sys/kernel/mm/transparent_hugepage/defrag
+always defer defer+madvise [madvise] never
+$ cat /sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none
+511
+$ cat /sys/kernel/mm/transparent_hugepage/hugepages-64kB/enabled
+always inherit madvise [never]
+```
+
+Huge pages for everyone, and only processes that explicitly ask are allowed to
+stall for them. `defrag=madvise` is the upstream default; whether `enabled`
+starts as `always` or `madvise` is a build option, and distributions differ.
+Keep the `511` in mind. I didn't change any of these files, since other people
+were using the same kernel. Everything below is per-region `madvise`.
+
+## Reproducing the win
+
+My test maps a 1 GiB buffer aligned to 2 MiB, applies `MADV_HUGEPAGE` or
+`MADV_NOHUGEPAGE`, and touches it. Then it does a dependent pointer chase in
+random order, one slot per 64-byte line, so every load waits on the previous
+one and the TLB sits on the critical path. Before trusting anything, it reads
+`/proc/self/smaps` to check the kernel really handed over huge pages.
+
+<TryIt what="1 GiB random chase, huge versus small pages" lang="cpp" toolchain="g++ 13.3 -O2, linuxkit 6.10.14 aarch64">
+```cpp
+char* p = map_aligned(1ul << 30);                 // mmap + round up to 2 MiB
+madvise(p, bytes, huge ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+for (size_t off = 0; off < bytes; off += 4096) p[off] = 1;   // fault it in
+anon_huge_kb(p);                                  // AnonHugePages from smaps
+
+// one 8-byte slot per 64-byte line, linked into a single random cycle
+for (size_t i = 0; i < lines; i++)
+    v[order[i] * 8] = order[(i + 1) % lines] * 8;
+for (size_t i = 0; i < 20'000'000; i++) idx = v[idx];   // timed
+```
+
+<Output>
+```text
+huge    smaps: Rss 1048576 kB, AnonHugePages 1048576 kB
+        random chase 136.5 ns/access   (median of 5; 125.9 – 151.4)
+nohuge  smaps: Rss 1048576 kB, AnonHugePages       0 kB
+        random chase 183.3 ns/access   (median of 5; 162.5 – 200.3)
+```
+
+Shared 4-CPU container. On the quieter first VM the best pair was 117.3 against
+207.7 ns.
+</Output>
+</TryIt>
+
+`AnonHugePages 1048576 kB` is the line to check on your own systems: the whole
+gigabyte was backed by 512 huge pages. And the win is real. A quarter off every
+random access on the shared box, closer to 40% on the quiet one. That's the
+number THP's defenders quote, and they aren't wrong.
+
+## The explanation everyone repeats
+
+Here's why Redis says it hurts. [Redis's latency guide](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency/)
+says that "when a Linux kernel has transparent huge pages enabled, Redis incurs
+to a big latency penalty after the `fork` call is used." `BGSAVE` forks, the
+child writes the snapshot, and every page the parent modifies meanwhile gets
+copied ([chapter 22](/topics/22-redis) covers the memory side). With 2 MiB
+pages, the story goes, each copy is 512 times larger. I'd repeated that
+myself. It's in chapter 04 of this site.
+
+So I measured it. After populating the buffer, my test forks, parks the child
+on a pipe, and has the parent write one byte into each 2 MiB region:
+
+<TryIt what="fork(), then one write per 2 MiB region in the parent" lang="cpp" toolchain="g++ 13.3 -O2, linuxkit 6.10.14 aarch64">
+```cpp
+pid_t pid = fork();                              // timed
+if (pid == 0) { read(pipefd[0], &c, 1); _exit(0); }   // child just holds the pages
+
+for (size_t off = 0; off < bytes; off += 2 << 20) p[off + 64] = 2;   // 512 writes, each timed
+// then: AnonHugePages for the region, and Private_Dirty from smaps_rollup
+```
+
+<Output>
+```text
+huge    fork() 0.51 ms
+        COW, 1 write per 2 MiB: 512 writes, median 4.4 us, max 69.9 us
+        smaps: AnonHugePages 0 kB
+        rollup Private_Dirty: 2120 kB
+nohuge  fork() 12.93 ms
+        COW, 1 write per 2 MiB: 512 writes, median 2.1 us
+```
+
+First VM, one run. Shared-container medians of five: fork() 0.38 ms against
+3.04 ms, and 3.9 µs against 1.2 µs per write.
+</Output>
+</TryIt>
+
+Look at `Private_Dirty`. If each write had copied a 2 MiB page, the parent
+would own a gigabyte of fresh private memory. It owns 2,120 kB: 512 copies of
+4 KiB plus change. Meanwhile `AnonHugePages` went from a full gigabyte to zero.
+So the kernel didn't copy the huge pages. It broke them.
+
+<Callout label="Why the 2 MiB copy doesn't happen anymore">
+Since Linux 5.8, a write fault on a shared anonymous huge page splits the
+2 MiB mapping into 512 small ones and copies only the 4 KiB you touched. It's
+Kirill Shutemov's [`3917c80280c9`, "thp: change CoW semantics for anon-THP"](https://github.com/torvalds/linux/commit/3917c80280c93a7123f1a3a6dcdb10a3ea19737d),
+and its message names the victim: the old behaviour "is the primary reason THP
+is unusable for some workloads, like Redis." The Redis advice dates from
+kernels like RHEL 7's 3.10, where the whole 2 MiB really was copied.
+</Callout>
+
+Here's that path in the kernel I ran, trimmed:
+
+<SourceRead file="mm/huge_memory.c" repo="linux" tag="v6.10" href="https://github.com/torvalds/linux/blob/v6.10/mm/huge_memory.c#L1527-L1612">
+```c
+vm_fault_t do_huge_pmd_wp_page(struct vm_fault *vmf)
+{
+	...
+	/* Early check when only holding the PT lock. */
+	if (PageAnonExclusive(page))
+		goto reuse;            // nobody else maps it: just make it writable
+	...
+	if (folio_ref_count(folio) >
+			1 + folio_test_swapcache(folio) * folio_nr_pages(folio))
+		goto unlock_fallback;  // the fork child still maps it
+	...
+unlock_fallback:
+	folio_unlock(folio);
+	spin_unlock(vmf->ptl);
+fallback:
+	__split_huge_pmd(vma, vmf->pmd, vmf->address, false, NULL);
+	return VM_FAULT_FALLBACK;  // retry as an ordinary 4 KiB COW fault
+}
+```
+</SourceRead>
+
+There's no branch left that allocates a fresh 2 MiB page and copies into it.
+Two things follow, and neither is the folklore version:
+
+- **fork() got faster with THP, not slower.** 0.38 ms against 3.04 ms
+  (medians, shared box) for the same gigabyte. Copying 512 page-middle entries
+  is cheaper than copying 262,144 PTEs.
+- **Each first write after the fork costs a split**: 3.9 µs median against
+  1.2 µs for a plain small-page COW. Most of that is probably the kernel
+  allocating a page table and filling in 512 entries. Slower, sure, but
+  microseconds, not a 2 MiB memcpy.
+
+Snapshots do have a quieter cost: they shred your huge pages. After one
+`BGSAVE` on a write-heavy instance, most of the heap is back on 4 KiB pages
+until khugepaged gets around to rebuilding it. Which brings us to the costs
+that are real.
+
+## What actually hurts: stalling at fault time
+
+Remember `defrag`. When a process faults on a huge-page-eligible region and
+the buddy allocator has no free 2 MiB block, the kernel has to decide whether
+to make one. Making one means **direct compaction**: migrating other pages
+out of the way, synchronously, inside your page fault. Here are the options,
+quoted from the [kernel docs](https://docs.kernel.org/admin-guide/mm/transhuge.html)
+where the wording matters:
+
+- `always`: stall "and directly reclaim pages and compact memory in an effort
+  to allocate a THP immediately."
+- `defer`: wake kswapd and kcompactd in the background and fall back to small
+  pages now; khugepaged fixes it up later.
+- `defer+madvise`: stall like `always`, but only in `MADV_HUGEPAGE` regions.
+  Everyone else gets `defer`.
+- `madvise`: stall like `always` in `MADV_HUGEPAGE` regions, fall back
+  everywhere else without waking anything. This is the default.
+- `never`: don't try.
+
+`always` used to be the default. Mel Gorman changed it to `madvise` in Linux
+4.6, in [commit `444eb2a449ef`](https://github.com/torvalds/linux/commit/444eb2a449ef36fe115431ed7b71467c4563c7f1),
+whose message says "It's been years and it's time to throw in the towel."
+David Rientjes of Google added `defer+madvise` in [4.11](https://github.com/torvalds/linux/commit/21440d7eb9044001b7fdb71d0163689f60a0f2a1).
+A lot of the 2012–2016 horror stories come from `always`, on RHEL 6 and 7
+kernels that predate both changes.
+
+I measured it directly. A second test faults a 1 GiB region one 2 MiB chunk
+at a time and times each chunk. Three flavours: `MADV_HUGEPAGE` (allowed to
+compact, under the default `defrag=madvise`), no advice at all (THP allowed
+but not allowed to stall), and `MADV_NOHUGEPAGE`. Then I ran it again after
+fragmenting memory: fill 1.5 GB with small pages and free every other one,
+leaving holes everywhere.
+
+<Compare
+  cols={["Region", "Memory state", "p50 per 2 MiB", "p99", "max", "Got huge pages"]}
+  rows={[
+    ["MADV_HUGEPAGE", "fresh", "29–31 µs", "2.7–11.7 ms", "11–15 ms", "100%"],
+    ["no advice", "fresh", "26–31 µs", "0.29–0.41 ms", "0.4–2.0 ms", "98–99%"],
+    ["MADV_NOHUGEPAGE", "fresh", "174–475 µs", "0.36–2.8 ms", "0.5–3.7 ms", "0%"],
+    ["MADV_HUGEPAGE", "fragmented", "267–663 µs", "14.9–22.1 ms", "18–35 ms", "80–84%"],
+    ["no advice", "fragmented", "180–413 µs", "0.7–5.4 ms", "1.5–9.6 ms", "37–42%"],
+    ["MADV_NOHUGEPAGE", "fragmented", "194–195 µs", "0.65–0.74 ms", "0.9 ms", "0%"],
+  ]}
+/>
+
+Three runs on fresh memory and two fragmented, on the first VM. A small-page
+chunk pays 512 separate faults, so that row's median is worst.
+
+There's the whole trade in one table. At the median, huge pages are six to
+fifteen times cheaper to fault in. At the tail, on fragmented memory, a region that asked for
+them nicely waits 15 to 22 milliseconds at p99 and 35 at worst. During a
+single fresh-memory run `/proc/vmstat` counted 100 new `compact_stall`
+events. One fault in a hundred took longer than forking the whole gigabyte
+did with small pages. You won't
+find it in a CPU profile either, because it's sitting inside a store
+instruction in your `malloc`.
+
+Now compare the first two rows. On fresh memory, the no-advice region fell
+back to small pages 1–2% of the time, and the `MADV_HUGEPAGE` region's p99 is
+bad. I think those are the same 1–2% of faults: where one gave up, the other
+waited for compaction. That's `defrag=madvise` doing exactly what the docs
+say, and it's also why the no-advice region was only 37–42% huge once memory
+was fragmented.
+
+## What actually hurts: memory you didn't ask for
+
+RSS is the other real cost. A huge page is all-or-nothing: touch one byte and
+you've got 2 MiB resident. A third test touches one byte in each 2 MiB region
+of a 256 MiB mapping:
+
+```text
+NOHUGEPAGE, 1 byte per 2 MiB       Rss     512 kB   AnonHugePages       0 kB
+HUGEPAGE,   1 byte per 2 MiB       Rss  262144 kB   AnonHugePages  262144 kB
+```
+
+Same 128 bytes of data, 512 times the memory. Real allocators aren't quite
+that sparse, but they're sparser than you'd think. jemalloc returns memory to
+the kernel with `madvise(MADV_DONTNEED)` on ranges usually much smaller than
+2 MiB. DigitalOcean found in 2015 that under THP those ranges often couldn't
+be reclaimed "because the entire page would have to be unneeded"
+([DigitalOcean engineering](https://www.digitalocean.com/blog/transparent-huge-pages-and-alternative-memory-allocators)).
+jemalloc's author wrote that its purging "wreaks havoc on Linux transparent
+huge pages" ([issue #243](https://github.com/jemalloc/jemalloc/issues/243)),
+and a [2019 report](https://github.com/jemalloc/jemalloc/issues/1674) measured
+250–283 MB RSS with THP `always` against 12–17 MB with it off, for the same
+100-thread program.
+
+khugepaged makes this worse slowly, and slowly is the worst way. Its
+`max_ptes_none` is how many empty 4 KiB slots it'll fill with zeroes when
+collapsing a 2 MiB range. In [`mm/khugepaged.c`](https://github.com/torvalds/linux/blob/v6.10/mm/khugepaged.c)
+the default is `HPAGE_PMD_NR - 1`, so 511: it'll build a huge page around a
+single live 4 KiB page. I touched one page in eight of a fresh 256 MiB region,
+then called `madvise(MADV_HUGEPAGE)` on it and watched:
+
+```text
+1 page in 8, before madvise        Rss   32768 kB   AnonHugePages       0 kB
+  after MADV_HUGEPAGE, t=40s       Rss   32768 kB   AnonHugePages       0 kB
+  after MADV_HUGEPAGE, t=50s       Rss   36352 kB   AnonHugePages    4096 kB
+  after MADV_HUGEPAGE, t=100s      Rss  108032 kB   AnonHugePages   86016 kB
+  after MADV_HUGEPAGE, t=180s      Rss  222720 kB   AnonHugePages  217088 kB
+```
+
+Nothing for 40 seconds, then RSS climbed about 14 MiB every ten seconds. With
+`pages_to_scan` at 4096 and a 10-second sleep, khugepaged covers 16 MiB per
+pass across the whole machine, so that's about the rate you'd predict. My
+process didn't allocate a byte in those three minutes, and its footprint went
+up almost sevenfold. Now picture that inside a container with a memory limit.
+That's Couchbase's "possibly lead to an OOM kill."
+
+## Why the advice changed
+
+None of these costs went away. What changed is who's in charge of the
+tradeoff. In the old arrangement, a kernel guessed on every fault whether
+memory was worth backing with 2 MiB, for an allocator with no idea huge pages
+existed. In the new one, an allocator packs objects to fill huge pages, and
+a kernel only stalls when asked.
+
+Google did the allocator half first. Their OSDI 2021 paper, [Beyond malloc efficiency to fleet efficiency](https://www.usenix.org/conference/osdi21/presentation/hunter),
+describes Temeraire, a huge-page-aware backend for TCMalloc. Across eight
+application studies it improved "requests-per-second (RPS) by 7.7% and
+reducing RAM usage 2.4%", and at fleet scale it gave "6% fewer TLB miss
+stalls, and 26% reduction in memory wasted due to fragmentation." Look at
+that last number. A huge-page-aware allocator fragments *less*, because it
+knows which 2 MiB ranges it can hand back whole.
+
+That's the TCMalloc MongoDB 8.0 moved to, and it's why its advice reversed.
+Its [8.0 docs](https://www.mongodb.com/docs/v8.0/administration/tcmalloc-performance/)
+ask for a specific combination:
+
+- `enabled` set to `always`.
+- `defrag` set to `defer+madvise`, so nothing stalls unless it asked.
+- `khugepaged/max_ptes_none` set to **0**, so khugepaged never invents memory
+  that wasn't there.
+
+It applies only on x86_64 and ARM64 with a kernel new enough for `rseq`
+(4.18+), and "If you are using MongoDB 7.0 or earlier, disable THP." Read
+that list again next to the measurements above. Each line switches off one of
+the failure modes I reproduced.
+
+Meta came at it from the kernel side. Their 2024 patch series [splitting underused THPs](https://lkml.iu.edu/hypermail/linux/kernel/2408.1/05858.html)
+opens by saying "Meta uses madvise in production as the current THP=always
+policy vastly overprovisions THPs in sparsely accessed memory areas." On
+CPU-bound services, `always` bought 1.8% performance for 7.7% more memory;
+with the new shrinker, about the same gain (1.7%) cost only 2.4%. It landed
+in Linux 6.12 as `transparent_hugepage/shrink_underused`. That's newer than
+the 6.10 kernel I tested, so I haven't run it. jemalloc has an experimental
+huge-page-aware allocator too ([`src/hpa.c` in 5.3.0](https://github.com/jemalloc/jemalloc/blob/5.3.0/src/hpa.c)),
+but it's off by default and I wouldn't bet a database on it yet.
+
+And the pages got smaller. Ryan Roberts's **multi-size THP** landed in Linux
+6.8 ([LWN](https://lwn.net/Articles/957188/)) and lets anonymous memory use
+folios between 4 KiB and 2 MiB. You can see the sysfs directories in my
+transcript above: 16 kB through 1024 kB, all `never` by default. A 64 KiB page
+probably wastes far less on a sparse heap and needs no compaction to find, but
+those switches are global, and I wasn't going to flip them on a kernel other
+people were benchmarking on. So I can't tell you what they'd do to my table.
+
+Redis moved too, more quietly. Since 6.2 it ships `disable-thp yes` and calls
+`prctl(PR_SET_THP_DISABLE)` on itself when the system is set to `always`
+([6.2 release notes](https://github.com/redis/redis/blob/6.2/00-RELEASENOTES)).
+Its current startup check recommends `madvise` instead of `never`. A modern
+Redis already opts itself out, so you don't need to turn THP off for the
+whole box to protect it.
+
+Even for plain JVMs it cuts both ways. Alexandr Nikitin [measured THP
+improving p95 by about 0.8 ms](https://alexandrnikitin.github.io/blog/transparent-hugepages-measuring-the-performance-impact/)
+on a 200 GB-heap service in 2017. [LinkedIn in 2013](https://www.linkedin.com/blog/engineering/optimization/optimizing-linux-memory-management-low-latency-high-throughput-databases)
+turned it off after the kernel split a 5 GB heap's huge pages to migrate them
+between NUMA nodes. Same feature, different workloads, opposite answers.
+
+## What I got wrong, and what I still can't explain
+
+My first pass had an anomaly I was ready to write up. After the fork, the
+parent also wrote into every 4 KiB page, and on the first VM the pages that
+had been huge came out cheaper to COW (1.2–3.2 µs) than pages that never were
+(2.6–4.0 µs). I had a theory about physical contiguity and `struct page`
+locality. On the quieter shared box the gap vanished: 1.14 µs against
+1.06 µs, medians of five. It was probably just the other jobs on the first VM.
+
+What I can't explain is one fragmented run of the no-advice region. Under
+`defrag=madvise` that region isn't allowed to compact, yet its p99 hit 5.4 ms,
+against 0.7 ms on the run beside it. Maybe it's direct reclaim on the
+small-page fallback path, or maybe it's another tenant stealing the CPU. I
+didn't record `/proc/vmstat` around that run, and the shared box caps buffers
+at 1 GB, so I couldn't recreate the 1.5 GB fragmentation to find out. If you
+can, capture `compact_stall`, `allocstall_movable` and `pgscan_direct` before
+and after; that should settle it.
+
+## What to do on Monday
+
+Start by finding out what you have. These are safe to run on any box:
+
+```shell
+cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag
+cat /sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none
+grep AnonHugePages /proc/$PID/smaps_rollup           # is your process actually using them?
+grep -E 'thp_fault_alloc|thp_fault_fallback|compact_stall' /proc/vmstat
+uname -r                                              # below 5.8, the 2 MiB COW copy is real
+```
+
+Then decide:
+
+- **If `defrag` says `always`, change it first.** It's the setting behind
+  most of the old stories, and it hasn't been the default since 4.6. `madvise`
+  or `defer+madvise` keeps huge pages and removes the stalls for everyone who
+  didn't ask for them.
+- **If you're on a kernel older than 5.8 and something forks a big heap**
+  (Redis `BGSAVE`, AOF rewrites, anything that snapshots by forking), the old
+  advice still holds: `never`, or at least `madvise` plus Redis's `disable-thp`.
+- **If you run MongoDB 8.0+ on x86_64 or ARM64**, follow its three settings
+  exactly. It's the one vendor telling you to turn THP on, and it's also the
+  one telling you `max_ptes_none=0`.
+- **If you run Oracle, Couchbase, Splunk or Cloudera**, follow your vendor's
+  current page, not a blog post from 2014 (this one included, eventually).
+  Oracle has already moved to `madvise` on UEK7.
+- **If memory limits matter more than latency** (dense containers, anything
+  that's been OOM-killed), set `max_ptes_none` well below 511. Zero is
+  MongoDB's answer. On 6.12+, look at `shrink_underused`.
+- **If you own the allocator**, the direction is clear enough: `madvise`
+  system-wide, and let a huge-page-aware allocator like TCMalloc with Temeraire
+  decide what gets 2 MiB.
+
+Alert on `compact_stall` rising in `/proc/vmstat`. It's the counter that
+moves when a page fault started waiting on the kernel, and in my runs it was
+the only sign those 35 ms faults had happened at all. And in design review,
+ask two questions: does anything here `fork()` a large heap, and which kernel
+is it on? Those two answers are most of the decision.
