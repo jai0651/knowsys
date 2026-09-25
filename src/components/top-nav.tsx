@@ -4,6 +4,7 @@ import { Search } from "./search";
 
 const LINKS = [
   { href: "/sections", label: "Chapters" },
+  { href: "/blog", label: "Field notes" },
   { href: "/labs", label: "Labs" },
 ];
 

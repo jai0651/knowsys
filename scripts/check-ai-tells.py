@@ -28,20 +28,27 @@ def prose(path):
     b = re.sub(r"<pre>.*?</pre>|<script.*?</script>|<style.*?</style>|<svg.*?</svg>|<code>.*?</code>", " ", b, flags=re.S)
     return html.unescape(re.sub(r"<[^>]+>", " ", b))
 
+def prose_mdx(path):
+    t = open(path, encoding="utf-8").read()
+    t = re.sub(r"^---\n.*?\n---\n", " ", t, flags=re.S)
+    t = re.sub(r"```.*?```|`[^`]*`", " ", t, flags=re.S)
+    t = re.sub(r"<[A-Z][A-Za-z]*\b[^>]*?/>", " ", t, flags=re.S)
+    return html.unescape(re.sub(r"<[^>]+>", " ", t))
+
 def main():
-    files = sorted(glob.glob("topics/*.html"))
+    files = sys.argv[1:] or sorted(glob.glob("content/chapters/*.mdx") + glob.glob("content/posts/*.mdx"))
     totals = collections.Counter(); per_page = {}
     examples = collections.defaultdict(list)
     words_total = 0
     for f in files:
-        p = prose(f); words_total += len(p.split())
+        p = prose_mdx(f) if f.endswith(".mdx") else prose(f); words_total += len(p.split())
         hits = collections.Counter()
         for name, pat in PATTERNS.items():
             for mm in re.finditer(pat, p, re.I):
                 hits[name] += 1; totals[name] += 1
                 if len(examples[name]) < 3:
                     s = " ".join(p[max(0,mm.start()-58):mm.end()+58].split())
-                    examples[name].append(f"{f.split('/')[1][:22]}: …{s}…")
+                    examples[name].append(f"{f.split('/')[-1][:22]}: …{s}…")
         per_page[f] = sum(hits.values())
     print(f"{len(files)} chapters, {words_total:,} words of prose\n")
     print("tells by kind:")

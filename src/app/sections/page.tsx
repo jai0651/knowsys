@@ -27,8 +27,8 @@ export default function SectionsPage() {
             Every chapter
           </h1>
           <p className="mb-12 max-w-2xl text-[15.5px] leading-relaxed text-muted">
-            {topics.length} chapters and {labs.length} labs. Each one answers the same six
-            questions, in the same order:{" "}
+            {topics.length} chapters and {labs.length} labs. Each chapter takes one of four
+            shapes (mechanism, phenomenon, decision or model) and a mechanism chapter walks{" "}
             <span className="font-mono text-[13.5px] text-accent">{SPINE.join(" → ")}</span>.
           </p>
 

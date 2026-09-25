@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
 import { allPages, groups } from "./manifest";
+import { allPosts } from "./posts";
 
 export interface Hit {
   /** page slug */
@@ -21,6 +22,8 @@ export interface Hit {
   /** chapter number */
   n: string;
   status: string;
+  /** explicit destination, for hits that are not chapters */
+  u?: string;
 }
 
 const strip = (s: string) =>
@@ -65,6 +68,14 @@ export function buildIndex(): Hit[] {
         status: p.status, h: heading, a: anchor,
         x: `${heading} ${strip(body.slice(from, to)).slice(0, 700)}`.toLowerCase(),
       });
+    });
+  }
+
+  for (const p of allPosts()) {
+    out.push({
+      s: p.slug, t: p.title, g: "Field notes", k: "page", n: "✎",
+      status: "live", u: `/blog/${p.slug}`,
+      x: `${p.title} ${p.dek} ${p.tags.join(" ")} ${strip(p.body).slice(0, 1200)}`.toLowerCase(),
     });
   }
   return out;

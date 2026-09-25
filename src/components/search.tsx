@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 
 interface Hit {
   s: string; t: string; g: string; k: "page" | "section";
-  h?: string; a?: string; x: string; n: string; status: string;
+  h?: string; a?: string; x: string; n: string; status: string; u?: string;
 }
 
 /** Ranks title matches above heading matches above body matches, and an exact
@@ -75,7 +75,7 @@ export function Search() {
     (h: Hit) => {
       setOpen(false);
       setQ("");
-      router.push(`/topics/${h.s}${h.a ? `#${h.a}` : ""}`);
+      router.push(h.u ?? `/topics/${h.s}${h.a ? `#${h.a}` : ""}`);
     },
     [router],
   );

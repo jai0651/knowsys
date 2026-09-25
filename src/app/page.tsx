@@ -4,6 +4,7 @@ import { TopNav } from "@/components/top-nav";
 import { Terrain } from "@/components/terrain";
 import { groups, topics, labs, livePages, countOf } from "@/lib/manifest";
 import { cn } from "@/lib/utils";
+import { allPosts, formatDate } from "@/lib/posts";
 
 const DOT: Record<string, string> = {
   machine: "bg-machine", os: "bg-os", conc: "bg-conc", data: "bg-data",
@@ -54,6 +55,7 @@ const RULES = [
 
 export default function Home() {
   const chapterGroups = groups.filter((g) => g.slug !== "the-labs");
+  const posts = allPosts().slice(0, 4);
 
   return (
     <>
@@ -110,6 +112,35 @@ export default function Home() {
           </div>
         </section>
 
+        {/* ── field notes ──────────────────────────────────────────────── */}
+        {posts.length > 0 && (
+          <section className="pt-20">
+            <div className="mb-3 text-[10.5px] font-semibold uppercase tracking-[0.15em] text-accent">
+              Field notes
+            </div>
+            <div className="mb-10 flex flex-wrap items-end justify-between gap-4">
+              <h2 className="max-w-[24ch] text-[28px] font-bold leading-tight tracking-[-0.02em] text-ink sm:text-[36px]">
+                Real outages, told start to finish
+              </h2>
+              <Link href="/blog" className="inline-flex items-center gap-1 text-[14px] font-medium text-accent">
+                All of them <ArrowRight className="size-4" />
+              </Link>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {posts.map((p) => (
+                <Link key={p.slug} href={`/blog/${p.slug}`} className="glass glass-hover group rounded-2xl p-5">
+                  <div className="mb-2 flex items-center gap-2 font-mono text-[10.5px] text-faint">
+                    <span className="uppercase tracking-wider text-accent">{p.kicker}</span>
+                    <span>{formatDate(p.date)}</span>
+                  </div>
+                  <div className="mb-1.5 text-[16px] font-semibold leading-snug text-ink">{p.title}</div>
+                  <p className="text-[13.5px] leading-relaxed text-muted">{p.dek}</p>
+                </Link>
+              ))}
+            </div>
+          </section>
+        )}
+
         {/* ── the shapes ───────────────────────────────────────────── */}
         <section className="pt-20">
           <div className="mb-3 text-[10.5px] font-semibold uppercase tracking-[0.15em] text-accent">
@@ -147,13 +178,13 @@ export default function Home() {
             What&rsquo;s in here
           </div>
           <h2 className="mb-4 text-[28px] font-bold tracking-[-0.02em] text-ink sm:text-[36px]">
-            {topics.length} chapters, {labs.length} labs, seven groups
+            {topics.length} chapters, {labs.length} labs, {chapterGroups.length} groups
           </h2>
           <p className="mb-10 max-w-[62ch] text-[16px] leading-relaxed text-muted">
             {livePages.length === 0
               ? "None are written yet. The stubs carry their six questions and say so on the page."
               : `${livePages.length} written so far. The rest are stubs, and they say so on the page.`}{" "}
-            Redis, locking and VPC come first — they&rsquo;re the three that prove the shape works.
+            The machine and the operating system are the most complete: that&rsquo;s the layer every other group stands on.
           </p>
 
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
