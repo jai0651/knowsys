@@ -1,5 +1,9 @@
 # KnowSys prose style
 
+> **Chapter structure lives in `docs/CHAPTER_FORMAT.md`** (numbered topical
+> sections, step-through diagrams, Why-subheads, tables, a summary). The
+> reference chapter is 10. The voice rules below still apply.
+
 The target reader is a senior engineer who has already read the docs and the
 top three blog posts. They are here because those were not deep enough. Write
 for someone who will notice if you are bluffing.

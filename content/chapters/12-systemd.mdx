@@ -1,84 +1,123 @@
 ---
 title: systemd & Process Supervision
-dek: "What PID 1 has to do, how a supervisor keeps services alive, and how systemd's units, cgroups and journal work, including the gap between 'started' and 'ready' where most surprises live."
-readingTime: "~24 min"
-versions: "systemd 255.4 (Ubuntu 24.04) as PID 1 in Docker · linuxkit 6.10.14 · aarch64 · section 5.2 on a shared 4-CPU container · source quoted at v255"
-prereqs: "Chapters 06 and 07"
-updated: "2026-09-25"
+dek: "What PID 1 has to do, how a supervisor keeps a service alive, and how systemd's units, jobs, cgroups and journal work. Most of the surprises live in the gap between a service having started and being ready."
+readingTime: "~30 min"
+level: "Intermediate"
+versions: "systemd 255.4 (Ubuntu 24.04) as PID 1 in Docker · linuxkit 6.10.14 · aarch64 · section 7.3 on a shared 4-CPU container · source quoted at v255"
+prereqs: "processes, fork and exec, signals"
+updated: "2026-09-26"
 ---
+
+Every service you deploy to a Linux server is started, watched and stopped by
+something. On most servers that something is systemd. The unit files that ship
+with Postgres, nginx and Redis are systemd units, and Kubernetes' kubelet places
+pods in the same cgroup tree systemd builds.
+
+You mostly notice it when it surprises you. An app connects to its database
+before the database can serve. A deploy hangs for a minute and a half on one
+service. A service that crashes every few seconds shows green on every
+dashboard for weeks.
+
+This chapter starts from the simplest way to keep a program running and fixes
+it one step at a time, up to PID 1. Then it covers units and jobs, the gap
+between started and ready, one connection through socket activation, the ways
+supervision fails, and what it all costs.
+
+<SectionHeading n="01" id="why-supervisor">Why a service needs a supervisor</SectionHeading>
 
 You've written a web service, and it runs fine when you start it by hand. Now
 it has to live on a server. How do you keep it running?
 
-The first thing everyone tries is `./server &` over ssh, and it goes wrong in
-four ways. Log out and the shell's hangup signal may take the server with it. If
-it crashes at 3am it stays down. If the machine reboots, nothing starts it
-again. And its output goes to a terminal that no longer exists.
+<Sub n="1.1" title="Running it by hand, and the init script">
 
-The classic Unix answer, for decades, was an init script. The script started the
-program, the program **daemonized** (forked, detached from the terminal and let
-its parent exit), and the script wrote its PID to a file so that "stop" could
-find it later. Can you spot the weakness? Nothing is watching. If the daemon
-crashes, nobody finds out. And the pidfile holds a number, not a process, so
-after a crash that number can belong to something else entirely by the time you
-try to kill it.
+Everyone first tries `./server &` over ssh. It goes wrong in four
+ways:
 
-The fix is a **supervisor**: a program that runs your service as its own direct
-child, in the foreground. A parent is told by the kernel whenever a child exits,
-so the supervisor always knows when the service died, and can restart it. Tools
-like daemontools and runit made that idea popular.
+| What happens | Result |
+|---|---|
+| You log out | The shell's hangup signal may take the server with it |
+| It crashes at 3am | It stays down |
+| The machine reboots | Nothing starts it again |
+| It writes output | The output goes to a terminal that no longer exists |
+
+For decades the classic Unix answer was an init script. It started
+the program, and the program **daemonized**: it forked, detached from the
+terminal and let its parent exit. Then it wrote the program's PID to a file so that
+"stop" could find it later.
+
+<Why>What's wrong with a pidfile?</Why>
+
+Nothing is watching. If the daemon crashes, nobody finds out.
+
+And the pidfile holds a number, not a process. After a crash, that number can
+belong to something else entirely by the time you try to kill it.
+
+</Sub>
+
+<Sub n="1.2" title="From pidfiles to supervisors">
+
+What fixes it is a **supervisor**: a program that runs your service as its own
+direct child, in the foreground. The kernel tells a parent whenever a child
+exits, so the supervisor always knows when the service died, and can restart
+it.
+
+Supervision grew roughly in this order:
+
+| System | Idea |
+|---|---|
+| **System V init** | Shell scripts that daemonize a program, write a pidfile and forget about it. Nothing notices a crash. |
+| **daemontools** (Dan Bernstein, late 1990s) | `supervise` runs the program in the foreground as its direct child and restarts it on exit. Programs are told *not* to daemonize, so the supervisor always knows the PID. |
+| **runit** (Gerrit Pape) | The daemontools idea, small enough to be PID 1. Void Linux uses it as init. |
+| **Upstart** (Ubuntu, 2006) | Event-driven: jobs start when events fire. It tracked forking daemons by following `fork()` with ptrace, which was fragile. |
+| **systemd** (Lennart Poettering and Kay Sievers, 2010) | Dependency-based, socket activation borrowed from inetd and launchd, and cgroups to track processes. |
+
+systemd was announced in [Rethinking PID 1](http://0pointer.de/blog/projects/systemd.html),
+April 2010. One line from that post matters most for this chapter is about
+cgroups: "cgroup membership is securely inherited by child processes, they
+cannot escape."
+
+</Sub>
+
+<Sub n="1.3" title="What systemd promises, and what it doesn't">
+
+Everything systemd manages is a **unit**: a service, a socket, a mount, a
+timer. Units declare dependencies, every service gets its own cgroup, and all
+their output goes to one journal.
+
+| systemd promises | systemd doesn't promise |
+|---|---|
+| Units start in an order consistent with their declared dependencies, computed as one transaction | That a unit reported **active** is ready to serve |
+| Every process a service spawns is attributed to that service, however it forks | That `After=` pulls anything in |
+| It restarts per the policy you wrote | That a service that keeps restarting is healthy |
+| stdout and stderr reach the journal with trusted metadata | That every line you log is kept |
+
+Each item in the right-hand column turns up in a transcript later in the
+chapter.
+
+</Sub>
+
+<SectionHeading n="02" id="pid1">What PID 1 owes the kernel</SectionHeading>
 
 Which raises the next question: who supervises the supervisor? At the top of
-that chain is **PID 1**, the one process the kernel starts itself at boot, and
-every other process descends from it. PID 1 has two jobs the kernel won't do for
-anyone else. When a process's parent dies first, the orphan is handed to PID 1,
-and PID 1 must collect its exit status, or it lingers in the process table as a
-**zombie**. And the kernel only delivers a signal to PID 1 if PID 1 has
-installed a handler for it.
+that chain is **PID 1**, the one process the kernel starts itself at boot.
+Every other process descends from it.
 
-Here's where that bites. In a container, whatever your Dockerfile's `CMD` runs
-becomes PID 1 of its namespace. Suppose it's a program with no `SIGTERM`
-handler. What happens on `docker stop`? The `SIGTERM` is silently dropped,
-Docker waits out its grace period and then sends `SIGKILL`. I tried it with
-`sleep` as PID 1: **10.16 s** to stop, and five zombies left behind by the
-processes I'd spawned under it. With `--init`, which puts the tiny tini init in
-front, it stopped in **0.093 s**.
+PID 1 has two jobs the kernel won't do for anyone else, and a third rule that
+makes its bugs expensive.
 
-**systemd** is the PID 1 on most Linux servers now, and it's a supervisor with
-more ideas built in. Everything it manages is a **unit** (a service, a socket, a
-mount, a timer) with declared dependencies, so the database can come up before
-the app that needs it. Every service gets its own cgroup, so systemd can find
-and stop every process a service spawned, however it forked. And all their
-output goes to one journal. The packages for Postgres, nginx and Redis on your
-distro ship unit files, and Kubernetes' kubelet uses the same systemd cgroup
-tree to place pods.
+<Sub n="2.1" title="Reaping orphans">
 
-Most surprises from here on live in two gaps: between a service having
-*started* and being *ready*, and between asking it to stop and it having
-stopped. A service that ignores `SIGTERM` takes **90.22 seconds** to stop under
-systemd's defaults, which section 4.3 explains. The chapter goes through what PID
-1 owes the kernel, how units and jobs are laid out, one connection through socket
-activation, and the ways supervision fails.
+When a process dies, its parent gets `SIGCHLD` and must `wait()` for it.
+Until it does, the dead process stays in the process table as a **zombie**.
 
-<SectionHeading n="01" cmd="man 7 pid_namespaces" id="contract">What PID 1 owes the kernel</SectionHeading>
+When the parent dies first, the orphan is reparented to init. So init has to
+reap children it never started.
 
-Two things, and the kernel won't do either for you.
+<Why>Why do zombies pile up in containers?</Why>
 
-- **Reap orphans.** When a process dies, its parent gets `SIGCHLD` and must
-  `wait()` for it, or the entry stays in the process table as a zombie. When the
-  parent dies first, the orphan is reparented to init. So init has to reap
-  children it never started.
-- **Handle signals deliberately.** The kernel won't deliver a signal to init
-  unless init installed a handler for it. [pid_namespaces(7)](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)
-  spells it out for namespaces: from inside, only signals with an established
-  handler reach PID 1; from an ancestor namespace, `SIGKILL` and `SIGSTOP` still
-  work. That's the whole 10 seconds above. `sleep` has no `SIGTERM` handler, so
-  Docker's `SIGTERM` is dropped, and Docker falls back to `SIGKILL` when its
-  grace period runs out.
-
-There's a third rule, stated less often. If PID 1 on the host exits or crashes,
-the kernel panics. That's why a crash in systemd isn't a service outage but a
-machine outage, and it's why the CVEs in section 4.6 matter.
+In a container, whatever your Dockerfile's `CMD` runs becomes PID 1 of its
+namespace. If that program never calls `wait()`, every orphan it inherits
+stays a zombie.
 
 <Callout label="Why the zombies in that container never went away">
 A zombie holds no memory, just a slot in the process table and an exit status
@@ -89,50 +128,51 @@ PID 1 is `docker-init` (tini), a program whose entire purpose is to call
 `wait()` in a loop and forward signals. That's the minimum viable init.
 </Callout>
 
-<Sub n="1.1" title="From pidfiles to supervisors">
+</Sub>
 
-System V init ran shell scripts that daemonized a program, wrote its PID to a
-file, and forgot about it. Stopping meant reading the pidfile and hoping the
-number still referred to the same process. Nothing noticed a crash.
+<Sub n="2.2" title="Signals only reach PID 1 through a handler">
 
-Supervision grew out of that, roughly in this order:
+The kernel won't deliver a signal to init unless init installed a handler for
+it. [pid_namespaces(7)](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)
+spells it out for namespaces: from inside, only signals with an established
+handler reach PID 1. From an ancestor namespace, `SIGKILL` and `SIGSTOP` still
+work.
 
-- **daemontools** (Dan Bernstein, late 1990s). `supervise` runs a program in
-  the foreground, as its direct child, and restarts it on exit. Programs are
-  told *not* to daemonize, so the supervisor always knows the PID.
-- **runit** (Gerrit Pape). The daemontools idea, small enough to be PID 1, and
-  used as init by Void Linux.
-- **Upstart** (Ubuntu, 2006). Event-driven: jobs start when events fire. It
-  tracked forking daemons by following `fork()` with ptrace, which was fragile.
-- **systemd** (Lennart Poettering and Kay Sievers, announced in
-  [Rethinking PID 1](http://0pointer.de/blog/projects/systemd.html), April 2010).
-  Dependency-based instead of event-based, socket activation borrowed from
-  inetd and launchd, and cgroups to track processes. From that post: "cgroup
-  membership is securely inherited by child processes, they cannot escape."
+<Why>Why does docker stop sometimes take ten seconds?</Why>
+
+Because `docker stop` sends `SIGTERM` to PID 1 and waits out a grace period
+before sending `SIGKILL`. If PID 1 has no `SIGTERM` handler, the first signal
+is silently dropped, and all you see is the wait.
+
+In a test with `sleep` as PID 1, then with `--init` in front of it:
+
+| PID 1 | `docker stop` took | Zombies left |
+|---|---|---|
+| `sleep` (no `SIGTERM` handler, never calls `wait()`) | **10.16 s** | Five, from the processes spawned under it |
+| `docker-init` (tini), via `--init` | **0.093 s** | None |
 
 </Sub>
 
-<Sub n="1.2" title="What systemd promises, and what it doesn't">
+<Sub n="2.3" title="When init dies, the machine dies">
 
-systemd promises that it'll start units in an order consistent with their
-declared dependencies, computed as one transaction; that every process a
-service spawns is attributed to that service, however it forks; that it'll
-restart per the policy you wrote; and that stdout and stderr end up in the
-journal with trusted metadata.
+There's a third rule, stated less often. If PID 1 on the host exits or
+crashes, the kernel panics.
 
-It doesn't promise that a unit reported **active** is ready to serve. It
-doesn't promise that `After=` pulls anything in. And it definitely doesn't
-promise that a service that keeps restarting is healthy. Each of those turns up
-in a transcript below.
+So a crash in systemd isn't a service outage. It's a machine outage, and it's
+why the CVEs in section 6.6 matter more than bugs in any one service.
 
 </Sub>
 
-<SectionHeading n="02" cmd="systemctl list-jobs" id="layout">Units, jobs, and one cgroup per service</SectionHeading>
+<SectionHeading n="03" id="units">Units, jobs and the transaction</SectionHeading>
 
 A **unit** is a named object loaded from a file: `foo.service`, `foo.socket`,
-`foo.timer`, `home.mount`, `multi-user.target`, `system.slice`. The file is
-INI syntax, but what systemd keeps in memory is a graph node with two sets of
-edges, and the whole design depends on them being separate.
+`foo.timer`, `home.mount`, `multi-user.target`, `system.slice`. It's written in INI
+syntax. What systemd keeps in memory is a node in a graph.
+
+<Sub n="3.1" title="Two kinds of edge">
+
+Each unit node has two sets of edges, and the whole design depends on them
+being separate:
 
 <Compare
   cols={["Edge", "Question it answers", "Pulls the other unit in?", "Orders the start?"]}
@@ -144,21 +184,41 @@ edges, and the whole design depends on them being separate.
   ]}
 />
 
-That table is probably the chapter's most expensive line, and it's in section 3.3 with a
-transcript. Requirement and ordering are orthogonal. `Requires=db.service`
-without `After=db.service` starts both **at the same time**.
+Requirement and ordering are orthogonal. `Requires=db.service` without
+`After=db.service` starts both **at the same time**. That's probably the most
+expensive line in this chapter, and section 4.3 shows it with a transcript.
 
-<Sub n="2.1" title="Jobs and the transaction">
+</Sub>
 
-You never start a unit directly. `systemctl start app` asks the manager, over
-D-Bus, to enqueue a **job**: a (unit, type) pair like `app.service/start`. The
-manager builds a <em className="term">transaction</em> around that anchor job:
-walk the requirement edges, add a job for every unit pulled in, merge
-duplicates, then walk the ordering edges looking for cycles. Only a consistent
-transaction gets committed to the run queue.
+<Sub n="3.2" title="Jobs, and how one start becomes a plan">
 
-I caught one mid-flight. `db.service` takes three seconds to report ready, and
-`app-good.service` has `Requires=` and `After=` on it:
+You never start a unit directly. `systemctl start app` asks the manager to
+enqueue a **job**: a (unit, type) pair like `app.service/start`. The manager
+builds a <em className="term">transaction</em> around that anchor job before
+anything runs.
+
+<Steps
+  title="systemctl start, from a command to a run queue"
+  lanes={[
+    { t: "systemctl", s: "a client", icon: "›" },
+    { t: "D-Bus", s: "to PID 1", icon: "⇄" },
+    { t: "Anchor job", s: "unit/start", icon: "◉" },
+    { t: "Requirements", s: "Wants, Requires", icon: "⊕" },
+    { t: "Ordering", s: "After, Before", icon: "⇅" },
+    { t: "Run queue", s: "committed jobs", icon: "≡" },
+  ]}
+  steps={[
+    [0, "`systemctl start app-good` doesn't start anything itself. It's a client of the manager."],
+    [1, "It asks PID 1, over **D-Bus**, to enqueue a job."],
+    [2, "The manager creates the **anchor job**, `app-good.service/start`: a (unit, type) pair."],
+    [3, "It walks the **requirement edges**, adds a job for every unit pulled in (here `db.service/start`), and merges duplicates."],
+    [4, "It walks the **ordering edges** looking for cycles. A cycle is either broken by deleting a job or fails the whole transaction."],
+    [5, "Only a consistent transaction is committed. `db.service/start` runs, and `app-good.service/start` sits `waiting` on its ordering edge."],
+  ]}
+/>
+
+You can catch that last step mid-flight. Here `db.service` takes three seconds
+to report ready, and `app-good.service` has `Requires=` and `After=` on it:
 
 ```shell
 $ systemctl start --no-block app-good; sleep 0.3; systemctl list-jobs
@@ -169,16 +229,31 @@ JOB UNIT             TYPE  STATE
 2 jobs listed.
 ```
 
-Two jobs, one `waiting` on an ordering edge, one `running`. Nothing in the
-unit files mentioned "wait". That's the ordering graph at work.
+Two jobs, one `waiting` on an ordering edge, one `running`. Nothing in the unit
+files mentioned "wait". That's the ordering graph at work.
 
 </Sub>
 
-<Sub n="2.2" title="What the engine does with a cycle">
+<Sub n="3.3" title="What the engine does with a cycle">
 
-What does it do when the ordering graph has a loop? I expected an error, probably a loud one. I built
-three units, `cyc-a` → `cyc-b` → `cyc-c` → `cyc-a`, each with `Wants=` and
-`After=` on the next, and started `cyc-a`:
+What happens when the ordering graph has a loop? The test: three units,
+`cyc-a` → `cyc-b` → `cyc-c` → `cyc-a`, each with `Wants=` and `After=` on the
+next.
+
+<Predict
+  q="You run systemctl start cyc-a on those three units. What happens?"
+  options={[
+    "It fails with a non-zero exit code and starts nothing",
+    "It succeeds; all three units end up active",
+    "It succeeds; one or more units are silently left out",
+    "systemctl hangs, waiting on the cycle forever",
+  ]}
+  answer={2}
+>
+systemd deletes a job to break the cycle, logs it, and starts the rest. The
+exit code is zero. With `Wants=` edges, the dropped unit takes anything only it
+wanted along with it.
+</Predict>
 
 ```shell
 $ systemctl start cyc-a; echo rc=$?
@@ -194,10 +269,13 @@ inactive
 inactive
 ```
 
-Exit code zero. systemd silently dropped a unit from the boot and carried on,
-and `cyc-c` went with it because nothing else wanted it. Swap `Wants=` for
-`Requires=` and the same start fails with `Transaction order is cyclic`. Here's
-the loop that decides:
+systemd dropped `cyc-b` from the start and carried on. `cyc-c` went with it,
+because nothing else wanted it. Swap `Wants=` for `Requires=` and the same
+start fails with `Transaction order is cyclic`.
+
+<Why>How does it choose which job to drop?</Why>
+
+Here's the loop that decides:
 
 <SourceRead
   file="src/core/transaction.c — transaction_verify_order_one()"
@@ -227,13 +305,14 @@ if (j->generation == generation) {
 
 `job_matters_to_anchor` is the whole policy. A job pulled in by `Requires=`
 matters to the anchor, so it can't be dropped. A job pulled in by `Wants=`
-doesn't, so the first one found walking back along the cycle gets deleted. On a
-real machine that shows up as `SKIP` on the console at boot, and a service that
-just isn't running afterwards.
+doesn't, so the first one found walking back along the cycle gets deleted.
+
+On a real machine that shows up as `SKIP` on the console at boot, and a service
+that just isn't running afterwards.
 
 </Sub>
 
-<Sub n="2.3" title="The cgroup tree">
+<Sub n="3.4" title="One cgroup per service">
 
 Every service gets its own cgroup, under a slice. That's the layout that makes
 supervision reliable, and you can read it straight off the filesystem:
@@ -251,8 +330,8 @@ supervision reliable, and you can read it straight off the filesystem:
   ]}}
 />
 
-PID 1's own cgroup, from inside the container (I ran with `--cgroupns=host`, so
-Docker's prefix shows):
+PID 1's own cgroup, from inside the test container (run with
+`--cgroupns=host`, so Docker's prefix shows):
 
 ```shell
 $ cat /proc/1/cgroup
@@ -261,21 +340,135 @@ $ cat /sys/fs/cgroup/docker/990fb6a9d14a*/system.slice/systemd-journald.service/
 6283264
 ```
 
-A `fork()` inherits the cgroup and a double-fork doesn't escape it, so "which
-processes belong to this service" is a directory listing and not a guess. This
-is also what the Kubernetes kubelet leans on, in section 9.
+<Why>Why does a cgroup beat a pidfile?</Why>
+
+A `fork()` inherits the cgroup, and a double-fork doesn't escape it. So "which
+processes belong to this service" is a directory listing, not a guess.
+
+This is also what the Kubernetes kubelet leans on (section 12).
 
 </Sub>
 
-<SectionHeading n="03" cmd="strace -f -e trace=accept4,execve /usr/local/bin/echo-activated" id="hot-path">One connection, from socket to accept()</SectionHeading>
+<SectionHeading n="04" id="readiness">Started versus ready</SectionHeading>
+
+`After=` makes one job wait for another to be "started". What "started" means
+is set by the dependency's `Type=`, and that setting decides whether `After=`
+means anything at all.
+
+<Sub n="4.1" title="What Type= means by started">
+
+| `Type=` | The service counts as started when… | What that tells you |
+|---|---|---|
+| **`simple`** (the default) | The manager has forked the process. Before `execve`, even. | Nothing about the program |
+| **`exec`** | `execve` succeeds | It catches a missing binary; nothing about readiness |
+| **`forking`** | The original process exits, the old double-fork convention | Ready, if the daemon only exits its parent when ready. You'll usually want `PIDFile=` too. |
+| **`notify`** | The process sends `READY=1` over the socket in `$NOTIFY_SOCKET` | Ready, because the service said so |
+
+</Sub>
+
+<Sub n="4.2" title="sd_notify by hand">
+
+`sd_notify` is one `sendto()` of a datagram on a Unix socket. Here's a fake
+database that takes three seconds to warm up:
+
+```cpp
+// notify-slow.cpp: Type=notify by hand
+static void notify(const char* msg) {
+    const char* path = getenv("NOTIFY_SOCKET");
+    if (!path) return;
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    sockaddr_un sa{};
+    sa.sun_family = AF_UNIX;
+    strncpy(sa.sun_path, path, sizeof sa.sun_path - 1);
+    if (sa.sun_path[0] == '@') sa.sun_path[0] = '\0';   // abstract namespace
+    sendto(fd, msg, strlen(msg), 0, (sockaddr*)&sa, sizeof sa);
+    close(fd);
+}
+
+int main() {
+    sleep(3);                                   // load a cache, open a DB...
+    notify("READY=1\nSTATUS=serving");
+    for (;;) pause();
+}
+```
+
+What stops another process from sending `READY=1`? The notify socket has `SO_PASSCRED` set, so each message arrives with the
+sender's PID. `service_notify_message_authorized()` in
+[src/core/service.c](https://github.com/systemd/systemd/blob/v255/src/core/service.c#L4295)
+checks it against `NotifyAccess=`, which for `Type=notify` defaults to the main
+PID only. Messages from anyone else get logged and dropped.
+
+</Sub>
+
+<Sub n="4.3" title="Requires= without After=, and After= without Wants=">
+
+That database ran twice in the test: as `db.service` with `Type=notify`, and as
+`db-simple.service` with `Type=simple`. Then four one-shot "apps" printed the
+database's state at the moment they ran:
+
+```shell
+app-bad:        Requires=db.service                          → "db is activating"   start took 0.02s
+app-good:       Requires=db.service  After=db.service        → "db is active"       start took 3.03s
+app-simple:     Requires=db-simple   After=db-simple         → "db-simple is active" start took 0.01s
+app-after-only:                      After=db.service        → "db is inactive"
+```
+
+Four units, four different failures of intuition:
+
+| Unit | What went wrong |
+|---|---|
+| **`app-bad`** | The bug everyone writes. `Requires=` pulled the database in, and with no ordering edge both jobs ran in parallel. The app ran while the database was still `activating`. |
+| **`app-good`** | Correct. The 3.03 s is the database's warm-up, spent in the `waiting` state from section 3.2. |
+| **`app-simple`** | Right dependencies, and it still loses. The database reported `active` 0.01 s after launch, three seconds before it could serve, because `Type=simple` defines "started" as "forked". |
+| **`app-after-only`** | Didn't start the database at all. `After=` only orders jobs that are already in the transaction. |
+
+<Callout label="Design implication">
+`Wants=` or `Requires=` decides *whether*. `After=` decides *when*. You almost
+always want both, and then `After=` only waits as long as the dependency's
+`Type=` says it should. A `Type=simple` dependency is "ready" the instant it's
+forked, so ordering after it buys you nothing. Services you write that others
+depend on should be `Type=notify`.
+</Callout>
+
+</Sub>
+
+<Sub n="4.4" title="network.target and network-online.target">
+
+There's a famous special case of the same trap. The
+[systemd.io page](https://systemd.io/NETWORK_ONLINE/) is blunt about the
+distinction:
+
+| Target | What reaching it means |
+|---|---|
+| `network.target` | The network manager has started. "Whether any network interfaces are already configured when it is reached is not defined." It matters mostly at shutdown. |
+| `network-online.target` | Actively waits for a routable address, and "will time out after 90s". |
+
+If you really need the network up, you need both lines:
+
+```ini
+[Unit]
+Wants=network-online.target
+After=network-online.target
+```
+
+<Callout label="Common mistake" kind="warn">
+`After=network-online.target` on its own. If nothing else pulls the target in,
+the ordering edge points at a job that isn't there, and your service starts as
+early as it always did. It's the `app-after-only` bug with a more convincing
+name.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="05" id="socket-activation">Socket activation, one connection at a time</SectionHeading>
 
 Here's the operation to trace. A TCP connection arrives on a port where no
 service process is running yet. What has to happen between the SYN and the
 service's `accept()` returning?
 
-<Sub n="3.1" title="The fd that PID 1 was holding">
+<Sub n="5.1" title="The fd that PID 1 was holding">
 
-The socket unit is four lines, and the service unit is two:
+A socket unit here is four lines, and the service unit is two:
 
 ```ini
 # /etc/systemd/system/hello.socket
@@ -296,38 +489,40 @@ inactive
 LISTEN 0  4096  127.0.0.1:7777  0.0.0.0:*  users:(("systemd",pid=1,fd=47))
 ```
 
-Meanwhile the kernel completes the handshake into that socket's backlog whether or not
-anyone's accepting. PID 1 has the fd in its event loop, sees it go readable,
-and enqueues `hello.service/start`. As far as the client knows, it's connected and just
+So the first client isn't refused: the kernel completes the handshake into that socket's backlog whether
+or not anyone is accepting. As far as the client knows, it's connected and just
 waiting for bytes.
 
 </Sub>
 
-<Sub n="3.2" title="Getting fd 47 to become fd 3">
+<Sub n="5.2" title="From fd 47 to fd 3">
 
 systemd 255 changed how children are spawned. Earlier versions forked PID 1 and
-did all the sandbox setup in the child; the [v255 NEWS](https://github.com/systemd/systemd/blob/v255/NEWS)
-explains that this ran glibc code that isn't safe between `fork` and `exec`, and
-that from now on "the new process is spawned using CLONE_VM and CLONE_VFORK
-semantics via posix_spawn(3), and it immediately execs a new internal binary,
-systemd-executor". The executor receives the configuration over a memfd, sets
-up namespaces, credentials and fds, then execs your binary.
+did all the sandbox setup in the child. The [v255 NEWS](https://github.com/systemd/systemd/blob/v255/NEWS)
+explains that this ran glibc code that isn't safe between `fork` and `exec`.
 
-<Flow
-  wrap={3}
-  steps={[
-    { label: "SYN → backlog", sub: "PID 1 owns fd 47" },
-    { label: "epoll wakes PID 1", sub: "enqueue service/start" },
-    { label: "posix_spawn", sub: "systemd-executor, CLONE_VFORK", accent: true },
-    { label: "shift_fds()", sub: "dup fd 47 to fd 3" },
-    { label: "LISTEN_PID, LISTEN_FDS", sub: "set to the child's own PID" },
-    { label: "execve(ExecStart)", sub: "accept(3) returns" },
+From v255, "the new process is spawned using CLONE_VM and CLONE_VFORK semantics
+via posix_spawn(3), and it immediately execs a new internal binary,
+systemd-executor". Step through one cold connection:
+
+<StepSequence
+  title="One connection to a socket-activated service"
+  actors={["Client", "Kernel", "PID 1", "executor", "Service"]}
+  messages={[
+    { from: 0, to: 1, label: "SYN", note: "The client connects to 127.0.0.1:7777. The kernel completes the handshake into the backlog of the listening socket, **fd 47 in PID 1**." },
+    { from: 1, to: 2, label: "readable", note: "PID 1 has fd 47 in its event loop. epoll reports it readable." },
+    { from: 2, to: 2, label: "enqueue start", note: "PID 1 enqueues `hello.service/start`, the same job machinery as `systemctl start`." },
+    { from: 2, to: 3, label: "posix_spawn", note: "It spawns **systemd-executor** with `CLONE_VM` and `CLONE_VFORK`, and passes it the configuration over a memfd." },
+    { from: 3, to: 3, label: "shift_fds()", note: "The executor sets up namespaces and credentials, then moves fd 47 down to **fd 3** with `fcntl(F_DUPFD, i + 3)`." },
+    { from: 3, to: 3, label: "LISTEN_*", note: "It sets `LISTEN_PID` to its own PID, plus `LISTEN_FDS` and `LISTEN_FDNAMES`." },
+    { from: 3, to: 4, label: "execve", note: "It execs `ExecStart`. Same process, same PID, so `LISTEN_PID` is exactly right." },
+    { from: 4, to: 1, label: "accept(3)", note: "The service calls `accept()` on fd 3 and gets the connection that has been waiting in the backlog." },
+    { from: 4, to: 0, label: "hello", note: "The first bytes go back to the client. It never saw a refusal, only a short wait." },
   ]}
 />
 
-Fd 47 moves with `fcntl(F_DUPFD, i + 3)` in a loop in `shift_fds()`, so the
-passed sockets always start at 3, the constant `SD_LISTEN_FDS_START`. Then the
-environment is built:
+Passed sockets always start at 3, the constant `SD_LISTEN_FDS_START`.
+Then the environment is built:
 
 <SourceRead
   file="src/core/exec-invoke.c — build_environment()"
@@ -359,11 +554,19 @@ if (n_fds > 0) {
 ```
 </SourceRead>
 
-Why `LISTEN_PID` at all? Environment variables are inherited. If your service
-runs a shell script that forks a helper, the helper sees `LISTEN_FDS=1` too, and
-without the PID check it'd start calling `accept()` on an fd it doesn't own.
-`getpid_cached()` runs in the executor, and that's the same process that execs the
-service, so the PID is exactly right. On the library side, it's the first thing checked:
+</Sub>
+
+<Sub n="5.3" title="LISTEN_PID, and the protocol by hand">
+
+<Why>Why pass LISTEN_PID at all?</Why>
+
+Environment variables are inherited. If your service runs a shell script that
+forks a helper, the helper sees `LISTEN_FDS=1` too. Without the PID check it'd
+start calling `accept()` on an fd it doesn't own.
+
+`getpid_cached()` runs in the executor, the same process that execs the
+service, so the PID matches. On the library side, it's the first thing
+checked:
 
 <SourceRead
   file="src/libsystemd/sd-daemon/sd-daemon.c — sd_listen_fds()"
@@ -399,10 +602,11 @@ finish:
 ```
 </SourceRead>
 
-Note the `fd_cloexec` loop. The fds arrive *without* close-on-exec, because they
-had to survive one `execve`, and the library turns it back on so they don't
-survive a second. It's a small enough protocol to do by hand, so I did, in C++
-with no libsystemd:
+Note the `fd_cloexec` loop. The fds arrive *without* close-on-exec, because
+they had to survive one `execve`. `sd_listen_fds` turns it back on so they don't
+survive a second.
+
+It's a small enough protocol to do by hand, in C++ with no libsystemd:
 
 <TryIt what="A socket-activated server that reads the protocol itself" lang="cpp" toolchain="g++ 13.3 -O2, Ubuntu 24.04 in Docker, aarch64">
 ```cpp
@@ -449,98 +653,30 @@ lrwx------ 1 root root 64 Sep 25 13:06 3 -> socket:[482356]
 <Output>
 First connection: it started the service and was served by it. Fd 3 is the
 listening socket PID 1 had been holding. Fds 1 and 2 are a socket too, a stream
-connection to journald (section 6.2).
+connection to journald (section 8.2).
 
-Then I sent the service `kill -9`. It went `failed`, the socket stayed up, and
-the next `nc` started a fresh instance, PID 206, with no refused connection in
+Then the service got `kill -9`. It went `failed`, the socket stayed up, and the
+next `nc` started a fresh instance, PID 206, with no refused connection in
 between. The listening socket never closed, because the process that owned it
 was never the one that died.
 </Output>
 </TryIt>
 
-</Sub>
-
-<Sub n="3.3" title="Started is not ready, and After= is not Wants=">
-
-When does systemd consider a service "started"? It depends on `Type=`, and it's
-the setting that decides whether `After=` means anything.
-
-- **`Type=simple`** (the default): started the moment the manager has forked
-  the process. Before `execve`, even.
-- **`Type=exec`**: started once `execve` succeeds. Catches a missing binary;
-  says nothing about readiness.
-- **`Type=forking`**: started when the original process exits, the old
-  double-fork daemon convention. You'll usually want a `PIDFile=` too.
-- **`Type=notify`**: started when the process sends `READY=1` over the socket in
-  `$NOTIFY_SOCKET`.
-
-`sd_notify` is one `sendto()` of a datagram on a Unix socket. Here's a fake
-database that takes three seconds to warm up:
-
-```cpp
-// notify-slow.cpp: Type=notify by hand
-static void notify(const char* msg) {
-    const char* path = getenv("NOTIFY_SOCKET");
-    if (!path) return;
-    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    sockaddr_un sa{};
-    sa.sun_family = AF_UNIX;
-    strncpy(sa.sun_path, path, sizeof sa.sun_path - 1);
-    if (sa.sun_path[0] == '@') sa.sun_path[0] = '\0';   // abstract namespace
-    sendto(fd, msg, strlen(msg), 0, (sockaddr*)&sa, sizeof sa);
-    close(fd);
-}
-
-int main() {
-    sleep(3);                                   // load a cache, open a DB...
-    notify("READY=1\nSTATUS=serving");
-    for (;;) pause();
-}
-```
-
-I ran it twice, as `db.service` with `Type=notify` and as `db-simple.service`
-with `Type=simple`. Then four one-shot "apps" that print the database's state
-at the moment they run:
-
-```shell
-app-bad:        Requires=db.service                          → "db is activating"   start took 0.02s
-app-good:       Requires=db.service  After=db.service        → "db is active"       start took 3.03s
-app-simple:     Requires=db-simple   After=db-simple         → "db-simple is active" start took 0.01s
-app-after-only:                      After=db.service        → "db is inactive"
-```
-
-Four units, four different failures of intuition:
-
-- **`app-bad`** is the bug everyone writes. `Requires=` pulled the database in,
-  and with no ordering edge both jobs ran in parallel. The app ran while the
-  database was still `activating`.
-- **`app-good`** is correct. The 3.03 s is the database's warm-up, spent in the
-  `waiting` state you saw in section 2.1.
-- **`app-simple`** has the right dependencies and still loses. The database
-  reported `active` 0.01 s after launch, three seconds before it could serve,
-  because `Type=simple` defines "started" as "forked".
-- **`app-after-only`** didn't start the database at all. `After=` only orders
-  jobs that are already in the transaction.
-
-<Callout label="The two-line rule, and the one line after it">
-`Wants=` or `Requires=` decides *whether*. `After=` decides *when*. You almost
-always want both, and then `After=` only waits as long as the dependency's
-`Type=` says it should. A `Type=simple` dependency is "ready" the instant it's
-forked, so ordering after it buys you nothing.
+<Callout label="Design implication">
+Socket activation separates owning the port from serving it. Restarts and
+crashes don't refuse connections, and because PID 1 binds the socket, the
+service never needs the privilege to bind port 443 (section 8.3 takes every
+other privilege away too). The one exception is section 6.2.
 </Callout>
 
-How does the manager know the datagram came from the service and not some
-other process? The notify socket has `SO_PASSCRED` set, so each message
-arrives with the sender's PID, and `service_notify_message_authorized()` in
-[src/core/service.c](https://github.com/systemd/systemd/blob/v255/src/core/service.c#L4295)
-checks it against `NotifyAccess=` (the main PID only, by default for
-`Type=notify`). Messages from anyone else get logged and dropped.
-
 </Sub>
 
-<SectionHeading n="04" cmd="journalctl -u crashy -o short-monotonic" id="failure">How supervision fails</SectionHeading>
+<SectionHeading n="06" id="failure">How supervision fails</SectionHeading>
 
-<Sub n="4.1" title="The restart loop that looks healthy">
+A supervisor restarts what dies and stops what it's told to. Each of those has
+a failure mode that looks like success from the outside.
+
+<Sub n="6.1" title="The restart loop that looks healthy">
 
 A crashing service with `Restart=on-failure` and default settings:
 
@@ -550,8 +686,28 @@ ExecStart=/bin/sh -c "echo starting; sleep 0.2; echo segfault-ish >&2; exit 139"
 Restart=on-failure
 ```
 
-It restarts every 100 ms (`DefaultRestartUSec=100ms`), and the start limit
-of 5 starts in 10 s stops it after about two seconds:
+Step through one pass round the loop:
+
+<Steps
+  title="Restart=on-failure, round and round"
+  lanes={[
+    { t: "Running", s: "ExecStart", icon: "▶" },
+    { t: "Exited", s: "status 139", icon: "✕" },
+    { t: "RestartSec", s: "100 ms default", icon: "⏱" },
+    { t: "Start limit", s: "5 per 10 s", icon: "▦" },
+    { t: "failed", s: "given up", icon: "■" },
+  ]}
+  steps={[
+    [0, "`crashy.service` starts, prints `starting`, and 0.2 s later exits with status 139."],
+    [1, "The manager is the parent, so it sees the exit at once. It records `Result=exit-code`, and `Restart=on-failure` says try again."],
+    [2, "It waits `RestartSec`, 100 ms by default (`DefaultRestartUSec=100ms`), then schedules a restart job and bumps `NRestarts`."],
+    [3, "Before starting, `service_can_start()` checks the start limit: `StartLimitBurst=5` within `StartLimitIntervalSec=10s`. Under the limit, it's back to step 1."],
+    [4, "The sixth start inside ten seconds fails the check: `Start request repeated too quickly`. The unit is `failed` about two seconds after the first crash."],
+    [4, "`Result` still says `exit-code`, not `start-limit-hit`. `service_enter_dead()` only overwrites a result that's still `SERVICE_SUCCESS`, and the start-limit check runs before the start path resets it."],
+  ]}
+/>
+
+Journal and unit state agree:
 
 ```shell
 [27299.110431] crashy.service: Failed with result 'exit-code'.
@@ -565,15 +721,27 @@ StartLimitBurst=5
 StartLimitIntervalUSec=10s
 ```
 
-I expected `Result=start-limit-hit`, and the manpage says that's a possible
-value. What stuck was the first failure. `service_enter_dead()` only
-overwrites the result `if (s->result == SERVICE_SUCCESS)`, and the start-limit
-check in `service_can_start()` runs before the start path resets it. So if your
-alerting greps for `start-limit-hit` on a unit that crashed its way there, it
-won't find it. `systemctl --failed` will.
+The manpage lists `start-limit-hit` as a possible `Result`, but the first
+failure stuck. If your alerting greps for `start-limit-hit` on a unit that
+crashed its way there, it won't find it. `systemctl --failed` will.
 
-Now the variant that matters. Same crash, but after one second of uptime, with
-`RestartSec=2`:
+Now the variant that matters: the same crash, but after one second of uptime,
+with `RestartSec=2`.
+
+<Predict
+  q="crashy-slow runs for one second, crashes, and restarts two seconds later. After 32 seconds, what does systemctl show?"
+  options={[
+    "failed, after hitting the start limit",
+    "active (running), with ten restarts behind it",
+    "activating, stuck in the restart timer",
+    "inactive, because Restart= gave up",
+  ]}
+  answer={1}
+>
+A three-second cycle only fits three or four starts into any ten-second window,
+so the limit of five never trips. The unit is `active (running)` and absent from
+`systemctl --failed`, however many times it has crashed.
+</Predict>
 
 ```shell
 $ systemctl start crashy-slow; sleep 32
@@ -586,24 +754,26 @@ $ systemctl --failed
 ● crashy.service loaded failed failed crashy.service
 ```
 
-Ten crashes in 32 seconds, and it's `active (running)` and missing from
-`--failed`. A three-second cycle only fits three or four starts into any
-ten-second window, so the limit never trips. I left it running and later saw
-`restart counter is at 58` go past in the journal. That's how a service that
-segfaults every few seconds stays green for weeks. Chris Siebenmann wrote up a
-real one, a [Prometheus host agent](https://utcc.utoronto.ca/~cks/space/blog/linux/SystemdRestartHidesProblems)
+Ten crashes in 32 seconds, and only the fast crasher is on the list. Left
+running, the slow one later showed `restart counter is at 58` in the journal.
+
+That's how a service that segfaults every few seconds stays green for weeks.
+Chris Siebenmann wrote up a real one, a [Prometheus host agent](https://utcc.utoronto.ca/~cks/space/blog/linux/SystemdRestartHidesProblems)
 crashing with a Go runtime error that went unnoticed partly because of
 `Restart=always`.
 
-**`NRestarts` is the number to alert on, not `ActiveState`.** It survives `daemon-reload` (it's serialized with the rest of the unit's
-state) and resets on the next manual start or a `systemctl reset-failed`.
+<Callout label="Common mistake" kind="warn">
+Alerting on `ActiveState`. Alert on `NRestarts`. It survives `daemon-reload`
+(it's serialized with the rest of the unit's state) and resets on the next
+manual start or a `systemctl reset-failed`.
+</Callout>
 
 </Sub>
 
-<Sub n="4.2" title="The socket that dies with its service">
+<Sub n="6.2" title="The socket that dies with its service">
 
-This one I found by accident. My cold-start benchmark stopped `hello.service`
-thirty times in a tight loop so each connection would trigger a fresh start.
+This one turned up by accident. A cold-start benchmark stopped `hello.service`
+thirty times in a tight loop, so each connection would trigger a fresh start.
 Partway through, connections started getting refused:
 
 ```shell
@@ -614,18 +784,24 @@ hello.socket: Failed with result 'service-start-limit-hit'.
 ```
 
 When the service hits its start limit, the socket unit goes down with it and
-**closes the listening socket**. After I lifted the service limit with
-`StartLimitIntervalSec=0`, the socket hit its own, separate limit
-(`TriggerLimitBurst=20` per `TriggerLimitIntervalSec=2s`) and failed with
-`trigger-limit-hit`. Either way, the port is now refusing connections. Socket activation was
-supposed to prevent exactly that. A crash-looping
-socket-activated service turns from "slow" into "down" at the sixth crash.
+**closes the listening socket**.
+
+<Why>Doesn't lifting the service's limit fix it?</Why>
+
+No. With `StartLimitIntervalSec=0` on the service, the socket hit its own,
+separate limit (`TriggerLimitBurst=20` per `TriggerLimitIntervalSec=2s`) and
+failed with `trigger-limit-hit`.
+
+Either way, the port now refuses connections, which is what socket activation
+was supposed to prevent. A crash-looping socket-activated service turns from
+"slow" into "down" at the sixth crash.
 
 </Sub>
 
-<Sub n="4.3" title="The 90-second stop">
+<Sub n="6.3" title="The 90-second stop">
 
-Back to the opening. The defaults, read from the running manager:
+A service that ignores `SIGTERM` takes **90.22 seconds** to stop under
+systemd's defaults. Here are those defaults, read from the running manager:
 
 ```shell
 $ systemctl show stubborn -p TimeoutStopUSec -p KillMode -p KillSignal -p FinalKillSignal
@@ -633,6 +809,25 @@ TimeoutStopUSec=1min 30s
 KillMode=control-group
 KillSignal=15
 FinalKillSignal=9
+```
+
+And here's what they do to a Python service that catches `SIGTERM` and
+carries on:
+
+<StepSequence
+  title="systemctl stop on a service that ignores SIGTERM"
+  actors={["systemctl", "PID 1", "stubborn"]}
+  messages={[
+    { from: 0, to: 1, label: "stop", note: "`systemctl stop stubborn` enqueues a stop job." },
+    { from: 1, to: 2, label: "SIGTERM", note: "The manager sends `KillSignal=15` to every process in the unit's cgroup, because `KillMode=control-group`." },
+    { from: 2, to: 2, label: "ignore", note: "python3 logs `got SIGTERM, ignoring` and keeps running." },
+    { from: 1, to: 1, label: "wait 90 s", note: "The manager sits in `stop-sigterm` for `TimeoutStopUSec=1min 30s`." },
+    { from: 1, to: 2, label: "SIGKILL", note: "`State 'stop-sigterm' timed out. Killing.` It sends `FinalKillSignal=9`, which can't be caught." },
+    { from: 1, to: 0, label: "failed", note: "The unit fails with `Result=timeout`. The stop took **90.22 s**." },
+  ]}
+/>
+
+```shell
 $ time systemctl stop stubborn
 stop took 90.22 s
 [27351.722146] python3[479]: got SIGTERM, ignoring
@@ -641,20 +836,28 @@ stop took 90.22 s
 [27441.913059] stubborn.service: Failed with result 'timeout'.
 ```
 
-At shutdown, units stop in reverse dependency order, so one stubborn service
-blocks everything ordered before it for the full 90 seconds. Fedora 38 accepted
-a [change](https://fedoraproject.org/wiki/Changes/Shorter_Shutdown_Timer) to cut
-it to 45 s and, via `TimeoutStopFailureMode=abort`, to send `SIGABRT` first so
-the hang leaves a core dump. That's the better fix in your own units too: a
-core of the thing that wouldn't stop tells you why.
+<Why>Why does one stubborn service slow the whole shutdown?</Why>
+
+At shutdown, units stop in reverse dependency order. One stubborn service
+blocks everything ordered before it for the full 90 seconds.
+
+Fedora 38 accepted a [change](https://fedoraproject.org/wiki/Changes/Shorter_Shutdown_Timer)
+to cut it to 45 s and, via `TimeoutStopFailureMode=abort`, to send `SIGABRT`
+first so the hang leaves a core dump. That's the better fix in your own units
+too: a core of the thing that wouldn't stop tells you why.
 
 </Sub>
 
-<Sub n="4.4" title="KillMode and the processes left behind">
+<Sub n="6.4" title="KillMode and the processes left behind">
 
-`KillMode=control-group` (the default) signals every process in the cgroup.
-`KillMode=process` signals only the main PID. I ran a service that starts two
-`setsid` background children, in both modes:
+`KillMode=` decides who gets the stop signal:
+
+| `KillMode=` | Signals | Children after stop |
+|---|---|---|
+| `control-group` (the default) | Every process in the cgroup | All dead, even ones that called `setsid` |
+| `process` | Only the main PID | Alive, and **still in the service's cgroup** |
+
+A test service started two `setsid` background children, in both modes:
 
 ```shell
 $ systemd-cgls -u system.slice | grep -A3 forker-process
@@ -670,9 +873,7 @@ $ cat /proc/617/cgroup
 0::/docker/990fb6a9.../system.slice/forker-process.service
 ```
 
-`setsid` didn't help the control-group version escape: all three died. In
-process mode the children survived, and they **stayed in the service's cgroup**.
-Starting the unit again gave:
+Starting the process-mode unit again gave:
 
 ```shell
 forker-process.service: Found left-over process 616 (sleep) in control group while starting unit. Ignoring.
@@ -681,14 +882,14 @@ forker-process.service: Found left-over process 617 (sleep) in control group whi
 
 Five processes in the unit now, two of them from the last run. Some units ship
 `KillMode=process` on purpose (sshd, so a restart doesn't kill your login
-sessions), but I'd guess most uses are a leak.
+sessions), but most other uses are probably a leak.
 
 </Sub>
 
-<Sub n="4.5" title="The watchdog">
+<Sub n="6.5" title="The watchdog">
 
 `WatchdogSec=2` puts `WATCHDOG_USEC=2000000` in the environment and expects
-`WATCHDOG=1` over the notify socket more often than that. My test program
+`WATCHDOG=1` over the notify socket more often than that. The test program
 pinged every second, six times, then pretended to deadlock:
 
 ```shell
@@ -699,46 +900,41 @@ pinged every second, six times, then pretended to deadlock:
 [27480.143467] systemd[1]: wd.service: Scheduled restart job, restart counter is at 1.
 ```
 
-`SIGABRT`, not `SIGTERM`, so you get a core of the stuck state. Where you put the ping
-matters more than the interval, I think. Sent from a dedicated timer thread, it proves the
-process is alive and nothing more. Sent from the event loop after real work, it
-proves the event loop isn't wedged, and that's probably what you care about.
+It sends `SIGABRT`, not `SIGTERM`, so you get a core of the stuck state.
+
+Where you put the ping matters more than the interval. Sent from a dedicated timer
+thread, it proves the process is alive and nothing more. Sent from the event
+loop after real work, it proves the event loop isn't wedged, and that's
+probably what you care about.
 
 </Sub>
 
-<Sub n="4.6" title="When PID 1 is the thing that breaks">
+<Sub n="6.6" title="When PID 1 is the thing that breaks">
 
 A bug in a service kills that service. A bug in PID 1 panics the kernel, and
 PID 1 parses input unprivileged users can influence.
 
-- **[CVE-2021-33910](https://www.qualys.com/2021/07/20/cve-2021-33910/denial-of-service-systemd.txt)**
-  (Qualys, July 2021). systemd reads `/proc/self/mountinfo` and escapes each
-  mount path with `unit_name_path_escape()`, which used `strdupa()`, an
-  `alloca()` on the stack. A path over 8 MB (the default stack limit), mounted
-  by an unprivileged user via FUSE, crashed PID 1 and with it the machine.
-  Qualys traced it to v220, April 2015, where a heap `strdup()` became
-  `strdupa()`.
-- **[CVE-2018-15686](https://ubuntu.com/security/notices/USN-3816-1)** (Jann
-  Horn, Google Project Zero). Across `daemon-reexec`, systemd serializes its
-  state to a text file and reads it back. Reading used `fgets()` with a fixed
-  buffer, so an overlong status line written through `NotifyAccess` got split,
-  and the second half was parsed as a fresh serialized field. That was state
-  injection into PID 1, with a path to root. Versions up to 239 were affected.
+| CVE | What reached PID 1 | What went wrong |
+|---|---|---|
+| **[CVE-2021-33910](https://www.qualys.com/2021/07/20/cve-2021-33910/denial-of-service-systemd.txt)** (Qualys, July 2021) | A mount path over 8 MB (the default stack limit), mounted by an unprivileged user via FUSE | systemd reads `/proc/self/mountinfo` and escapes each path with `unit_name_path_escape()`, which used `strdupa()`, an `alloca()` on the stack. PID 1 crashed, and the machine with it. Qualys traced it to v220, April 2015, where a heap `strdup()` became `strdupa()`. |
+| **[CVE-2018-15686](https://ubuntu.com/security/notices/USN-3816-1)** (Jann Horn, Google Project Zero) | An overlong status line written through `NotifyAccess` | Across `daemon-reexec`, systemd serializes its state to a text file and reads it back with `fgets()` and a fixed buffer. The line got split, and the second half was parsed as a fresh serialized field: state injection into PID 1, with a path to root. Versions up to 239 were affected. |
 
-Both are roughly the same shape. Attacker-controlled bytes (a mount path, a status
-string) reached code in PID 1 that assumed a size bound.
+Both are roughly the same shape. Attacker-controlled bytes, a mount path or a
+status string, reached code in PID 1 that assumed a size bound.
 
 </Sub>
 
-<SectionHeading n="05" cmd="systemd-analyze && ps -o rss -p 1" id="cost">What supervision costs</SectionHeading>
+<SectionHeading n="07" id="cost">What supervision costs</SectionHeading>
 
 <Callout label="The machine" kind="note">
 systemd 255.4 as PID 1 in an `ubuntu:24.04` container on Docker Desktop, kernel
 6.10.14-linuxkit, aarch64 on an Apple M4, 10 vCPUs. Run with `--privileged
 --cgroupns=host`. Timings are from Python `perf_counter` around the command, or
-from journal monotonic timestamps where I say so. A VM on a laptop, so treat the
+from journal monotonic timestamps where noted. A VM on a laptop, so treat the
 tails as noisy.
 </Callout>
+
+<Sub n="7.1" title="Starting, querying and activating">
 
 <Cost
   items={[
@@ -753,24 +949,29 @@ tails as noisy.
   ]}
 />
 
-A few things fall out of that. Supervision adds about a millisecond of manager
-work per start over a bare `fork+exec`, and most of what you see from
-`systemctl` is the client itself: `systemctl show`, which changes nothing, costs
-2.5 ms. If a deploy script calls `systemctl` in a loop over 500 units, that's
-over a second in client startup alone, and `systemctl start a b c ...` in one
-call is the fix.
+Most of that time goes into the client. Supervision adds about a millisecond of manager work
+per start over a bare `fork+exec`, while `systemctl show`, which changes
+nothing, costs 2.5 ms.
 
-Socket activation's cold path is a couple of milliseconds. That seems cheap enough
-for an SSH daemon or a metrics exporter, and it's why Ubuntu has shipped `sshd`
-[socket-activated by default](https://discourse.ubuntu.com/t/sshd-now-uses-socket-based-activation-ubuntu-22-10-and-later/30189) since 22.10. It isn't cheap enough to do per request,
-and `Accept=yes` (one instance per connection, inetd style) does exactly that.
+If a deploy script calls `systemctl` in a loop over 500 units, that's over a
+second in client startup alone. `systemctl start a b c ...` in one call is the
+fix.
 
-<Sub n="5.1" title="The journald burst that wasn't 10,000">
+Socket activation's cold path is a couple of milliseconds. That seems cheap
+enough for an SSH daemon or a metrics exporter, and Ubuntu has shipped `sshd`
+[socket-activated by default](https://discourse.ubuntu.com/t/sshd-now-uses-socket-based-activation-ubuntu-22-10-and-later/30189)
+since 22.10. It isn't cheap enough to do per request, and `Accept=yes` (one
+instance per connection, inetd style) does exactly that.
+
+</Sub>
+
+<Sub n="7.2" title="The journald burst that wasn't 10,000">
 
 journald's default rate limit is `RateLimitBurst=10000` per
-`RateLimitIntervalSec=30s`, per service. I had a service print 50,000 lines as
-fast as Python could. **37,500** made it in. Where does 37,500 come from? The
-burst is scaled by free disk space, in
+`RateLimitIntervalSec=30s`, per service. A test service printed 50,000 lines as
+fast as Python could, and **37,500** made it in.
+
+Where does 37,500 come from? The burst is scaled by free disk space, in
 [journald-rate-limit.c](https://github.com/systemd/systemd/blob/v255/src/journal/journald-rate-limit.c#L159-L185):
 
 ```c
@@ -790,26 +991,27 @@ burst = (burst * (k-16)) / 4;
   result={{ label: "Consistent with 'available' being journald's own size cap, not the disk", value: "k = 31" }}
 />
 
-The disk had 402 GB free, which would give k = 38 and a burst of 55,000. My
-reading is that "available" is measured against journald's `SystemMaxUse=`
-budget (10% of the filesystem, capped at 4 GiB) minus what's used, which lands
-just under 2^32. I checked the arithmetic, not that code path. Dropped
-lines don't announce themselves at the time: a
-`Suppressed 62502 messages from chatty.service` line only appeared when the
-service logged again, after the window, and it counted this run's 12,500 plus
-all 50,002 lines of a second run I'd started inside the same 30 s.
+Yet the disk had 402 GB free, which would give k = 38 and a burst of 55,000. The
+likeliest reading is that "available" is measured against journald's
+`SystemMaxUse=` budget (10% of the filesystem, capped at 4 GiB) minus what's
+used, which lands just under 2^32. That's checked against the arithmetic, not
+the code path.
+
+Nothing said lines were dropped, because the report is deferred. A `Suppressed 62502 messages from
+chatty.service` line only appeared when the service logged again, after the
+window. It counted this run's 12,500 plus all 50,002 lines of a second run
+started inside the same 30 s.
 
 </Sub>
 
-<Sub n="5.2" title="What the sandbox costs, and a number I got wrong first">
+<Sub n="7.3" title="What the sandbox costs, and a harness that lied">
 
-My first measurement of hardening said it cost about **28 ms** per cold start:
-2.5 ms plain, 30.6 ms with the drop-in from section 6.3. I believed it for a
-while. Then I reran it on a second Linux box (the shared lab container, same
-kernel and systemd, 4 CPUs) and got a *plain* unit at 17 to 60 ms, which made no
-sense next to 2.5.
+The first measurement of hardening said it cost about **28 ms** per cold start:
+2.5 ms plain, 30.6 ms with the drop-in from section 8.3. A rerun on a second
+Linux box (the shared lab container, same kernel and systemd, 4 CPUs) gave a
+*plain* unit at 17 to 60 ms, which made no sense next to 2.5.
 
-It was the harness, as far as I can tell. For the hardened run I'd added a 150 ms sleep
+It was the harness, as far as I can tell. The hardened run had a 150 ms sleep
 between stopping the service and connecting, to stay under the socket's trigger
 limit. That sleep alone does it:
 
@@ -836,33 +1038,35 @@ starts each (medians, shared 4-CPU container):
     ["DynamicUser=yes", "3.46 · 3.37 · 3.54", "+1.4"],
     ["ProtectKernelTunables, -Modules, ProtectControlGroups", "5.10 · 5.02 · 5.23", "+3.0"],
     ["SystemCallFilter=@system-service", "7.07 · 6.53 · 6.44", "+4.6"],
-    ["All sixteen lines from 6.3", "10.95 · 11.64 · 10.89", "+9.0"],
+    ["All sixteen lines from 8.3", "10.95 · 11.64 · 10.89", "+9.0"],
   ]}
 />
 
-So the seccomp filter is the biggest single line, which seems to fit: `@system-service`
-expands to 375 syscall names on this build, and the executor compiles them into
-a BPF program with libseccomp on every start. Mount-namespace directives are each roughly a millisecond or less.
+Of all the lines, the seccomp filter costs most, which seems to fit:
+`@system-service` expands to 375 syscall names on this build, and the executor
+compiles them into a BPF program with libseccomp on every start. The
+mount-namespace directives are each roughly a millisecond or less.
 
-What I can't explain is the gap. Waiting 50 ms or more after a stop makes the
-next cold start ten times slower, and it isn't the client: busy-spinning through
-the gap instead of sleeping gave the same 20 to 25 ms, and a plain `fork+exec`
-of `/bin/true` after the same sleep took 0.3 ms. Journal timestamps put the
-missing time in PID 1, before it logs `Started`: one sample went 21.5 ms from
-`connect()` to `Started ks12-hello.service`. My guess is idle-vCPU wake-up
-latency in Docker Desktop's VM, hitting PID 1's CPU and not mine, but a guess is
-all it is. An off-CPU trace of PID 1 (`offcputime-bpfcc -p 1`) with and without
-the gap would settle it, and I didn't want to trace the init of a box other
-people were using.
+What's still unexplained is the gap. Waiting 50 ms or more after a stop makes
+the next cold start ten times slower, and it isn't the client: busy-spinning
+through the gap instead of sleeping gave the same 20 to 25 ms, and a plain
+`fork+exec` of `/bin/true` after the same sleep took 0.3 ms.
+
+Journal timestamps put the missing time in PID 1, before it logs `Started`: one
+sample went 21.5 ms from `connect()` to `Started ks12-hello.service`. My guess
+is idle-vCPU wake-up latency in Docker Desktop's VM, hitting PID 1's CPU and not
+the client's, but a guess is all it is. An off-CPU trace of PID 1
+(`offcputime-bpfcc -p 1`) with and without the gap would settle it. It wasn't
+run, because tracing the init of a box other people were using seemed unwise.
 
 </Sub>
 
-<SectionHeading n="06" cmd="systemd-analyze security hello.service" id="operating">Operating it</SectionHeading>
+<SectionHeading n="08" id="operating">Operating it</SectionHeading>
 
-<Sub n="6.1" title="Seeing where boot time goes">
+<Sub n="8.1" title="Seeing where boot time goes">
 
-`blame` sorts units by their own start time; `critical-chain` shows the path that
-actually gated the target. That's usually the one you want.
+`blame` sorts units by their own start time. `critical-chain` shows the path
+that actually gated the target, and that's usually the one you want.
 
 ```shell
 $ systemd-analyze
@@ -883,32 +1087,18 @@ graphical.target @188ms
 ```
 
 On a real server the usual top of that chain is `network-online.target`, and
-the usual cause is a unit that asked for it without needing it. The
-[systemd.io page](https://systemd.io/NETWORK_ONLINE/) is blunt about the
-distinction. `network.target` means the network manager has started, and
-"whether any network interfaces are already configured when it is reached is not
-defined"; it matters mostly at shutdown. `network-online.target` actively waits
-for a routable address, and it "will time out after 90s". If you really need the
-network up, you need both lines:
-
-```ini
-[Unit]
-Wants=network-online.target
-After=network-online.target
-```
-
-`After=network-online.target` on its own is the section 3.3 bug again. If
-nothing else pulls the target in, the ordering edge points at a job that isn't
-there, and your service starts as early as it always did.
+the usual cause is a unit that asked for it without needing it (section 4.4).
 
 </Sub>
 
-<Sub n="6.2" title="The journal is a socket, then a file">
+<Sub n="8.2" title="The journal is a socket, then a file">
 
-A service's stdout and stderr are a Unix stream socket to journald. That's
-why fd 1 and 2 showed up as `socket:[480492]` in section 3.2. journald reads
-the peer's credentials and cgroup off that socket and stamps them on every line.
-Those `_`-prefixed fields are *trusted*: the client can't forge them.
+A service's stdout and stderr are a Unix stream socket to journald. That's why
+fds 1 and 2 showed up as `socket:[480492]` in section 5.3.
+
+journald reads the peer's credentials and cgroup off that socket and stamps
+them on every line. Those `_`-prefixed fields are *trusted*: the client can't
+forge them.
 
 ```shell
 $ journalctl -u hello.service -o verbose -n 1
@@ -924,17 +1114,20 @@ $ journalctl -u hello.service -o verbose -n 1
 
 `_SYSTEMD_INVOCATION_ID` changes on every start, so `journalctl
 _SYSTEMD_INVOCATION_ID=...` gives you the logs of exactly one run of a
-crash-looping service. It's also asynchronous: querying immediately
-after my 50,000-line burst showed 8,363 lines, and the full 37,500 a few seconds
-later. Don't assert on the journal in a test without waiting for it.
+crash-looping service.
+
+It's also asynchronous. Querying immediately after the 50,000-line
+burst showed 8,363 lines, and the full 37,500 a few seconds later. Don't
+assert on the journal in a test without waiting for it.
 
 </Sub>
 
-<Sub n="6.3" title="Hardening, and the score">
+<Sub n="8.3" title="Hardening, and the score">
 
-Every custom unit I'd written scored **9.6 UNSAFE** in `systemd-analyze
-security`, the same as most units shipped by packages. systemd's own daemons sit
-between 2.1 and 4.3. I added one drop-in to `hello.service`:
+Every custom unit written for this chapter scored **9.6 UNSAFE** in
+`systemd-analyze security`, the same as most units shipped by packages.
+systemd's own daemons sit between 2.1 and 4.3. One drop-in for
+`hello.service`:
 
 ```ini
 # /etc/systemd/system/hello.service.d/harden.conf
@@ -972,26 +1165,67 @@ touch: cannot touch '/usr/x': Read-only file system
 x
 ```
 
-Same binary, unchanged. It now runs as a throwaway UID, with no capabilities,
-a seccomp filter, a read-only `/usr`, and a `/tmp` nobody else can see. The
-listening socket still works because PID 1 opened it before any of that applied.
-That's the quiet advantage of socket activation: the service never needs the
-privilege to bind port 443.
+Same binary, unchanged. It now runs as a throwaway UID, with no capabilities, a
+seccomp filter, a read-only `/usr`, and a `/tmp` nobody else can see.
 
-It isn't free at start time: the whole drop-in added about 9 ms to a cold
-activation, and section 5.2 has the per-directive numbers. For a long-running
+The listening socket still works because PID 1 opened it before any of that
+applied. That's the quiet advantage of socket activation: the service never
+needs the privilege to bind port 443.
+
+It isn't free at start time. All of it together added about 9 ms to a cold
+activation (section 7.3 has the per-directive numbers). For a long-running
 daemon that's nothing. For `Accept=yes`, which spawns per connection, it's the
 whole budget.
 
 </Sub>
 
-<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+<Sub n="8.4" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `active (running)`, but users see errors every few seconds | A crash cycle slower than 5 starts per 10 s | Alert on `NRestarts`; read one run with `_SYSTEMD_INVOCATION_ID=` |
+| App connects to its database before it's ready | `Requires=` without `After=`, or a `Type=simple` database | Add `After=`; make the database `Type=notify` |
+| Service starts before the network is up | `After=network-online.target` without `Wants=` | Add both lines, or retry the connection |
+| A unit silently isn't running after boot | A `Wants=` ordering cycle broken by deleting its job | `journalctl` for "ordering cycle"; remove one edge |
+| `systemctl stop` or shutdown takes 90 s | The service ignores `SIGTERM` | Handle `SIGTERM`; `TimeoutStopFailureMode=abort` for a core |
+| `docker stop` takes 10 s | PID 1 has no `SIGTERM` handler | Install one, or run with `--init` |
+| A socket-activated port refuses connections | The service hit its start limit and took the socket down | Fix the crash loop; check the socket unit's `Result` |
+| "Found left-over process" on start | `KillMode=process` | Use the default, `control-group` |
+| Log lines missing after a burst | journald's rate limit | Look for `Suppressed N messages`; raise `RateLimitBurst=` |
+
+</Sub>
+
+<SectionHeading n="09" id="summary">Summary</SectionHeading>
+
+1. **A supervisor runs your service as its direct child.** The kernel tells a
+   parent when a child exits, which a pidfile never could.
+2. **PID 1 must reap orphans and handle signals deliberately.** Without a
+   handler, `SIGTERM` to PID 1 is dropped: 10.16 s to `docker stop` with
+   `sleep` as PID 1, 0.093 s with `--init`.
+3. **If PID 1 dies, the kernel panics.** A bug in systemd is a machine outage.
+4. **Requirement and ordering are separate edges.** `Wants=` or `Requires=`
+   decides whether, `After=` decides when, and you almost always want both.
+5. **A `Wants=` cycle doesn't fail the start.** systemd deletes a job, logs it
+   and exits zero.
+6. **Started is not ready.** `Type=simple` counts as started once forked; only
+   `Type=notify` waits for the service to say `READY=1`.
+7. **Socket activation separates the port from the process.** PID 1 holds the
+   listening fd, hands it over as fd 3, and a crash refuses no connections,
+   until the start limit closes the socket.
+8. **A slow crash loop never trips the start limit.** Alert on `NRestarts`, not
+   `ActiveState`.
+9. **Ignoring `SIGTERM` costs 90 seconds per stop** under the defaults, and
+   blocks shutdown behind it.
+10. **Supervision costs about a millisecond per start; full hardening about
+    9 ms more.** The seccomp filter is the largest single part.
+
+<SectionHeading n="10" id="build">Build this</SectionHeading>
 
 **A socket-activated, `Type=notify`, watchdog-supervised service in about 80
 lines of C++, with no libsystemd.**
 
-- Take the `LISTEN_FDS` server from section 3.2 and add the `notify()` helper
-  from 3.3. Send `READY=1` after your setup and `WATCHDOG=1` from the accept
+- Take the `LISTEN_FDS` server from section 5.3 and add the `notify()` helper
+  from 4.2. Send `READY=1` after your setup and `WATCHDOG=1` from the accept
   loop, not from a timer thread.
 - Run systemd as PID 1 to test it:
   `docker run -d --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run ubuntu-with-systemd /lib/systemd/systemd`
@@ -1000,11 +1234,12 @@ lines of C++, with no libsystemd.**
   ones. There should be none.
 - Then crash-loop it on purpose and find the connection that gets refused. It's
   the one after the start limit.
-- Add the hardening drop-in from 6.3 and time cold activation with and without
+- Add the hardening drop-in from 8.3 and time cold activation with and without
   each line. Then add a 150 ms sleep before each connection and watch it get ten
-  times slower. If you can say why, you've answered the question I couldn't.
+  times slower. If you can say why, you've answered the question section 7.3
+  couldn't.
 
-<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
+<SectionHeading n="11" id="tradeoffs">What you give up</SectionHeading>
 
 <Compare
   cols={["You get", "You pay", "When the bill arrives"]}
@@ -1019,7 +1254,7 @@ lines of C++, with no libsystemd.**
   ]}
 />
 
-<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
+<SectionHeading n="12" id="in-the-wild">Where you meet this in the wild</SectionHeading>
 
 <CardGrid>
   <WildCard name="Kubernetes kubelet — the systemd cgroup driver" verdict="If your nodes run systemd, the kubelet and the container runtime should both say cgroupDriver: systemd, and match.">
@@ -1057,11 +1292,11 @@ lines of C++, with no libsystemd.**
   </WildCard>
 </CardGrid>
 
-<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+<SectionHeading n="13" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="What does PID 1 have to do that other processes don't?">
 Reap orphaned children, since they're reparented to it, and install handlers
-for any signal it wants to receive, because the kernel drops the rest. I ran
+for any signal it wants to receive, because the kernel drops the rest. With
 `sleep` as PID 1 in a container: five zombies after five orphaned children, and
 `docker stop` took 10.16 s because `SIGTERM` was ignored until Docker sent
 `SIGKILL`. With `--init` it stopped in 0.09 s.
@@ -1070,7 +1305,7 @@ for any signal it wants to receive, because the kernel drops the rest. I ran
 <QA level="beginner" q="What's the difference between Requires= and After=?">
 `Requires=` pulls the other unit into the transaction and fails you if it
 fails. `After=` only orders two jobs that are both already queued. With only
-`Requires=`, both start in parallel; I measured an app seeing its database as
+`Requires=`, both start in parallel; in the test, the app saw its database as
 `activating`. With only `After=`, the database isn't started at all.
 </QA>
 
@@ -1090,9 +1325,9 @@ the PID matches, so forked helpers don't also grab the fd, and accepts on fd 3.
 
 <QA level="intermediate" q="A service shows active (running) but users report errors every few seconds. What do you look at?">
 `systemctl show -p NRestarts`. A crash cycle slower than 5 starts per 10 s
-never trips the start limit, so the unit stays green. I had one at 10 restarts
-in 32 s, `active` and absent from `systemctl --failed`. Then the journal for one
-invocation with `_SYSTEMD_INVOCATION_ID=`.
+never trips the start limit, so the unit stays green. In the test, one reached
+10 restarts in 32 s, `active` and absent from `systemctl --failed`. Then the
+journal for one invocation with `_SYSTEMD_INVOCATION_ID=`.
 </QA>
 
 <QA level="deep" q="Why does KillMode=process exist, and why is it usually a mistake?">
@@ -1118,7 +1353,7 @@ the systemd driver, the runtime asks systemd to create a scope per container
 under `kubepods.slice`, and there's one owner.
 </QA>
 
-<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="14" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
   <Q q="You add After=network-online.target and the service still starts before the network is up. Why?">
@@ -1147,7 +1382,7 @@ under `kubepods.slice`, and there's one owner.
   </WildCard>
   <WildCard name="systemd — src/libsystemd/sd-daemon/sd-daemon.c">
     [sd_listen_fds and sd_notify](https://github.com/systemd/systemd/blob/v255/src/libsystemd/sd-daemon/sd-daemon.c)
-    in under 800 lines. Short enough to reimplement, as section 3 does.
+    in under 800 lines. Short enough to reimplement, as section 5 does.
   </WildCard>
   <WildCard name="systemd.service(5) and systemd.unit(5)">
     The [service manpage](https://www.freedesktop.org/software/systemd/man/255/systemd.service.html)
@@ -1162,7 +1397,7 @@ under `kubepods.slice`, and there's one owner.
   </WildCard>
 </CardGrid>
 
-<SectionHeading n="12" cmd="ls ../" id="related">Related chapters</SectionHeading>
+<SectionHeading n="15" id="related">Related chapters</SectionHeading>
 
 <CardGrid>
   <WildCard name="06 · Processes & Scheduling">

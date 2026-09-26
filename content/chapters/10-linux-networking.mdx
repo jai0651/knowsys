@@ -1,208 +1,124 @@
 ---
 title: The Linux Networking Stack
-dek: "The path a packet takes from the network card to your read() call, the fixed-size queues along the way, and how to find out which one is dropping your traffic."
-readingTime: "~26 min"
-versions: "Linux v6.10 source · measured on linuxkit 6.10.14 aarch64 (shared 4-CPU container) and Apple M4 · macOS 26.5.1"
-prereqs: "Chapters 04 and 07"
-updated: "2026-09-25"
+dek: "Every request your service handles arrives as packets. Between the network card and your read() call, each one passes through a chain of fixed-size queues, and any of them can quietly drop it. This chapter follows one packet all the way up, and shows where to look when traffic goes missing."
+readingTime: "~28 min"
+level: "Intermediate"
+versions: "Linux v6.10 source · measured on linuxkit 6.10.14 aarch64 and Apple M4 · macOS 26.5.1"
+prereqs: "syscalls, TCP basics"
+updated: "2026-09-26"
 ---
 
-A network card receives a stream of frames off the wire and turns each one into
-bytes. Your program, somewhere above, calls `read()` on a socket and gets the
-payload in order, with the headers stripped and lost packets resent. This
-chapter is about everything that happens in between, and it's easiest to
-understand by building it up from the naive version.
+Every backend engineer runs into the network stack eventually. A load balancer
+reports timeouts your application never logged. A Kubernetes node stops
+accepting new connections while old ones carry on. A UDP metrics collector
+quietly loses a tenth of what it's sent.
 
-The naive version is for the card to interrupt the CPU for every packet and let
-the kernel copy it in. That works at dial-up speeds. A 10 Gbit/s link can carry
-close to 15 million minimum-size frames a second, though, and a core that took
-an interrupt for each one would do nothing else. So two fixes come first. The
-card writes packets straight into memory itself, into a **ring** of buffers it
-shares with its driver, without the CPU copying anything. And instead of one
-interrupt per packet, the driver takes one interrupt, switches it off, and
-polls the ring in batches until it's empty. Linux calls that polling scheme
-**NAPI**.
+In each case the packet reached the machine and the kernel threw it away,
+before your code ran. Knowing the path a packet takes, and the queues along it,
+turns those mysteries into a counter you can read.
 
-Now the kernel has a packet in memory and needs to keep track of it as it moves
-up the stack. It wraps each one in a `struct sk_buff`, a record that points at
-the bytes and carries everything learned about them on the way. IP checks where
-the packet is going. The firewall hooks (netfilter, and its connection tracker
-if you use one) get a look. TCP puts the bytes in order and appends them to your
-socket's receive queue, then wakes your thread if it's asleep in `epoll` or
-`read()`. Sending goes the same way in reverse, through a queueing layer and a
-transmit ring.
+This chapter follows one packet from the network card to your `read()` call,
+then one back out. Along the way it shows where each queue sits, how it
+overflows, where the drop is counted, and which setting fixes it.
 
-Look at what that design is made of: a chain of hand-offs, and every hand-off is
-a queue with a fixed size. The ring holds so many descriptors, the per-CPU
-backlog so many packets, the socket buffer so many bytes. When a queue is full,
-the next packet is dropped. Almost every "the network lost it" problem is one
-of those queues overflowing, and almost every one of them has a counter
-somewhere.
+<SectionHeading n="01" id="why-a-stack">Why the kernel needs a network stack</SectionHeading>
 
-Here's a question that shows why this matters. Your server calls `listen(fd,
-128)`, and a burst of a thousand new connections arrives before it gets round
-to calling `accept()`. What happens to the ones that don't fit? The kernel drops
-their handshake packets. Each client resends after about a second, so those
-users see an extra second or more of latency, and your application's logs show
-nothing at all, because the requests never reached it. That's exactly the
-backlog nginx and HAProxy ask you to size. It has cousins: a full connection
-tracking table (`nf_conntrack: table full, dropping packet`) has taken down more
-than one Kubernetes node, and a UDP service like DNS or statsd loses datagrams
-silently when its receive buffer fills.
+A network card delivers **frames**: a few hundred to a few thousand bytes each,
+with headers for Ethernet, IP and TCP stacked in front of the payload. They
+arrive out of order, some are duplicated, and some never arrive at all.
 
-I found out how hidden some of this is with a forty-line server that called
-`listen(fd, 4)` and never accepted. **Five** connections got in, not four. And
-when I counted the refused SYNs with the tracepoint every drop-debugging guide
-recommends, it saw zero of the 120 the kernel had counted. Section 4.1 explains
-both. The rest of the chapter follows one packet in and one out, then goes
-through where each drop is counted and what a packet costs.
+Your program wants something far simpler: a stream of bytes, in order, from one
+other program. Everything in between is the kernel's network stack. It
+reassembles, reorders, acknowledges and retransmits for every socket on the
+machine, so that each application sees a clean stream.
 
-<SectionHeading n="01" cmd="man 7 tcp" id="contract">What the stack promises</SectionHeading>
+<Sub n="1.1" title="What the stack promises you">
 
-For TCP the promise is an ordered, reliable byte stream per socket. For UDP it's
-much less: a datagram arrives intact or not at all. That's the whole contract
-from the application's side, and it says nothing about *how many* packets the
-kernel is allowed to throw away to keep it.
+What you're promised depends on the protocol you ask for.
 
-It's allowed to throw away a lot. TCP hides the loss behind retransmission and
-UDP doesn't hide it at all. Between the wire and your `read()` there's a chain
-of bounded queues, and each one drops when it's full:
+| Protocol | What you're promised | What you're not |
+|---|---|---|
+| **TCP** | An ordered, reliable byte stream per socket | How long it takes, or how much gets retransmitted |
+| **UDP** | Each datagram arrives intact, or not at all | That it arrives, arrives once, or arrives in order |
 
-- **The NIC's RX ring.** A fixed number of descriptors pointing at DMA buffers.
-- **The per-CPU backlog**, `netdev_max_backlog` packets long (1,000 by default,
-  from [`net/core/hotdata.c`](https://github.com/torvalds/linux/blob/v6.10/net/core/hotdata.c)).
-- **The conntrack table**, if anything on the box uses netfilter state.
-- **The socket's receive buffer**, `sk_rcvbuf` bytes, charged by allocation size.
-- **The listener's accept queue**, sized by your `listen()` backlog and capped by `somaxconn`.
+<Why>Why doesn't TCP's reliability mean nothing gets dropped?</Why>
 
-Sending has its own chain: the socket send buffer, the qdisc, and the TX ring.
+Because reliability is about the *stream*, not the *packets*. TCP hides loss by
+retransmitting, so a dropped packet costs you time, not data. UDP doesn't hide
+it at all.
 
-<Callout label="Why 'the network dropped it' is almost never the diagnosis">
-Every one of those queues has a counter. They live in at least four places:
-`ethtool -S` for the ring, `/proc/net/softnet_stat` for the backlog, `nstat`
-for the socket and listener, `dmesg` for conntrack. A drop you "can't see" is
-usually a drop you're reading the wrong file for.
+Neither promise says anything about how many packets the kernel may throw away
+along the way. And it throws away a lot, every time a queue fills up.
+
+<Callout label="Design implication">
+"The network dropped it" is rarely the right diagnosis. Most drops happen
+inside the receiving machine, in a queue with a fixed size and a counter you can
+read. Section 3 lists all of them.
 </Callout>
 
-<SectionHeading n="02" cmd="grep -n 'struct sk_buff {' include/linux/skbuff.h" id="layout">sk_buff, and the bytes it points at</SectionHeading>
+</Sub>
 
-Every packet in the kernel is a `struct sk_buff`. Its name is older than most of
-the code in it (it's short for "socket buffer"), and the thing to understand is
-that it's *metadata about* a packet. It doesn't contain the bytes. It points at
-them.
+<SectionHeading n="02" id="receive-path">The receive path, step by step</SectionHeading>
 
-<SourceRead
-  file="include/linux/skbuff.h"
-  repo="torvalds/linux"
-  tag="v6.10"
-  href="https://github.com/torvalds/linux/blob/v6.10/include/linux/skbuff.h#L859"
->
-```c
-struct sk_buff {
-	union {
-		struct {
-			/* These two members must be first to match sk_buff_head. */
-			struct sk_buff		*next;
-			struct sk_buff		*prev;
-			union {
-				struct net_device	*dev;
-				unsigned long		dev_scratch;
-			};
-		};
-		struct rb_node		rbnode; /* used in netem, ip4 defrag, and tcp stack */
-		/* ... */
-	};
-	struct sock		*sk;
-	/* ... tstamp ... */
-	char			cb[48] __aligned(8);
-	/* ... _skb_refdst, destructor ... */
-#if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
-	unsigned long		 _nfct;
-#endif
-	unsigned int		len,
-				data_len;
-	/* ... ~60 lines of flag bits, hash, mark, protocol ... */
-	__u16			transport_header;
-	__u16			network_header;
-	__u16			mac_header;
-	/* ... */
-	/* These elements must be at the end, see alloc_skb() for details.  */
-	sk_buff_data_t		tail;
-	sk_buff_data_t		end;
-	unsigned char		*head,
-				*data;
-	unsigned int		truesize;
-	refcount_t		users;
-	/* ... */
-};
-```
-</SourceRead>
+A network card receives frames off the wire and turns them into bytes. Your
+program, somewhere above, calls `read()` and gets the payload. It's easiest to
+understand the path between them by starting from the naive version and fixing
+it.
 
-A handful of those fields do most of the work:
+<Sub n="2.1" title="From the wire to memory">
 
-- **`next` / `prev`** come first so an skb can sit on a queue with no extra
-  allocation. Every queue in section 1 is a list of these.
-- **`head`, `data`, `tail`, `end`** bracket the actual buffer. `data` moves
-  forward as each layer strips its header, so IP never copies the Ethernet
-  frame. It just advances a pointer by 14 bytes.
-- **`mac_header`, `network_header`, `transport_header`** are 16-bit offsets from
-  `head`, not pointers. That's what my bpftrace script used to find the TCP
-  port: `head + transport_header`.
-- **`_nfct`** is conntrack's pointer to this packet's flow entry. It's why a
-  packet carries its connection state through every later hook for free.
-- **`truesize`** is what the socket gets charged for, and it isn't `len`.
+In the naive design, the card interrupts the CPU for every packet and let
+the kernel copy it in. That works at dial-up speeds.
 
-Past `end`, in the same allocation as the data, sits `struct skb_shared_info`.
-It holds `nr_frags` and an array of `frags[]`, each one a reference to a page
-plus an offset and length. That array is how the stack avoids copying: GRO
-glues packets together by appending frags, `sendfile` hands page-cache pages to
-TCP as frags, and `MSG_ZEROCOPY` pins your user pages and does the same.
+<Why>Why not one interrupt per packet?</Why>
 
-```text
-head        data                         tail        end
- |headroom  | eth | ip | tcp | payload... | tailroom  | skb_shared_info: nr_frags, frags[] → pages
-             ^mac   ^network ^transport
-```
+Because of the numbers. A 10 Gbit/s link can carry close to **15 million
+minimum-size frames a second** (section 7 works it out). A core taking an
+interrupt for each one would do nothing else.
 
-<Sub n="2.1" title="truesize, measured">
+So modern drivers make two changes:
 
-How big is the gap between `len` and `truesize`? I asked for a 64 KB receive
-buffer on a UDP socket, sent it 10,000 datagrams of 100 bytes each, and didn't
-read any of them. (The code is in section 4.5.)
+- **DMA into a ring.** It owns a ring of descriptors, each pointing at a
+  buffer the driver allocated in advance. It writes each frame into the next free
+  buffer by itself. No CPU touches the bytes.
+- **Poll instead of interrupt.** The driver takes one interrupt, switches
+  further interrupts off, and polls the ring in batches until it's empty. Linux
+  calls this **NAPI** (the "new API"; LWN's [history](https://lwn.net/Articles/244640/)
+  is still the best account).
 
-Asking for 64 KB got me 131,072, according to `getsockopt`. It kept **158 datagrams**.
-That's 131,072 / 158 ≈ **830 bytes of buffer per 100-byte payload**, because the
-socket is charged for the skb struct and the whole slab allocation behind the
-data, not for the bytes you'll `recv()`. So a UDP service sized with "rcvbuf
-divided by message size" is off by roughly 8× for small messages.
+Step through what happens to one packet:
+
+<Steps
+  title="One packet, from the wire to your read()"
+  lanes={[
+    { t: "NIC", s: "network card", icon: "⌁" },
+    { t: "RX ring", s: "buffers in RAM", icon: "▦" },
+    { t: "Driver · NAPI", s: "softirq on a CPU", icon: "⚡" },
+    { t: "IP + netfilter", s: "route, firewall", icon: "⇅" },
+    { t: "TCP · socket", s: "receive queue", icon: "≡" },
+    { t: "Your app", s: "epoll · read()", icon: "◉" },
+  ]}
+  steps={[
+    [0, "A frame arrives at the **network card**. It checks the frame is addressed to it and that the checksum is good."],
+    [1, "The card copies the frame into a free buffer in the **RX ring** by itself, using DMA. **No CPU is involved yet.**"],
+    [2, "The card raises **one interrupt**. The IRQ handler masks further interrupts from that queue and calls `napi_schedule()`."],
+    [2, "In a softirq, **NAPI** polls the ring in batches (up to `dev_weight` = 64 per device) and wraps each packet in an `sk_buff`."],
+    [3, "**IP** checks the packet is for this host, and **netfilter** (the firewall, and conntrack if you use it) gets a look."],
+    [4, "**TCP** puts bytes in order, sends ACKs, and appends the payload to the socket's **receive queue**. If the queue is full, the packet is dropped here."],
+    [5, "**epoll** wakes your thread, and `read()` copies the bytes into your buffer. This is the first time your code sees the packet."],
+  ]}
+/>
+
+Two things in that walk matter for everything that follows. The CPU doesn't
+touch the packet until step 3, and every hand-off between stages is a **queue
+with a fixed size**.
 
 </Sub>
 
-<SectionHeading n="03" cmd="perf trace -e 'net:*' -- curl localhost" id="hot-path">One packet in, one packet out</SectionHeading>
+<Sub n="2.2" title="The softirq budget: 300 packets at a time">
 
-<Sub n="3.1" title="From the wire to RAM, and the interrupt nobody wants">
-
-The NIC owns a ring of descriptors, each one pointing at a buffer the driver
-pre-allocated. A frame arrives, the NIC DMAs it into the next free buffer,
-writes the length into the descriptor and raises an interrupt. No CPU has
-touched a byte yet.
-
-Its IRQ handler does almost nothing. It masks further interrupts from that
-queue and calls `napi_schedule()`, which puts the queue's `napi_struct` on this
-CPU's poll list and raises `NET_RX_SOFTIRQ`. Everything after this runs in
-softirq context, on the CPU that took the interrupt. Hold on to that last
-clause; half of section 4 follows from it.
-
-Why mask the interrupt? At a million packets a second, one interrupt per
-packet would leave no CPU for anything else. **NAPI** (the "new API"; LWN's [history](https://lwn.net/Articles/244640/) is still the best
-account) turns the device into something you poll while it's busy and interrupt
-on only when it goes idle.
-
-</Sub>
-
-<Sub n="3.2" title="net_rx_action, and the budget of 300">
-
-Here's the loop that runs when the softirq fires:
+NAPI polling runs in a **softirq**: deferred interrupt work that runs on the CPU
+that took the interrupt, ahead of any normal thread. Here's the loop:
 
 <SourceRead
   file="net/core/dev.c"
@@ -238,28 +154,108 @@ static __latent_entropy void net_rx_action(struct softirq_action *h)
 ```
 </SourceRead>
 
-Two limits, whichever hits first. `netdev_budget` is 300 packets per softirq
-run. `netdev_budget_usecs` defaults to two jiffies (the source says
-`2 * USEC_PER_SEC / HZ`), which reads as 2000 µs on the container I used.
-Inside that, each driver's `poll()` is handed a weight, `dev_weight`, 64 by
-default. I read all three off the box: `300`, `2000`, `64`.
+It stops at whichever limit comes first:
 
-When the loop runs out of budget with work still pending, it bumps
-`sd->time_squeeze`. That's column three of `/proc/net/softnet_stat`, and it's
-the only direct evidence you'll get that a CPU couldn't keep up with its queues.
+| Setting | Default | Meaning |
+|---|---|---|
+| `netdev_budget` | 300 | Packets per softirq run, across all devices |
+| `netdev_budget_usecs` | 2 jiffies (2,000 µs on the box measured) | Time per softirq run |
+| `dev_weight` | 64 | Packets one device's `poll()` may take per turn |
+
+<Why>Why have a budget at all?</Why>
+
+Because softirqs run ahead of every thread. Without a limit, a flood of packets
+could keep one CPU in softirq forever, and nothing else on that CPU would run.
+
+When the loop runs out of budget with work still pending, it increments
+`time_squeeze`. That's column three of `/proc/net/softnet_stat`, and it's the only
+direct evidence that a CPU couldn't keep up with its queues.
 
 </Sub>
 
-<Sub n="3.3" title="Up the stack: GRO, netfilter, TCP">
+<Sub n="2.3" title="sk_buff: a record about a packet">
 
-Inside the driver's poll, each frame becomes an skb and goes to
-`napi_gro_receive()`. **GRO** (generic receive offload; LWN covered it in
-[2009](https://lwn.net/Articles/358910/)) holds packets from the same flow and
-merges consecutive ones into one big skb with a frags list. About forty-five 1,500-byte
-segments can go up the stack as a single 64 KB skb, paying the per-packet cost
-once.
+Every packet in the kernel is a `struct sk_buff` ("socket buffer"). The key
+idea is that it's *metadata about* a packet. It doesn't contain the bytes; it
+points at them.
 
-After that it's a sequence of function calls, all still in softirq:
+<SourceRead
+  file="include/linux/skbuff.h"
+  repo="torvalds/linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/include/linux/skbuff.h#L859"
+>
+```c
+struct sk_buff {
+	union {
+		struct {
+			/* These two members must be first to match sk_buff_head. */
+			struct sk_buff		*next;
+			struct sk_buff		*prev;
+			/* ... dev ... */
+		};
+		/* ... */
+	};
+	struct sock		*sk;
+	char			cb[48] __aligned(8);
+#if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
+	unsigned long		 _nfct;
+#endif
+	unsigned int		len,
+				data_len;
+	__u16			transport_header;
+	__u16			network_header;
+	__u16			mac_header;
+	/* These elements must be at the end, see alloc_skb() for details.  */
+	sk_buff_data_t		tail;
+	sk_buff_data_t		end;
+	unsigned char		*head,
+				*data;
+	unsigned int		truesize;
+	refcount_t		users;
+	/* ... */
+};
+```
+</SourceRead>
+
+A handful of fields do most of the work:
+
+| Field | What it's for |
+|---|---|
+| `next`, `prev` | Lets the skb sit on a queue with no extra allocation. Every queue in this chapter is a list of these. |
+| `head`, `data`, `tail`, `end` | Bracket the real buffer. `data` moves forward as each layer strips its header, so IP never copies the Ethernet frame. |
+| `mac_header`, `network_header`, `transport_header` | 16-bit offsets from `head` to each layer's header |
+| `_nfct` | Conntrack's pointer to this packet's flow entry |
+| `truesize` | What the socket is charged for. It isn't `len`. |
+
+<Why>Why does truesize matter?</Why>
+
+Because receive buffers are charged by `truesize`, not by the bytes you'll
+`recv()`. In a test on Linux 6.10, a UDP socket with a 128 KB buffer held only
+**158 datagrams of 100 bytes**. That's about **830 bytes of buffer per 100-byte
+payload**: the skb struct and the whole slab allocation behind the data. Sizing a
+UDP buffer as "buffer ÷ message size" is off by roughly 8× for small messages.
+
+Past `end`, in the same allocation, sits `skb_shared_info` with an array of
+`frags[]`, each a reference to a page. That array is how the stack avoids
+copying: GRO glues packets together by appending frags, and `sendfile` hands
+page-cache pages to TCP the same way.
+
+</Sub>
+
+<Sub n="2.4" title="Up the stack: GRO, netfilter and TCP">
+
+Inside the driver's poll, each frame goes to `napi_gro_receive()`.
+
+<Why>Why merge packets before processing them?</Why>
+
+Processing costs roughly the same per packet whatever its size. **GRO**
+(generic receive offload; LWN covered it in [2009](https://lwn.net/Articles/358910/))
+holds packets from the same flow and merges consecutive ones into one large
+skb. About forty-five 1,500-byte segments can travel up the stack as one 64 KB
+skb and pay the per-packet cost once.
+
+After that it's a chain of function calls, all still in softirq:
 
 <Flow
   wrap={4}
@@ -275,136 +271,95 @@ After that it's a sequence of function calls, all still in softirq:
   ]}
 />
 
-At `PREROUTING`, conntrack looks up the packet's tuple in its hash table. A
-first packet of a new flow gets an entry allocated and stored in `_nfct`. On a
-Kubernetes node running kube-proxy in iptables mode, this happens to every
-packet, because the service NAT rules depend on connection state.
+At `PREROUTING`, **conntrack** looks up the packet's flow in its hash table and
+creates an entry for a new flow. On a Kubernetes node running kube-proxy in
+iptables mode, that happens to every packet, because service NAT depends on
+connection state.
 
-`tcp_v4_rcv()` then finds the socket. If a user thread holds the socket lock
-right now, the skb goes on the socket's *backlog* (a different backlog again)
-and is processed when the lock is released. Otherwise `tcp_rcv_established()`
-runs the fast path, appends the data to `sk_receive_queue`, and calls
+`tcp_v4_rcv()` then finds the socket. If a user thread holds the socket lock at
+that moment, the skb waits on the socket's *backlog* until the lock is released.
+Otherwise the fast path appends the data to `sk_receive_queue` and calls
 `sk_data_ready`.
 
 </Sub>
 
-<Sub n="3.4" title="Waking the thread: epoll">
+<Sub n="2.5" title="Waking your thread: epoll">
 
-`sk_data_ready` defaults to `sock_def_readable()`, which wakes the socket's wait
-queue. If you're blocked in `read()`, that's you. If you registered the socket
-with epoll, the wait-queue entry is epoll's `ep_poll_callback()`, which puts
-the socket's `epitem` on the epoll instance's ready list and wakes whoever is in
-`epoll_wait()`.
+`sk_data_ready` wakes whoever is waiting on the socket. If you're blocked in
+`read()`, that's you. If the socket is in an epoll set, epoll's callback puts
+the socket on the ready list and wakes the thread in `epoll_wait()`.
 
-That's where the classic thundering herd lives. Put one listening socket in
-many workers' epoll sets and a single SYN can wake all of them.
-`EPOLLEXCLUSIVE` (Linux 4.5, [man page](https://man7.org/linux/man-pages/man2/epoll_ctl.2.html))
-limits it to one. But which one? Cloudflare found that
+<Why>Why can one connection wake every worker?</Why>
+
+Put one listening socket in many workers' epoll sets, and a single new
+connection wakes all of them: the **thundering herd**. `EPOLLEXCLUSIVE` (Linux
+4.5, [man page](https://man7.org/linux/man-pages/man2/epoll_ctl.2.html)) limits
+it to one waiter.
+
+But which one? Cloudflare found that
 [wake-ups go LIFO](https://blog.cloudflare.com/the-sad-state-of-linux-socket-balancing/):
-the most recently added waiter gets the connection, so one NGINX worker took
-most of the load.
+the most recently added waiter gets the connection, so one NGINX worker ended up
+with most of the load.
 
 </Sub>
 
-<Sub n="3.5" title="Which CPU does all this?">
+<SectionHeading n="03" id="drops">Where packets get dropped</SectionHeading>
 
-Everything so far ran on the CPU that took the interrupt. Spreading that out is
-the job of four separate mechanisms, all documented in
-[`scaling.rst`](https://github.com/torvalds/linux/blob/v6.10/Documentation/networking/scaling.rst):
+Each queue on the receive path drops when it's full, and each one counts its
+drops somewhere different. This is the table to keep open during an incident.
 
-- **RSS** is the NIC hashing the 4-tuple into one of several RX queues, each
-  with its own IRQ. It's hardware, it's free, and it's bounded by the number of
-  queues.
-- **RPS** does the same in software: the receiving CPU hashes the packet and
-  enqueues it on another CPU's backlog, then sends an IPI. Useful when the NIC
-  has fewer queues than you have cores.
-- **RFS** steers to the CPU where the consuming thread last ran, so the
-  softirq work and your `recv()` share a cache.
-- **`SO_REUSEPORT`** (Linux 3.9, [LWN](https://lwn.net/Articles/542629/)) moves
-  the fan-out to the socket layer: several sockets bind the same port and the
-  kernel hashes each new flow to one of them.
+| Queue | Fills when | Where it's counted | Usual fix |
+|---|---|---|---|
+| **RX ring** | The CPU can't drain it fast enough | `ethtool -S eth0` | Bigger ring, spread load with RSS |
+| **Per-CPU backlog** | Softirq processing falls behind (default 1,000 packets) | `/proc/net/softnet_stat` | Raise `netdev_max_backlog`, use RPS |
+| **Conntrack table** | Too many tracked flows | `dmesg`: "table full" | Raise `nf_conntrack_max` |
+| **Socket receive buffer** | Your app reads too slowly | `nstat` RcvbufErrors | Read faster, raise `SO_RCVBUF` |
+| **Accept queue** | The app doesn't `accept()` in time | `nstat` ListenOverflows | Faster accept loop, bigger backlog |
 
-My VM had none of the first one. `ethtool -l eth0` reported
-`Combined: 1`, a single virtio queue, so every packet from outside lands on
-whichever CPU services that one interrupt.
+<Sub n="3.1" title="The accept queue">
 
-Loopback is its own case. `lo` has no ring and no IRQ. Its transmit function
-calls `__netif_rx()`, which drops the skb onto the *current* CPU's backlog, and a
-pseudo-NAPI called `process_backlog` delivers it. That's why loopback traffic
-shows up in `softnet_stat`: during a five-second iperf3 run, the processed
-column rose by 2,397,701 while `IpInReceives` in the same namespace rose by
-2,397,255.
+A new TCP connection passes through two queues before your application sees it.
+Step through the handshake:
 
-</Sub>
+<StepSequence
+  title="From SYN to accept()"
+  actors={["Client", "Kernel (listener)", "Your app"]}
+  messages={[
+    { from: 0, to: 1, label: "SYN", note: "The client asks to connect. The kernel records a half-open connection in the **SYN queue**." },
+    { from: 1, to: 0, label: "SYN-ACK", note: "It replies on its own. Your application isn't involved yet." },
+    { from: 0, to: 1, label: "ACK", note: "The handshake completes. The connection moves to the **accept queue**, sized by your `listen()` backlog and capped by `somaxconn`." },
+    { from: 2, to: 1, label: "accept()", note: "Your application calls `accept()` and takes the connection off the queue. **If it's slow to do this, the queue fills.**" },
+    { from: 1, to: 2, label: "new socket", note: "Only now does your code have a socket, and only now can it log anything about this request." },
+  ]}
+/>
 
-<Sub n="3.6" title="The send path, down to the TX ring">
+When the accept queue is full, Linux doesn't refuse new connections. It
+silently ignores their SYNs.
 
-`write()` on a TCP socket lands in `tcp_sendmsg()`, which copies your bytes into
-skbs on the socket's write queue. Nothing is sent yet. `tcp_write_xmit()` then
-decides how much it can send (congestion window, receive window, pacing), and
-with TSO it builds segments up to 64 KB for the NIC to cut into MTU-sized ones.
+<Predict
+  q="Your server calls listen(fd, 128), and a burst of 1,000 new connections arrives before it calls accept(). What do the clients that don't fit see?"
+  options={[
+    "An immediate \"connection refused\"",
+    "A delay of a second or more, then success",
+    "An error in your application's logs",
+    "Nothing: the kernel queues all 1,000",
+  ]}
+  answer={1}
+>
+The kernel drops the SYNs that don't fit. Each client retransmits after about a
+second, so those users see an extra second or more of latency. Your logs show
+nothing, because the requests never reached your code. `nstat` counts every one
+as a ListenOverflow.
+</Predict>
 
-From there it goes `ip_queue_xmit()`, through netfilter `OUTPUT` and
-`POSTROUTING`, to `dev_queue_xmit()`. That's where the **qdisc** sits: the
-queueing discipline for the device, usually `fq_codel` or `fq` on a physical
-NIC. XPS picks which TX queue. The driver's `ndo_start_xmit()` writes a
-descriptor into the TX ring and rings a doorbell. Later, a TX-completion
-interrupt (or the next NAPI poll) frees the skb.
+<Why>Why doesn't the kernel just refuse the connection?</Why>
 
-Loopback skips the qdisc entirely. `tc -s qdisc show dev lo` in my namespace
-said `noqueue` with 0 packets sent, straight after three iperf3 runs had pushed
-about 250 GB through it.
+Because a refusal is final, and a full queue is probably temporary. Dropping the
+SYN lets the client's normal retry logic try again a moment later, when there
+may be room.
 
-</Sub>
-
-<Sub n="3.7" title="Skipping copies, and skipping the stack">
-
-A normal `write()` copies once, user memory into skb memory. There are three
-ways to avoid it, and each works at a different layer:
-
-- **`sendfile()`** moves page-cache pages into the socket as frags. No copy
-  into user space and none out. Netflix built its CDN on this, plus kernel TLS,
-  on FreeBSD; Drew Gallatin's
-  [400 Gb/s talk](https://papers.freebsd.org/2021/eurobsdcon/gallatin-netflix-freebsd-400gbps.files/gallatin-netflix-freebsd-400gbps-slides.pdf)
-  is the reference. Linux got kTLS transmit in 4.13.
-- **`MSG_ZEROCOPY`** (Linux 4.14) pins your user pages and tells you on the
-  socket error queue when the kernel's done with them. The
-  [kernel doc](https://github.com/torvalds/linux/blob/v6.10/Documentation/networking/msg_zerocopy.rst)
-  says it's "generally only effective at writes over around 10 KB", because
-  pinning and the completion notification cost more than a small memcpy.
-- **XDP** skips the stack. A BPF program runs in the driver's poll, on the raw
-  DMA buffer, before any skb exists, and returns drop, pass, transmit or
-  redirect. **AF_XDP** (4.18) redirects frames into a user-space ring.
-
-I tried `MSG_ZEROCOPY` over loopback expecting a speed-up. Every one of 64
-one-megabyte sends came back flagged `SO_EE_CODE_ZEROCOPY_COPIED`. The doc
-explains it: anything "looped to a local socket will incur a deferred copy". You
-pay for the pinning and the notification *and* still get the copy.
-
-XDP's appeal is the number. The
-[CoNEXT 2018 paper](https://dl.acm.org/doi/10.1145/3281411.3281443) reports
-single-core processing "as high as 24 million packets per second". Cloudflare
-runs its DDoS drops and its L4 load balancer there
-([L4Drop](https://blog.cloudflare.com/l4drop-xdp-ebpf-based-ddos-mitigations/)),
-and Facebook's [Katran](https://engineering.fb.com/2018/05/22/open-source/open-sourcing-katran-a-scalable-network-load-balancer/)
-does the same. How the verifier, maps and helpers work is its own chapter:
-[eBPF](/topics/48-ebpf).
-
-Last, **busy polling**. `SO_BUSY_POLL` (3.11) lets a thread in `recv()` spin
-on the NAPI queue itself instead of sleeping until the softirq wakes it. It
-trades a burnt core for fewer wake-ups. The newer knobs,
-`napi_defer_hard_irqs` (5.8) and `SO_PREFER_BUSY_POLL` (5.11), are described in
-[`napi.rst`](https://github.com/torvalds/linux/blob/v6.10/Documentation/networking/napi.rst).
-I didn't measure any of them: busy polling on loopback polls nothing.
-
-</Sub>
-
-<SectionHeading n="04" cmd="nstat -az | grep -i -e listen -e rcvbuf" id="failure">Five ways to lose a packet</SectionHeading>
-
-<Sub n="4.1" title="The accept queue, and the drop that isn't a drop">
-
-Here's the program from the opening. It's forty lines and it's the fastest way
-I know to make `ListenOverflows` move.
+Here's a forty-line program that makes the counter move. It listens with a
+backlog of 4, never calls `accept()`, and connects twenty clients.
 
 <TryIt what="Listen with backlog 4, never accept, connect 20 clients" lang="cpp" toolchain="g++ 13.3 -O2, linuxkit 6.10.14 aarch64">
 ```cpp
@@ -443,35 +398,27 @@ TcpExtTCPSynRetrans             45
 ```
 
 On a listening socket, `Recv-Q` is the current accept-queue length and `Send-Q`
-is the limit. It's holding **5 against a limit of 4**, because the check in
+is the limit. It holds **5 against a limit of 4**, because the check in
 [`include/net/sock.h`](https://github.com/torvalds/linux/blob/v6.10/include/net/sock.h#L1018)
-is `sk_ack_backlog > sk_max_ack_backlog`, not `>=`. Same program on the Mac
-(macOS 26.5.1) admitted exactly four, and `netstat -s` there reported
-`0 listen queue overflow`.
+is `sk_ack_backlog > sk_max_ack_backlog`, not `>=`. The same program on macOS
+26.5.1 admitted exactly four.
 </Output>
 </TryIt>
 
-Fifteen clients, sixty overflows in four seconds: every SYN they sent,
-original and retransmit, counted once. The client never sees an error. Its SYN
-just goes unanswered, and from the outside that's indistinguishable from packet
-loss on the wire.
+Fifteen clients produced sixty overflows in four seconds: every SYN they sent,
+original and retransmit, counted once. The clients never see an error.
 
-Then the retransmit timing surprised me. Counting overflows once a second for a
-single stuck client, they landed at t = 0, 1, 2, 3, 4, 5, 7, 11 and 19 seconds.
-If you learnt "1, 3, 7, 15" you learnt it before Linux 6.5, which added
-`tcp_syn_linear_timeouts` ([ccce324dabfe](https://github.com/torvalds/linux/commit/ccce324dabfe))
-with a default of 4. Its first four retries are a flat second apart.
+Retry timing has also changed. On Linux 6.10 the stuck client's SYNs went
+out at 0, 1, 2, 3, 4, 5, 7, 11 and 19 seconds. If you learned "1, 3, 7, 15",
+you learned it before Linux 6.5 added `tcp_syn_linear_timeouts`
+([ccce324dabfe](https://github.com/torvalds/linux/commit/ccce324dabfe)), whose
+first four retries are a flat second apart.
 
-Now the invisible part. With a bpftrace script filtering bare SYNs to port 9000
-on both `skb:kfree_skb` and `skb:consume_skb`, a ten-second run gave:
+<Why>Why doesn't the drop tracer see these drops?</Why>
 
-```text
-TcpExtListenOverflows           105
-@[tracepoint:skb:consume_skb, tcp_rcv_state_process]: 110
-```
-
-That's 105 refused SYNs plus the 5 that were accepted, and **not one** hit
-`kfree_skb`. Here's why:
+Tracing the `skb:kfree_skb` tracepoint is the standard way to find drops. In a
+ten-second run it saw **zero** of the 105 refused SYNs. They all went through
+`consume_skb` instead, the same path as a packet that was delivered:
 
 <SourceRead
   file="net/ipv4/tcp_input.c"
@@ -496,111 +443,102 @@ That's 105 refused SYNs plus the 5 that were accepted, and **not one** hit
 ```
 </SourceRead>
 
-`tcp_conn_request()` increments `LINUX_MIB_LISTENOVERFLOWS`, jumps to `drop:`,
-calls `tcp_listendrop()` and returns 0. Its caller ignores the return value and
-frees the SYN with `consume_skb()`. So dropwatch, `perf record -e skb:kfree_skb`
-and every drop-reason dashboard miss the single most common TCP overload
-signal. I checked v6.12, v6.15 and v6.17: the `consume_skb` is still there.
+That `consume_skb` is still there in v6.12, v6.15 and v6.17, as far as I could check.
 
-<Callout label="Why the drop tracer lies about SYN floods">
-Drop reasons (`kfree_skb_reason`, 5.17) only cover packets freed through
-`kfree_skb`. A SYN refused for a full accept queue goes through `consume_skb`,
-the same path as a packet delivered successfully. For listen overflows, trust
+<Callout label="Common mistake" kind="warn">
+Drop reasons, dropwatch and `perf record -e skb:kfree_skb` all miss listen
+overflows, the most common TCP overload signal. For the accept queue, trust
 `nstat` and `ss -ltn`, not the tracer.
 </Callout>
 
-Fixing it is rarely about the backlog number. A full accept queue means the application
-isn't calling `accept()` fast enough: a blocked event loop, a GC pause, a
-thread pool at its cap. Raise the backlog to ride out bursts. `somaxconn` went
-from 128 to 4096 in Linux 5.4
-([19f92a030ca6](https://github.com/torvalds/linux/commit/19f92a030ca6d772ab44b22ee6a01378a8cb32d4)),
-and Cloudflare runs 16k
-([SYN packet handling in the wild](https://blog.cloudflare.com/syn-packet-handling-in-the-wild/)).
-But the application is the thing to look at.
+Raising the backlog helps you ride out bursts. `somaxconn` went from 128 to 4096
+in Linux 5.4 ([19f92a030ca6](https://github.com/torvalds/linux/commit/19f92a030ca6d772ab44b22ee6a01378a8cb32d4)),
+and Cloudflare runs 16k ([SYN packet handling in the wild](https://blog.cloudflare.com/syn-packet-handling-in-the-wild/)).
+But a full accept queue usually means the application isn't calling `accept()`
+fast enough: a blocked event loop, a GC pause, a thread pool at its cap. That's
+the thing to fix.
 
 </Sub>
 
-<Sub n="4.2" title="nf_conntrack: table full, dropping packet">
+<Sub n="3.2" title="nf_conntrack: table full, dropping packet">
 
-This is the one that shows up in Kubernetes postmortems. Conntrack has a
-fixed-size table, and when it's full, as Cloudflare's
+This is the one that shows up in Kubernetes postmortems. Conntrack keeps a
+fixed-size table of flows. When it's full, as Cloudflare's
 [Conntrack tales](https://blog.cloudflare.com/conntrack-tales-one-thousand-and-one-flows/)
 puts it, "packets creating new flows will be dropped. No questions asked."
-Existing flows keep working, so the symptom is new connections timing out while
+
+<Why>Why do old connections keep working?</Why>
+
+Because existing flows already have an entry. Only packets that would *create*
+an entry are dropped. So the symptom is new connections timing out while
 dashboards for established traffic look fine.
 
-Its default size scales with RAM. On 64-bit hosts with more than 4 GB the
-bucket count is fixed at 262,144 and `nf_conntrack_max` equals it
-([`nf_conntrack-sysctl.rst`](https://github.com/torvalds/linux/blob/v6.10/Documentation/networking/nf_conntrack-sysctl.rst)
-and `nf_conntrack_core.c`). The 8 GB VM I used read exactly that: 262144 and
-262144.
+Its default size scales with RAM. On 64-bit hosts with more than 4 GB,
+`nf_conntrack_max` is 262,144
+([`nf_conntrack-sysctl.rst`](https://github.com/torvalds/linux/blob/v6.10/Documentation/networking/nf_conntrack-sysctl.rst)),
+and the 8 GB VM used here read exactly that. Smaller nodes get smaller tables,
+which is how [loveholidays](https://deploy.live/blog/kubernetes-networking-problems-due-to-the-conntrack/)
+hit it: they halved node RAM while connection counts doubled.
+Mark Betz's [GKE incident](https://www.markbetz.net/2023/12/12/exhausting-conntrack-table-space-crippled-our-k8s-cluster/)
+was a misbehaving CDN flooding an RPC client through Linkerd.
 
-Smaller nodes get smaller tables. That's probably the commonest way in, and it's how
-[loveholidays](https://deploy.live/blog/kubernetes-networking-problems-due-to-the-conntrack/)
-hit it: they halved node RAM while connection counts doubled. Mark Betz's
-[GKE incident](https://www.markbetz.net/2023/12/12/exhausting-conntrack-table-space-crippled-our-k8s-cluster/)
-was a misbehaving CDN flooding an RPC client through Linkerd until the nodes
-logged the message in this section's title.
-
-One detail matters for who can fix it. From inside a network namespace (a pod is one), `echo 100 > /proc/sys/net/netfilter/nf_conntrack_max`
-gave me `Permission denied`. It's a node-wide setting, so a pod can't raise it
-and kube-proxy sets it at startup
+<Callout label="Design implication">
+Conntrack is node-wide. Writing `nf_conntrack_max` from inside a pod's network
+namespace returns `Permission denied`, so the fix happens on the node
 ([kubernetes#71261](https://github.com/kubernetes/kubernetes/issues/71261)).
-Watch `nf_conntrack_count` against `nf_conntrack_max` and alert well before
-100%.
+Alert on `nf_conntrack_count` against `nf_conntrack_max` well before 100%.
+</Callout>
 
 </Sub>
 
-<Sub n="4.3" title="One core pinned in softirq">
+<Sub n="3.3" title="One core pinned in softirq">
 
 Cloudflare's [How to receive a million packets per second](https://blog.cloudflare.com/how-to-receive-a-million-packets/)
-is the canonical version. A naive single-threaded UDP receiver got about 370k
-packets per second. The limit wasn't the application. All packets from one
-source hashed to one RX queue, and "CPU #4 can't do any more work - it's
-totally busy just reading the 350kpps."
+is the classic example. A single-threaded UDP receiver got about 370k packets a
+second. The limit probably wasn't where you'd guess: it wasn't the application. Every packet from one source hashed to
+one RX queue, so one CPU was "totally busy just reading the 350kpps."
 
-Adding receiver threads doesn't help much, because the bottleneck is the softirq on
-the CPU that owns the queue. What helped was spreading the flows over more RX
-queues, `SO_REUSEPORT` for several receiving sockets, and keeping the receiver
-on the NIC's NUMA node (the wrong node cost up to 4× in their test). The end
-result was 1.4 Mpps on one NUMA node.
+<Why>Why doesn't adding receiver threads help?</Why>
 
-You'll recognise it: `mpstat -P ALL 1` shows one CPU at 100% in
-`%soft` and the rest idle. On a VM with a single virtio queue, like the one I
-measured on, you'll hit it early. RPS is the software fix when you can't get
-more queues.
+Because the bottleneck is the softirq on the CPU that owns the queue, not the
+threads reading the socket. What helped was spreading flows across more RX
+queues, using `SO_REUSEPORT` for several receiving sockets, and keeping the
+receiver on the NIC's NUMA node (the wrong node cost up to 4×). That got them to
+1.4 million packets a second on one NUMA node.
+
+You'll probably recognise it: `mpstat -P ALL 1` shows one CPU at 100% `%soft` and the
+rest idle. On a VM with a single virtio queue you'll hit it early.
 
 </Sub>
 
-<Sub n="4.4" title="ksoftirqd, and a fix reverted seven years later">
+<Sub n="3.4" title="ksoftirqd, and a fix reverted seven years later">
 
-Softirqs normally run on the tail of an interrupt, ahead of any thread. To keep
-them from starving everything, `__do_softirq()` gives up after 2 ms or 10
-restarts
-([`kernel/softirq.c`](https://github.com/torvalds/linux/blob/v6.10/kernel/softirq.c#L475))
-and hands the rest to the per-CPU `ksoftirqd` thread, which the scheduler
-treats like any other thread.
+To keep softirqs from starving everything, `__do_softirq()` gives up after 2 ms
+or 10 restarts ([`kernel/softirq.c`](https://github.com/torvalds/linux/blob/v6.10/kernel/softirq.c#L475))
+and hands the rest to the per-CPU `ksoftirqd` thread, which is scheduled like
+any other thread.
 
-That handoff has been argued about for a decade. In 2016 Eric Dumazet's
-"softirq: Let ksoftirqd do its job"
-([4cd13c21b207](https://github.com/torvalds/linux/commit/4cd13c21b207), 4.9)
-stopped softirqs from sneaking back in once `ksoftirqd` was running. Under a
-UDP flood, the receiving process went from "~2,000 packets per second" to
-"~900,000".
+That handoff has been argued about for a decade:
 
-In 2023 Paolo Abeni reverted it
-([d15121be7485](https://github.com/torvalds/linux/commit/d15121be7485), 6.5)
-because deferring to a normal-priority thread caused "high latencies". The
-revert says the livelock can now be handled by threaded NAPI (5.12, `echo 1 >
-/sys/class/net/eth0/threaded`), which gives each NAPI instance its own kernel
-thread you can pin and prioritise.
+- **2016, Linux 4.9.** Eric Dumazet's "softirq: Let ksoftirqd do its job"
+  ([4cd13c21b207](https://github.com/torvalds/linux/commit/4cd13c21b207))
+  stopped softirqs sneaking back in while `ksoftirqd` ran. Under a UDP flood, the
+  receiving process went from "~2,000 packets per second" to "~900,000".
+- **2023, Linux 6.5.** Paolo Abeni reverted it
+  ([d15121be7485](https://github.com/torvalds/linux/commit/d15121be7485))
+  because deferring to a normal-priority thread caused "high latencies". The
+  revert points to **threaded NAPI** (5.12) instead, which gives each NAPI
+  instance its own kernel thread you can pin and prioritise.
 
 If `top` shows `ksoftirqd/N` near 100%, the softirq budget on CPU N is
-permanently exhausted. It's pretty much section 4.3 wearing a different hat.
+permanently exhausted. It's section 3.3 wearing a different hat.
 
 </Sub>
 
-<Sub n="4.5" title="The receive buffer fills and sendto() doesn't care">
+<Sub n="3.5" title="The UDP receive buffer">
+
+UDP has no flow control, so a slow reader loses data, and the sender can't
+tell. Here's a socket that asks for 64 KB and never reads:
 
 <TryIt what="A UDP socket that asks for 64 KB and never reads" lang="cpp" toolchain="g++ 13.3 -O2, linuxkit 6.10.14 aarch64">
 ```cpp
@@ -629,36 +567,134 @@ UdpInErrors                     9842
 UdpRcvbufErrors                 9842
 ```
 
-The kernel **doubles** what you ask for (`__sock_set_rcvbuf()` stores
+Linux **doubles** what you ask for (`__sock_set_rcvbuf()` stores
 `val * 2` to leave room for skb overhead), then charges each datagram its
-`truesize`. The sender got success for all 10,000 packets. The receiver got 158.
+`truesize`. The sender got success for all 10,000. The receiver got 158.
 </Output>
 </TryIt>
 
-That's the UDP failure in one screen: loss the sender can't see, counted in
-`UdpRcvbufErrors`. For DNS servers, statsd collectors and syslog receivers it's
-the first counter to check. Raising `SO_RCVBUF` needs `net.core.rmem_max`
-raised too (212,992 on this box), or the request is silently capped.
+For DNS servers, statsd collectors and syslog receivers, `UdpRcvbufErrors` is
+the first counter to check. Raising `SO_RCVBUF` also needs `net.core.rmem_max`
+raised (212,992 on this box), or the request is silently capped.
 
-TCP can't lose data this way, but it pays in time. Cloudflare's
+<Why>So should TCP buffers just be huge?</Why>
+
+No. TCP can't lose data this way, but it pays in time. Cloudflare's
 [story of one latency spike](https://blog.cloudflare.com/the-story-of-one-latency-spike/)
 traced multi-millisecond stalls to `tcp_collapse()`, which compacts a bloated
 receive queue inside softirq. Cutting the `tcp_rmem` maximum from 32 MiB took
-`net_rx_action` from 23 ms to 3 ms. So a bigger buffer seems like the safe choice and isn't.
+`net_rx_action` from 23 ms to 3 ms.
 
 </Sub>
 
-<SectionHeading n="05" cmd="iperf3 -c 127.0.0.1 -t 5" id="cost">What a packet costs</SectionHeading>
+<SectionHeading n="04" id="send-path">The send path</SectionHeading>
+
+Sending runs the same layers in reverse, with one important difference: data
+waits in the socket until TCP decides it's allowed to send it.
+
+<Steps
+  title="One write(), from your buffer to the wire"
+  lanes={[
+    { t: "Your app", s: "write()", icon: "◉" },
+    { t: "Socket", s: "write queue", icon: "≡" },
+    { t: "TCP", s: "cwnd · pacing", icon: "⇆" },
+    { t: "IP + netfilter", s: "OUTPUT", icon: "⇅" },
+    { t: "qdisc", s: "fq_codel · fq", icon: "▤" },
+    { t: "TX ring · NIC", s: "on the wire", icon: "⌁" },
+  ]}
+  steps={[
+    [0, "`write()` enters the kernel through `tcp_sendmsg()`, which copies your bytes into skbs. This is the one copy a normal send makes."],
+    [1, "The skbs sit on the socket's **write queue**. `write()` can return now, **before anything has been sent**."],
+    [2, "`tcp_write_xmit()` decides how much may go: the congestion window, the receiver's window and pacing. With TSO it builds segments up to 64 KB for the NIC to cut up."],
+    [3, "`ip_queue_xmit()` adds the IP header and passes netfilter's `OUTPUT` and `POSTROUTING` hooks."],
+    [4, "`dev_queue_xmit()` hands the packet to the **qdisc**, the device's queueing discipline, usually `fq_codel` or `fq` on a real NIC."],
+    [5, "The driver writes a descriptor into the **TX ring** and rings the NIC's doorbell. A completion interrupt later frees the skb."],
+  ]}
+/>
+
+<Why>Why doesn't write() returning mean the data was sent?</Why>
+
+Because `write()` only copies into the socket's write queue. Whether and when
+the bytes leave depends on TCP's windows, which depend on the network and the
+receiver. A successful `write()` means "the kernel has your data", nothing more.
+
+Loopback skips the qdisc entirely. `tc -s qdisc show dev lo` reported `noqueue`
+with 0 packets sent, straight after three iperf3 runs had pushed about 250 GB
+through `lo`.
+
+<SectionHeading n="05" id="scaling">Scaling across cores: RSS, RPS, RFS and SO_REUSEPORT</SectionHeading>
+
+Everything in section 2 ran on the CPU that took the interrupt. On a busy
+server, one CPU isn't enough, so Linux has four ways to spread the work. All are
+documented in [`scaling.rst`](https://github.com/torvalds/linux/blob/v6.10/Documentation/networking/scaling.rst).
+
+| Mechanism | Where it runs | What it does | Cost |
+|---|---|---|---|
+| **RSS** | The NIC | Hashes each flow's 4-tuple into one of several RX queues, each with its own IRQ | Free, but limited by the number of hardware queues |
+| **RPS** | Software, on the receiving CPU | Hashes the packet and hands it to another CPU's backlog | An inter-processor interrupt per batch |
+| **RFS** | Software | Like RPS, but picks the CPU where the reading thread last ran | Same as RPS, plus a flow table |
+| **`SO_REUSEPORT`** | The socket layer (Linux 3.9, [LWN](https://lwn.net/Articles/542629/)) | Several sockets bind one port; each new flow is hashed to one of them | Uneven load if flows are uneven |
+
+<Why>Which one should you reach for first?</Why>
+
+RSS, if the NIC has more queues than you're using (`ethtool -l eth0`). RPS when
+it doesn't: the VM measured here reported `Combined: 1`, a single virtio queue,
+so every packet from outside landed on one CPU. And `SO_REUSEPORT` when the
+application itself is the bottleneck, with one accept loop.
+
+Loopback is a special case. `lo` has no ring and no IRQ. Its transmit function
+drops each skb onto the *current* CPU's backlog, so loopback traffic shows up
+in `softnet_stat`. During one five-second iperf3 run, the processed
+column rose by 2,397,701 while `IpInReceives` rose by 2,397,255.
+
+<SectionHeading n="06" id="bypass">Skipping copies, and skipping the stack</SectionHeading>
+
+A normal `write()` copies once, from your memory into skb memory. And every
+packet pays the full cost of the stack. Four features cut one or both:
+
+| Feature | What it skips | Best for | Watch out for |
+|---|---|---|---|
+| **`sendfile()`** | Copying file data through user space | Serving static files | Only file → socket |
+| **`MSG_ZEROCOPY`** (4.14) | The copy on send, by pinning your pages | Sends over about 10 KB | Completion bookkeeping; no gain on loopback |
+| **XDP** | The whole stack: runs in the driver before any skb exists | DDoS drops, L4 load balancing | No sockets, no TCP, BPF limits |
+| **AF_XDP** (4.18) | The stack, delivering raw frames to a user-space ring | Custom packet processing | You rebuild what the stack did |
+
+`sendfile` is how Netflix serves video: page-cache pages go straight to the
+socket, plus kernel TLS. Drew Gallatin's
+[400 Gb/s talk](https://papers.freebsd.org/2021/eurobsdcon/gallatin-netflix-freebsd-400gbps.files/gallatin-netflix-freebsd-400gbps-slides.pdf)
+is the reference (on FreeBSD; Linux got kTLS transmit in 4.13).
+
+<Why>Why didn't MSG_ZEROCOPY help on loopback?</Why>
+
+In a test, every one of 64 one-megabyte sends came back flagged
+`SO_EE_CODE_ZEROCOPY_COPIED`. The
+[kernel doc](https://github.com/torvalds/linux/blob/v6.10/Documentation/networking/msg_zerocopy.rst)
+explains it: anything "looped to a local socket will incur a deferred copy". You
+pay for the pinning and the notification *and* still get the copy.
+
+XDP's appeal is speed. The
+[CoNEXT 2018 paper](https://dl.acm.org/doi/10.1145/3281411.3281443) reports
+single-core processing "as high as 24 million packets per second". Cloudflare
+runs its DDoS drops there ([L4Drop](https://blog.cloudflare.com/l4drop-xdp-ebpf-based-ddos-mitigations/)),
+and Facebook's [Katran](https://engineering.fb.com/2018/05/22/open-source/open-sourcing-katran-a-scalable-network-load-balancer/)
+load balancer does the same. How XDP programs are verified and run is covered in
+[chapter 48, eBPF](/topics/48-ebpf).
+
+Last, **busy polling**. `SO_BUSY_POLL` (3.11) lets a thread in `recv()` spin on
+the NAPI queue itself instead of sleeping until the softirq wakes it. It trades
+a burnt core for fewer wake-ups. The newer knobs are in
+[`napi.rst`](https://github.com/torvalds/linux/blob/v6.10/Documentation/networking/napi.rst).
+
+<SectionHeading n="07" id="cost">What a packet costs</SectionHeading>
 
 <Callout label="The machines" kind="note">
 **Linux:** kernel 6.10.14-linuxkit, aarch64, in a Docker Desktop VM on an Apple
-M4, run in a dedicated network namespace inside a shared 4-CPU container. g++
-13.3 `-O2`. Three runs each, median reported. **macOS:** the same M4, macOS
-26.5.1, Apple clang 21 `-O2`. The Linux box was shared with other workloads
-while these ran, so treat its numbers as a floor.
+M4, inside a shared 4-CPU container; g++ 13.3 `-O2`; median of three runs. The
+box was shared with other workloads, so treat its numbers as a floor.
+**macOS:** the same M4, macOS 26.5.1, Apple clang 21 `-O2`.
 </Callout>
 
-<Sub n="5.1" title="Loopback, by write size">
+<Sub n="7.1" title="Loopback throughput by write size">
 
 One sender thread, one reader thread, a loopback TCP connection, and a fixed
 write size per run:
@@ -674,22 +710,21 @@ write size per run:
   ]}
 />
 
-Read the ns-per-write column. From 64 bytes to 1 KB it barely moves, so at
-small sizes you're paying a fixed ~250 ns per call on Linux, probably most of it
-the syscall, the socket lock and skb allocation. Past 16 KB the copy dominates
-and throughput flattens out. Linux inside a VM beat native macOS by about 1.8×
-on small writes, on the same silicon. I haven't dug into why.
+<Why>Why is the cost per write almost flat for small writes?</Why>
 
-iperf3 on the same Linux loopback gave 146, 142 and 131 Gbit/s over five
-seconds, median **142 Gbit/s**. `ss -tin` mid-run showed `mss:65483` and about
-48 KB per data segment. So loopback isn't a network at all. It's roughly a memcpy
-with a TCP state machine attached.
+From 64 bytes to 1 KB, the time per call barely moves, so small writes pay a
+fixed ~250 ns each on Linux: the syscall, the socket lock and skb allocation.
+Past 16 KB the copy dominates and throughput flattens. Batch small writes and
+most of that fixed cost disappears.
+
+iperf3 on the same loopback reached a median of **142 Gbit/s**. Loopback isn't
+really a network; it's closer to a memcpy with a TCP state machine attached.
 
 </Sub>
 
-<Sub n="5.2" title="The per-packet budget on real wire">
+<Sub n="7.2" title="The per-packet budget on a real NIC">
 
-Loopback hides the number that matters on a NIC: packets per second.
+Loopback hides the number that matters on real hardware: packets per second.
 Here's the arithmetic for 10 GbE with minimum-size frames:
 
 <Estimate
@@ -703,34 +738,25 @@ Here's the arithmetic for 10 GbE with minimum-size frames:
   result={{ label: "Cores the full stack needs for 10 GbE line rate, small packets", value: "≈ 35–40" }}
 />
 
-That last line is why DDoS mitigation lives in XDP. A flood of small packets
-through the normal stack needs dozens of cores just to decide to drop it.
-Cloudflare's L4Drop post says moving drops into XDP meant softirq CPU rose "by
-slightly over a factor of 2" while packet rate rose "by over a factor of 40".
+<Callout label="Design implication">
+A flood of small packets through the normal stack needs dozens of cores just to
+decide to drop it. That's why DDoS mitigation lives in XDP: Cloudflare saw
+softirq CPU rise "by slightly over a factor of 2" while packet rate rose "by
+over a factor of 40".
+</Callout>
+
+One result here is still open. Every loopback iperf3 run reported retransmits
+(16, 75 and 19), though loopback can't lose packets. The counters say they were
+spurious: `TcpRetransSegs` roughly matched `TCPDSACKRecv`, and tail-loss probes
+fired. My best guess is the receiving thread being descheduled on a shared
+box, so ACKs arrive after the probe timeout. Pinning both threads to idle CPUs
+on a dedicated machine would settle it.
 
 </Sub>
 
-<Sub n="5.3" title="Retransmits on a link that can't lose packets">
+<SectionHeading n="08" id="tools">Tools for a Monday morning</SectionHeading>
 
-Every iperf3 run on loopback reported retransmits: 16, 75 and 19 in three
-five-second runs. Loopback doesn't drop, so what's being retransmitted?
-
-Counters say they were spurious. In each run `TcpRetransSegs` roughly
-matched `TCPDSACKRecv` (16 and 16, 75 and 73, 19 and 17): the receiver reported
-already having the data. `TCPLossProbes` fired too, and `ss -tin` showed
-`retrans:0/11 dsack_dups:11`. So a tail-loss probe timer is expiring before an
-ACK comes back.
-
-I think it's scheduling. On a shared 4-CPU box the receiving thread gets
-descheduled, ACKs stall past the probe timeout, and TCP probes. I haven't
-proved it. Pinning sender and receiver to idle CPUs on a dedicated machine and
-checking whether the count drops to zero would settle it.
-
-</Sub>
-
-<SectionHeading n="06" cmd="watch -d cat /proc/net/softnet_stat" id="operating">The Monday tools</SectionHeading>
-
-<Sub n="6.1" title="Where each drop is counted">
+<Sub n="8.1" title="Where each drop is counted">
 
 ```shell
 # Ring and driver: rx_drops, rx_missed, per-queue counters, xdp counters
@@ -738,7 +764,7 @@ ethtool -S eth0 | grep -iE 'drop|miss|err|xdp'
 ethtool -l eth0            # how many RX/TX queues. "Combined: 1" means no RSS
 ethtool -g eth0            # ring size; -G to grow it
 
-# Per-CPU backlog and budget. One row per CPU, hex, 15 columns on 6.10
+# Per-CPU backlog and budget. One row per CPU, hex
 cat /proc/net/softnet_stat   # col1 processed, col2 dropped, col3 time_squeeze
 
 # Listener and socket counters, as deltas since the last call
@@ -758,103 +784,86 @@ mpstat -P ALL 1            # %soft column
 
 The 6.10 `softnet_stat` layout is in
 [`net/core/net-procfs.c`](https://github.com/torvalds/linux/blob/v6.10/net/core/net-procfs.c).
-Older guides, including packagecloud's otherwise excellent
+Older guides, including packagecloud's excellent
 [Monitoring and Tuning the Linux Networking Stack](https://blog.packagecloud.io/monitoring-tuning-linux-networking-stack-receiving-data/),
-describe column 9 as `cpu_collision`; it's hard-coded to 0 now, and columns
-13–15 are backlog length, CPU index and the two queue lengths.
+describe column 9 as `cpu_collision`; it's always 0 now.
 
 </Sub>
 
-<Sub n="6.2" title="Tracing drops, and where tracing fails">
+<Sub n="8.2" title="Tracing drops">
 
 For drops that go through `kfree_skb`, drop reasons turn a count into a
 location:
 
 ```shell
-# Needs tracefs mounted. Counts drops by function and reason code.
+# Counts drops by function and reason code
 bpftrace -e 'tracepoint:skb:kfree_skb { @[ksym(args->location), args->reason] = count(); }'
 
 # Or the older tool
 dropwatch -l kas
 ```
 
-Reason codes are the enum in
+Reason codes are listed in
 [`include/net/dropreason-core.h`](https://github.com/torvalds/linux/blob/v6.10/include/net/dropreason-core.h);
 `SOCKET_RCVBUFF`, `SOCKET_BACKLOG`, `CPU_BACKLOG` and `PROTO_MEM` are the ones
-you'll see under load. Two things bit me on the VM. `perf` wouldn't run at all
-(Ubuntu's wrapper wants `linux-tools-6.10.14-linuxkit`, which doesn't exist), so
-bpftrace is the route in. And the tracepoint is global, not per-namespace: my
-first unfiltered run counted every other container's drops too, until I filtered
-on the TCP port.
-
-Plus the gap from section 4.1: listen overflows never appear here at all.
+you'll see under load. Two cautions: the tracepoint is global, not
+per-namespace, so filter on a port, and it never sees listen overflows
+(section 3.1).
 
 </Sub>
 
-<Sub n="6.3" title="What to change, in order">
+<Sub n="8.3" title="Symptom, cause, fix">
 
-1. **Find the counter first.** Guessing sysctls without a moving counter is how
-   people end up with 32 MB `tcp_rmem` and the latency spike from 4.5.
-2. **Accept-queue overflows:** fix the application's accept rate, then raise
-   the `listen()` backlog, then `somaxconn`.
-3. **One hot softirq CPU:** more RX queues (`ethtool -L`), RSS indirection,
-   RPS if the NIC can't, then `SO_REUSEPORT` receivers.
-4. **`time_squeeze` climbing:** raise `netdev_budget`, or move to threaded NAPI
-   and give the NAPI threads their own cores.
-5. **Conntrack:** raise `nf_conntrack_max` on the node, shorten timeouts for
-   short-lived flows, or add `notrack` rules for traffic that doesn't need state.
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| New connections time out; logs show nothing | Accept queue full | Speed up the accept loop, then raise the backlog and `somaxconn` |
+| New connections fail on one node; old ones fine | Conntrack table full | Raise `nf_conntrack_max` on the node, shorten timeouts, `notrack` stateless traffic |
+| One CPU at 100% `%soft`, others idle | All traffic on one RX queue | More queues (`ethtool -L`), RSS, then RPS, then `SO_REUSEPORT` |
+| `time_squeeze` climbing | Softirq budget exhausted | Raise `netdev_budget`, or threaded NAPI on dedicated cores |
+| UDP messages lost, sender sees no error | Receive buffer full | Read faster, raise `SO_RCVBUF` and `rmem_max` |
+| Multi-millisecond latency spikes on TCP | Oversized receive buffers collapsing | Lower the `tcp_rmem` maximum |
+
+<Callout label="Common mistake" kind="warn">
+Tuning sysctls without a counter that's moving. Find the counter first; that's
+how people end up with 32 MB `tcp_rmem` and the latency spike from section 3.5.
+</Callout>
 
 </Sub>
 
-<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+<SectionHeading n="09" id="summary">Summary</SectionHeading>
+
+1. **The stack is a chain of queues.** Ring, backlog, conntrack, socket buffer,
+   accept queue: each has a fixed size, and each drops when full.
+2. **The CPU doesn't see a packet until the softirq.** The NIC writes it into RAM
+   itself, and NAPI polls in batches instead of taking an interrupt per packet.
+3. **Softirq work has a budget.** 300 packets or 2 jiffies per run; running out
+   shows up as `time_squeeze`.
+4. **An skb points at a packet; it doesn't hold it.** Sockets are charged
+   `truesize`, about 830 bytes for a 100-byte UDP datagram.
+5. **A full accept queue drops SYNs silently.** Clients retry after about a
+   second, your logs show nothing, and drop tracers miss it; `nstat` doesn't.
+6. **Conntrack exhaustion is node-wide.** New flows fail while existing ones
+   work, and a pod can't fix it.
+7. **UDP loses data the sender can't see.** Check `UdpRcvbufErrors` first.
+8. **`write()` returning means the kernel has your data**, not that it was sent.
+9. **Spread load in order:** RSS, then RPS, then `SO_REUSEPORT`.
+10. **The full stack costs microseconds per packet.** Line rate with small
+    packets needs XDP. That's why DDoS mitigation lives there.
+
+<SectionHeading n="10" id="build">Build this</SectionHeading>
 
 **A drop census for one machine.**
 
 - Write a script that snapshots `ethtool -S`, `softnet_stat`, `nstat -az` and
   the conntrack count, then diffs two snapshots and prints only what moved.
 - Break the box five ways and check your script catches each: the backlog-4
-  server from 4.1, the UDP flood from 4.5, iperf3 with RPS off and then on, a
-  `tc qdisc add dev lo root netem loss 5%`, and a conntrack table filled by
-  short connections in a throwaway VM (not a shared machine).
-- Then run the same five with a `kfree_skb` bpftrace alongside and note which
-  ones the tracer misses. You should find at least one.
+  server from section 3.1, the UDP flood from section 3.5, iperf3 with RPS off
+  and then on, `tc qdisc add dev lo root netem loss 5%`, and a conntrack table
+  filled by short connections in a throwaway VM.
+- Run the same five with a `kfree_skb` bpftrace alongside, and note which ones
+  the tracer misses. You should find at least one.
 
-<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
-
-<Compare
-  cols={["You get", "You pay", "When the bill arrives"]}
-  rows={[
-    ["NAPI: no interrupt storm under load", "Softirq work runs on whatever CPU took the IRQ", "When one queue's CPU hits 100% %soft"],
-    ["GRO: one stack traversal per 64 KB", "Packets wait briefly to be merged", "In latency-sensitive RPCs, as microseconds"],
-    ["Conntrack: stateful NAT and firewalls", "A fixed-size table, per node", "At nf_conntrack_max, as new flows dropped"],
-    ["Big receive buffers, fewer drops", "tcp_collapse in softirq, bufferbloat", "As multi-ms spikes (Cloudflare, 2015)"],
-    ["MSG_ZEROCOPY: no copy on send", "Pinning, error-queue bookkeeping", "Below ~10 KB, and always on loopback"],
-    ["XDP: tens of Mpps per core", "No sockets, no TCP, BPF constraints", "The first time you need the stack after all"],
-  ]}
-/>
-
-<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
-
-<CardGrid>
-  <WildCard name="Cloudflare: a million packets per second" verdict="The best single demonstration that the bottleneck is usually the RX queue's CPU, not your code.">
-    Marek Majkowski, 2015. One RX queue saturates one core at about 350k pps;
-    multiple queues, SO_REUSEPORT and NUMA-local receivers get to 1.4 Mpps.
-  </WildCard>
-  <WildCard name="Cloudflare: one NGINX worker takes all the load" verdict="Fair wake-ups aren't something epoll promises.">
-    epoll wakes accept waiters LIFO, so the busiest worker keeps getting busier.
-    SO_REUSEPORT evens out CPU but, in their test, doubled worst-case latency.
-  </WildCard>
-  <WildCard name="GKE: conntrack exhaustion" verdict="A pod-level flood, a node-level table, and nothing inside the pod could fix it.">
-    Mark Betz, 2023. A misconfigured CDN flooded an RPC client through Linkerd
-    until nodes logged "nf_conntrack: table full, dropping packet".
-  </WildCard>
-  <WildCard name="Netflix: 400 Gb/s from one box" verdict="What zero-copy looks like when the whole product depends on it.">
-    FreeBSD, not Linux, but the same idea: sendfile from the page cache plus
-    kernel TLS, and then TLS offloaded to the NIC to save memory bandwidth.
-  </WildCard>
-</CardGrid>
-
-<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+<SectionHeading n="11" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="What's the difference between the SYN queue and the accept queue?">
 The SYN queue holds half-open connections: SYN received, SYN-ACK sent, waiting
@@ -873,54 +882,52 @@ rate becomes an interrupt storm and nothing else runs.
 </QA>
 
 <QA level="intermediate" q="Your UDP service loses messages but the sender sees no errors. Where do you look?">
-`nstat` for `UdpRcvbufErrors`. The receive buffer is full, and `sendto()` on a
-local or remote sender succeeds regardless. Remember the socket is charged
-`truesize`: on my test a 100-byte datagram cost about 830 bytes of buffer. Raise
-`SO_RCVBUF` (and `rmem_max`, or the request is capped), or read faster, or
-spread load with `SO_REUSEPORT`.
+`nstat` for `UdpRcvbufErrors`. The receive buffer is full, and `sendto()`
+succeeds regardless. The socket is charged `truesize`: in the test above, a
+100-byte datagram cost about 830 bytes of buffer. Raise `SO_RCVBUF` (and
+`rmem_max`, or the request is capped), read faster, or spread load with
+`SO_REUSEPORT`.
 </QA>
 
 <QA level="intermediate" q="RSS, RPS and RFS: what does each do?">
 RSS is the NIC hashing flows into multiple hardware queues with separate IRQs.
-RPS is the same hash done in software by the receiving CPU, which then hands
-the packet to another CPU's backlog via IPI. RFS extends RPS to pick the CPU
-where the consuming application thread last ran, for cache locality. RSS is
-free but limited by queue count; RPS and RFS cost an IPI and some CPU.
+RPS is the same hash done in software by the receiving CPU, which hands the
+packet to another CPU's backlog via IPI. RFS extends RPS to pick the CPU where
+the consuming thread last ran, for cache locality. RSS is free but limited by
+queue count; RPS and RFS cost an IPI and some CPU.
 </QA>
 
-<QA level="intermediate" q="A Kubernetes node starts timing out new connections, existing ones are fine. First guess?">
+<QA level="intermediate" q="A Kubernetes node starts timing out new connections; existing ones are fine. First guess?">
 Conntrack. When the table's full, packets that would create a new entry are
 dropped while established flows keep matching existing entries. Check `dmesg`
 for "nf_conntrack: table full" and compare `nf_conntrack_count` to
-`nf_conntrack_max`. It's node-wide, so the fix happens on the node, not in the
-pod.
+`nf_conntrack_max`. It's node-wide, so the fix happens on the node.
 </QA>
 
 <QA level="deep" q="Why might dropwatch show nothing during a SYN flood that's overflowing your accept queue?">
 In v6.10 (and through v6.17), `tcp_rcv_state_process()` hands the SYN to
 `tcp_conn_request()`, which records the overflow and returns, and then frees
 the SYN with `consume_skb()`, not `kfree_skb()`. Drop tracing hooks
-`kfree_skb`. I reproduced it: 105 listen overflows in `nstat`, zero matching
+`kfree_skb`. Reproduced: 105 listen overflows in `nstat`, zero matching
 `kfree_skb` events, 110 matching `consume_skb` events.
 </QA>
 
 <QA level="deep" q="When does MSG_ZEROCOPY make things slower?">
 Below roughly 10 KB per send, where pinning pages and processing completion
 notifications cost more than the copy (the kernel doc's own guidance). And on
-loopback or to any local socket, where the kernel does a deferred copy anyway.
-I measured that: 64 of 64 one-megabyte sends over loopback came back flagged
-`SO_EE_CODE_ZEROCOPY_COPIED`.
+loopback or to any local socket, where the kernel does a deferred copy anyway:
+64 of 64 one-megabyte sends came back flagged `SO_EE_CODE_ZEROCOPY_COPIED`.
 </QA>
 
 <QA level="deep" q="Where does XDP run relative to the rest of the stack, and what do you lose?">
 In the driver's NAPI poll, on the raw DMA buffer, before an skb is allocated,
-so before GRO, tc, netfilter and sockets. That's why it can drop or forward at
-tens of millions of packets per second per core. You lose everything above it:
-no conntrack, no TCP, no socket lookup, and the BPF verifier's limits on what
-the program may do. AF_XDP hands frames to user space when you need more logic.
+so before GRO, tc, netfilter and sockets. That's why it can drop or forward tens
+of millions of packets per second per core. You lose everything above it: no
+conntrack, no TCP, no socket lookup, and the BPF verifier's limits apply. AF_XDP
+hands frames to user space when you need more logic.
 </QA>
 
-<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="12" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
   <Q q="listen(fd, 4) and no accept(). How many connections complete on Linux 6.10?">
@@ -936,30 +943,29 @@ the program may do. AF_XDP hands frames to user space when you need more logic.
     rmem_max.
   </Q>
   <Q q="Why does loopback traffic show up in /proc/net/softnet_stat?">
-    lo's transmit calls netif_rx(), which queues the skb on the per-CPU
-    backlog, and process_backlog delivers it like any other NAPI instance.
+    lo's transmit queues the skb on the per-CPU backlog, and process_backlog
+    delivers it like any other NAPI instance.
   </Q>
 </Quiz>
 
 <CardGrid>
   <WildCard name="packagecloud: Monitoring and Tuning the Linux Networking Stack">
-    Joe Damato, 2016, in two parts. Still the most complete walk through
-    the receive path at source level; check the column layouts against a newer
-    kernel.
+    Joe Damato, 2016, in two parts. The most complete walk through the receive
+    path at source level; check the column layouts against a newer kernel.
   </WildCard>
   <WildCard name="Documentation/networking/scaling.rst">
     RSS, RPS, RFS, accelerated RFS and XPS, from the people who wrote them,
-    with the configuration files for each.
+    with the configuration for each.
   </WildCard>
   <WildCard name="Cloudflare: SYN packet handling in the wild">
     Both listen queues, the counters, and syncookies, with production numbers.
   </WildCard>
   <WildCard name="Høiland-Jørgensen et al., The eXpress Data Path (CoNEXT 2018)">
-    The design paper for XDP, with the benchmarks against DPDK and the normal stack.
+    The design paper for XDP, with benchmarks against DPDK and the normal stack.
   </WildCard>
 </CardGrid>
 
-<SectionHeading n="12" cmd="ls ../" id="related">Related chapters</SectionHeading>
+<SectionHeading n="13" id="related">Related chapters</SectionHeading>
 
 <CardGrid>
   <WildCard name="eBPF: Running Your Code in the Kernel">
@@ -967,15 +973,15 @@ the program may do. AF_XDP hands frames to user space when you need more logic.
     maps, helpers and attach points. [Chapter 48](/topics/48-ebpf).
   </WildCard>
   <WildCard name="Syscalls, Interrupts & the Kernel Boundary">
-    Top halves, bottom halves and the per-call cost behind the 250 ns
-    floor in section 5. [Chapter 07](/topics/07-syscalls-kernel-boundary).
+    Top halves, bottom halves and the per-call cost behind the 250 ns floor in
+    section 7. [Chapter 07](/topics/07-syscalls-kernel-boundary).
   </WildCard>
   <WildCard name="Containers from Scratch">
-    Network namespaces and veth pairs, the pieces every test in this chapter
-    ran inside. [Chapter 11](/topics/11-containers).
+    Network namespaces and veth pairs, the pieces every test in this chapter ran
+    inside. [Chapter 11](/topics/11-containers).
   </WildCard>
   <WildCard name="Load Balancing & Traffic Management">
-    What sits in front of these listeners, and how L4 balancers like Katran
-    use the fast path. [Chapter 34](/topics/34-load-balancing).
+    What sits in front of these listeners, and how L4 balancers like Katran use
+    the fast path. [Chapter 34](/topics/34-load-balancing).
   </WildCard>
 </CardGrid>

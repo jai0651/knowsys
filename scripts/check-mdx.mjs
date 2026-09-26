@@ -81,19 +81,9 @@ for (const file of files) {
     }
   });
 
-  // Does the chapter wear the shape its manifest entry claims?
-  const slug = file.split("/").pop().replace(/\.mdx$/, "");
-  if (ARCH[slug] && rel.includes("chapters/")) {
-    const want = SPINE[ARCH[slug]];
-    const have = new Set([...src.matchAll(/id="([a-z-]+)"/g)].map((m) => m[1]));
-    const missing = want.filter((id) => !have.has(id));
-    if (missing.length > 1) {
-      console.log(
-        `  ${rel}  archetype "${ARCH[slug]}" wants [${want.join(", ")}] — missing ${missing.join(", ")}`,
-      );
-      problems++;
-    }
-  }
+  // Chapters are organised by topic now (numbered sections, see
+  // docs/STYLE.md), so the per-archetype section-id check is retired. The
+  // manifest still records an archetype for the browse page.
 
   // A parent section must not share a title with a subsection inside it. The
   // bulk rename produced eleven of these, and each one put two identical rows

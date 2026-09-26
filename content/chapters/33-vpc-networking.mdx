@@ -1,120 +1,114 @@
 ---
 title: VPC & Cloud Networking
-dek: "Your VPC is not a network. It's a lookup table consulted by a card in someone else's server, and almost every surprising thing about it follows from that."
-readingTime: "~24 min"
+dek: "How a cloud provider fakes a private network for every customer on shared hardware, why that makes your VPC a lookup table and not a network, and how that explains the silent failures and the cross-AZ bill."
+readingTime: "~28 min"
+level: "Intermediate"
 versions: "AWS VPC · prices quoted us-east-1, September 2026"
-prereqs: "IP routing, CIDR, NAT, the OSI layers you actually use"
-updated: "2026-09-20"
+prereqs: "IP routing, CIDR, NAT"
+updated: "2026-09-26"
 ---
 
-Put yourself in a cloud provider's position. You have a building full of
-physical servers on one shared physical network. Customer A wants a private
-network of their own. So does customer B, and both of them want to use the
-addresses `10.0.0.0` to `10.0.255.255`, because that's what every tutorial
-says. Neither may ever see the other's packets. You can't run separate cables
-and switches for every customer who clicks a button. How do you give each of
-them a private network?
+Every service you deploy on AWS runs inside a VPC, whether you drew one or took
+the default. Most of the time it stays out of the way. Then a request times out
+with no error anywhere, two teams discover they can't connect their networks,
+or the bill shows thousands a month for traffic between zones.
 
-You fake it, in the one place every packet has to pass through: the network
-card of the host it's leaving. Chapter 47 described those hosts, running
-customers' VMs on a hypervisor, with a card (AWS calls it Nitro) that handles
-networking for all of them. Give each card a table. For every VM it knows which
-customer's network the VM belongs to, and for every address in that network it
-knows which physical host that VM is on. When customer A's VM sends a packet to
-`10.0.2.9`, the card looks up where *A's* `10.0.2.9` lives, wraps the packet in
-an outer packet addressed to that physical host and tagged with A's network,
-and sends it across the shared network. The card at the other end unwraps it
-and delivers it only to A's VM. B's `10.0.2.9` is a different entry in the
-table, and it never sees the packet.
+Those surprises have one root. A VPC isn't a network with cables and routers.
+It's a lookup table, consulted by a card in the server your instance runs on.
+Once you see it that way, the failures stop looking arbitrary.
 
-That's a **VPC**, and it explains most of how one behaves: it isn't a network,
-it's a lookup table. There's no cable between your instances, no switch, and no
-router at the `.1` address, even though every subnet has one "by convention".
-Each piece you configure is really an entry in that table:
+This chapter builds a VPC from the provider's side, then walks through the
+pieces you configure, one packet's trip between zones, the failures that
+produce no error message, and what it all costs.
 
-- A **CIDR block** is your address range. `10.0.0.0/16` means the first 16 bits
-  are fixed, which leaves 65,536 addresses.
-- A **subnet** is a slice of that range pinned to one **availability zone**,
-  one of the separate data centres in a region. How many instances fit in a
-  `/24`? 256 addresses, minus the 5 AWS reserves in every subnet, so 251.
-- A **route table** says where packets for each destination go: stay inside
-  the VPC, out through an internet gateway, or through a NAT gateway that
-  swaps in a public address for servers that shouldn't be reachable directly.
-- A **security group** is a set of allow rules the card checks before it sends
-  or delivers anything, and it remembers connections, so replies get through.
-
-Seeing it as a table makes a strange failure obvious. What happens if you
-delete a NAT gateway that a route still points at? You might expect an error.
-But the route is just an entry, and now it points at nothing. It stays, its
-state becomes `blackhole`, and matching packets are dropped with no reply and
-no log line. The instance sees a timeout. Section 4.2 has the one-line check to
-run after any teardown.
-
-The same model explains the day-to-day questions. On EKS, the default VPC CNI
-gives every pod its own VPC address, so the number of pods you can run is tied
-to how big your subnets are. Two teams that both picked `10.0.0.0/16` can't peer
-their VPCs, because the table can't tell their addresses apart. And traffic
-between availability zones leaves one data centre for another, so it shows up
-on the bill.
-
-One caveat. Every other chapter here is measured on a machine I own. I don't
-have an AWS account with Nitro instances to break, so this one is built from the
-documentation, the ENA driver's counter names, AWS talks and public postmortems,
-and wherever I show output I haven't run, I say so. The chapter covers what
-isolation you do and don't get, the pieces a VPC is made of, one packet's trip
-between zones, the failures that produce no error, and what it all costs.
-
-<SectionHeading n="01" cmd="aws ec2 describe-vpcs" id="contract">Isolation, and what it isn't</SectionHeading>
-
-A VPC gives you a private IPv4 address range that behaves, from inside, like a
-flat routed network you own. Two instances in the same VPC can reach each other
-by private IP with no configuration beyond a permissive security group.
-
-What you're sold is isolation. What you actually get is **a distributed lookup
-table**: there's no cable between your two instances, no switch, no VLAN. Each
-packet is wrapped, shipped across a shared physical substrate, and unwrapped by
-hardware on the far side. Holding that model in your head explains most of the
-behaviour that otherwise looks arbitrary.
-
-<Callout label="The sentence that reframes it">
-There is no router. The "VPC router" at address `x.x.x.1` in every subnet is not
-a device — it's a convention. Routing decisions are made by the hypervisor's
-network card on the *sending* host, before the packet leaves. So you cannot log in to it, cannot saturate it, and cannot make it a
-bottleneck.
+<Callout label="How this chapter was built" kind="note">
+Every other chapter here is measured on a machine I own. I don't have an AWS
+account with Nitro instances to break, so this one is built from the
+documentation, the ENA driver's counter names, AWS talks and public
+postmortems. Wherever I show output I haven't run, I say so.
 </Callout>
 
-<Sub n="1.1" title="What it guarantees">
+<SectionHeading n="01" id="overlay">A private network on shared hardware</SectionHeading>
 
-- **L3 isolation.** Packets don't leak between VPCs without explicit peering,
-  a transit gateway, or an endpoint.
-- **Stable private addressing.** An ENI's private IP is yours for the life of
-  the interface.
-- **Stateful filtering by default.** Security groups track connections, so
-  return traffic is allowed without a matching rule.
+Put yourself in a cloud provider's position. You have a building full of
+physical servers on one shared physical network. Every customer wants a private
+network of their own.
 
-</Sub>
+<Sub n="1.1" title="The provider's problem">
 
-<Sub n="1.2" title="What it does not">
+Customer A wants a private network. So does customer B, and both want the
+addresses `10.0.0.0` to `10.0.255.255`, because that's what every tutorial
+says. Neither may ever see the other's packets.
 
-- **No broadcast or multicast.** ARP is emulated. Anything built on broadcast
-  discovery — old clustering software, some licence servers — simply won't work.
-- **No guaranteed bandwidth between two instances.** You get an allowance tied
-  to instance size, and it's a ceiling, not a reservation.
-- **No overlapping CIDRs, ever.** Two VPCs with overlapping ranges cannot peer.
-  This is the decision that's hardest to reverse, and it's made on day one by
-  whoever typed `10.0.0.0/16` without thinking.
+<Why>Why not give each customer their own switches?</Why>
+
+Because customers create networks by clicking a button, thousands of times a
+day. You can't run separate cables and switches for every one of them. The
+isolation has to come from software, on hardware everyone shares.
 
 </Sub>
 
-<SectionHeading n="02" cmd="aws ec2 describe-subnets" id="layout">What a VPC is actually made of</SectionHeading>
+<Sub n="1.2" title="Fake it in the network card">
 
-<Sub n="2.1" title="Addresses you don't get to use">
+You fake it in the one place every packet has to pass through: the network card
+of the host it's leaving. Chapter 47 described those hosts, running customers'
+VMs on a hypervisor, with a card (AWS calls it **Nitro**) that handles
+networking for all of them.
 
-AWS reserves five addresses in every subnet. On a `/28` — sixteen addresses —
-that leaves eleven usable, which catches people out when they carve subnets
-small to feel tidy.
+Give each card a table. For every VM, it knows which customer's network the VM
+belongs to. For every address in that network, it knows which physical host
+the VM is on.
 
-<Figure caption="A /28 subnet. Those five reserved addresses are fixed by convention, not configurable, and they cost proportionally more the smaller you cut the subnet.">
+When customer A's VM sends a packet to `10.0.2.9`, the card looks up where
+*A's* `10.0.2.9` lives. It wraps the packet in an outer packet addressed to that
+physical host, tagged with A's network, and sends it across the shared network.
+The card at the other end unwraps it and delivers it only to A's VM.
+
+B's `10.0.2.9` is a different entry in the table, and it never sees the packet.
+
+<Callout label="Design implication">
+There is no router. The "VPC router" at `x.x.x.1` in every subnet isn't a
+device; it's a convention. Routing decisions are made by the network card on
+the *sending* host, before the packet leaves. So you can't log in to it,
+can't saturate it, and can't make it a bottleneck.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="02" id="pieces">The pieces you configure</SectionHeading>
+
+That's a **VPC**. Each piece you configure in the console is really an entry in
+that table, pushed out to the cards that need it.
+
+<Sub n="2.1" title="CIDR blocks and subnets">
+
+A **CIDR block** is your address range. `10.0.0.0/16` means the first 16 bits
+are fixed, which leaves 65,536 addresses.
+
+A **subnet** is a slice of that range pinned to one **availability zone**, one of
+the separate data centres in a region.
+
+<Why>Why does subnet size matter on Kubernetes?</Why>
+
+On EKS, the default VPC CNI gives every pod its own VPC address. So the number
+of pods you can run is tied to how big your subnets are, and a subnet carved
+small on day one caps the cluster later.
+
+</Sub>
+
+<Sub n="2.2" title="Addresses you don't get to use">
+
+<Predict
+  q="You carve a /28 subnet, sixteen addresses, for a small service. How many instances can you put in it on AWS?"
+  options={["16", "14", "11", "8"]}
+  answer={2}
+>
+Eleven. AWS reserves five addresses in every subnet, whatever its size. On a
+`/24` that leaves 251 of 256; on a `/28` it leaves 11 of 16, which catches out
+people who carve subnets small to feel tidy.
+</Predict>
+
+<Figure caption="A /28 subnet. The five reserved addresses are fixed, not configurable, and they cost proportionally more the smaller you cut the subnet.">
 <Cells
   cellWidth={56}
   rows={[
@@ -122,7 +116,7 @@ small to feel tidy.
       label: "10.0.0.0/28",
       cells: [".0", ".1", ".2", ".3", ".4", ".5", ".6", ".7", ".8", ".9", ".10", ".11", ".12", ".13", ".14", ".15"],
       cursor: 1,
-      cursorLabel: "the \"router\" — a convention, not a box",
+      cursorLabel: "the \"router\": a convention, not a box",
       dimFrom: 15,
       dimBefore: 4,
     },
@@ -130,13 +124,29 @@ small to feel tidy.
 />
 </Figure>
 
-`.0` is the network address, `.1` the implied router, `.2` the DNS resolver,
-`.3` is reserved for future use, and the last address is the broadcast address —
-reserved even though broadcast doesn't work.
+| Address | Reserved for |
+|---|---|
+| `.0` | The network address |
+| `.1` | The implied router |
+| `.2` | The DNS resolver |
+| `.3` | Future use |
+| Last (`.15` here) | Broadcast, reserved even though broadcast doesn't work |
 
 </Sub>
 
-<Sub n="2.2" title="The pieces, and which ones are real">
+<Sub n="2.3" title="Route tables, gateways and security groups">
+
+Three more pieces decide where a packet may go:
+
+| Piece | What it does |
+|---|---|
+| **Route table** | Says where packets for each destination go: stay inside the VPC, out through an internet gateway, or through a NAT gateway |
+| **NAT gateway** | Swaps in a public source address for servers that shouldn't be reachable directly |
+| **Security group** | A set of allow rules the card checks before it sends or delivers anything. It remembers connections, so replies get through |
+
+</Sub>
+
+<Sub n="2.4" title="Which pieces are real">
 
 <Compare
   cols={["Thing", "What it actually is", "Where it lives"]}
@@ -144,7 +154,7 @@ reserved even though broadcast doesn't work.
     ["VPC", "A CIDR range and a tenancy boundary in a control plane", "Nowhere physical"],
     ["Subnet", "A CIDR slice pinned to one availability zone", "Nowhere physical"],
     ["Route table", "Rows consulted on the sending host", "Pushed to every host with an ENI in the subnet"],
-    ["ENI", "A virtual NIC — MAC, IPs, SG bindings", "State on the Nitro card of the host running the instance"],
+    ["ENI", "A virtual NIC: MAC, IPs, SG bindings", "State on the Nitro card of the host running the instance"],
     ["Security group", "A stateful rule set, evaluated per packet", "Enforced in hardware on the Nitro card"],
     ["NACL", "A stateless ordered rule list", "Evaluated at the subnet boundary"],
     ["Internet gateway", "A horizontally scaled NAT and routing target", "Genuinely a fleet"],
@@ -152,101 +162,183 @@ reserved even though broadcast doesn't work.
 />
 
 Note how many rows say "nowhere physical". A VPC is mostly a set of facts the
-control plane distributes to hosts, and the enforcement happens at the edge, on
-the machine your instance is running on.
+control plane distributes to hosts. Enforcement happens at the edge, on the
+machine your instance is running on.
 
 </Sub>
 
-<SectionHeading n="03" cmd="aws ec2 describe-network-interfaces" id="hot-path">One packet, AZ to AZ</SectionHeading>
+<SectionHeading n="03" id="guarantees">Isolation, and what it isn't</SectionHeading>
 
-Follow one TCP packet from an instance in AZ-a to an instance in AZ-b, same VPC.
+From inside, a VPC behaves like a flat routed network you own. Two instances in
+the same VPC can reach each other by private IP with no configuration beyond a
+permissive security group.
 
-<Figure caption="The two decapsulation steps are where isolation is enforced. An instance never sees the substrate addresses, and the substrate never sees your private IPs as anything but payload.">
-<Flow
-  wrap={3}
+What you're sold is isolation. What you get is **a distributed lookup table**:
+no cable between your two instances, no switch, no VLAN. Each packet is
+wrapped, shipped across a shared physical substrate, and unwrapped by hardware
+on the far side.
+
+<Sub n="3.1" title="What it guarantees">
+
+| Guarantee | What it means |
+|---|---|
+| **L3 isolation** | Packets don't leak between VPCs without explicit peering, a transit gateway, or an endpoint |
+| **Stable private addressing** | An ENI's private IP is yours for the life of the interface |
+| **Stateful filtering by default** | Security groups track connections, so return traffic is allowed without a matching rule |
+
+</Sub>
+
+<Sub n="3.2" title="What it does not">
+
+| Not provided | Consequence |
+|---|---|
+| **Broadcast or multicast** | ARP is emulated. Anything built on broadcast discovery, like old clustering software and some licence servers, won't work |
+| **Guaranteed bandwidth between two instances** | You get an allowance tied to instance size, and it's a ceiling, not a reservation |
+| **Overlapping CIDRs** | Two VPCs with overlapping ranges can't peer, ever |
+
+<Why>Why can't overlapping VPCs peer?</Why>
+
+Because the table can't tell their addresses apart. If both VPCs contain
+`10.0.2.9`, a lookup for that address has two answers, and the card has no way
+to choose.
+
+<Callout label="Common mistake" kind="warn">
+Typing `10.0.0.0/16` without thinking. It's the decision that's hardest to
+reverse, and it's made on day one. Years later two teams that both took the
+default need to peer, and the fix is renumbering a production VPC.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="04" id="packet-path">One packet, AZ to AZ</SectionHeading>
+
+Follow one TCP packet from an instance in AZ-a to an instance in AZ-b, in the
+same VPC. The two decapsulation steps are where isolation is enforced.
+
+<Sub n="4.1" title="From socket write to delivery">
+
+<Steps
+  title="One packet between availability zones"
+  lanes={[
+    { t: "Guest", s: "kernel · ENA driver", icon: "◉" },
+    { t: "Nitro card", s: "security group", icon: "⛨" },
+    { t: "Mapping", s: "private IP → host", icon: "⌗" },
+    { t: "Encapsulate", s: "substrate packet", icon: "▣" },
+    { t: "Physical network", s: "AWS backbone", icon: "⇆" },
+    { t: "Target Nitro", s: "decap · deliver", icon: "⇣" },
+  ]}
   steps={[
-    { label: "socket write", sub: "guest kernel, ENA driver" },
-    { label: "Nitro card", sub: "SG evaluated here", accent: true },
-    { label: "mapping lookup", sub: "private IP → host IP" },
-    { label: "encapsulate", sub: "wrapped in a substrate packet" },
-    { label: "physical network", sub: "AWS backbone, real routers" },
-    { label: "decap + deliver", sub: "target Nitro → target ENI" },
+    [0, "Your instance writes to a socket. The guest kernel builds the packet for `10.0.2.47`, and the **ENA driver** hands the frame to the card."],
+    [1, "The **Nitro card** evaluates the sending instance's security group, in hardware, before anything leaves the host."],
+    [2, "`10.0.2.47` means nothing to the physical network. The card looks up which physical host holds that private IP, in its cache or from the **mapping service**."],
+    [3, "The card **wraps** the packet in a substrate packet addressed to that host and tagged with your VPC."],
+    [4, "The substrate is a real network with real routers, and it has never heard of your `10.0.0.0/16`. Your private IPs are only payload."],
+    [5, "The target host's card **unwraps** the packet, applies the destination security group, and delivers it to the target ENI. The instance never sees substrate addresses."],
   ]}
 />
-</Figure>
-
-<Sub n="3.1" title="The mapping service">
-
-Step 3 is the interesting one. Your instance addresses a packet to
-`10.0.2.47`. That address means nothing to the physical network. Your sending Nitro card asks a **mapping service** — described publicly in AWS's own
-re:Invent networking talks — which physical host currently holds that private
-IP, gets back a substrate address, and wraps the packet.
-
-Two consequences fall straight out:
-
-- **The first packet to a cold destination is slower.** Mapping entries are
-  cached on the card; a miss costs a lookup (single-digit milliseconds, in my
-experience, though I have never managed to measure it cleanly). You'll occasionally see this as an
-  unexplained first-connection latency that never reproduces under load.
-- **Live migration works.** Moving an instance is a mapping update, not a
-  renumbering. Your IP follows you because the IP was never bound to hardware
-  in the first place.
 
 </Sub>
 
-<Sub n="3.2" title="Security groups are not a firewall in front of you">
+<Sub n="4.2" title="The mapping service">
 
-A security group is evaluated on the Nitro card of the *sending* and *receiving*
-hosts, before the packet reaches any guest. There's no appliance to route
-through and no throughput cost that scales with rule count in the way an
+Step 3 is where the interesting behaviour comes from. The sending card asks a
+**mapping service**, described publicly in AWS's re:Invent networking talks,
+which physical host currently holds that private IP. It gets back a substrate
+address and wraps the packet.
+
+<Why>Why is the first packet to a new destination slower?</Why>
+
+Because mapping entries are cached on the card, and a miss costs a lookup. It's
+probably single-digit milliseconds, though I've never managed to measure it
+cleanly. You'll occasionally see it as first-connection latency that never
+reproduces under load.
+
+<Why>How can an instance move hosts and keep its IP?</Why>
+
+Live migration is a mapping update, not a renumbering. Your IP follows you
+because it was never bound to hardware in the first place.
+
+</Sub>
+
+<Sub n="4.3" title="Security groups against NACLs">
+
+A security group is evaluated on the Nitro card of the *sending* and
+*receiving* hosts, before the packet reaches any guest. There's no appliance to
+route through, and no throughput cost that scales with rule count the way an
 iptables chain does.
 
-They're also **stateful**. That difference from a NACL causes more outages than
-any other VPC feature, so it gets a diagram.
+| | Security group | NACL |
+|---|---|---|
+| **State** | Stateful: tracks connections | Stateless: every packet judged alone |
+| **Where** | The Nitro card of each instance | The subnet boundary |
+| **Rules** | A set of allow rules | An ordered rule list |
+| **Return traffic** | Allowed automatically | Needs its own rule |
 
-<Figure caption="Same request, two filtering models. The NACL needs an explicit outbound rule for the ephemeral port range or the response is silently dropped — and a dropped response looks exactly like an application hang.">
-<Sequence
-  actors={["client", "security group", "NACL"]}
+That difference in state causes more outages than any other VPC feature. Here's
+the same request through each:
+
+<StepSequence
+  title="One request through a security group, then through a NACL"
+  actors={["Client", "Security group", "NACL"]}
   messages={[
-    { from: 0, to: 1, label: "SYN → :443", note: "inbound rule allows 443" },
-    { from: 1, to: 0, label: "SYN-ACK from :443", accent: true, note: "allowed — connection is tracked" },
-    { from: 0, to: 2, label: "SYN → :443", note: "inbound rule allows 443" },
-    { from: 2, to: 0, label: "SYN-ACK from :443", dashed: true, note: "DROPPED — no outbound rule for :32768-60999" },
+    { from: 0, to: 1, label: "SYN → :443", note: "The inbound rule allows port 443, so the SYN is delivered. The security group **records the connection**." },
+    { from: 1, to: 0, label: "SYN-ACK from :443", note: "The reply is allowed with no outbound rule, because the connection is tracked." },
+    { from: 0, to: 2, label: "SYN → :443", note: "Now the same request through a NACL with the same inbound rule. The SYN gets in." },
+    { from: 2, to: 0, label: "SYN-ACK from :443", dashed: true, note: "**Dropped.** The reply goes to the client's ephemeral port, and there's no outbound rule for `:32768-60999`. The NACL has no memory of the SYN." },
   ]}
 />
-</Figure>
+
+<Callout label="Common mistake" kind="warn">
+Adding a NACL that mirrors your security group's inbound rules and nothing
+else. The responses are silently dropped, and a dropped response looks exactly
+like an application hang. Give every NACL an outbound rule for the ephemeral
+port range.
+</Callout>
 
 </Sub>
 
-<SectionHeading n="04" cmd="aws ec2 describe-route-tables" id="failure">Failures with no error message</SectionHeading>
+<SectionHeading n="05" id="silent-failures">Failures with no error message</SectionHeading>
 
-<Sub n="4.1" title="NAT gateway port exhaustion">
+Because a VPC is a table, most of its failures are an entry that says "drop"
+or a ceiling that's quietly hit. Nothing replies, so the instance sees a
+timeout and nothing else.
 
-A NAT gateway rewrites source addresses, so every outbound connection consumes
-a source port *per unique destination*. AWS documents the ceiling as roughly
-55,000 simultaneous connections to a single destination IP and port, and
-returns `ErrorPortAllocation` past it (per destination, so one busy endpoint
-can starve everything else).
+<Sub n="5.1" title="The blackhole route">
 
-That failure has a distinctive shape: everything works, then a batch job
-fans out to one third-party API, and unrelated services start failing to
-connect. Nothing in your application changed. You ran out of tuples.
+<Predict
+  q="You delete a NAT gateway, but a route in a private subnet still points at it. What do instances in that subnet see when they connect out?"
+  options={[
+    "The API refuses to delete the gateway",
+    "The route is removed automatically",
+    "An ICMP unreachable, so connections fail fast",
+    "Nothing: packets vanish and connections time out",
+  ]}
+  answer={3}
+>
+The route is just an entry, and now it points at nothing. It stays, its state
+becomes `blackhole`, and matching packets are dropped with no ICMP unreachable,
+no log line, and no error on the instance beyond a timeout.
+</Predict>
 
-Mitigations, in order of how much they actually help:
+<Steps
+  title="How a teardown leaves a blackhole"
+  lanes={[
+    { t: "NAT gateway", s: "deleted", icon: "✕" },
+    { t: "Route table", s: "0.0.0.0/0 → nat-…", icon: "≡" },
+    { t: "Instance", s: "connect()", icon: "◉" },
+    { t: "Nitro card", s: "route lookup", icon: "⌗" },
+    { t: "Timeout", s: "no error", icon: "◷" },
+  ]}
+  steps={[
+    [0, "Someone deletes a NAT gateway during a cleanup. The API call succeeds."],
+    [1, "The route that pointed at it **isn't removed**. Its state changes to `blackhole`."],
+    [2, "An instance in the subnet opens a connection to the internet and sends a SYN."],
+    [3, "The card matches the route, finds a target that no longer exists, and **drops the packet**. No ICMP, no log line."],
+    [4, "The client retransmits, then times out. From the instance, it looks like the remote end is down."],
+  ]}
+/>
 
-1. **Don't route it through NAT.** A VPC endpoint for S3, DynamoDB and the rest
-   keeps that traffic off the gateway entirely, and off your bill.
-2. **More NAT gateways.** One per AZ is the default advice and also halves
-   cross-AZ charges.
-3. **Fewer connections.** Connection pooling and keep-alive.
-
-</Sub>
-
-<Sub n="4.2" title="The blackhole route">
-
-Delete a NAT gateway and the route pointing at it doesn't disappear. It goes to
-state `blackhole`, and packets matching it are dropped silently — no ICMP
-unreachable, no log line, no error on the instance beyond a timeout.
+Find them with one query:
 
 ```shell
 aws ec2 describe-route-tables \
@@ -254,14 +346,38 @@ aws ec2 describe-route-tables \
   --output text
 ```
 
-Run that after any teardown. It takes a second and it's the single highest-yield
-VPC check I know.
+Run that after any teardown. It takes a second and it's the highest-yield VPC
+check I know.
 
 </Sub>
 
-<Sub n="4.3" title="Allowances you didn't know you had">
+<Sub n="5.2" title="NAT gateway port exhaustion">
 
-Instance network performance is a set of ceilings, and crossing one shows up as
+A NAT gateway rewrites source addresses, so every outbound connection consumes
+a source port *per unique destination*. AWS documents the ceiling as roughly
+55,000 simultaneous connections to a single destination IP and port, and
+returns `ErrorPortAllocation` past it.
+
+<Why>Why do unrelated services fail at the same time?</Why>
+
+Because the limit is per destination, on a gateway everyone shares. Everything
+works, then a batch job fans out to one third-party API, and other services
+start failing to connect. Nothing in your application changed. You ran out of
+tuples.
+
+Mitigations, in order of how much they help:
+
+| Fix | Why it helps |
+|---|---|
+| **Don't route it through NAT** | A VPC endpoint for S3, DynamoDB and the rest keeps that traffic off the gateway entirely, and off your bill |
+| **More NAT gateways** | One per AZ is the default advice, and it also halves cross-AZ charges |
+| **Fewer connections** | Connection pooling and keep-alive |
+
+</Sub>
+
+<Sub n="5.3" title="Allowances you didn't know you had">
+
+Instance network performance is a set of ceilings. Crossing one shows up as
 packet loss with no error anywhere in your application. The ENA driver counts
 them, and almost nobody looks:
 
@@ -269,8 +385,8 @@ them, and almost nobody looks:
 ethtool -S eth0 | grep -E 'allowance_exceeded'
 ```
 
-You get five counters back. Made-up values, to show the shape — I don't have a
-Nitro instance to paste a real run from:
+You get five counters back. These are made-up values to show the shape; I don't
+have a Nitro instance to paste a real run from:
 
 ```
 bw_in_allowance_exceeded: 0
@@ -280,31 +396,58 @@ conntrack_allowance_exceeded: <n>
 linklocal_allowance_exceeded: 0
 ```
 
-What matters is that they're counters, so any non-zero value is cumulative since
-boot and tells you nothing about *when*. Sample them on an interval or you can't
-tell a burst last Tuesday from a problem happening now.
+They're counters, so any non-zero value is cumulative since boot and tells you
+nothing about *when*. Sample them on an interval, or you can't tell a burst
+last Tuesday from a problem happening now.
 
 A non-zero `conntrack_allowance_exceeded` means the Nitro card's connection
-tracking table is full — probably a scan, a huge fan-out, or half-open
-connections piling up. It isn't in CloudWatch by default. So the instance drops
-packets, the application sees timeouts, and every dashboard you'd normally reach
-for looks fine.
+tracking table is full, usually from a scan, a huge fan-out, or half-open
+connections piling up.
+
+<Callout label="Design implication">
+`conntrack_allowance_exceeded` isn't in CloudWatch by default. The instance
+drops packets, the application sees timeouts, and every dashboard you'd
+normally reach for looks fine. Ship the `ethtool -S` counters yourself.
+</Callout>
 
 </Sub>
 
-<SectionHeading n="05" cmd="ethtool -S eth0 | grep allowance" id="cost">$4,200 a month for one chatty pair</SectionHeading>
+<Sub n="5.4" title="MTU, and the 9001 you probably aren't getting">
+
+Inside a VPC the MTU is 9001 bytes. Traffic leaving through an internet gateway
+drops to 1500, and paths through some gateway types drop further.
+
+<Why>Why do small requests work while large ones hang?</Why>
+
+A packet with DF set that's too large for the path gets an ICMP
+fragmentation-needed response. Plenty of security groups and on-prem firewalls
+drop that ICMP, and the result is the classic **PMTU black hole**: small
+requests work, large ones hang forever.
+
+```shell
+# Find the real path MTU, without trusting anyone's documentation
+tracepath 10.0.2.47
+ping -M do -s 8973 10.0.2.47      # 8973 + 28 bytes of header = 9001
+```
+
+</Sub>
+
+<SectionHeading n="06" id="cost">What cloud networking costs</SectionHeading>
+
+Traffic between availability zones leaves one data centre for another, so it
+shows up on the bill. The rates are small; the volumes aren't.
 
 <Callout label="Read the current price list" kind="warn">
 Every figure here is us-east-1, retrieved September 2026, and AWS changes
-these. Take the *shape* of the arithmetic and substitute today's numbers —
-the structural point (cross-AZ is charged in both directions, NAT is charged
-twice) outlives any particular rate.
+these. Take the *shape* of the arithmetic and substitute today's numbers. The
+structural point (cross-AZ is charged in both directions, NAT is charged twice)
+outlives any particular rate.
 </Callout>
 
-<Sub n="5.1" title="The line items that surprise people">
+<Sub n="6.1" title="The line items that surprise people">
 
 <Cost items={[
-  { what: "Cross-AZ data transfer", value: "$0.01/GB", source: "charged in EACH direction — $0.02/GB round trip" },
+  { what: "Cross-AZ data transfer", value: "$0.01/GB", source: "charged in EACH direction: $0.02/GB round trip" },
   { what: "NAT gateway, per hour", value: "$0.045", source: "per gateway, per AZ, whether idle or not" },
   { what: "NAT gateway, data processed", value: "$0.045/GB", source: "on top of any transfer charge" },
   { what: "VPC peering, same AZ", value: "$0.00/GB", source: "same-AZ peered traffic is free" },
@@ -317,7 +460,7 @@ transfer charge, so the same gigabyte can be billed twice on one hop.
 
 </Sub>
 
-<Sub n="5.2" title="What a chatty microservice actually costs">
+<Sub n="6.2" title="$4,200 a month for one chatty pair">
 
 Take two services exchanging 40 KB per request, deployed across three AZs for
 availability, so roughly two-thirds of calls cross a zone boundary.
@@ -333,98 +476,88 @@ availability, so roughly two-thirds of calls cross a zone boundary.
   result={{ label: "monthly, for one service pair, in transfer alone", value: "≈ $4,200" }}
 />
 
-Nothing is misconfigured in that scenario. It's the documented rate applied to a
-normal architecture, and it's the reason zone-aware routing exists — pinning
-callers to same-AZ targets where consistency allows takes that number to
-roughly zero.
+Nothing is misconfigured in that scenario. It's the documented rate applied to
+a normal architecture.
+
+<Callout label="Design implication">
+This is why zone-aware routing exists. Pinning callers to same-AZ targets,
+where consistency allows, takes that number to roughly zero.
+</Callout>
 
 </Sub>
 
-<Sub n="5.3" title="MTU, and the 9001 you probably aren't getting">
+<SectionHeading n="07" id="operating">Debugging and monitoring a VPC</SectionHeading>
 
-Inside a VPC the MTU is 9001 bytes. Traffic leaving through an internet gateway
-drops to 1500. Paths through some gateway types drop further, and a packet with
-DF set that's too large gets an ICMP fragmentation-needed response — which
-plenty of security groups and on-prem firewalls drop, producing the classic
-**PMTU black hole**: small requests work, large ones hang forever.
+<Sub n="7.1" title="Answering 'why can't A reach B'">
 
-```shell
-# Find the real path MTU, without trusting anyone's documentation
-tracepath 10.0.2.47
-ping -M do -s 8973 10.0.2.47      # 8973 + 28 bytes of header = 9001
-```
-
-</Sub>
-
-<SectionHeading n="06" cmd="aws ec2 start-network-insights-analysis" id="operating">Why can't A reach B</SectionHeading>
-
-<Sub n="6.1" title="Answering 'why can't A reach B'">
-
-There's a specific order that resolves this fastest, and it isn't the order most
-people use. Work from the cheapest check to the most expensive:
+There's an order that resolves this fastest, and it isn't the order most people
+use. Work from the cheapest check to the most expensive:
 
 1. **Reachability Analyzer.** It evaluates route tables, SGs, NACLs and gateways
-   statically and tells you the blocking component by name. No packets sent.
-2. **Blackhole routes.** The query in 4.2.
+   statically and names the blocking component. No packets sent.
+2. **Blackhole routes.** The query in 5.1.
 3. **NACLs, both directions.** Stateless means the return path needs its own
    rule, and the ephemeral range is the usual gap.
-4. **Flow logs, filtered to REJECT.** This tells you *that* something was
-   dropped and by which ENI.
+4. **Flow logs, filtered to REJECT.** These tell you *that* something was
+   dropped, and by which ENI.
 5. **Only then, tcpdump on the instance.**
 
-Flow logs are where people start and they're the slowest useful step, because
-they show rejects but not *why* — a REJECT line doesn't say whether the SG or
-the NACL did it.
+<Why>Why not start with flow logs?</Why>
+
+They're where people start, and they're the slowest useful step. They show
+rejects but not *why*: a REJECT line doesn't say whether the SG or the NACL did
+it.
 
 </Sub>
 
-<Sub n="6.2" title="What to watch continuously">
+<Sub n="7.2" title="What to watch continuously">
 
 <Compare
   cols={["Signal", "Where", "What it means"]}
   rows={[
-    ["conntrack_allowance_exceeded", "ethtool -S on the instance", "Nitro connection table full — fan-out or half-open pileup"],
+    ["conntrack_allowance_exceeded", "ethtool -S on the instance", "Nitro connection table full: fan-out or half-open pileup"],
     ["bw_out_allowance_exceeded", "ethtool -S", "You've hit the instance-size ceiling, not a network fault"],
     ["ErrorPortAllocation", "CloudWatch, NAT gateway", "Port exhaustion to one destination"],
     ["IdleTimeoutCount", "CloudWatch, NAT gateway", "Connections idle past 350 s and silently dropped"],
-    ["Cross-AZ transfer bytes", "Cost Explorer, grouped by AZ", "The bill in 5.2, before it arrives"],
+    ["Cross-AZ transfer bytes", "Cost Explorer, grouped by AZ", "The bill in 6.2, before it arrives"],
   ]}
 />
 
 </Sub>
 
-<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+<Sub n="7.3" title="Symptom, cause, fix">
 
-**Build the overlay yourself, on one laptop.** Two network namespaces, a VXLAN
-tunnel between them, and a tiny userspace "mapping service" that resolves an
-overlay IP to a tunnel endpoint.
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Outbound connections time out after a teardown | Blackhole route | Query for `blackhole` routes; repoint or delete them |
+| Several services fail to connect at once, nothing deployed | NAT port exhaustion to one destination | VPC endpoint, more NAT gateways, connection pooling |
+| Timeouts, dashboards look fine | `conntrack_allowance_exceeded` or another allowance | Sample `ethtool -S`; bigger instance or fewer connections |
+| Connection opens, request sent, client waits forever | NACL missing an outbound ephemeral-port rule | Add the rule for the return path |
+| Small requests work, large uploads hang | PMTU black hole | `tracepath`, `ping -M do`; allow ICMP fragmentation-needed |
+| Two VPCs can't peer | Overlapping CIDRs | Renumber, a private NAT layer, or PrivateLink |
+| Transfer bill far above estimate | Cross-AZ traffic billed both ways | Zone-aware routing |
 
-- Create two netns, give each a veth with an overlay address in `10.99.0.0/24`.
-- Bridge them with VXLAN over loopback, so the encapsulation is real.
-- Write 30 lines that maintain the FDB from a dictionary, and ping across.
-- Then delete an entry and watch the ping stop with no ICMP error at all.
+</Sub>
 
-That last step is the whole chapter in one experiment. A blackhole route and a
-missing mapping entry fail identically — silently — and once you've caused it
-yourself the AWS behaviour stops feeling mysterious.
-
-<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
+<Sub n="7.4" title="What you give up">
 
 <Compare
   cols={["You get", "You pay", "When the bill arrives"]}
   rows={[
     ["Isolation with no hardware", "Encapsulation overhead and a mapping lookup", "As unexplained first-packet latency"],
-    ["Live migration, stable IPs", "Your IP was never bound to anything", "Never — this one is pure upside"],
+    ["Live migration, stable IPs", "Your IP was never bound to anything", "Never: this one is pure upside"],
     ["Stateful SGs enforced in hardware", "NACLs behave completely differently", "The first time someone adds a NACL"],
     ["Multi-AZ availability", "Cross-AZ transfer billed both directions", "Monthly, at about $4k per chatty service pair"],
     ["Managed NAT", "$0.045/hr + $0.045/GB, and a port ceiling", "During a fan-out to one third-party API"],
   ]}
 />
 
-<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
+</Sub>
+
+<Sub n="7.5" title="Where you meet this in the wild">
 
 <CardGrid>
-  <WildCard name="AWS re:Invent — 'Another Day, Another Billion Packets'" verdict="The closest thing to a primary source on how the overlay works, from the people who built it.">
+  <WildCard name="AWS re:Invent: 'Another Day, Another Billion Packets'" verdict="The closest thing to a primary source on how the overlay works, from the people who built it.">
     The networking deep-dive talk where AWS describes the mapping service,
     encapsulation and the Nitro offload path. If you only consume one source on
     VPC internals, make it this one.
@@ -437,23 +570,64 @@ yourself the AWS behaviour stops feeling mysterious.
   </WildCard>
 </CardGrid>
 
-<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+</Sub>
+
+<SectionHeading n="08" id="summary">Summary</SectionHeading>
+
+1. **A VPC is a lookup table, not a network.** The card on each host maps your
+   private IPs to physical hosts and wraps every packet.
+2. **There is no router.** The `.1` address is a convention; routing happens on
+   the sending host.
+3. **Every subnet loses five addresses.** A `/24` holds 251 instances, a `/28`
+   holds 11.
+4. **Overlapping CIDRs can never peer.** The table can't tell the addresses
+   apart, so choose ranges on day one.
+5. **Security groups are stateful; NACLs aren't.** A NACL needs an outbound rule
+   for the ephemeral range, or responses vanish.
+6. **Deleted targets leave blackhole routes.** Packets are dropped with no
+   error; query for them after every teardown.
+7. **NAT gateways run out of ports per destination.** About 55,000 connections
+   to one IP and port, shared by everything behind the gateway.
+8. **Allowance counters live in `ethtool -S`**, not CloudWatch. Sample them, or
+   the drops stay invisible.
+9. **The VPC MTU is 9001, but paths out are smaller.** Blocked ICMP turns that
+   into a PMTU black hole.
+10. **Cross-AZ traffic is billed in both directions.** One chatty service pair
+    can cost about $4,200 a month; zone-aware routing removes most of it.
+
+<SectionHeading n="09" id="build">Build this</SectionHeading>
+
+**Build the overlay yourself, on one laptop.** Two network namespaces, a VXLAN
+tunnel between them, and a tiny userspace "mapping service" that resolves an
+overlay IP to a tunnel endpoint.
+
+- Create two netns, give each a veth with an overlay address in `10.99.0.0/24`.
+- Bridge them with VXLAN over loopback, so the encapsulation is real.
+- Write 30 lines that maintain the FDB from a dictionary, and ping across.
+- Then delete an entry and watch the ping stop with no ICMP error at all.
+
+That last step is the whole chapter in one experiment. A blackhole route and a
+missing mapping entry fail identically, silently, and once you've caused it
+yourself the AWS behaviour stops feeling mysterious.
+
+<SectionHeading n="10" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="How many usable addresses are in a /28 subnet on AWS?">
 Eleven. Sixteen addresses minus five reserved: the network address, the implied
 router at `.1`, the DNS resolver at `.2`, one reserved for future use at `.3`,
-and the broadcast address at the end — reserved even though broadcast doesn't
+and the broadcast address at the end, reserved even though broadcast doesn't
 function in a VPC.
 </QA>
 
-<QA level="intermediate" q="Security groups versus NACLs — when does the difference actually bite?">
+<QA level="intermediate" q="Security groups versus NACLs: when does the difference actually bite?">
 Statefulness. A security group tracks connections, so allowing inbound 443
 automatically permits the response. A NACL is stateless and evaluates each
 packet independently, so the same setup needs an explicit *outbound* rule
 covering the ephemeral port range or every response is dropped.
 
 What makes it nasty is the symptom: a silently dropped response is
-indistinguishable from an application hang. A connection establishes, the request is delivered, and the client just waits.
+indistinguishable from an application hang. A connection establishes, the
+request is delivered, and the client just waits.
 </QA>
 
 <QA level="intermediate" q="A deleted NAT gateway left traffic failing with no errors. What happened?">
@@ -465,8 +639,8 @@ else. Query route tables for routes in `blackhole` state after any teardown.
 <QA level="deep" q="Two instances in the same VPC, different AZs. Describe the packet path.">
 A guest writes to a socket; the ENA driver hands the frame to the Nitro card.
 Security group rules are evaluated there, in hardware, before anything leaves
-the host. That card resolves the destination private IP to a physical host address
-through the mapping service, encapsulates the packet, and sends it over
+the host. That card resolves the destination private IP to a physical host
+address through the mapping service, encapsulates the packet, and sends it over
 the AWS substrate: a real network, with real routers, that has never heard of
 your `10.0.0.0/16`. On the far side, a card decapsulates, applies the
 destination security group, and delivers to the target ENI.
@@ -484,20 +658,20 @@ port space that every other service in the subnet depends on.
 
 Then check `conntrack_allowance_exceeded` in `ethtool -S` on the busiest
 instances, because a connection-tracking overflow presents almost identically
-and isn't in CloudWatch at all. A VPC endpoint is usually the durable fix, taking that traffic off the gateway
-and off the bill together.
+and isn't in CloudWatch at all. A VPC endpoint is usually the durable fix,
+taking that traffic off the gateway and off the bill together.
 </QA>
 
-<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="11" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
-  <Q q="You carve a /28 for a small service. How many instances fit?">
-    Eleven, not sixteen. Five addresses per subnet are reserved regardless of
-    subnet size, so the smaller you cut it the more proportional waste you take.
-  </Q>
   <Q q="Why can't you ping the VPC router at x.x.x.1?">
     Because it isn't a device. Routing is applied on the sending host's Nitro
     card; the `.1` address is a reserved convention with nothing listening.
+  </Q>
+  <Q q="A security group allows inbound 443 and has no outbound rules. Do responses get out?">
+    Yes. Security groups are stateful, so the tracked connection's return
+    traffic is allowed. A NACL in the same position would drop them.
   </Q>
   <Q q="Small HTTP requests work, large uploads hang forever. First guess?">
     A PMTU black hole. Path MTU drops below 9001, the sender gets an ICMP
@@ -505,18 +679,18 @@ and off the bill together.
     with DF set vanish. Test with `ping -M do -s 8973`.
   </Q>
   <Q q="Two VPCs, both 10.0.0.0/16, need to talk. What are your options?">
-    Not peering — overlapping CIDRs can't peer. You're left with renumbering
+    Not peering: overlapping CIDRs can't peer. You're left with renumbering
     one, a private NAT layer, or a PrivateLink endpoint that exposes specific
     services instead of joining the networks.
   </Q>
 </Quiz>
 
 <CardGrid>
-  <WildCard name="AWS docs — VPC quotas">
+  <WildCard name="AWS docs: VPC quotas">
     The ceilings that become incidents: routes per table, rules per SG, ENIs and
     IPs per instance type. Worth reading once, in full, before designing.
   </WildCard>
-  <WildCard name="ENA driver — ethtool counters">
+  <WildCard name="ENA driver: ethtool counters">
     The `*_allowance_exceeded` family, documented in the AWS ENA driver repo.
     The fastest way to distinguish "the network is broken" from "you hit a
     documented ceiling".
@@ -527,6 +701,23 @@ and off the bill together.
   </WildCard>
   <WildCard name="Linux VXLAN + netns">
     `ip link add type vxlan` and two namespaces. The cheapest way to build the
-    mental model in section 7 on hardware you already own.
+    mental model from section 9 on hardware you already own.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="12" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Virtualization, Hypervisors & microVMs">
+    The hosts and the Nitro card this chapter's overlay runs on.
+    [Chapter 47](/topics/47-virtualization).
+  </WildCard>
+  <WildCard name="The Linux Networking Stack">
+    What happens to the packet once it reaches your instance's kernel, and
+    how Linux's own conntrack table fills up. [Chapter 10](/topics/10-linux-networking).
+  </WildCard>
+  <WildCard name="Containers from Scratch">
+    Network namespaces and veth pairs, the pieces the Build-this overlay is
+    made of. [Chapter 11](/topics/11-containers).
   </WildCard>
 </CardGrid>

@@ -1,106 +1,191 @@
 ---
 title: Block Devices & SSDs
-dek: "Random reads are only 4.7× slower than sequential on NVMe. On a spinning disk the ratio was a hundred. Most storage advice you have absorbed predates that change."
-readingTime: "~22 min"
+dek: "What sits below the filesystem: a block interface designed for spinning disks, and flash that can't overwrite in place. You'll learn why random reads are now only 4.7× slower than sequential, where write amplification comes from, and why queue depth decides what you measure."
+readingTime: "~25 min"
+level: "Intermediate"
 versions: "Measured on Apple M4 · APFS on internal NVMe · macOS 26.5.1"
-prereqs: "Chapters 07 and 08"
-updated: "2026-09-19"
+prereqs: "syscalls, the page cache"
+updated: "2026-09-26"
 ---
 
+Sooner or later a storage problem reaches you without a code change behind it.
+A Postgres box starts committing slowly months after launch. A benchmark on a
+new drive looks far better than production. An NVMe drive rated for a million
+IOPS delivers twenty thousand.
+
+Each of these comes from the device below the filesystem, and from the gap
+between the simple interface it offers and the flash that actually stores your
+bytes. Much of the storage advice you've absorbed was written for spinning disks
+and predates that gap.
+
+This chapter starts with the block interface, then covers how flash works
+underneath it, write amplification and wear, NVMe and queue depth, the ways the
+abstraction leaks (drives that lie about flushing among them), and the measured
+costs.
+
+<SectionHeading n="01" id="block-device">The block device contract</SectionHeading>
+
+<Sub n="1.1" title="A numbered array of blocks">
+
 Below the filesystem from chapter 08 is a very simple promise. The operating
-system sees a **block device**: a numbered array of fixed-size blocks, 512
-bytes or 4 KB each. Write block 7, read block 7 later, get your bytes back.
-Overwrite block 7 and the old contents are gone.
+system sees a **block device**: a numbered array of fixed-size blocks, 512 bytes
+or 4 KB each.
+
+Write block 7, read block 7 later, get your bytes back. Overwrite block 7 and
+the old contents are gone. A block device promises addressable, fixed-size
+blocks that persist, and that's it.
+
+</Sub>
+
+<Sub n="1.2" title="Built for spinning disks">
 
 That interface was designed for spinning disks, and on a spinning disk it's
-natural. Block 7 is a physical spot on a platter; to overwrite it the head
-moves there and writes. Moving the head is the expensive part, though (a seek,
-plus waiting for the platter to come round), so reading scattered blocks could
-be something like a hundred times slower than reading them in order. A great
-deal of storage advice comes from that one ratio: append-only logs, Kafka's
-design, LSM-tree databases like RocksDB and Cassandra, "avoid random I/O".
+natural. Block 7 is a physical spot on a platter; to overwrite it, the head
+moves there and writes.
 
-Flash has no moving parts, so random reads should be cheap. Are they? Mostly. On
-the NVMe drive in this laptop a random 4 KB read costs 120.8 µs against 25.7 µs
-sequential, **4.7 times**, not a hundred. But flash has a constraint of its
-own, and it's stranger than a seek. You can write flash one small **page** at a
-time (a few KB), but only onto a page that's been erased, and you can only erase
-a whole **erase block** of megabytes at once. So how would a drive overwrite
-block 7 in place? It can't, not without erasing hundreds of neighbouring pages
-along with it.
+<Why>Why did everyone learn to avoid random I/O?</Why>
 
-The drive's answer is to never overwrite at all. It writes the new block 7 to a
-fresh page somewhere else, updates an internal map to say where block 7 lives
-now, and marks the old page dead. Firmware inside the drive, the **Flash
-Translation Layer**, keeps that map and hides all of it behind the simple
-block interface. It's a good trick, and it has a bill.
+Because moving the head is the expensive part: a seek, plus waiting for the
+platter to come round. Reading scattered blocks could be something like a
+hundred times slower than reading them in order.
 
-Dead pages pile up. What happens when the drive wants them back? It has to
-erase their block. But
-that block usually still holds live pages too, so it copies those somewhere
-else first. Here's a quick calculation. If the blocks the drive reclaims are
-three-quarters live, then freeing one means copying three pages for every one
-it gains. Every page you write ends up costing about four writes to the flash.
-That ratio is **write amplification** (flash writes per write you asked for), and
-it climbs steeply as the drive
-fills, because fuller drives have fewer mostly-dead blocks to choose from. It's
-why a Postgres box can start committing slowly months after launch with nothing
-changed but free space, and why a benchmark on a fresh, empty drive can look
-far better than the same drive will a year in.
+A great deal of storage advice comes from that one ratio: append-only logs,
+Kafka's design, LSM-tree databases like RocksDB and Cassandra, "avoid random
+I/O".
 
-One more thing changed with flash: a drive can work on many requests at once.
-**NVMe**, the protocol the OS uses to talk to modern SSDs over PCIe, gives it
-deep queues of outstanding requests. So a single thread issuing one read at a
-time mostly measures latency, and you only see the drive's throughput with many
-requests in flight.
+</Sub>
 
-The rest of the chapter goes through the contract and the translation layer,
-the layout of pages and erase blocks, one read's path from `pread()` down to the
-flash, the ways the abstraction leaks (drives that lie about flushing among
-them), and the measured costs.
+<SectionHeading n="02" id="flash">Flash can't overwrite in place</SectionHeading>
 
-<SectionHeading n="01" cmd="nvme id-ctrl /dev/nvme0" id="contract">A flat array, and the lie underneath</SectionHeading>
+Flash has no moving parts, so random reads should be cheap. Are they? Mostly.
+On the NVMe drive in this laptop a random 4 KB read costs 120.8 µs against
+25.7 µs sequential: **4.7 times**, not a hundred.
 
-A block device promises addressable, fixed-size blocks that persist. Write block N, read block N, get your bytes back. That's it.
+But flash has a constraint of its own, and it's stranger than a seek.
 
-Underneath an SSD, essentially none of that's physically true. Your logical
-block number is translated to a wildly different physical location, which moves
-without telling you, on media that cannot overwrite in place and wears out.
+<Sub n="2.1" title="Pages and erase blocks">
 
-<Callout label="The layer that makes a lie true">
-Flash can be *written* in pages of a few kilobytes but only *erased* in blocks
-of megabytes. Overwriting one 4 KB page in place is physically impossible. The
-**Flash Translation Layer** hides this: it writes your new data somewhere fresh,
-remaps the logical address, and marks the old location dead. Every surprising
-SSD behaviour comes out of that indirection.
-</Callout>
+You can write flash one small **page** at a time (a few KB), but only onto a
+page that's been erased. And you can only erase a whole **erase block** of
+megabytes at once.
 
-<SectionHeading n="02" cmd="nvme smart-log /dev/nvme0" id="layout">Pages, blocks, and the erase problem</SectionHeading>
-
-<Sub n="2.1" title="Pages, blocks and the erase problem">
-
-<Figure caption="Three granularities that do not line up. You read and write pages, you erase blocks, and the mismatch between them is why an SSD does more writing than you asked for.">
+<Figure caption="Three granularities that don't line up. You read and write pages, you erase blocks, and the mismatch between them is why an SSD does more writing than you asked for.">
 <Cells
   cellWidth={58}
   rows={[
-    { label: "erase block", cells: ["one erase unit — several MB"], cursor: 0, cursorLabel: "the only thing that can be reset" },
+    { label: "erase block", cells: ["one erase unit: several MB"], cursor: 0, cursorLabel: "the only thing that can be reset" },
     { label: "pages", cells: ["4K", "4K", "4K", "4K", "4K", "4K", "4K", "4K"], },
     { label: "state", cells: ["live", "dead", "live", "dead", "dead", "live", "free", "free"], dimFrom: 6 },
   ]}
 />
 </Figure>
 
-To reclaim those dead pages the controller must copy the live ones elsewhere and
-erase every page in it. That's **garbage collection**, it happens in the
-background, and it competes with your I/O.
+<Why>So how would a drive overwrite block 7 in place?</Why>
+
+It can't, not without erasing hundreds of neighbouring pages along with it.
+Overwriting one 4 KB page in place is physically impossible.
 
 </Sub>
 
-<Sub n="2.2" title="Write amplification">
+<Sub n="2.2" title="The Flash Translation Layer">
+
+The drive's answer is to never overwrite at all. Firmware inside the drive, the
+**Flash Translation Layer** (FTL), keeps a map from your logical block numbers
+to physical pages, and hides everything behind the simple block interface.
+
+<Steps
+  title="Overwriting block 7 on an SSD"
+  lanes={[
+    { t: "Host", s: "write block 7", icon: "◉" },
+    { t: "FTL map", s: "logical → physical", icon: "⇄" },
+    { t: "Old page", s: "block 7's old data", icon: "▭" },
+    { t: "Fresh page", s: "erased, free", icon: "▦" },
+  ]}
+  steps={[
+    [0, "The OS asks the drive to write new contents to **logical block 7**. As far as it knows, block 7 is one fixed place."],
+    [1, "The FTL looks up block 7 and finds the physical page that holds it today."],
+    [3, "It **doesn't touch that page**. It writes the new data to a fresh, already-erased page somewhere else."],
+    [1, "It updates the map: block 7 now lives at the new physical page. Your logical address hasn't changed; its location has."],
+    [2, "The old page is marked **dead**. It can't be reused until its whole erase block is erased."],
+  ]}
+/>
+
+Underneath an SSD, essentially none of the block contract is physically true.
+Your logical block number is translated to a wildly different physical location,
+which moves without telling you, on media that can't overwrite in place and
+wears out.
+
+<Callout label="Design implication">
+Every surprising SSD behaviour comes out of that indirection. It's a good trick,
+and it has a bill: dead pages, garbage collection, write amplification and wear.
+The rest of this chapter is that bill.
+</Callout>
+
+</Sub>
+
+<Sub n="2.3" title="Garbage collection">
+
+Dead pages pile up. What happens when the drive wants them back?
+
+It has to erase their block. But that block usually still holds live pages too,
+so the controller copies those somewhere else first. That's **garbage
+collection**.
+
+<Steps
+  title="Reclaiming one erase block"
+  lanes={[
+    { t: "Victim block", s: "live + dead pages", icon: "▤" },
+    { t: "Copy live", s: "to a fresh block", icon: "⇢" },
+    { t: "FTL map", s: "update locations", icon: "⇄" },
+    { t: "Erase", s: "the whole block", icon: "✕" },
+    { t: "Free pool", s: "ready for writes", icon: "▦" },
+  ]}
+  steps={[
+    [0, "The controller picks a block to reclaim. It holds a mix of **live** pages still in use and **dead** ones left behind by overwrites."],
+    [1, "It **copies every live page** to a fresh block. These are writes to flash that you never asked for."],
+    [2, "The FTL map is updated so each copied logical block points at its new home."],
+    [3, "Now the block holds only dead pages, so the controller **erases the whole block** at once, megabytes in one go."],
+    [4, "The block's pages go back to the free pool. The drive gained the dead pages, and paid for them with the copies in step 2."],
+  ]}
+/>
+
+It happens in the background, and it competes with your I/O. That's why an
+SSD's latency varies when you haven't changed anything.
+
+</Sub>
+
+<SectionHeading n="03" id="write-amplification">Write amplification and wear</SectionHeading>
+
+<Sub n="3.1" title="The arithmetic of reclaiming space">
 
 Because reclaiming space means copying live data, the device writes more bytes
-to flash than you handed it. The ratio is **write amplification**, and it
-determines both sustained write throughput and how fast the drive wears out.
+to flash than you handed it. The ratio of flash writes to the writes you asked
+for is **write amplification**.
+
+<Predict
+  q="The blocks your drive reclaims are three-quarters live. For each page you write, roughly how many pages does the flash end up writing?"
+  options={["1", "1.33", "About 4", "75"]}
+  answer={2}
+>
+Freeing one block of four pages means copying three live pages to gain one free
+one. So every page you write ends up costing about **four writes** to the flash:
+yours, plus three copies. That's a write amplification of about 4.
+</Predict>
+
+<Why>Why does it get worse as the drive fills?</Why>
+
+Because fuller drives have fewer mostly-dead blocks to choose from. Every block
+the controller can reclaim is mostly live, so every reclaim copies more.
+
+That's how a Postgres box can start committing slowly months after launch with
+nothing changed but free space. And it's why a benchmark on a fresh, empty
+drive can look far better than the same drive will a year in.
+
+</Sub>
+
+<Sub n="3.2" title="Write amplification by workload">
+
+It determines both sustained write throughput and how fast the drive wears out.
 
 <Compare
   cols={["Workload", "Typical WA", "Why"]}
@@ -108,89 +193,27 @@ determines both sustained write throughput and how fast the drive wears out.
     ["Large sequential writes", "~1.0", "Whole blocks filled and retired together"],
     ["Random 4 KB writes, drive half empty", "~2–3", "Blocks hold a mix of live and dead pages"],
     ["Random writes, drive nearly full", "10 or more", "Little free space; GC copies constantly"],
-    ["Aligned, TRIM'd, overprovisioned", "closer to 1", "Controller knows what is genuinely dead"],
+    ["Aligned, TRIM'd, overprovisioned", "closer to 1", "Controller knows what's really dead"],
   ]}
 />
 
 Note the third row. **A nearly full SSD is dramatically slower at writes**, and
-the effect is nonlinear near the end. Keeping 10–20% free is a performance
-setting, not tidiness.
+the effect is nonlinear near the end.
+
+<Callout label="Common mistake" kind="warn">
+Treating free space on an SSD as tidiness. Keeping 10–20% free is a performance
+setting: write amplification climbs sharply on a full drive.
+</Callout>
 
 </Sub>
 
-<Sub n="2.3" title="Why NVMe is fast">
-
-SATA inherited a single command queue of 32 entries from an era when the device
-was a spinning platter and deep queues were pointless. NVMe allows up to 65,535
-queues of 65,536 entries, mapped over PCIe with the doorbell register in memory
-the host can write directly.
-
-That matters because flash parallelism is most of the performance story. A drive
-has many independent channels and dies; keeping them all busy needs many
-outstanding requests. Section 5 shows what happens when you don't provide them.
-
-</Sub>
-
-<SectionHeading n="03" cmd="biosnoop-bpfcc" id="hot-path">One read, down to the flash</SectionHeading>
-
-<Flow
-  wrap={3}
-  steps={[
-    { label: "pread()", sub: "syscall, ~350 ns" },
-    { label: "page cache miss", sub: "chapter 08 gives up" },
-    { label: "block layer", sub: "merge, sort, schedule" },
-    { label: "NVMe submission queue", sub: "entry + doorbell write", accent: true },
-    { label: "FTL translate", sub: "logical → physical, on device" },
-    { label: "flash read + completion", sub: "interrupt or poll" },
-  ]}
-/>
-
-<Sub n="3.1" title="Queue depth is the variable that matters most">
-
-A single-threaded loop of blocking `pread` calls has a queue depth of one. One
-request outstanding, most of the device's parallelism idle, and you measure
-*latency* while believing you measured *throughput*.
-
-Real throughput needs depth: many threads, asynchronous I/O, or io_uring from
-chapter 07. A drive rated at a million IOPS will deliver perhaps twenty
-thousand at queue depth one, and both numbers are honest.
-
-</Sub>
-
-<SectionHeading n="04" cmd="fio --name=precondition --rw=randwrite" id="failure">Where the abstraction leaks</SectionHeading>
-
-<Sub n="4.1" title="The write cliff">
-
-Fresh SSDs are fast. They don't stay that way. Sustained random writes fill the overprovisioned space, GC
-has to run continuously, and throughput can drop by an order of magnitude — then
-stay there.
-
-Benchmarks routinely miss this by running for thirty seconds on a fresh drive.
-If you're qualifying storage, don't skip preconditioning: fill it, then write randomly for
-an hour, then start measuring.
-
-</Sub>
-
-<Sub n="4.2" title="Devices that lie about flushing">
-
-Many drives have a volatile write cache and acknowledge writes on arrival there.
-A `FLUSH CACHE` command is supposed to force persistence. Some consumer drives
-have historically ignored it, or implemented it as a no-op, so `fsync` returns
-success over data that a power cut will lose.
-
-Enterprise drives have power-loss protection — they've got — a capacitor large enough to flush
-the cache on failure — and that capacitor's a meaningful part of why they cost more. If durability matters, this is a hardware purchasing decision, not a
-software one.
-
-</Sub>
-
-<Sub n="4.3" title="Wear, and its arithmetic">
+<Sub n="3.3" title="Wear, and its arithmetic">
 
 Each flash cell survives a limited number of erase cycles: roughly 1,000–3,000
 for consumer TLC, more for enterprise. Wear levelling spreads writes so no block
 dies early, and the drive reports remaining life through SMART.
 
-Arithmetic is simple, and you should do it once:
+The arithmetic is simple, and you should do it once:
 
 <Estimate
   rows={[
@@ -208,17 +231,120 @@ your monitoring would tell you until SMART started counting down.
 
 </Sub>
 
-<SectionHeading n="05" cmd="fio --rw=randread --bs=4k --iodepth=1" id="cost">Random is only 4.7× worse now</SectionHeading>
+<SectionHeading n="04" id="nvme">NVMe and queue depth</SectionHeading>
+
+One more thing changed with flash: a drive can work on many requests at once.
+**NVMe**, the protocol the OS uses to talk to modern SSDs over PCIe, gives it
+deep queues of outstanding requests.
+
+<Sub n="4.1" title="Why NVMe is fast">
+
+| Interface | Queues | Entries per queue | Designed for |
+|---|---|---|---|
+| **SATA** | 1 | 32 | A spinning platter, where deep queues were pointless |
+| **NVMe** | Up to 65,535 | Up to 65,536 | Flash over PCIe, with the doorbell register in memory the host can write directly |
+
+<Why>Why does a drive need that many queues?</Why>
+
+Because flash parallelism is most of the performance story. A drive has many
+independent channels and dies, and keeping them all busy needs many outstanding
+requests.
+
+</Sub>
+
+<Sub n="4.2" title="One read, down to the flash">
+
+Here's one `pread()` that misses the page cache, from your thread to the flash
+and back:
+
+<StepSequence
+  title="One pread(), down to the flash"
+  actors={["Your thread", "Kernel", "NVMe queue", "Drive · FTL"]}
+  messages={[
+    { from: 0, to: 1, label: "pread()", note: "The syscall costs about 350 ns before anything else happens (chapter 07)." },
+    { from: 1, to: 1, label: "cache miss", note: "The page cache doesn't have it, so chapter 08's layer gives up and the **block layer** merges, sorts and schedules the request." },
+    { from: 1, to: 2, label: "SQ entry + doorbell", note: "The driver writes an entry into an NVMe **submission queue** and writes the doorbell register to tell the drive." },
+    { from: 2, to: 3, label: "fetch", note: "The drive picks up the command. The **FTL translates** the logical block to a physical page, on the device." },
+    { from: 3, to: 1, label: "completion", note: "The flash read finishes and the drive posts a completion, signalled by an **interrupt or a poll**." },
+    { from: 1, to: 0, label: "return", note: "The kernel copies the data up and `pread()` returns. One request, one full round trip." },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="4.3" title="Queue depth is the variable that matters most">
+
+A single-threaded loop of blocking `pread` calls has a queue depth of one. One
+request outstanding, most of the device's parallelism idle, and you measure
+*latency* while believing you measured *throughput*.
+
+<Why>Why do rated IOPS look so far from what you measure?</Why>
+
+Because rated figures assume deep queues. A drive rated at a million IOPS will
+deliver perhaps twenty thousand at queue depth one, and both numbers are honest.
+
+Real throughput needs depth: many threads, asynchronous I/O, or io_uring from
+chapter 07.
+
+</Sub>
+
+<SectionHeading n="05" id="failure">Where the abstraction leaks</SectionHeading>
+
+<Sub n="5.1" title="The write cliff">
+
+Fresh SSDs are fast. They don't stay that way. Sustained random writes fill the
+overprovisioned space, GC has to run continuously, and throughput can drop by an
+order of magnitude, then stay there.
+
+<Callout label="Common mistake" kind="warn">
+Benchmarking for thirty seconds on a fresh drive. If you're qualifying storage,
+precondition it: fill it, then write randomly for an hour, then start measuring.
+</Callout>
+
+</Sub>
+
+<Sub n="5.2" title="Devices that lie about flushing">
+
+Many drives have a volatile write cache and acknowledge writes on arrival there.
+A `FLUSH CACHE` command is supposed to force persistence.
+
+<StepSequence
+  title="fsync on a drive that ignores flushes"
+  actors={["Your app", "Kernel", "Drive cache", "Flash"]}
+  messages={[
+    { from: 0, to: 1, label: "fsync", note: "Your app asks for durability, as chapter 08 says it should." },
+    { from: 1, to: 2, label: "write", note: "The kernel sends the dirty data. The drive puts it in its **volatile write cache** and acknowledges straight away." },
+    { from: 1, to: 2, label: "FLUSH CACHE", note: "The kernel sends a flush, which is supposed to force the cache onto the flash." },
+    { from: 2, to: 1, label: "ok", note: "Some consumer drives have historically **ignored it, or treated it as a no-op**, and report success anyway." },
+    { from: 1, to: 0, label: "success", note: "`fsync` returns success. Your app tells the user their data is safe." },
+    { from: 2, to: 3, label: "power cut", dashed: true, note: "The power fails before the cache reaches the flash. **The data a successful fsync promised is gone.**" },
+  ]}
+/>
+
+<Why>Why do enterprise drives cost more?</Why>
+
+Partly for this. They have power-loss protection: a capacitor large enough to
+flush the cache during a power failure, and that capacitor is a meaningful part
+of the price.
+
+<Callout label="Design implication">
+If `fsync` durability matters, it's partly a hardware purchasing decision, and
+no amount of correct software substitutes for it.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="06" id="cost">Random is only 4.7× worse now</SectionHeading>
 
 <Callout label="The machine" kind="note">
 Apple M4, macOS 26.5.1, APFS on the internal NVMe. A 3 GB file read with
-`F_NOCACHE` and page-aligned buffers so the page cache is genuinely bypassed.
-Queue depth is **one** throughout — single-threaded blocking `pread` — so these
+`F_NOCACHE` and page-aligned buffers so the page cache is really bypassed.
+Queue depth is **one** throughout (single-threaded blocking `pread`), so these
 are latency numbers, and the throughput column is what one thread achieves, not
 what the device can do.
 </Callout>
 
-<Sub n="5.1" title="Random versus sequential">
+<Sub n="6.1" title="Random versus sequential">
 
 <Cost items={[
   { what: "4 KB sequential read, uncached", value: "25.7 µs", source: "3 GB file, F_NOCACHE, QD1" },
@@ -227,19 +353,28 @@ what the device can do.
 ]} />
 
 **4.7×.** On a 7,200 rpm spinning disk that ratio was roughly a hundred,
-because a random read meant a seek and a rotation. Flash has no moving parts and
-the remaining gap is readahead and queue behaviour, not physics.
+because a random read meant a seek and a rotation. Flash has no moving parts,
+and the remaining gap is readahead and queue behaviour, not physics.
 
 This is the single most out-of-date belief in storage engineering. "Random I/O
-is catastrophic, always design for sequential access" was correct advice that
-is now merely a mild preference. B-trees became competitive with LSM-trees again
-partly for this reason.
+is catastrophic, always design for sequential access" was correct advice that is
+now merely a mild preference.
+
+<Why>Why are B-trees competitive with LSM-trees again?</Why>
+
+LSM-trees won on spinning disks by converting random writes to sequential ones,
+which was worth 100×. On NVMe that conversion is worth about 4.7×, while LSM
+compaction adds its own write amplification.
+
+The trade is close now, and modern B-tree engines are competitive again. It's a
+design argument settled by hardware changing underneath it; remember that the
+next time one feels settled.
 
 </Sub>
 
-<Sub n="5.2" title="Read size, and why small reads waste the device">
+<Sub n="6.2" title="Read size, and why small reads waste the device">
 
-<Figure caption="Per-read cost grows far slower than the read size. Going from 4 KB to 4 MB is 1,024× the data for 26× the time — so the device is almost entirely idle during a small-read workload.">
+<Figure caption="Per-read cost grows far slower than the read size. Going from 4 KB to 4 MB is 1,024× the data for 26× the time, so the device is almost entirely idle during a small-read workload.">
 <Plot
   logY
   xLabel="read size (bytes, log positions)"
@@ -265,24 +400,27 @@ partly for this reason.
 />
 
 **Forty times the throughput, from read size alone.** Same device, same file,
-same queue depth. A 4 KB read pays the full round trip — syscall, block layer,
-submission, FTL lookup, completion interrupt — to move almost nothing.
+same queue depth. A 4 KB read pays the full round trip from section 4.2
+(syscall, block layer, submission, FTL lookup, completion interrupt) to move
+almost nothing.
 
-Two practical conclusions. Read in large chunks when you can, and if you can't,
-get depth: many small reads in flight amortise the same fixed costs
-concurrently. That's exactly what io_uring exists to make easy.
+<Callout label="Design implication">
+Read in large chunks when you can. If you can't, get depth: many small reads in
+flight amortise the same fixed costs concurrently. That's exactly what io_uring
+exists to make easy.
+</Callout>
 
 </Sub>
 
-<SectionHeading n="06" cmd="iostat -xz 1" id="operating">Queue depth is the number</SectionHeading>
+<SectionHeading n="07" id="operating">Watching the device</SectionHeading>
 
-<Sub n="6.1" title="What to watch">
+<Sub n="7.1" title="What to watch">
 
 ```shell
 # Latency, queue depth and utilisation per device. Start here.
 iostat -xz 1                   # await, aqu-sz, %util, r/s, w/s
 
-# Where is the time — device or queue?
+# Where is the time: device or queue?
 biolatency-bpfcc               # histogram of device service time
 biosnoop-bpfcc                 # per-I/O, with process attribution
 
@@ -298,24 +436,70 @@ sudo fs_usage -f diskio
 **`aqu-sz` in `iostat` is the number to check first.** A queue depth near 1 with
 poor throughput means your application isn't giving the device enough work, and
 no amount of faster hardware will help. Depth of 30 with rising `await` means
-the device is genuinely the bottleneck.
+the device really is the bottleneck.
 
 </Sub>
 
-<Sub n="6.2" title="Getting more out of the device">
+<Sub n="7.2" title="Getting more out of the device">
 
 1. **Bigger reads and writes.** 40× is available for free if your access pattern
    allows it.
 2. **More depth.** Threads, async I/O, or io_uring. A blocking single-threaded
    loop uses a fraction of an NVMe drive.
 3. **Keep 10–20% free.** Write amplification climbs sharply on a full drive.
-4. **Enable TRIM** so the controller knows what's genuinely dead. `fstrim` on a
+4. **Enable TRIM** so the controller knows what's really dead. `fstrim` on a
    timer is the usual arrangement.
 5. **Align to 4 KB.** A misaligned write touches two pages and doubles the work.
 
 </Sub>
 
-<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+<Sub n="7.3" title="What you give up">
+
+| You get | You pay | When the bill arrives |
+|---|---|---|
+| A flat array of persistent blocks | An FTL doing invisible work underneath | As latency variance during GC |
+| Random I/O only 4.7× worse than sequential | Advice tuned for spinning disks is now wrong | As an over-engineered sequential design |
+| Enormous parallelism via NVMe queues | Only if you supply queue depth | At 91 MB/s from a drive rated for thousands |
+| Wear levelling and transparent remapping | Write amplification, and a finite life | Two years in, per the arithmetic in 3.3 |
+| Fast acknowledged writes | A volatile cache that may ignore flushes | On power loss, on consumer hardware |
+
+</Sub>
+
+<Sub n="7.4" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Throughput far below the rating, `aqu-sz` near 1 | Queue depth of one | Threads, async I/O or io_uring |
+| Small reads slow, device looks idle | Fixed per-request cost dominates | Read in larger chunks |
+| Writes slow down months after launch | Drive filling up; write amplification climbing | Keep 10–20% free, enable TRIM |
+| Benchmark great, production much slower | Fresh drive, no GC pressure | Precondition before measuring |
+| SMART life dropping faster than expected | Write amplification multiplying your writes | Do the TBW arithmetic; cut random writes |
+| Data lost after power cut despite `fsync` | Drive ignored the flush | Drives with power-loss protection |
+
+</Sub>
+
+<SectionHeading n="08" id="summary">Summary</SectionHeading>
+
+1. **A block device is a flat array of blocks.** The interface was designed for
+   spinning disks.
+2. **Random I/O was expensive because of the head.** A seek and a rotation made
+   it about 100× slower than sequential.
+3. **On NVMe, random reads are only 4.7× slower.** Most "avoid random I/O"
+   advice now overstates the cost.
+4. **Flash writes pages but erases blocks.** So it can't overwrite in place.
+5. **The FTL never overwrites.** It writes somewhere fresh, remaps, and marks the
+   old page dead.
+6. **Garbage collection copies live pages before erasing.** Those copies are
+   write amplification.
+7. **Write amplification climbs as the drive fills.** Keep 10–20% free.
+8. **It also wears the drive out.** 3× amplification turned a five-year drive
+   into a two-year one.
+9. **Queue depth decides what you measure.** At depth one you see latency, not
+   the device's throughput.
+10. **Some drives lie about flushing.** Power-loss protection is a hardware
+    purchase.
+
+<SectionHeading n="09" id="build">Build this</SectionHeading>
 
 **Find your device's real shape**, then find out how much of it you were using.
 
@@ -329,36 +513,7 @@ the device is genuinely the bottleneck.
 Then run `fio` with the same parameters and see how close your numbers are. If
 they differ a lot, the interesting work is finding out why.
 
-<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
-
-<Compare
-  cols={["You get", "You pay", "When the bill arrives"]}
-  rows={[
-    ["A flat array of persistent blocks", "An FTL doing invisible work underneath", "As latency variance during GC"],
-    ["Random I/O only 4.7× worse than sequential", "Advice tuned for spinning disks is now wrong", "As an over-engineered sequential design"],
-    ["Enormous parallelism via NVMe queues", "Only if you supply queue depth", "At 91 MB/s from a drive rated for thousands"],
-    ["Wear levelling and transparent remapping", "Write amplification, and a finite life", "Two years in, per the arithmetic in 4.3"],
-    ["Fast acknowledged writes", "A volatile cache that may ignore flushes", "On power loss, on consumer hardware"],
-  ]}
-/>
-
-<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
-
-<CardGrid>
-  <WildCard name="The LSM versus B-tree reassessment" verdict="A design argument settled by hardware changing underneath it. Remember that the next time one feels settled.">
-    LSM-trees won on spinning disks by converting random writes to sequential
-    ones — worth 100×. On NVMe that conversion is worth about 4.7×, while LSM
-    compaction adds its own write amplification. The trade is genuinely close
-    now, and modern B-tree engines are competitive again.
-  </WildCard>
-  <WildCard name="Power-loss protection capacitors" verdict="If fsync durability matters, it is partly a hardware purchase and no amount of correct software substitutes for it.">
-    Enterprise drives carry enough capacitance to flush their write cache during
-    a power failure. Consumer drives generally don't, and some have historically
-    treated a flush command as advisory.
-  </WildCard>
-</CardGrid>
-
-<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+<SectionHeading n="10" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="Why can't an SSD overwrite a block in place?">
 Flash is written in pages of a few kilobytes but erased only in blocks of
@@ -377,7 +532,7 @@ the device does extra writing on your behalf.
 
 It matters twice: it caps sustained write throughput, and it consumes endurance.
 A workload writing 500 GB a day at 3× amplification puts 1.5 TB a day on the
-flash — turning a drive rated for 1,200 TBW into roughly a two-year part.
+flash, turning a drive rated for 1,200 TBW into roughly a two-year part.
 </QA>
 
 <QA level="intermediate" q="Your NVMe drive is rated for a million IOPS and you're getting 20,000. What's wrong?">
@@ -386,18 +541,18 @@ has one request outstanding, so you're measuring latency and most of the
 device's channels and dies are idle.
 
 Rated IOPS figures assume deep queues. Get depth with threads, asynchronous
-I/O, or io_uring. Check `aqu-sz` in `iostat` — near 1 means the application is
+I/O, or io_uring. Check `aqu-sz` in `iostat`: near 1 means the application is
 the bottleneck, not the hardware.
 </QA>
 
 <QA level="deep" q="How much slower is random I/O than sequential, and how has that changed?">
 On this NVMe I measured 120.8 µs for a 4 KB random read against 25.7 µs
-sequential at queue depth one — about 4.7×. On a 7,200 rpm disk the ratio was
+sequential at queue depth one, about 4.7×. On a 7,200 rpm disk the ratio was
 roughly 100×, because random meant a seek plus rotational latency.
 
 That's a qualitative change, not a quantitative one. Design advice built around
 "random I/O is catastrophic" is now overcautious, and it's part of why B-trees
-became competitive with LSM-trees again — the sequential conversion LSMs perform
+became competitive with LSM-trees again: the sequential conversion LSMs perform
 is worth far less than it used to be.
 </QA>
 
@@ -411,12 +566,12 @@ Second, free space. Write amplification climbs sharply past roughly 80–90% ful
 and production drives are fuller than test ones.
 
 Third, queue depth and read size. I measured 91 MB/s at 4 KB and 3,608 MB/s at
-4 MB on identical hardware — 40× from read size alone. If the benchmark used
+4 MB on identical hardware: 40× from read size alone. If the benchmark used
 large sequential reads and production does small random ones, you're comparing
 two different devices.
 </QA>
 
-<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="11" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
   <Q q="Your SSD is 95% full and writes got slow. Why?">
@@ -428,7 +583,7 @@ two different devices.
     and leaves the device's parallelism idle.
   </Q>
   <Q q="Roughly how much does read size matter at fixed queue depth?">
-    About 40× between 4 KB and 4 MB on the measured drive — 91 MB/s against
+    About 40× between 4 KB and 4 MB on the measured drive: 91 MB/s against
     3,608 MB/s.
   </Q>
   <Q q="fsync returned success on a consumer SSD. Is the data safe from power loss?">
@@ -442,7 +597,7 @@ two different devices.
     The standard storage benchmark. Precondition properly, sweep queue depth and
     block size, and it will tell you what your device actually does.
   </WildCard>
-  <WildCard name="'Coding for SSDs' — Emmanuel Goossaert">
+  <WildCard name="'Coding for SSDs', Emmanuel Goossaert">
     A six-part series on the FTL, write amplification and access patterns. The
     clearest free explanation of why SSDs behave as they do.
   </WildCard>
@@ -453,5 +608,21 @@ two different devices.
   <WildCard name="biolatency and biosnoop (bcc)">
     Device service time as a histogram, and per-I/O attribution to processes.
     Separates "the device is slow" from "we are asking badly".
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="12" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Filesystems & the Page Cache">
+    The layer above this one: the page cache, `fsync` and the rename dance.
+    [Chapter 08](/topics/08-filesystems).
+  </WildCard>
+  <WildCard name="Syscalls, Interrupts & the Kernel Boundary">
+    The per-call cost, interrupts, and io_uring, the easy way to get queue
+    depth. [Chapter 07](/topics/07-syscalls-kernel-boundary).
+  </WildCard>
+  <WildCard name="eBPF: Running Your Code in the Kernel">
+    Where `biolatency` and `biosnoop` come from. [Chapter 48](/topics/48-ebpf).
   </WildCard>
 </CardGrid>

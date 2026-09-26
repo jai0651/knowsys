@@ -1,94 +1,59 @@
 ---
 title: Filesystems & the Page Cache
-dek: "A cached read costs 518 nanoseconds and an uncached one costs 45,000. Everything a filesystem does is in service of keeping you on the right side of that."
-readingTime: "~23 min"
+dek: "How the kernel turns a disk full of numbered blocks into named files, why a cached read costs 518 nanoseconds and an uncached one 45,000, and the difference between data you can read back and data that survives a power cut."
+readingTime: "~26 min"
+level: "Intermediate"
 versions: "Measured on Apple M4 · APFS on internal NVMe · macOS 26.5.1"
-prereqs: "Chapters 04 and 07"
-updated: "2026-09-19"
+prereqs: "virtual memory, syscalls"
+updated: "2026-09-26"
 ---
 
+Every service reads and writes files, even the ones that think they don't. A
+database is slow for twenty minutes after a restart and fine all afternoon. A
+pod's memory climbs towards its limit though the heap is small. A config file
+comes back empty after a power cut, though the write returned success.
+
+All three come from the same place: the layer the kernel puts between your
+`read()` and `write()` calls and the disk. It finds your data by name, and it
+hides how slow the disk is by keeping file data in RAM.
+
+This chapter builds that layer up from a bare array of blocks. It covers inodes
+and names, the page cache on a read and a write, what `fsync` promises, how
+journalling keeps the structure consistent after a crash, and the ways data gets
+lost silently, fsyncgate included.
+
+<SectionHeading n="01" id="files-on-blocks">Files on top of blocks</SectionHeading>
+
 To a computer, a disk is one enormous array of numbered blocks, a few kilobytes
-each. There are no files in it, no names and no folders. Everything you think
-of as "the filesystem" is a data structure the kernel builds on top of that
-array, and it has two jobs: find your data by name, and hide how slow the disk
-is.
+each. There are no files in it, no names and no folders.
 
-Take the first job. You ask for `/home/jai/notes.txt`. Where is it? The
-filesystem keeps a small record for every file, called an **inode**, holding
-its size, owner, permissions and the list of blocks where its bytes live. A
-directory is just a file whose contents are a table of names and inode
-numbers. So opening that path means reading the root directory to find `home`,
-reading `home` to find `jai`, reading `jai` to find `notes.txt`, and then
-reading its inode to learn which blocks to fetch. Notice that the name isn't
-stored in the file at all. It's an entry in its parent directory. So renaming
-a file doesn't touch its data.
+Everything you think of as "the filesystem" is a data structure the kernel
+builds on top of that array. It has two jobs: find your data by name, and hide
+how slow the disk is.
 
-The second job matters more for performance. A random 4 KB read that has to
-reach the SSD on this machine takes about **45,000 ns**. The same read served
-from RAM takes about 518 ns, eighty-seven times less. So the kernel keeps copies
-of recently used file data in whatever RAM is free, in the **page cache**, and
-every ordinary `read` checks there first. That's why a database can be slow for
-twenty minutes after a restart and fine all afternoon: the cache starts empty.
+<Sub n="1.1" title="Finding a file by name">
 
-Writes go through the same cache, and here's where it gets interesting. When
-`write()` returns, your bytes are in RAM and the page is marked **dirty**. The
-kernel flushes dirty pages to the disk later, in the background, and that's
-called **writeback**. Here's a question worth pausing on: your program writes a
-file, gets success, and the power fails five seconds later. Is the data on the
-disk? Very possibly not. Linux can hold dirty data for up to about 30 seconds
-by default. If you need it on the disk now, you call `fsync`, which forces the
-flush and waits for the device to confirm.
+You ask for `/home/jai/notes.txt`. Where is it?
 
-That one distinction, visible versus durable, explains most of the data-loss
-stories in this area. Postgres writes its log and calls `fsync` before it tells
-you a transaction committed. Careful tools update a file by writing a temporary
-copy, syncing it, and renaming it over the original, because a rename is atomic
-and a half-written file never becomes visible. Kafka goes the other way and
-leans on the page cache on purpose, keeping messages there instead of in the
-JVM heap. And because the page cache counts against a container's memory, file
-I/O can push a pod towards its limit. The [OOM field
-note](/blog/oom-killed-at-sixty-percent) reproduces that.
+The filesystem keeps a small record for every file, called an **inode**, holding
+its size, owner, permissions, timestamps and the list of blocks where its bytes
+live. A directory is just a file whose contents are a table of names and inode
+numbers.
 
-The rest of the chapter covers what the filesystem promises, how inodes and
-extents are laid out, what happens on a read that hits and one that misses, how
-journalling keeps the structure consistent after a crash, and the ways data
-gets lost silently, fsyncgate included.
+So opening that path means reading the root directory to find `home`, reading
+`home` to find `jai`, reading `jai` to find `notes.txt`, and then reading its
+inode to learn which blocks to fetch.
 
-<SectionHeading n="01" cmd="man 2 fsync" id="contract">Visible is not durable</SectionHeading>
+<Why>Why doesn't renaming a file touch its data?</Why>
 
-A filesystem promises that a successful `write()` will be visible to any
-subsequent `read()`. Note the exact shape of that promise: it's about
-*visibility*, not about *durability*. Your bytes are in the page cache. Whether
-they're on a disk is a separate question with a separate syscall.
-
-<Callout label="The distinction that causes data loss">
-`write()` returning success means the kernel accepted your data. `fsync()`
-returning success means the device claims to have it. Between those two points
-sits a window — typically up to 30 seconds of dirty page writeback — where a
-power cut loses everything. Every database calls `fsync`. Most application code doesn't, and probably gets
-away with it.
-</Callout>
-
-<Sub n="1.1" title="What POSIX guarantees, and what it doesn't">
-
-- **Guaranteed:** a read after a write, in the same or another process, sees the
-  new data.
-- **Guaranteed:** `rename()` within a directory is atomic. No reader sees a
-  partial state. This is the foundation of safe file updates.
-- **Not guaranteed:** that data survives a crash without `fsync`.
-- **Not guaranteed:** ordering between writes to different files.
-- **Not guaranteed:** that a failed `fsync` can be retried. More on that below,
-  because it's genuinely alarming.
+Because the name isn't stored in the file at all. It's an entry in its parent
+directory. A rename edits that entry and leaves the inode and its blocks alone.
 
 </Sub>
 
-<SectionHeading n="02" cmd="stat -c '%i %h %b' ./file" id="layout">Inodes, names, and the page cache</SectionHeading>
+<Sub n="1.2" title="Inodes, names and extents">
 
-<Sub n="2.1" title="Inodes, names and extents">
-
-A file is an **inode**: a structure holding size, permissions, timestamps and
-pointers to data blocks. A filename is not part of it. Directories are just
-files mapping names to inode numbers, and that indirection explains several
+That indirection, names in directories pointing at inodes, explains several
 behaviours people find surprising.
 
 <Figure caption="Two names, one inode. Deleting a name decrements a link count; the data goes when the count and the open-descriptor count both reach zero. So deleting a file an open process is using frees no space at all.">
@@ -108,118 +73,298 @@ behaviours people find surprising.
 />
 </Figure>
 
-Modern filesystems track data as **extents** — a start block and a length —
+Modern filesystems track data as **extents**, a start block and a length,
 instead of listing every block. A contiguous 1 GB file needs one extent, not
-250,000 block pointers. Fragmentation is what turns one extent into thousands,
-and it's the mechanism behind a file that gets slower to read over its lifetime.
+250,000 block pointers.
+
+Fragmentation is what turns one extent into thousands. It's usually the
+mechanism behind a file that gets slower to read over its lifetime.
 
 </Sub>
 
-<Sub n="2.2" title="The page cache">
+<SectionHeading n="02" id="page-cache">The page cache</SectionHeading>
 
-Every read and write goes through a cache of file pages in RAM, keyed by inode
-and offset. Section 5 measures its value at about 87×, and it's the reason
-`free` on a busy Linux box shows almost no free memory — the kernel is using it
-all as cache and will hand it back on demand.
+<Sub n="2.1" title="Why the kernel keeps file data in RAM">
 
-Writes land in the cache and are marked **dirty**. Writeback happens later, on a
-timer or under memory pressure. That window is exactly what makes `fsync`
-necessary.
+The second job, hiding the disk, matters more for performance.
+
+A random 4 KB read that has to reach the SSD on this machine takes about
+**45,000 ns**. The same read served from RAM takes about 518 ns, eighty-seven
+times less.
+
+So the kernel keeps copies of recently used file data in whatever RAM is free,
+in the **page cache**, keyed by inode and offset. Every ordinary `read` checks
+there first.
+
+<Why>Why is a database slow for twenty minutes after a restart?</Why>
+
+Because the cache starts empty. Until the working set has been read once from
+the device, every read pays the 45,000 ns path.
+
+<Why>Why does free show almost no free memory on a busy box?</Why>
+
+Because the kernel is using it all as cache and will hand it back on demand.
+"Free memory" on a healthy server is close to zero by design.
 
 </Sub>
 
-<SectionHeading n="03" cmd="vmtouch -v ./file" id="hot-path">A read, hit and miss</SectionHeading>
+<Sub n="2.2" title="A read, hit and miss">
 
-<Flow
-  wrap={3}
+Step through one `read()`:
+
+<Steps
+  title="One 4 KB read(), hit and miss"
+  lanes={[
+    { t: "Your app", s: "read(fd, buf, n)", icon: "◉" },
+    { t: "Syscall", s: "~350 ns (ch. 07)", icon: "⇣" },
+    { t: "Page cache", s: "inode + offset", icon: "▦" },
+    { t: "Block layer", s: "queue · merge", icon: "≡" },
+    { t: "Device", s: "NVMe", icon: "⌁" },
+  ]}
   steps={[
-    { label: "read(fd, buf, n)", sub: "syscall, ~350 ns (ch. 07)" },
-    { label: "page cache lookup", sub: "hit → copy and return", accent: true },
-    { label: "return", sub: "~518 ns total, measured" },
-    { label: "miss", sub: "allocate a page, issue I/O" },
-    { label: "block layer", sub: "queue, merge, schedule" },
-    { label: "device", sub: "~45,000 ns for 4 KB random" },
+    [0, "Your code calls `read()` for 4 KB at some offset in the file."],
+    [1, "The call crosses into the kernel, which costs about 350 ns on its own (chapter 07)."],
+    [2, "The kernel looks up the page by **inode and offset**. On a **hit**, it copies the bytes into your buffer and returns: about **518 ns** in total, measured."],
+    [2, "On a **miss**, it allocates a page in the cache and issues I/O to fill it. Your thread waits."],
+    [3, "The **block layer** queues the request, merges it with neighbours where it can, and schedules it."],
+    [4, "The **device** reads the block: about **45,000 ns** for a 4 KB random read. The page fills, and the copy to your buffer finally happens."],
   ]}
 />
 
-<Sub n="3.1" title="Journalling, and what it actually protects">
-
-A crash midway through a multi-block update leaves the filesystem inconsistent —
-an inode claiming blocks the allocator thinks are free, a directory entry
-pointing at nothing. A **journal** fixes this by writing intent first: record
-what you're about to do, do it, then clear the record. After a crash, replay or
-discard.
-
-The important qualifier: ext4's default `data=ordered` journals **metadata
-only**. Your filesystem will be structurally consistent after a crash. Your
-file contents may be garbage. Those are different properties and only the first
-one is being promised.
+The page stays in the cache afterwards, so the next read of it is a hit. That's
+the whole trick.
 
 </Sub>
 
-<Sub n="3.2" title="Updating a file safely">
+<Sub n="2.3" title="Writes and dirty pages">
+
+Writes go through the same cache. When `write()` returns, your bytes are in RAM
+and the page is marked **dirty**.
+
+The kernel flushes dirty pages to the disk later, in the background, on a timer
+or under memory pressure. That's called **writeback**, and Linux can hold dirty
+data for up to about 30 seconds by default.
+
+That window is exactly what makes `fsync` necessary.
+
+</Sub>
+
+<SectionHeading n="03" id="durability">Visible is not durable</SectionHeading>
+
+A filesystem promises that a successful `write()` will be visible to any
+subsequent `read()`. Note the exact shape of that promise: it's about
+*visibility*, not *durability*.
+
+Your bytes are in the page cache. Whether they're on a disk is a separate
+question with a separate syscall.
+
+<Sub n="3.1" title="What POSIX guarantees, and what it doesn't">
+
+| Property | Guaranteed? | What it means for you |
+|---|---|---|
+| A read after a write, in the same or another process, sees the new data | **Yes** | Other processes see your write straight away |
+| `rename()` within a directory is atomic | **Yes** | No reader sees a partial state. This is the foundation of safe file updates. |
+| Data survives a crash without `fsync` | No | Up to about 30 s of writes can vanish |
+| Ordering between writes to different files | No | After a crash, file B can be newer than file A |
+| A failed `fsync` can be retried | No | Section 5.1; it's alarming |
+
+</Sub>
+
+<Sub n="3.2" title="fsync, from write() to the device">
+
+<Predict
+  q="Your program writes a file and write() returns success. The power fails five seconds later. Is the data on the disk?"
+  options={[
+    "Yes: write() returning means it's stored",
+    "Very possibly not: it may still be a dirty page in RAM",
+    "No, never: Linux always waits 30 seconds",
+    "Only if the file is smaller than 4 KB",
+  ]}
+  answer={1}
+>
+`write()` returning means the page cache has your data, marked dirty. Linux can
+hold dirty data for up to about 30 seconds before writeback. If the power fails
+inside that window, it's gone. If you need it on the disk now, call `fsync`.
+</Predict>
+
+`fsync` forces the flush and waits for the device to confirm. Here's the whole
+path, with the two points that matter marked:
+
+<Steps
+  title="write() then fsync(): visible, then durable"
+  lanes={[
+    { t: "Your app", s: "write · fsync", icon: "◉" },
+    { t: "Page cache", s: "dirty pages", icon: "▦" },
+    { t: "Writeback", s: "flush dirty pages", icon: "⇣" },
+    { t: "Block layer", s: "queue · merge", icon: "≡" },
+    { t: "Device", s: "confirms", icon: "⌁" },
+  ]}
+  steps={[
+    [0, "Your code calls `write()`. The kernel copies the bytes into a page."],
+    [1, "The page is marked **dirty** and `write()` returns. The data is **visible** to every reader now, and **durable nowhere**."],
+    [1, "Left alone, it stays dirty until a timer or memory pressure triggers writeback, up to about 30 s later. A power cut in this window loses it."],
+    [0, "Your code calls `fsync(fd)`. It blocks."],
+    [2, "The kernel starts writeback of that file's dirty pages **now**, instead of later."],
+    [3, "The block layer queues the writes and sends them to the device."],
+    [4, "The device reports the data written, and `fsync` returns. Only now can you tell a user their data is safe."],
+  ]}
+/>
+
+<Callout label="Design implication">
+`write()` returning success means the kernel accepted your data. `fsync()`
+returning success means the device claims to have it. Postgres writes its log
+and calls `fsync` before it tells you a transaction committed. Every database
+calls `fsync`. Most application code doesn't, and probably gets away with it.
+</Callout>
+
+Kafka goes the other way and leans on the page cache on purpose, keeping
+messages there instead of in the JVM heap.
+
+</Sub>
+
+<Sub n="3.3" title="Updating a file safely">
 
 Because `rename` is atomic and `write` is not, the durable-update pattern is
 always the same four steps:
 
 ```shell
 # 1. write the new content to a temporary file in the SAME directory
-# 2. fsync the temp file          — data is on the device
-# 3. rename temp over the target  — atomic swap
-# 4. fsync the DIRECTORY          — the rename itself is durable
+# 2. fsync the temp file          (data is on the device)
+# 3. rename temp over the target  (atomic swap)
+# 4. fsync the DIRECTORY          (the rename itself is durable)
 ```
 
-Step 4 is the one everyone forgets. The rename is a directory metadata change,
-and it sits in the page cache like anything else. Skip it and a crash can leave
-you with neither the old file nor the new one.
+A half-written file never becomes visible, because readers see either the old
+name's target or the new one.
+
+<StepSequence
+  title="The rename dance, and what a crash leaves at each step"
+  actors={["Your app", "Temp file", "Directory", "Device"]}
+  messages={[
+    { from: 0, to: 1, label: "write", note: "Write the new content to `config.tmp` in the **same directory** as the target. Readers still see the old `config`." },
+    { from: 1, to: 3, label: "fsync(temp)", note: "The new **data** is on the device. A crash now leaves the old file intact, plus a stray temp file." },
+    { from: 0, to: 2, label: "rename", note: "`rename(config.tmp, config)` swaps the name **atomically**. Readers see the old file or the new one, never half of each." },
+    { from: 2, to: 3, label: "fsync(dir)", note: "The rename is a directory change, and it's sitting in the page cache like anything else. This `fsync` makes the **rename itself** durable." },
+  ]}
+/>
+
+<Why>Why fsync the directory?</Why>
+
+Because the rename is a directory metadata change, and it sits in the page cache
+like anything else. Skip step 4 and a crash can leave you with neither the old
+file nor the new one.
+
+<Callout label="Common mistake" kind="warn">
+Stopping after the rename. Step 4 is the one everyone forgets, and it's the one
+that makes the rename survive a crash.
+</Callout>
+
+SQLite's atomic commit documentation is the best free explanation of building
+durability on a filesystem that offers so little. It lists which guarantees
+SQLite relies on and which it assumes are absent, written by people who had to
+make it work everywhere, including on filesystems that lie.
 
 </Sub>
 
-<SectionHeading n="04" cmd="dmesg | grep -i 'I/O error'" id="failure">fsyncgate, and other silent losses</SectionHeading>
+<SectionHeading n="04" id="journalling">Journalling, and what it actually protects</SectionHeading>
 
-<Sub n="4.1" title="fsyncgate">
+<Sub n="4.1" title="Writing intent first">
 
-In 2018 the Postgres team discovered that on Linux, when writeback fails, the
-kernel marks the pages clean and reports the error to **whichever descriptor
-happens to call `fsync` next** — once. A subsequent `fsync` returns success,
-because the error state has been consumed and the dirty pages are gone.
+A crash midway through a multi-block update leaves the filesystem inconsistent:
+an inode claiming blocks the allocator thinks are free, a directory entry
+pointing at nothing.
 
-So the intuitive recovery — "`fsync` failed, retry it" — is not merely
-ineffective. It converts a reported failure into a silent one, and the data is
-already unrecoverable. Postgres now panics on `fsync` failure, on the grounds
-that crashing is the only honest response.
-
-**If `fsync` fails, you cannot retry. Treat it as fatal.**
+A **journal** fixes this by writing intent first. Record what you're about to
+do, do it, then clear the record. After a crash, replay or discard.
 
 </Sub>
 
-<Sub n="4.2" title="Directory operations at scale">
+<Sub n="4.2" title="Metadata only, by default">
+
+<Why>Why can a file hold garbage after a clean journal replay?</Why>
+
+Because ext4's default `data=ordered` journals **metadata only**. Your
+filesystem will be structurally consistent after a crash. Your file contents may
+be garbage.
+
+Those are different properties and only the first one is being promised.
+
+<Callout label="Common mistake" kind="warn">
+Reading "journalled filesystem" as "my data survives crashes". The journal keeps
+the filesystem's own structures consistent. Your file's contents are still your
+job, with `fsync` and the rename dance.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="05" id="failure">fsyncgate, and other silent losses</SectionHeading>
+
+<Sub n="5.1" title="fsyncgate">
+
+In 2018 the Postgres team discovered what Linux does when writeback fails. The
+mailing list thread changed how every serious database handles write errors, and
+it repays reading in full.
+
+<StepSequence
+  title="A failed writeback, reported once"
+  actors={["Postgres", "Page cache", "Kernel writeback", "Device"]}
+  messages={[
+    { from: 0, to: 1, label: "write", note: "Postgres writes data. The pages are dirty in the page cache." },
+    { from: 2, to: 3, label: "writeback", note: "The kernel writes the dirty pages back in the background." },
+    { from: 3, to: 2, label: "I/O error", note: "The device reports an error. The write failed." },
+    { from: 2, to: 1, label: "mark clean", note: "The kernel **marks the pages clean** anyway. The dirty data is gone from memory, and it isn't on the disk." },
+    { from: 0, to: 2, label: "fsync", note: "The error goes to **whichever descriptor happens to call `fsync` next**, once. Here, `fsync` fails." },
+    { from: 0, to: 2, label: "fsync (retry)", note: "Postgres retries. `fsync` returns **success**, because the error state has been consumed. The data is still lost." },
+  ]}
+/>
+
+<Why>Why can't you just retry a failed fsync?</Why>
+
+Because the intuitive recovery doesn't merely fail. It converts a reported
+failure into a silent one, and the data is already unrecoverable.
+
+Postgres now panics on `fsync` failure, on the grounds that crashing is the only
+honest response. The fix across the industry was the same.
+
+<Callout label="Design implication">
+If `fsync` fails, you can't retry. Treat it as fatal, and recover from your own
+log or a replica.
+</Callout>
+
+</Sub>
+
+<Sub n="5.2" title="Directory operations at scale">
 
 A directory with a million entries makes every `open` a lookup in a structure
 that may be a linear list. ext4's `dir_index` uses hashed B-trees and handles it;
-older filesystems and some network filesystems do not.
+older filesystems and some network filesystems don't.
 
-Standard fix is sharding by hash prefix — `ab/cd/abcdef...` — and it's why
-every object store, Git, and most cache directories look like that.
+The standard fix is sharding by hash prefix, `ab/cd/abcdef...`. That's probably
+why every object store, Git, and most cache directories look like that.
 
 </Sub>
 
-<Sub n="4.3" title="Page cache eviction under memory pressure">
+<Sub n="5.3" title="Page cache eviction under memory pressure">
 
 The page cache competes with anonymous memory. A large allocation can evict the
-file pages your service depends on, and the first symptom is reads that were
-518 ns becoming 45,000 ns with nothing in your code having changed.
+file pages your service depends on, and it may not be your allocation. The first symptom is reads that were 518 ns
+becoming 45,000 ns with nothing in your code having changed.
 
-On Linux, `vm.swappiness` and cgroup memory limits decide who loses. In a
-container with a memory limit, the page cache counts against the limit, which
-surprises people. Clean cache is mostly harmless: the kernel reclaims it before
-it kills anything. Dirty pages and tmpfs are what get a file-heavy workload
-OOM-killed, because neither can be dropped until it's written somewhere.
+On Linux, `vm.swappiness` and cgroup memory limits decide who loses.
+
+<Why>Why does file I/O push a container towards its memory limit?</Why>
+
+Because in a container with a memory limit, the page cache counts against the
+limit, which surprises people. Clean cache is mostly harmless: the kernel
+reclaims it before it kills anything.
+
+Dirty pages and tmpfs are what get a file-heavy workload OOM-killed, because
+neither can be dropped until it's written somewhere.
 [The dashboard said 60%](/blog/oom-killed-at-sixty-percent) reproduces both.
 
 </Sub>
 
-<SectionHeading n="05" cmd="./bench --cached --nocache" id="cost">518 nanoseconds against 45,000</SectionHeading>
+<SectionHeading n="06" id="cost">518 nanoseconds against 45,000</SectionHeading>
 
 <Callout label="The machine" kind="note">
 Apple M4, macOS 26.5.1, APFS on the internal NVMe. Uncached numbers use a 3 GB
@@ -228,7 +373,7 @@ file that sat entirely in cache, so it measured RAM and would have called it
 disk. Stating it because that mistake is easy and invisible.
 </Callout>
 
-<Sub n="5.1" title="What the page cache is worth">
+<Sub n="6.1" title="What the page cache is worth">
 
 <Cost items={[
   { what: "4 KB random read, page cache hit", value: "518 ns", source: "warm 64 MB window, 20,000 reads" },
@@ -237,12 +382,11 @@ disk. Stating it because that mistake is easy and invisible.
 ]} />
 
 **Eighty-seven times.** That single ratio is why the kernel spends every byte of
-otherwise-idle RAM on file caching, and why "free memory" on a healthy server is
-close to zero by design.
+otherwise-idle RAM on file caching.
 
 </Sub>
 
-<Sub n="5.2" title="What durability costs">
+<Sub n="6.2" title="What durability costs">
 
 <Cost items={[
   { what: "Write 1 byte, no fsync", value: "975 ns", source: "300 pwrites, 4 KB apart" },
@@ -264,16 +408,18 @@ the gap is larger still.
   result={{ label: "why every database batches its fsyncs", value: "18.5% → 0.4%" }}
 />
 
+<Callout label="Design implication">
 Group commit is the standard answer: hold transactions for a millisecond, then
 `fsync` once for all of them. You trade a little latency for a large amount of
 throughput, and it's why database commit latency has a floor around the flush
 time of your storage.
+</Callout>
 
 </Sub>
 
-<SectionHeading n="06" cmd="grep -E 'Dirty|Writeback' /proc/meminfo" id="operating">Watching the cache and the writeback</SectionHeading>
+<SectionHeading n="07" id="operating">Watching the cache and the writeback</SectionHeading>
 
-<Sub n="6.1" title="Seeing the cache and the writeback">
+<Sub n="7.1" title="Seeing the cache">
 
 ```shell
 # How much of memory is page cache, and how much is dirty right now
@@ -298,20 +444,68 @@ your cache hit rate, expressed in the most direct way available.
 
 </Sub>
 
-<Sub n="6.2" title="Rules that hold up">
+<Sub n="7.2" title="Rules that hold up">
 
 1. **Use the rename dance for any file that matters.** Temp file, fsync, rename,
    fsync the directory. All four steps.
-2. **Treat `fsync` failure as fatal.** You cannot retry it.
+2. **Treat `fsync` failure as fatal.** You can't retry it.
 3. **Batch your fsyncs** if you control the write pattern. 19× is a lot to pay
    per operation.
 4. **Don't fight the page cache.** `O_DIRECT` is for software that maintains its
-   own buffer pool — databases — and is a pessimisation everywhere else.
+   own buffer pool (databases) and is a pessimisation everywhere else.
 5. **Remember the cache counts against container memory limits.**
 
 </Sub>
 
-<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+<Sub n="7.3" title="What you give up">
+
+| You get | You pay | When the bill arrives |
+|---|---|---|
+| A page cache worth 87× | It competes with your heap, and counts in cgroup limits | As an OOM kill you didn't expect |
+| `write()` returns immediately | Up to 30 s of data in volatile memory | On power loss |
+| `fsync`, real durability | 19× per operation | As commit latency with a hard floor |
+| Metadata journalling | Structural consistency only, not your file contents | After a crash, as valid files full of garbage |
+| Atomic rename | Only if you also fsync the directory | As neither the old nor the new file |
+
+</Sub>
+
+<Sub n="7.4" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Slow for minutes after a restart, then fine | Cold page cache | Expected; warm it, or wait. Check `read_bytes` against `rchar` |
+| Reads suddenly ~100× slower, nothing deployed | Working set evicted from the page cache | Find what allocated memory or what grew; check `/proc/$PID/io` |
+| Deleted a large file, no space freed | A process still has it open | Restart or close that process |
+| File empty or old after a power cut | No `fsync`, or no directory `fsync` after rename | The four-step rename dance |
+| Valid-looking files full of garbage after a crash | `data=ordered` journals metadata only | `fsync` your data; don't rely on the journal |
+| Pod OOM-killed doing file I/O | Dirty pages or tmpfs counted against the limit | Flush sooner, move tmpfs data to disk, raise the limit |
+| `open` slow in a huge directory | Linear directory lookup | Shard by hash prefix |
+
+</Sub>
+
+<SectionHeading n="08" id="summary">Summary</SectionHeading>
+
+1. **A disk has no files.** A filesystem is a data structure on an array of
+   numbered blocks.
+2. **A name is a directory entry, not part of the file.** It points at an inode,
+   so a rename doesn't touch the data.
+3. **Extents keep big files cheap to describe.** Fragmentation turns one extent
+   into thousands.
+4. **The page cache is worth about 87×.** 518 ns cached against ~45,000 ns from
+   NVMe for a 4 KB random read.
+5. **`write()` returning means visible, not durable.** Dirty pages can sit in RAM
+   for about 30 seconds.
+6. **`fsync` is what asks for durability**, and it cost 19× the write alone.
+7. **Safe updates take four steps.** Temp file, fsync, rename, fsync the
+   directory.
+8. **The default journal protects metadata only.** Your file contents can still
+   be garbage after a crash.
+9. **A failed `fsync` can't be retried.** Linux reports the error once and marks
+   the pages clean.
+10. **Group commit makes durability affordable.** 50 transactions per fsync took
+    the cost from 18.5% of a core to 0.4%.
+
+<SectionHeading n="09" id="build">Build this</SectionHeading>
 
 **Measure the cache cliff yourself, then fall off it.**
 
@@ -325,35 +519,7 @@ Then the durability half: time 1,000 small writes with and without `fsync`, and
 again with one `fsync` per 50 writes. You'll have derived group commit from
 first principles. More convincing than being told about it.
 
-<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
-
-<Compare
-  cols={["You get", "You pay", "When the bill arrives"]}
-  rows={[
-    ["A page cache worth 87×", "It competes with your heap, and counts in cgroup limits", "As an OOM kill you did not expect"],
-    ["write() returns immediately", "Up to 30 s of data in volatile memory", "On power loss"],
-    ["fsync, real durability", "19× per operation", "As commit latency with a hard floor"],
-    ["Metadata journalling", "Structural consistency only — not your file contents", "After a crash, as valid files full of garbage"],
-    ["Atomic rename", "Only if you also fsync the directory", "As neither the old nor the new file"],
-  ]}
-/>
-
-<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
-
-<CardGrid>
-  <WildCard name="fsyncgate, 2018" verdict="Changed how every serious database handles write errors, and the mailing list thread repays reading in full.">
-    Postgres discovered that a failed writeback on Linux is reported once and
-    then forgotten, with the dirty pages already discarded. Retrying `fsync`
-    returns success over lost data. The fix across the industry was to panic.
-  </WildCard>
-  <WildCard name="SQLite's atomic commit documentation" verdict="The best free explanation anywhere of building durability on top of a filesystem that offers so little.">
-    A long, precise account of exactly which filesystem guarantees SQLite relies
-    on and which it assumes are absent — written by people who had to make it
-    work everywhere, including on filesystems that lie.
-  </WildCard>
-</CardGrid>
-
-<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+<SectionHeading n="10" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="write() returned success. Is your data safe?">
 No. It means the kernel has your data in the page cache and a later read will
@@ -381,7 +547,7 @@ else on the box allocated memory and evicted your file pages, or the file grew
 past what the cache holds.
 
 On this hardware I measured 518 ns for a cached 4 KB read and about 45,000 ns
-uncached — 87×. Check `read_bytes` in `/proc/$PID/io` against `rchar`: a
+uncached: 87×. Check `read_bytes` in `/proc/$PID/io` against `rchar`: a
 widening gap between bytes requested and bytes fetched from the device is the
 cache hit rate falling.
 </QA>
@@ -389,7 +555,7 @@ cache hit rate falling.
 <QA level="deep" q="What is fsyncgate and why can't you retry a failed fsync?">
 Postgres found in 2018 that on Linux a writeback failure is reported to
 whichever descriptor calls `fsync` next, exactly once, and the kernel then marks
-the pages clean. A second `fsync` returns success — but the dirty data is
+the pages clean. A second `fsync` returns success, but the dirty data is
 already gone.
 
 So retrying converts a loud failure into a silent one over data you have already
@@ -398,7 +564,7 @@ on `fsync` failure. Crashing is the only honest response.
 </QA>
 
 <QA level="deep" q="Your database does 10,000 commits per second and fsync costs 18 µs. Do the arithmetic.">
-Ten thousand fsyncs at 18.5 µs is 185 ms of every second — about 18.5% of a core
+Ten thousand fsyncs at 18.5 µs is 185 ms of every second, about 18.5% of a core
 doing nothing but flushing, before any actual work.
 
 That's why group commit exists. Hold transactions for a millisecond and fsync
@@ -408,7 +574,7 @@ for most of a core, and it's why commit latency has a floor set by your
 storage's flush time.
 </QA>
 
-<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="11" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
   <Q q="You deleted a large file and no space was freed. Why?">
@@ -421,21 +587,21 @@ storage's flush time.
     is structurally consistent while individual files may contain garbage.
   </Q>
   <Q q="Roughly how much does the page cache buy you?">
-    Around 87× on this hardware — 518 ns cached against ~45,000 ns from NVMe for
+    Around 87× on this hardware: 518 ns cached against ~45,000 ns from NVMe for
     a 4 KB random read.
   </Q>
   <Q q="Should application code use O_DIRECT to avoid double buffering?">
-    Almost never. It's for software maintaining its own buffer pool — databases.
-    Everywhere else you lose the 87× and gain nothing.
+    Almost never. It's for software maintaining its own buffer pool, like
+    databases. Everywhere else you lose the 87× and gain nothing.
   </Q>
 </Quiz>
 
 <CardGrid>
-  <WildCard name="'PostgreSQL's fsync() surprise' — LWN">
+  <WildCard name="'PostgreSQL's fsync() surprise', LWN">
     The clearest write-up of fsyncgate, including why the kernel behaves that
     way and why it was hard to change.
   </WildCard>
-  <WildCard name="SQLite — Atomic Commit In SQLite">
+  <WildCard name="SQLite: Atomic Commit In SQLite">
     Which filesystem guarantees are real, which are assumed, and how to build
     durability without most of them.
   </WildCard>
@@ -446,5 +612,26 @@ storage's flush time.
   <WildCard name="vmtouch">
     Shows and controls exactly which pages of a file are resident. Turns page
     cache behaviour from a guess into an observation.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="12" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Syscalls, Interrupts & the Kernel Boundary">
+    The ~350 ns every `read()` and `write()` pays before the page cache is even
+    consulted. [Chapter 07](/topics/07-syscalls-kernel-boundary).
+  </WildCard>
+  <WildCard name="Block Devices & SSDs">
+    What happens below the block layer, and why `fsync` costs what it does.
+    [Chapter 09](/topics/09-storage-devices).
+  </WildCard>
+  <WildCard name="Virtual Memory & Page Tables">
+    Pages, reclaim and `mmap`, the machinery the page cache is built from.
+    [Chapter 04](/topics/04-virtual-memory).
+  </WildCard>
+  <WildCard name="Containers from Scratch">
+    cgroup memory limits, and why the page cache counts against them.
+    [Chapter 11](/topics/11-containers).
   </WildCard>
 </CardGrid>

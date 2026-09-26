@@ -1,74 +1,46 @@
 ---
 title: Concurrent Data Structures
-dek: "One mutex, striped locks, or no sharing at all. Striping is worth 16× on the measurement below — and going from 8 stripes to 64 is worth exactly nothing."
-readingTime: "~22 min"
+dek: "How to share a map, queue or counter between threads: one mutex, striped locks, or no sharing at all. You'll see what striping is worth, why more stripes stop helping, and what thread-safe doesn't cover."
+readingTime: "~25 min"
+level: "Intermediate"
 versions: "C++20 · clang 21 · measured on Apple M4, 8 threads"
-prereqs: "Chapters 13, 14 and 16"
-updated: "2026-09-19"
+prereqs: "mutexes, atomics, cache lines"
+updated: "2026-09-26"
 ---
 
-Start with the obvious design. Your service keeps an in-memory cache, a hash
-map that every request thread reads and writes, and you guard it with one
-mutex. It's correct, it's simple, and chapter 13 showed that an uncontended lock
-costs a few nanoseconds. So what goes wrong as traffic grows?
+Almost every service keeps some state in memory that many threads touch: a
+cache, a session table, a request counter, a work queue. The first version puts
+a mutex around it, and for a while that's fine.
 
-The lock turns the whole map into a single queue. However many threads you
-have, only one of them is ever inside the map, so eight threads can't do more
-map operations per second than one thread could. Chapter 16's arithmetic then
-takes over: as that one lock gets busier, waiting grows much faster than the
-load, and a profile starts showing threads spending more time waiting for the
-map than using it.
+Then traffic grows, and a profile starts showing threads spending more time
+waiting for the map than using it. The fixes you'll find in production code
+(Java's `ConcurrentHashMap`, Rust's `dashmap`, Go's `sync.Map`, the Linux
+kernel's per-CPU counters) are all variations on a few ideas.
 
-Look at what those threads are actually doing, though. Almost all of them are
-touching *different* keys. Thread A is updating a user session, thread B is
-reading a product, and they never conflict; they only wait because they share a
-lock. So split the lock. Keep an array of, say, sixteen locks, and let a key's
-hash pick which one guards it. Now two threads only wait for each other if their
-keys happen to land on the same lock. That's **lock striping**. For any two
-threads with random keys, how often do they collide? One time in sixteen. Most
-of the waiting disappears.
+This chapter starts with what a thread-safe structure actually promises, then
+goes from one lock, to striped locks, to no sharing at all. It measures what
+striping is worth, shows the ways it undoes itself, and ends with five
+questions that pick a design for you.
 
-Can you keep going, to 64 stripes, or 1,024? You can, and it mostly doesn't
-help. Once collisions are rare, the remaining cost isn't waiting. It's the
-**cache line** (from chapter 02, the block of memory cores pass between each
-other) that holds each lock, bouncing between the cores that use it.
+<SectionHeading n="01" id="thread-safe">What thread-safe promises</SectionHeading>
 
-The last step is to stop sharing at all. For something like a request counter,
-every thread bumping one number is as contended as it gets, so give each thread
-its own counter and add them up only when somebody reads the total. The Linux
-kernel's per-CPU counters work that way, and so do the per-thread caches in
-allocators like jemalloc and tcmalloc. The cost moves to the reader, and it
-only works for data you can merge.
+Before choosing how to make shared state safe, be clear what any of the options
+buys you.
 
-None of these makes a *sequence* of operations safe, which is where most bugs
-live. A concurrent map guarantees that each call happens all at once, but
-"check whether the key exists, then insert it" is two calls, and another thread
-can insert between them. And striping has two ways to undo itself: one very
-popular key that everyone wants, and any operation, like `size()`, that needs
-every stripe at once.
+<Sub n="1.1" title="Linearizability">
 
-You'll find all three designs in production code. Java's `ConcurrentHashMap`
-is the striped idea taken further, Rust's `dashmap` shards one map across many
-locks, and Go's `sync.Map` is tuned for keys that are written once and read
-often. The chapter measures what striping is worth, gives five questions that
-pick a design for you, and goes through the mistakes. My own first benchmark said
-striping made things *worse*, 14.3 ns with one stripe against 25.9 ns with
-sixteen, because each thread was hopping to a different stripe every time.
-Fixed, it was worth **sixteen to twenty-two times** at eight threads, and section
-3 has both runs.
-
-<SectionHeading n="01" cmd="cat DECISION.md" id="choice">How to make shared state safe</SectionHeading>
-
-Several threads need a shared map, queue or counter. You're choosing how to make
-that safe, and the options differ by roughly two orders of magnitude in
-throughput.
-
-Before choosing, be clear what any of them buys you. A concurrent structure
-promises **linearizability**: every operation appears to take effect
-instantaneously at some point between its call and its return, and all threads
-agree on the order.
+A concurrent structure promises **linearizability**: every operation appears to
+take effect instantaneously at some point between its call and its return, and
+all threads agree on the order.
 
 That's a guarantee about *single operations*. It says nothing about sequences.
+
+</Sub>
+
+<Sub n="1.2" title="Check, then act">
+
+"Check whether the key exists, then insert it" is two calls, and another thread
+can insert between them:
 
 ```cpp
 // Each call is individually atomic. The pair is not.
@@ -76,34 +48,76 @@ if (!map.contains(key))      // thread B can insert here
     map.insert(key, value);  // and you overwrite it
 ```
 
-<Callout label="What 'thread-safe' doesn't mean">
-`ConcurrentHashMap`, `sync.Map` and `dashmap` all make `get` and `insert`
-atomic. None make check-then-act atomic. Composing two safe operations gives an
-unsafe one, and that's why every such API grows a `compute_if_absent` /
-`LoadOrStore` / `entry()` method — those exist specifically to close this gap.
+Step through two threads running that code on the same key:
+
+<StepSequence
+  title="Two safe calls make one unsafe operation"
+  actors={["Thread A", "Concurrent map", "Thread B"]}
+  messages={[
+    { from: 0, to: 1, label: "contains(k)", note: "Thread A checks for the key. The call is atomic, and the answer is correct at that instant: **not there**." },
+    { from: 2, to: 1, label: "contains(k)", note: "Thread B checks the same key a moment later. Also not there." },
+    { from: 2, to: 1, label: "insert(k, vB)", note: "Thread B inserts its value. That call is atomic too." },
+    { from: 0, to: 1, label: "insert(k, vA)", note: "Thread A acts on an answer that's **no longer true**, and overwrites B's value. Each call was safe; the pair wasn't." },
+    { from: 1, to: 2, label: "B's value is gone", dashed: true, note: "B thinks it inserted. Depending on the code, you've lost an update or counted something twice." },
+  ]}
+/>
+
+<Why>So what's the fix, if every call is already atomic?</Why>
+
+Make the pair one call. That's why every concurrent map API grows a combined
+method: `compute_if_absent`, `LoadOrStore`, `entry()`. They exist specifically
+to make check-then-act a single atomic operation.
+
+<Callout label="Common mistake" kind="warn">
+Reading "thread-safe" as "safe to compose". `ConcurrentHashMap`, `sync.Map` and
+`dashmap` all make `get` and `insert` atomic. None of them make check-then-act
+atomic. Composing two safe operations gives an unsafe one.
 </Callout>
 
-<SectionHeading n="02" cmd="ls ./options/" id="options">One lock, many locks, or none</SectionHeading>
+</Sub>
 
-<Approach
-  n="1"
-  name="One mutex around an ordinary container"
-  breaks="Every operation serialises. Past about two threads of real contention it is your bottleneck."
-  bestFor="Genuinely almost everything. Start here and make a profile tell you to move."
->
-Boring, almost certainly correct, and trivially debuggable. The cost of being
-wrong is low, because replacing it later is a local change behind one interface.
-</Approach>
+<SectionHeading n="02" id="one-lock">One mutex around the whole map</SectionHeading>
 
-<Approach
-  n="2"
-  name="Lock striping"
-  breaks="A hot key defeats it completely, and size() stops being meaningful."
-  bestFor="Many threads, well-distributed keys, short critical sections. Worth 16x in section 3."
->
-Replace one lock with an array of them, each guarding a slice of the key space;
-the key's hash picks the stripe. Two threads on different stripes never
-interact.
+Start with the obvious design: an ordinary hash map that every request thread
+reads and writes, guarded by one mutex.
+
+<Sub n="2.1" title="Why it's the right place to start">
+
+It's correct, it's simple, and it's trivially debuggable. [Chapter 13](/topics/13-locks)
+showed that an uncontended lock costs a few nanoseconds.
+
+The cost of being wrong is low, too. Replacing it later is a local change
+behind one interface. For genuinely almost everything, start here and make a
+profile tell you to move.
+
+</Sub>
+
+<Sub n="2.2" title="The lock turns the map into a queue">
+
+However many threads you have, only one of them is ever inside the map. Eight
+threads can't do more map operations per second than one thread could.
+
+[Chapter 16](/topics/16-contention-tail-latency)'s arithmetic then takes over.
+As that one lock gets busier, waiting grows much faster than the load. Past
+about two threads of real contention, it's your bottleneck.
+
+<Why>Why do threads wait, if they're touching different keys?</Why>
+
+Look at what those threads are actually doing. Thread A is updating a user
+session, thread B is reading a product, and they never conflict. They only wait
+because they share a lock.
+
+</Sub>
+
+<SectionHeading n="03" id="striping">Lock striping</SectionHeading>
+
+So split the lock. That's **lock striping**, and it's the idea behind
+`dashmap` and the older `ConcurrentHashMap`.
+
+<Sub n="3.1" title="An array of locks, picked by hash">
+
+Keep an array of, say, sixteen locks, each guarding a slice of the key space,
+and let a key's hash pick which one guards it:
 
 ```cpp
 // Each stripe on its own cache line. Without alignas this reintroduces
@@ -114,32 +128,33 @@ struct alignas(128) Stripe {
 };
 std::vector<Stripe> stripes(16);
 ```
-</Approach>
 
-<Approach
-  n="3"
-  name="Per-thread state, merged on read"
-  breaks="Reads become O(threads), and you see a slightly stale aggregate."
-  bestFor="Counters, accumulators, statistics — anything commutative. Beats every algorithm here when it applies."
->
-Not a concurrent structure at all: the removal of sharing. Each thread writes
-its own copy with no synchronisation whatsoever, and a reader sums them.
+Here's one insert:
 
-Probably applies more often than people check, and it's the first thing to try.
-</Approach>
+<Steps
+  title="An insert into a striped map"
+  lanes={[
+    { t: "Key", s: "user:4127", icon: "k" },
+    { t: "Hash", s: "pick a stripe", icon: "#" },
+    { t: "Stripe lock", s: "own cache line", icon: "🔒" },
+    { t: "Stripe's map", s: "a slice of the keys", icon: "▦" },
+    { t: "Unlock", s: "release the stripe", icon: "↺" },
+  ]}
+  steps={[
+    [0, "A thread wants to insert a key. It doesn't take any global lock."],
+    [1, "It hashes the key and takes it modulo the stripe count. With sixteen stripes, this key lands on, say, stripe 5."],
+    [2, "It locks **stripe 5's mutex only**. That mutex sits on its own cache line, thanks to `alignas(128)`."],
+    [3, "It inserts into stripe 5's ordinary `unordered_map`. Threads working on other stripes carry on in parallel."],
+    [4, "It unlocks. Another thread only ever waited here if its key also hashed to stripe 5."],
+  ]}
+/>
 
-<Approach
-  n="4"
-  name="A lock-free structure"
-  breaks="Reclamation becomes a research problem, and throughput collapses under heavy contention — chapter 14 measured 162 ns against a mutex's 16 ns at eight threads."
-  bestFor="Signal handlers, interrupt context, hard real-time. Places where blocking is a correctness problem, not a speed one."
->
-Chapter 14 covers this in full. The short version for this decision: reach for
-it when you cannot tolerate a thread being descheduled while holding something,
-and not because it sounds faster.
-</Approach>
+Two threads with random keys collide one time in sixteen. Most of the waiting
+disappears.
 
-<SectionHeading n="03" cmd="./bench --stripes 1,8,64" id="crossover">Sixteen times, and why 64 stripes is 8</SectionHeading>
+</Sub>
+
+<Sub n="3.2" title="What striping is worth">
 
 <Callout label="The machine" kind="note">
 Apple M4, 10 cores, macOS 26.5.1, clang 21 `-O2 -pthread`. Eight threads,
@@ -148,7 +163,20 @@ critical-section body is a variable number of multiply-add rounds, so the lock's
 share of the cost can be varied.
 </Callout>
 
-<Sub n="3.1" title="What striping is worth">
+<Predict
+  q="Eight threads, with each thread using its own stripe. Going from 8 stripes to 64, what happens to the time per critical section?"
+  options={[
+    "About 8× faster: eight times as many locks",
+    "Somewhat faster, since collisions get even rarer",
+    "No change, to within noise",
+    "Much slower, from the extra memory",
+  ]}
+  answer={2}
+>
+There are eight threads. Once each can hold its own lock, more locks add no
+parallelism, only memory and cache pressure. The 8-stripe and 64-stripe columns
+below are identical to within noise at every body size.
+</Predict>
 
 <Compare
   cols={["body", "1 stripe", "8 stripes", "64 stripes", "speedup"]}
@@ -161,38 +189,194 @@ share of the cost can be varied.
   ]}
 />
 
-Two findings, and the second is more useful.
-
 **Striping is worth 16–22× at eight threads**, consistently across
-critical-section lengths. Close to the eightfold ideal, plus — probably — the coherence traffic you stop
-paying.
-
-Sixty-four stripes is no better than eight. Those two columns are identical
-to within noise at every body size. There are eight threads — once each can hold
-its own lock, more locks add only memory and cache pressure. Stripes beyond
-your thread count are decoration.
+critical-section lengths. That's more than the eightfold ideal, probably from
+the coherence traffic you stop paying.
 
 </Sub>
 
-<Sub n="3.2" title="The benchmark that lied to me">
+<Sub n="3.3" title="Why 64 stripes is no better than 8">
 
-My first version of this showed striping getting *slower* as stripes increased:
-14.3 ns at one stripe, 25.9 ns at sixteen. That result is wrong, and how it was
-wrong is the useful part.
+<Why>If collisions keep getting rarer, why stop at eight?</Why>
 
-Each thread picked its stripe as `(thread_id * 7919 + i) % stripes` — a different stripe
-every iteration. So every thread touched every stripe, no sharding
+Because once collisions are rare, the remaining cost isn't waiting. It's the
+**cache line** that holds each lock, bouncing between the cores that use it
+([chapter 02](/topics/02-memory-hierarchy) covers how cores pass lines between
+each other).
+
+With eight threads, eight stripes already give each thread its own lock.
+Stripes beyond your thread count are decoration.
+
+<Callout label="Design implication">
+Size the stripe count to your thread count, not your table size. Around eight
+for eight threads, maybe sixteen for headroom.
+</Callout>
+
+</Sub>
+
+<Sub n="3.4" title="The benchmark that lied to me">
+
+My first version of this benchmark showed striping getting *slower* as stripes
+increased: 14.3 ns at one stripe, 25.9 ns at sixteen. That result is wrong, and
+how it was wrong is the useful part.
+
+Each thread picked its stripe as `(thread_id * 7919 + i) % stripes`, a different
+stripe every iteration. So every thread touched every stripe, no sharding
 happened at all, and I measured the cache miss from walking 64 lines instead of
 one.
 
-Real sharded workloads have **affinity**: a thread, or a key, maps to a stripe
-and stays there. Change the access to `stripes[thread_id % n]` and the 16×
-appears. A striping benchmark without affinity measures cache misses, not
-striping.
+<Why>What was the benchmark missing?</Why>
+
+**Affinity.** Real sharded workloads have it: a thread, or a key, maps to a
+stripe and stays there. Change the access to `stripes[thread_id % n]` and the
+16× appears.
+
+<Callout label="Common mistake" kind="warn">
+A striping benchmark without affinity measures cache misses, not striping. If
+more stripes look slower, check how your threads pick them.
+</Callout>
 
 </Sub>
 
-<SectionHeading n="04" cmd="./choose --explain" id="choosing">Five questions</SectionHeading>
+<Sub n="3.5" title="Padding each stripe">
+
+Every shared lock or counter wants its own cache line. Miss one and chapter
+13's 55× false-sharing penalty lands on an otherwise well-designed structure,
+with nothing in the code looking wrong.
+
+The padding is 128 bytes on Apple Silicon because that's the M-series line
+size; 64 isn't enough there. Two usual misses: a size counter sitting next to
+the buckets, and the head and tail indices of a ring buffer in one struct.
+
+</Sub>
+
+<SectionHeading n="04" id="no-sharing">Not sharing at all</SectionHeading>
+
+The last step is to stop sharing. It isn't a concurrent structure at all; it's
+the removal of sharing.
+
+<Sub n="4.1" title="Per-thread state, merged on read">
+
+For something like a request counter, every thread bumping one number is as
+contended as it gets. So give each thread its own counter, and add them up only
+when somebody reads the total.
+
+<Steps
+  title="A per-thread counter: cheap writes, a reader that sums"
+  lanes={[
+    { t: "Thread 0", s: "slot 0", icon: "0" },
+    { t: "Thread 1", s: "slot 1", icon: "1" },
+    { t: "Thread 7", s: "slot 7", icon: "7" },
+    { t: "Reader", s: "wants the total", icon: "Σ" },
+    { t: "Result", s: "slightly stale", icon: "≈" },
+  ]}
+  steps={[
+    [0, "Thread 0 handles a request and bumps **its own** slot. No lock, no shared cache line, no synchronisation whatsoever."],
+    [1, "Thread 1 does the same, at the same moment, on its own padded slot. The two never interact."],
+    [2, "So do the other threads, up to thread 7. Writes scale with the thread count."],
+    [3, "Someone asks for the total. The reader walks **every slot** and adds them up, so a read costs O(threads)."],
+    [4, "Slots change while it walks, so the sum is a **slightly stale** aggregate. For a counter, that's fine."],
+  ]}
+/>
+
+The Linux kernel's per-CPU counters work this way, and so do the per-thread
+caches in allocators like jemalloc and tcmalloc.
+
+<Why>Why doesn't everything work this way?</Why>
+
+Because the cost moves to the reader, and it only works for data you can merge:
+counters, accumulators, statistics, anything commutative. When it applies, it
+beats every algorithm in this chapter, and it probably applies more often than
+people check.
+
+</Sub>
+
+<Sub n="4.2" title="When one atomic is enough">
+
+Sometimes the right structure is no structure. A counter that's read often
+wants `fetch_add`, not a map. A flag wants `fetch_or`. Check for a single
+hardware atomic before building anything.
+
+</Sub>
+
+<SectionHeading n="05" id="lock-free">Lock-free structures</SectionHeading>
+
+<Sub n="5.1" title="When blocking is a correctness problem">
+
+[Chapter 14](/topics/14-lock-free) covers lock-free structures in full. The
+short version for this decision: reach for one when you can't tolerate a thread
+being descheduled while holding something, and not because it sounds faster.
+
+That means signal handlers, interrupt context and hard real-time. Places where
+blocking is a correctness problem, not a speed one.
+
+<Why>Aren't lock-free structures faster?</Why>
+
+Not under heavy contention. Chapter 14 measured 162 ns against a mutex's 16 ns
+at eight threads. And reclamation, knowing when it's safe to free a node,
+becomes a research problem. If you need one, use an existing implementation.
+
+</Sub>
+
+<SectionHeading n="06" id="failure">Where striping undoes itself</SectionHeading>
+
+Striping has two ways to undo itself: one very popular key that everyone
+wants, and any operation that needs every stripe at once.
+
+<Sub n="6.1" title="The hot key">
+
+Striping assumes keys spread evenly. Real workloads probably have a key taking 40%
+of traffic, and it lives in exactly one stripe. You've built a 64-way concurrent
+map that behaves, for your actual traffic, like a map with one lock.
+
+<Why>Why doesn't the aggregate lock profile show it?</Why>
+
+Because an even-looking total can hide a skewed distribution. Compare wait time
+*per stripe*, never in aggregate. `perf lock contention` showing one lock
+dominating, while throughput doesn't improve with stripe count, is the
+signature.
+
+The fix isn't a better structure. If it's a counter, give each thread its own
+and sum on read. If it's a cache entry, replicate it per thread and accept some
+staleness. Removing the sharing is the answer.
+
+</Sub>
+
+<Sub n="6.2" title="Treating size() as a fact">
+
+`size()` on a striped or lock-free structure has two bad options:
+
+| Approach | What you get |
+|---|---|
+| Lock every stripe | Your cheapest-looking query becomes the most expensive call in the API, and it blocks all writers |
+| Sum per-stripe counters without a global lock | A number that was never simultaneously true: stripes are read at different instants and change in between |
+
+Java documents `ConcurrentHashMap.size()` as an estimate for exactly this
+reason. Most people read it as a fact. Using it for a capacity decision means
+building on a value that can be wrong in either direction.
+
+</Sub>
+
+<Sub n="6.3" title="Benchmarking with uniform keys">
+
+Uniform keys make every striped structure look excellent, and they hide the one
+failure mode that will actually hit you. Test with a **skewed** distribution:
+Zipf, or your real key frequencies taken from a log.
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Striped map shows 16× in the benchmark, nothing in production | A hot key hashing to one stripe | Per-thread state or per-thread replicas for that key |
+| More stripes make the benchmark slower | No affinity: every thread touches every stripe | Map each thread or key to a stable stripe |
+| Going from 8 stripes to 64 changes nothing | Stripes already exceed the thread count | Match stripe count to thread count |
+| A clean-looking design is mysteriously slow | Two locks or counters sharing a cache line | `alignas` each one to the line size (128 on Apple Silicon) |
+| `size()` is slow, or its number doesn't add up | It locks every stripe, or sums them at different instants | Treat it as an estimate; don't make capacity decisions on it |
+| Lost updates with a thread-safe map | Check-then-act across two calls | Use `compute_if_absent`, `LoadOrStore` or `entry()` |
+
+</Sub>
+
+<SectionHeading n="07" id="choosing">Choosing a design</SectionHeading>
+
+<Sub n="7.1" title="Five questions">
 
 1. **Can you avoid sharing entirely?** Per-thread state with a periodic merge
    beats every algorithm in this chapter. Check this first, every time.
@@ -200,98 +384,81 @@ striping.
    not a structure. A flag wants `fetch_or`.
 3. **Are your keys well distributed?** If yes, stripe, with stripe count ≈
    thread count. If a hot key takes a large share, striping buys you nothing and
-   you're back to step 1.
+   you're back to question 1.
 4. **Is blocking a correctness problem?** Signal handler, interrupt, hard
-   deadline — then lock-free, and use an existing implementation.
-5. **Otherwise use one mutex** and move on. It's probably right more often than this chapter's existence suggests.
-
-<SectionHeading n="05" cmd="perf lock contention --sort wait_total" id="mistakes">The hot key, and size()</SectionHeading>
-
-<Sub n="5.1" title="The hot key">
-
-Striping assumes keys spread evenly. Real workloads probably have a key taking 40% of traffic, and it lives in exactly one stripe. You've built a 64-way concurrent map
-that behaves, for your actual traffic, like a map with one lock.
-
-**Symptom:** throughput doesn't improve with stripe count, and `perf lock
-contention` shows one lock dominating. Compare wait time *per stripe*, never in
-aggregate — an even total hiding a skewed distribution is the signature.
-
-**Fix:** not a better structure. If it's a counter, give each thread its own and
-sum on read. If it's a cache entry, replicate per thread and maybe accept some
-staleness. Removing the sharing is the answer, which is step 1 again.
+   deadline: then lock-free, and use an existing implementation.
+5. **Otherwise use one mutex** and move on. It's probably right more often than
+   this chapter's existence suggests.
 
 </Sub>
 
-<Sub n="5.2" title="Treating size() as a fact">
+<Sub n="7.2" title="The four designs side by side">
 
-`size()` on a striped or lock-free structure either locks everything — making
-your cheapest-looking query the most expensive call in the API — or sums
-per-stripe counters without a global lock and returns a number that was never
-simultaneously true.
-
-Java documents `ConcurrentHashMap.size()` as an estimate. Most people read it as
-a fact. Using it for a capacity decision means building on a value that can be
-wrong in either direction.
+| Design | Best for | Breaks when |
+|---|---|---|
+| **One mutex** | Genuinely almost everything; start here | Past about two threads of real contention |
+| **Lock striping** | Many threads, well-distributed keys, short critical sections: 16× here | A hot key defeats it completely, and `size()` stops being meaningful |
+| **Per-thread state** | Counters, accumulators, statistics: anything commutative | Reads become O(threads), and you see a slightly stale aggregate |
+| **Lock-free** | Signal handlers, interrupt context, hard real-time | Heavy contention (162 ns against 16 ns in chapter 14), and reclamation |
 
 </Sub>
 
-<Sub n="5.3" title="Forgetting the padding">
+<Sub n="7.3" title="What production code chose">
 
-Every shared counter wants its own cache line. Miss one and chapter 13's 55×
-penalty lands on an otherwise well-designed structure, with nothing in the code
-looking wrong.
-
-Two usual misses: a size counter sitting next to the buckets, and the head and
-tail indices of a ring buffer in one struct.
-
-</Sub>
-
-<Sub n="5.4" title="Benchmarking with uniform keys">
-
-Uniform keys make every striped structure look excellent and hide the one
-failure mode that will actually hit you. Test with a **skewed** distribution —
-Zipf, or just take your real key frequencies from a log.
+| Implementation | Design |
+|---|---|
+| Java `ConcurrentHashMap`, Java 7 | Explicit segment striping |
+| Java `ConcurrentHashMap`, Java 8 | Per-bin locking plus CAS on empty bins, and a striped counter for `size()` |
+| Rust `dashmap` | One map sharded across many locks |
+| Go `sync.Map` | Tuned for keys that are written once and read often |
+| Linux per-CPU counters, jemalloc and tcmalloc caches | Per-CPU or per-thread state, merged on read |
+| LMAX Disruptor | A padded ring buffer with preallocated slots; head and tail on separate lines |
 
 </Sub>
 
-<SectionHeading n="06" cmd="./worksheet" id="worksheet">Decide it for your case</SectionHeading>
+<SectionHeading n="08" id="summary">Summary</SectionHeading>
+
+1. **Thread-safe means each call is atomic**, not that a sequence of calls is.
+2. **Check-then-act needs one combined call**, such as `compute_if_absent`,
+   `LoadOrStore` or `entry()`.
+3. **One mutex is the right starting point**, and it turns the structure into a
+   single queue once contention is real.
+4. **Striping lets threads on different keys stop waiting for each other**, and
+   it was worth 16–22× at eight threads here.
+5. **Stripes beyond your thread count are decoration**: 64 stripes measured the
+   same as 8.
+6. **A striping benchmark needs affinity**, or it measures cache misses instead.
+7. **Every stripe and counter needs its own cache line**, 128 bytes on Apple
+   Silicon.
+8. **Not sharing beats every structure** for anything you can merge on read.
+9. **A hot key turns a striped map back into one lock**; look at wait time per
+   stripe.
+10. **`size()` on a concurrent map is an estimate**, so don't make capacity
+    decisions from it.
+
+<SectionHeading n="09" id="build">Build this</SectionHeading>
 
 **Three experiments, and between them they cover every way this goes wrong.**
 
 - Build a `std::unordered_map` behind one mutex, then the same behind N padded
-  stripes. Benchmark at 1, 2, 4, 8 threads and N of 1, 8, 64. Confirm the
+  stripes. Benchmark at 1, 2, 4 and 8 threads and N of 1, 8 and 64. Confirm the
   plateau: past your thread count, more stripes buy nothing.
-- Introduce a hot key — send 40% of operations to one key — and watch the entire
-  benefit disappear.
+- Introduce a hot key, sending 40% of operations to one key, and watch the
+  entire benefit disappear.
 - Remove the `alignas` and measure what you lose.
 
 Then run the first one again with your *real* key distribution instead of a
 uniform one. If the answer changes, you've just avoided shipping the wrong
 structure.
 
-<SectionHeading n="07" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
-
-<CardGrid>
-  <WildCard name="LMAX Disruptor" verdict="The paper is mostly about cache lines, not queues. Read it for the mechanical sympathy argument.">
-    A financial exchange hitting millions of orders per second on a single
-    thread by replacing queues with a padded ring buffer and preallocated slots.
-    Head and tail on separate lines, every shared counter padded.
-  </WildCard>
-  <WildCard name="Java ConcurrentHashMap, before and after 8" verdict="A rare chance to read two serious designs for one problem, the second explaining what it disliked about the first.">
-    Java 7 used explicit segment striping. Java 8 replaced it with per-bin
-    locking plus CAS on empty bins, and made `size()` a striped counter — the
-    exact trade in 5.2.
-  </WildCard>
-</CardGrid>
-
-<SectionHeading n="08" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+<SectionHeading n="10" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="Your map is thread-safe. Is this correct? if (!m.contains(k)) m.insert(k, v);">
 No. Each call is atomic; the pair isn't. Another thread can insert between the
 check and the insert, so you overwrite it or double-count.
 
-Every concurrent map API grows a combined method — `compute_if_absent`,
-`LoadOrStore`, `entry()` — and those exist specifically to make check-then-act a
+Every concurrent map API grows a combined method (`compute_if_absent`,
+`LoadOrStore`, `entry()`), and those exist specifically to make check-then-act a
 single atomic operation.
 </QA>
 
@@ -307,13 +474,14 @@ reintroduce false sharing and lose most of the gain.
 
 <QA level="intermediate" q="You go from 8 stripes to 64 and nothing improves. Why?">
 You have eight threads. Once each can hold its own lock, more locks add no
-parallelism — only memory and cache pressure. Stripe count should track thread count, not table size.
+parallelism, only memory and cache pressure. Stripe count should track thread
+count, not table size.
 </QA>
 
 <QA level="deep" q="Why is size() on a concurrent map problematic?">
 Two bad options. Lock every stripe and it becomes the most expensive call in the
 API while blocking all writers. Or sum per-stripe counters without a global lock
-and return a number that was never simultaneously true — stripes are read at
+and return a number that was never simultaneously true: stripes are read at
 different instants and mutate in between.
 
 Java documents `ConcurrentHashMap.size()` as an estimate for exactly this reason.
@@ -326,14 +494,14 @@ Key distribution. The benchmark used uniform keys; production has a hot key
 taking a large share, and it hashes to one stripe. A 64-way map behaves like a
 1-way map for that traffic.
 
-Confirm by comparing lock wait *per stripe* instead of in aggregate — an even
+Confirm by comparing lock wait *per stripe* instead of in aggregate; an even
 total with a skewed distribution is the signature. The fix isn't a better
 structure: if it's a counter, give each thread its own and sum on read; if it's
 a cache entry, replicate and accept staleness. Removing the sharing beats every
 algorithm here.
 </QA>
 
-<SectionHeading n="09" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="11" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
   <Q q="You have 8 threads. How many stripes?">
@@ -342,7 +510,7 @@ algorithm here.
   </Q>
   <Q q="Why must each stripe be alignas(128) on Apple Silicon?">
     Otherwise several stripes share a cache line and their mutexes invalidate
-    each other — chapter 13's false sharing. 128 because that's the M-series
+    each other: chapter 13's false sharing. 128 because that's the M-series
     line size; 64 isn't enough there.
   </Q>
   <Q q="A striping benchmark shows more stripes are slower. What's wrong with it?">
@@ -355,13 +523,17 @@ algorithm here.
 </Quiz>
 
 <CardGrid>
-  <WildCard name="LMAX Disruptor technical paper">
-    Martin Thompson and colleagues on mechanical sympathy. Mostly about cache
-    lines, and better for it.
+  <WildCard name="LMAX Disruptor technical paper" verdict="The paper is mostly about cache lines, not queues. Read it for the mechanical sympathy argument.">
+    Martin Thompson and colleagues. A financial exchange hitting millions of
+    orders per second on a single thread by replacing queues with a padded ring
+    buffer and preallocated slots. Head and tail on separate lines, every shared
+    counter padded.
   </WildCard>
-  <WildCard name="Doug Lea — ConcurrentHashMap source">
-    The Java 8 rewrite, heavily commented by its author. Per-bin locking and the
-    striped counter are both explained in the code.
+  <WildCard name="Java ConcurrentHashMap, before and after 8" verdict="A rare chance to read two serious designs for one problem, the second explaining what it disliked about the first.">
+    Java 7 used explicit segment striping. Java 8 replaced it with per-bin
+    locking plus CAS on empty bins, and made `size()` a striped counter, the
+    exact trade in 6.2. Doug Lea's Java 8 source is heavily commented by its
+    author.
   </WildCard>
   <WildCard name="Herlihy & Shavit — chapters 9 and 13">
     Linked lists with fine-grained, optimistic and lazy locking, then concurrent
@@ -370,5 +542,26 @@ algorithm here.
   <WildCard name="ThreadSanitizer">
     Finds the race you didn't think about, including composed-operation ones a
     type system will happily accept.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="12" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Memory Hierarchy & Cache Coherence">
+    Cache lines and how cores pass them between each other: why padding matters
+    and why extra stripes stop helping. [Chapter 02](/topics/02-memory-hierarchy).
+  </WildCard>
+  <WildCard name="Locking Primitives, End to End">
+    What a mutex costs uncontended and contended, and the 55× false-sharing
+    measurement. [Chapter 13](/topics/13-locks).
+  </WildCard>
+  <WildCard name="Lock-Free & Wait-Free Programming">
+    CAS, reclamation, and why lock-free lost to a mutex at eight threads.
+    [Chapter 14](/topics/14-lock-free).
+  </WildCard>
+  <WildCard name="Contention, Queueing & Tail Latency">
+    The queueing arithmetic that makes one hot lock a bottleneck.
+    [Chapter 16](/topics/16-contention-tail-latency).
   </WildCard>
 </CardGrid>

@@ -1,20 +1,40 @@
 ---
 title: Virtual Memory & Page Tables
-dek: "Every address your program uses is fake. Translating it costs a cache of its own, and running out of that cache is a performance cliff nobody profiles for."
-readingTime: "~23 min"
+dek: "Every address your program uses is virtual, and the hardware translates each one before it can touch RAM. You'll learn how that translation works, why allocation is lazy, what a page fault costs, and why running out of translation cache is a performance cliff nobody profiles for."
+readingTime: "~26 min"
+level: "Intermediate"
 versions: "Measured on Apple M4 · 16 KB base pages · macOS 26.5.1"
-prereqs: "Chapter 02"
-updated: "2026-09-19"
+prereqs: "CPU caches, pointers"
+updated: "2026-09-26"
 ---
 
-Start with a computer that has no virtual memory, because for a long time
-that's how computers were built, and its problems are the reason everything in
-this chapter exists.
+You meet virtual memory long before you learn its name. A process shows 40 GB
+of virtual memory on a 16 GB machine. A container gets killed while its heap
+looks half empty. Redis snapshots a 50 GB dataset by calling `fork()`, and the
+machine doesn't run out of RAM.
+
+None of those is a bug. Each one follows from a single idea: the addresses your
+program uses aren't the addresses the RAM sees, and the kernel decides, page by
+page, what's behind each one.
+
+This chapter builds that idea from a machine without it, then follows one
+memory access through the translation hardware, one page fault through the
+kernel, and one `fork()` through copy-on-write. It ends with what a fault
+costs, where translation stops being free, and how to watch it in production.
+
+<SectionHeading n="01" id="why-virtual-memory">Why addresses need translating</SectionHeading>
+
+Start with a computer that has no virtual memory. For a long time that's how
+computers were built, and its problems are the reason everything in this
+chapter exists.
+
+<Sub n="1.1" title="A machine without translation">
 
 On that machine an address is just a position in the RAM chips. Address
-`0x1000` is byte 4,096 of physical memory, whoever asks for it. With one
-program running, that's fine. Try to run two and three problems show up almost
-at once:
+`0x1000` is byte 4,096 of physical memory, whoever asks for it.
+
+With one program running, that's fine. Try to run two and three problems show
+up almost at once:
 
 - **They collide.** Both programs were compiled to expect their code and data
   at particular addresses, and two programs can't both own `0x1000`.
@@ -23,82 +43,78 @@ at once:
 - **Memory has to be contiguous and real.** A program needs one unbroken block
   of free RAM as big as it might ever use, even if most of it sits idle.
 
-Virtual memory fixes all three with one idea: put a translation step between
-the address a program uses and the address the RAM sees. Your program says
-`0x1000`, and the hardware looks up where the kernel has put *this process's*
-`0x1000`. Another process's `0x1000` goes somewhere else. The addresses a
-program sees are **virtual**; the ones the RAM sees are **physical**.
+</Sub>
 
-Translating every byte separately would need a table as big as memory, so the
+<Sub n="1.2" title="One idea: translate in pages">
+
+Virtual memory fixes all three with one idea. Put a translation step between
+the address a program uses and the address the RAM sees.
+
+Your program says `0x1000`, and the hardware looks up where the kernel has put
+*this process's* `0x1000`. Another process's `0x1000` goes somewhere else. The
+addresses a program sees are **virtual**; the ones the RAM sees are
+**physical**.
+
+<Why>Why translate in pages, not bytes?</Why>
+
+Translating every byte separately would need a table as big as memory. So the
 hardware translates in fixed-size chunks called **pages**, 4 KB on most x86-64
-Linux machines. An address splits into two parts: which page, and where inside
-it. With 4 KB pages the low 12 bits are the offset, so virtual address
-`0x3A7C` is page `0x3`, offset `0xA7C`. If this process's **page table** says
-page 3 lives in physical frame `0x51`, the load goes to `0x51A7C`. The offset
-never changes; only the page number is swapped.
+Linux machines.
 
-Why does that fix collisions and protection? Because each process gets its own
-table and can only reach the frames listed in it. It fixes the contiguity problem
-too: consecutive virtual pages can sit in frames scattered all over RAM.
+An address splits into two parts: which page, and where inside it. With 4 KB
+pages the low 12 bits are the offset, so virtual address `0x3A7C` is page
+`0x3`, offset `0xA7C`.
 
-It creates a new problem, though. Where does the page table live? In memory,
-so every load would need another load first to find out where to go. Processors avoid that
-with a small cache of recent translations, the **TLB**. A quick question before
-going on: if a process touches 1 GB of memory at random, how many different
-translations does it need? With 4 KB pages it's 262,144, and no TLB holds
-anywhere near that many. That arithmetic is behind most of the performance
-story in section 5.
+If this process's **page table** says page 3 lives in physical frame `0x51`,
+the load goes to `0x51A7C`. The offset never changes; only the page number is
+swapped.
 
-One more consequence falls out for free. If a page has no entry in the table,
-the hardware can't translate the address, so it stops and hands control to the
-kernel. That's a **page fault**, and it's how allocation can be lazy. The
-kernel records that you reserved the memory and only finds a physical frame the
-first time you touch each page. That's why `malloc` of a gigabyte can return
-instantly on a machine with 8 GB free, and why the bill arrives later, one
-fault at a time. On this machine each of those faults costs about **570
-nanoseconds**, measured in section 5.1.
+| Problem | How per-process page tables fix it |
+|---|---|
+| Collisions | Each process has its own table, so two processes' `0x1000` map to different frames |
+| No protection | A process can only reach the frames listed in its own table |
+| Contiguous RAM | Consecutive virtual pages can sit in frames scattered all over RAM |
 
-With that model, some behaviour that looks broken turns out to be normal. A
-process with 40 GB of virtual memory on a 16 GB machine has *reserved*
-addresses, not used RAM. A container's memory limit counts pages that really
-have frames behind them, so it can be killed while the heap looks half
-empty. And Redis can snapshot a 50 GB dataset by calling `fork()`, because
-the child gets a copy of the page tables pointing at the same frames, and a
-page is only duplicated when one side writes to it.
+</Sub>
 
-The rest of the chapter makes each of those pieces precise: what the contract
-is, how the tables are laid out, what happens on every access, where it goes
-wrong, what it costs and how to watch it in production.
-
-<SectionHeading n="01" cmd="cat /proc/self/maps" id="contract">The three things you're buying</SectionHeading>
+<Sub n="1.3" title="What the contract gives you">
 
 So the contract comes down to three things, and most people only notice the
 first.
 
-- **A private address space.** Your pointers mean nothing in another process.
-- **More address space than RAM.** Allocation reserves addresses; physical
-  pages arrive later, or never.
-- **Protection and sharing.** Per-page permissions, and one physical page
-  mappable into many address spaces at different addresses.
+| You get | What it means in practice |
+|---|---|
+| **A private address space** | Your pointers mean nothing in another process |
+| **More address space than RAM** | Allocation reserves addresses; physical pages arrive later, or never |
+| **Protection and sharing** | Per-page permissions, and one physical page mappable into many address spaces at different addresses |
 
 What it doesn't sell you is free translation. Every load and store needs a
-virtual-to-physical lookup, and section 5 measures what happens when those
+virtual-to-physical lookup, and section 6 measures what happens when those
 lookups stop hitting their cache.
 
-<Callout label="The size that is probably not what you think">
-Page size is 4 KB on x86-64 Linux and **16 KB on Apple Silicon**. That changes
-the arithmetic for TLB reach, for internal fragmentation, and for how many
-pages your allocation actually touches. Query it — `getconf PAGE_SIZE` — instead of
-assuming.
+<Callout label="Common mistake" kind="warn">
+Assuming the page size. It's 4 KB on x86-64 Linux and **16 KB on Apple
+Silicon**. That changes the arithmetic for TLB reach, for internal
+fragmentation, and for how many pages your allocation actually touches. Query
+it with `getconf PAGE_SIZE`.
 </Callout>
 
-<SectionHeading n="02" cmd="getconf PAGE_SIZE" id="layout">A tree, and the cache in front of it</SectionHeading>
+</Sub>
+
+<SectionHeading n="02" id="page-tables">Page tables and the TLB</SectionHeading>
+
+Translation needs a table per process, and the table has to live somewhere.
+This section covers its shape, and the cache that keeps it off the critical
+path.
 
 <Sub n="2.1" title="A page table is a tree">
 
-Mapping every address individually would need a table bigger than memory. So
-the address is split into fields that index successive levels of a radix tree,
-and only populated branches exist.
+<Why>Why not one flat array per process?</Why>
+
+Mapping every address individually would need a table bigger than memory, and
+most of a 64-bit address space is never used. So the address is split into
+fields that index successive levels of a radix tree, and only populated
+branches exist.
 
 <Figure caption="Four levels on x86-64. An unmapped region costs nothing because its branch is simply absent. That's how a process reserves terabytes and consumes kilobytes.">
 <Tree
@@ -118,17 +134,19 @@ and only populated branches exist.
 />
 </Figure>
 
-A miss in the translation cache means walking that tree: four dependent memory
-accesses, each of which can itself miss cache. That's the cost section 5
-isolates.
+Finding one translation means walking that tree from the top: four dependent
+memory accesses, each of which can itself miss cache.
 
 </Sub>
 
 <Sub n="2.2" title="The TLB, and the word 'reach'">
 
-Walking the tree on every access would be unusable, so translations are cached
-in the **TLB**. The number that matters is **reach** — entries × page size —
-because that's how much memory you can touch before translations start missing.
+The tree lives in memory. So every load would need several more loads first,
+just to find out where to go.
+
+Processors avoid that with a small cache of recent translations, the **TLB**.
+The number that matters is **reach**: entries × page size. That's how much
+memory you can touch before translations start missing.
 
 <Compare
   cols={["Configuration", "Entries (typical)", "Reach"]}
@@ -139,40 +157,113 @@ because that's how much memory you can touch before translations start missing.
   ]}
 />
 
-Look at rows one and two. Same TLB, same silicon, 500× the reach, purely
-from page size. That's the entire argument for huge pages, and it's why
-databases and JVMs go out of their way to get them.
+Look at rows one and two. Same TLB, same silicon, 500× the reach, purely from
+page size.
+
+<Why>How many translations does 1 GB need?</Why>
+
+If a process touches 1 GB of memory at random with 4 KB pages, it needs
+262,144 different translations. No TLB holds anywhere near that many, so most
+of those accesses will walk the tree. That arithmetic is behind most of the
+performance story in sections 5 and 6.
+
+<Callout label="Design implication">
+Page size is the biggest lever on translation cost. That's the entire argument
+for huge pages, and it's why databases and JVMs go out of their way to get
+them for large, randomly accessed heaps.
+</Callout>
 
 </Sub>
 
-<SectionHeading n="03" cmd="perf stat -e dTLB-load-misses ./app" id="hot-path">Translating every single access</SectionHeading>
+<Sub n="2.3" title="Page-table isolation and every syscall">
+
+The kernel lives in a process's page tables too. The 2018 Meltdown mitigation,
+**KPTI**, unmapped most kernel pages from the user page table, so every syscall
+now switches page tables and flushes translations.
+
+That made virtual memory bookkeeping visible in ordinary application latency.
+If a 2017 syscall benchmark won't reproduce on a current kernel, page-table
+isolation is a likely reason.
+
+</Sub>
+
+<SectionHeading n="03" id="translation">One memory access, step by step</SectionHeading>
+
+Every load and store your program makes goes through the same path. Most of
+the time it ends in the first step or two.
 
 <Sub n="3.1" title="From pointer to byte">
 
-<Flow
-  wrap={3}
+<Steps
+  title="One load, from a virtual address to a byte"
+  lanes={[
+    { t: "Your code", s: "load through a pointer", icon: "◉" },
+    { t: "TLB", s: "recent translations", icon: "▦" },
+    { t: "Page walk", s: "PGD → PUD → PMD → PTE", icon: "⇣" },
+    { t: "Caches + RAM", s: "the data itself", icon: "≡" },
+    { t: "Kernel", s: "page fault handler", icon: "⚡" },
+  ]}
   steps={[
-    { label: "virtual address", sub: "what your pointer holds" },
-    { label: "TLB lookup", sub: "hit → physical address, ~free", accent: true },
-    { label: "cache access", sub: "chapter 02 takes over" },
-    { label: "TLB miss", sub: "walk the page table" },
-    { label: "4 dependent loads", sub: "each may miss cache itself" },
-    { label: "page not present", sub: "→ trap to the kernel" },
+    [0, "Your code loads through a pointer. The pointer holds a **virtual address**: page number in the high bits, offset in the low 12 (with 4 KB pages)."],
+    [1, "The CPU looks the page number up in the **TLB**. On a hit it has the physical frame almost for free, and the load goes straight on."],
+    [2, "On a **miss**, the hardware walks the page table: **four dependent loads** on x86-64, one per level, and each can miss cache itself."],
+    [2, "The last level, the **PTE**, gives the physical frame. The translation goes into the TLB so the next access to this page hits."],
+    [3, "Frame number plus the unchanged offset is the physical address. From here it's an ordinary cache access, the subject of chapter 02."],
+    [4, "If the walk finds no entry, the hardware can't translate. It stops and hands control to the kernel: a **page fault**."],
   ]}
 />
+
+Two things in that walk matter for the rest of the chapter. A TLB hit makes
+translation nearly free, and a miss costs a chain of dependent loads that no
+cache-miss counter labels as translation.
 
 </Sub>
 
 <Sub n="3.2" title="Lazy allocation, and why malloc is a liar">
 
-`malloc(1_000_000_000)` usually succeeds instantly on a machine with 8 GB of
-RAM. Nothing was allocated. The kernel recorded that a range of addresses is
-valid and returned.
+The last step is where allocation gets lazy. If a page has no entry, the kernel
+gets control, so it doesn't have to find a frame until you touch the page.
 
-Physical pages arrive on **first touch**. Your first write to each page traps
-into the kernel, which finds a free frame, zeroes it, installs a page table
-entry, and returns to re-execute your instruction. That's a **minor fault** —
-no disk involved — and section 5 measures it.
+<Predict
+  q="On a machine with 8 GB of RAM, you call malloc(1_000_000_000) and never touch the memory. What happens?"
+  options={[
+    "malloc fails: not enough free RAM",
+    "It succeeds instantly, and resident memory barely moves",
+    "It succeeds after the kernel zeroes 1 GB",
+    "It succeeds, and RSS grows by 1 GB straight away",
+  ]}
+  answer={1}
+>
+Nothing was allocated. The kernel recorded that a range of addresses is valid
+and returned. Physical frames arrive on **first touch**, one page at a time,
+so RSS only grows as your code writes to the pages.
+</Predict>
+
+Here's what happens when you do touch one of those pages:
+
+<Steps
+  title="First touch of a lazily allocated page"
+  lanes={[
+    { t: "Your code", s: "malloc, then a write", icon: "◉" },
+    { t: "Kernel's record", s: "valid address ranges", icon: "▤" },
+    { t: "MMU", s: "TLB + page walk", icon: "⇅" },
+    { t: "Fault handler", s: "find and zero a frame", icon: "⚡" },
+    { t: "Page table", s: "the new PTE", icon: "▦" },
+  ]}
+  steps={[
+    [0, "`malloc(1_000_000_000)` asks for a large block. Past its size threshold the allocator asks the kernel for address space with `mmap`."],
+    [1, "The kernel records that the range is valid and returns. **No physical memory is allocated**, which is why the call returns instantly."],
+    [0, "Later, your code writes to one of those pages for the first time."],
+    [2, "The TLB misses and the page walk finds **no entry**. The hardware traps into the kernel."],
+    [3, "The fault handler finds a free frame and **zeroes** it. On a 16 KB page, zeroing alone is a meaningful share of the cost."],
+    [4, "It installs a PTE pointing at the frame and returns. Your instruction re-executes and succeeds. That was a **minor fault**: about 570 ns on the M4."],
+  ]}
+/>
+
+<Why>Why zero the page first?</Why>
+
+Because the frame last belonged to someone else. Handing it over with another
+process's data in it would undo the protection from section 1.
 
 Two consequences people meet in production:
 
@@ -182,54 +273,157 @@ Two consequences people meet in production:
   back. When touches eventually exceed physical memory, the OOM killer decides
   who dies, and it decides late.
 
+<Callout label="Design implication">
+A process with 40 GB of virtual memory on a 16 GB machine has *reserved*
+addresses, not used RAM. A container's memory limit counts pages that really
+have frames behind them, so it can be killed while the heap looks half empty.
+Watch resident memory, not virtual size.
+</Callout>
+
 </Sub>
 
-<SectionHeading n="04" cmd="grep -i huge /proc/meminfo" id="failure">Running out of TLB reach</SectionHeading>
+<Sub n="3.3" title="Minor and major faults">
 
-<Sub n="4.1" title="TLB thrashing">
+Not every fault is the same size. The first distinction to make is whether the
+kernel had to go to disk.
+
+| Fault | What the kernel does | Cost |
+|---|---|---|
+| **Minor** | Finds a free frame, zeroes it and installs a mapping, or maps a page already in the page cache | About 570 ns on the M4 (section 6.1) |
+| **Major** | Reads the page from disk | Tens of microseconds or more |
+
+Minor faults are normal. A high major fault rate means you're swapping, and
+nothing else you measure will make sense until it stops.
+
+</Sub>
+
+<SectionHeading n="04" id="fork-cow">Sharing pages: fork and copy-on-write</SectionHeading>
+
+Per-page mappings let two address spaces point at the same physical frame.
+`fork()` uses that to copy a process without copying its memory.
+
+<Sub n="4.1" title="How Redis snapshots 50 GB">
+
+Redis writes a snapshot by forking. The child writes the dataset to disk while
+the parent keeps serving requests. Step through it:
+
+<StepSequence
+  title="fork() and copy-on-write during a Redis snapshot"
+  actors={["Redis parent", "Kernel", "Child"]}
+  messages={[
+    { from: 0, to: 1, label: "fork()", note: "Redis forks to write a snapshot. The child gets **a copy of the page tables**, pointing at the same frames. No data is copied." },
+    { from: 1, to: 2, label: "child runs", note: "The child sees the whole dataset at once, even at 50 GB, because nothing was duplicated." },
+    { from: 2, to: 1, label: "reads", note: "The child reads every page to write the snapshot. Reading a shared frame costs nothing extra." },
+    { from: 0, to: 1, label: "write → fault", note: "The parent keeps serving writes. Its first write to a shared page traps into the kernel." },
+    { from: 1, to: 0, label: "private copy", note: "The kernel copies that one page for the parent, and the write goes ahead. **A page is only duplicated when one side writes to it.**" },
+  ]}
+/>
+
+<Why>So what does a snapshot cost in memory?</Why>
+
+One page per page the parent writes while the child is running. A mostly-read
+workload barely grows. A write-heavy one can approach a second copy of the
+dataset, and those copies show up as RSS climbing during code that's only
+serving requests.
+
+</Sub>
+
+<Sub n="4.2" title="Copy-on-write with huge pages">
+
+The copy is one page, so page size sets the bill. Before Linux 5.8, the first
+write to a huge page shared after `fork()` copied all 2 MB: 512× the memory
+traffic of a 4 KB page for the same logical write.
+
+For Redis that turned a cheap snapshot into a memory spike and a latency cliff,
+and "disable THP" went into every guide. Kirill Shutemov's
+[commit 3917c80280c9](https://github.com/torvalds/linux/commit/3917c80280c93a7123f1a3a6dcdb10a3ea19737d)
+changed that: the kernel now splits the mapping and copies 4 KB, and the commit
+message names Redis as the workload it was for.
+
+What's left is the split itself, and losing the huge page in that range until
+khugepaged rebuilds it.
+
+</Sub>
+
+<SectionHeading n="05" id="failure">When translation gets expensive</SectionHeading>
+
+Each piece so far has a failure mode. They share a trait: none of them shows up
+where you'd first look.
+
+<Sub n="5.1" title="TLB thrashing">
 
 A working set that fits in cache but exceeds TLB reach performs terribly for a
-reason no cache-miss counter explains. Random access over a few hundred
-megabytes is the usual shape: the data may be in L2, and every access still
-pays a page walk.
+reason no cache-miss counter explains.
 
-Symptom: `dTLB-load-misses` high while `cache-misses` looks reasonable. Fix
-with huge pages, or by making the access pattern sequential so one translation
-serves many accesses.
+Random access over a few hundred megabytes is the usual shape. The data may be
+in L2, and every access still pays a page walk.
+
+<Predict
+  q="Your working set is 200 MB, fits in L3, and random access is still slow. With 4 KB pages, which counter do you expect to be high?"
+  options={[
+    "cache-misses",
+    "dTLB-load-misses",
+    "major page faults",
+    "context-switches",
+  ]}
+  answer={1}
+>
+Two hundred megabytes is roughly 50,000 pages at 4 KB, far past any TLB's entry
+count. A random pattern pays a page walk almost every time even though the data
+itself is cached. Cache-miss counters look fine, and the code looks fine.
+</Predict>
+
+The symptom is `dTLB-load-misses` high while `cache-misses` looks reasonable.
+Fix it with huge pages, or by making the access pattern sequential so one
+translation serves many accesses.
 
 </Sub>
 
-<Sub n="4.2" title="Huge pages, and their cost">
+<Sub n="5.2" title="Huge pages, and their cost">
 
-Transparent huge pages promote 2 MB regions automatically. Reach improves
+Transparent huge pages (THP) promote 2 MB regions automatically. Reach improves
 enormously. Two costs come with it:
 
-- **Fragmentation and stalls.** Finding a contiguous 2 MB physical region can
-  require compaction, and that can stall the faulting thread for milliseconds.
-- **Copy-on-write used to get 512× more expensive.** Before Linux 5.8, the
-  first write to a huge page shared after `fork()` copied all 2 MB. Kirill
-  Shutemov's [commit 3917c80280c9](https://github.com/torvalds/linux/commit/3917c80280c93a7123f1a3a6dcdb10a3ea19737d)
-  changed that: the kernel now splits the mapping and copies 4 KB, and the
-  commit message names Redis as the workload it was for. What's left is the
-  split itself, and losing the huge page in that range until khugepaged
-  rebuilds it.
+| Cost | What happens | Still true? |
+|---|---|---|
+| **Compaction stalls** | Finding a contiguous 2 MB physical region can require compaction, which can stall the faulting thread for milliseconds | Yes |
+| **COW after fork** | The first write to a shared huge page copied 2 MB | Fixed in Linux 5.8 (section 4.2) |
+| **RSS bloat on sparse data** | A sparse heap touching one byte per huge page holds 2 MB for each | Yes |
 
-Plenty of database guides still say to disable THP, and some of their reasons
-outlived the kernel that justified them. [The optimisation every database tells
-you to turn off](/blog/transparent-huge-pages) goes through which ones still hold.
-
-</Sub>
-
-<Sub n="4.3" title="Fragmentation you cannot see">
-
-A 16 KB page holding one live 32-byte object is 16 KB of resident memory. A
-long-running process with a scattered live set can hold far more RSS than the
-sum of its live allocations, and no allocator statistic will show it, because
-the allocator's own accounting is correct.
+<Callout label="Common mistake" kind="warn">
+Following "disable THP" without checking why. Plenty of database guides still
+say it, and some of their reasons outlived the kernel that justified them.
+[The optimisation every database tells you to turn off](/blog/transparent-huge-pages)
+goes through which ones still hold.
+</Callout>
 
 </Sub>
 
-<SectionHeading n="05" cmd="/usr/bin/time -v ./app" id="cost">What a page fault costs</SectionHeading>
+<Sub n="5.3" title="Fragmentation you cannot see">
+
+A 16 KB page holding one live 32-byte object is 16 KB of resident memory.
+
+A long-running process with a scattered live set can hold far more RSS than the
+sum of its live allocations. No allocator statistic will show it, because the
+allocator's own accounting is correct. Chapter 05 covers the allocator side of
+this.
+
+</Sub>
+
+<Sub n="5.4" title="What you give up">
+
+Every benefit in this chapter has a bill, and each arrives somewhere different.
+
+| You get | You pay | When the bill arrives |
+|---|---|---|
+| A private, contiguous-looking address space | A translation on every access | As TLB misses nobody profiles for |
+| Allocate now, commit later | RSS grows while your code appears idle | When the OOM killer arrives, late |
+| Huge pages, 500× the reach | Compaction stalls, RSS bloat on sparse data | The first fault that has to compact memory |
+| Per-page protection and sharing | Page-granular internal fragmentation | As RSS far above your live set |
+
+</Sub>
+
+<SectionHeading n="06" id="cost">What a page fault costs</SectionHeading>
 
 <Callout label="The machine" kind="note">
 Apple M4, macOS 26.5.1, clang 21 `-O2`, 16 KB pages. TLB numbers come from a
@@ -237,7 +431,7 @@ dependent pointer chase touching exactly one line per page, so translation is
 on the critical path.
 </Callout>
 
-<Sub n="5.1" title="A minor page fault">
+<Sub n="6.1" title="A minor page fault">
 
 <Cost items={[
   { what: "First touch of a fresh anonymous page", value: "686 ns", source: "20,000 pages, mmap MAP_ANON, one write each" },
@@ -245,17 +439,22 @@ on the critical path.
   { what: "Incremental cost of the fault itself", value: "≈ 570 ns", source: "difference of the two rows" },
 ]} />
 
-Be careful reading the second row. 116 ns for a "resident write" is high
-because the loop strides 16 KB, so every access is a cache miss and probably a
-TLB miss too. Subtracting it gives roughly 570 ns for the kernel's fault
-handling — trap, find a frame, zero 16 KB, install a PTE, return. Zeroing alone
-is a meaningful share of that.
+<Why>Why is a resident write 116 ns?</Why>
+
+Be careful reading the second row. It's high because the loop strides 16 KB,
+so every access is a cache miss and probably a TLB miss too.
+
+Subtracting it gives roughly 570 ns for the kernel's fault handling: trap, find
+a frame, zero 16 KB, install a PTE, return. Zeroing alone is a meaningful share
+of that.
 
 </Sub>
 
-<Sub n="5.2" title="Running out of TLB">
+<Sub n="6.2" title="Running out of TLB">
 
-<Figure caption="One dependent access per page, so each one needs its own translation. The curve is flat while translations are cached and climbs once they are not — the same shape as chapter 02's cache curve, one level of indirection up.">
+One dependent access per page, so each one needs its own translation:
+
+<Figure caption="The curve is flat while translations are cached and climbs once they are not. It's the same shape as chapter 02's cache curve, one level of indirection up.">
 <Plot
   xLabel="pages touched (16 KB each)"
   yLabel="ns per access"
@@ -279,22 +478,23 @@ is a meaningful share of that.
 />
 
 **Honest caveat:** these numbers confound TLB and cache. At 1,024 pages the
-span is 16 MB, roughly where chapter 02's curve also leaves L2. Both
-effects arrive together on this machine and I can't cleanly separate them
-without hardware counters macOS doesn't readily expose. On Linux,
-`perf stat -e dTLB-load-misses` separates them in one command.
+span is 16 MB, roughly where chapter 02's curve also leaves L2. Both effects
+arrive together on this machine, and I can't cleanly separate them without
+hardware counters macOS doesn't readily expose.
+
+On Linux, `perf stat -e dTLB-load-misses` separates them in one command.
 
 </Sub>
 
-<SectionHeading n="06" cmd="cat /proc/$PID/smaps_rollup" id="operating">Seeing translation pressure</SectionHeading>
+<SectionHeading n="07" id="operating">Seeing translation pressure</SectionHeading>
 
-<Sub n="6.1" title="What to look at">
+<Sub n="7.1" title="What to look at">
 
 ```shell
 # Is it translation or data?
 perf stat -e dTLB-load-misses,dtlb_load_misses.walk_active,page-faults ./app
 
-# Minor versus major faults — major means disk
+# Minor versus major faults. Major means disk
 /usr/bin/time -v ./app | grep -i fault
 
 # What's actually mapped, and how much is resident
@@ -306,28 +506,57 @@ cat /sys/kernel/mm/transparent_hugepage/enabled
 grep -i huge /proc/meminfo
 ```
 
-**Minor versus major faults is the first distinction to make.** Minor faults
-are the ~570 ns above and are normal. Major faults touch disk and cost tens of
-microseconds or more; a high major fault rate means you're swapping and nothing
-else you measure will make sense.
-
 </Sub>
 
-<Sub n="6.2" title="Reducing translation pressure">
+<Sub n="7.2" title="Reducing translation pressure">
 
 1. **Shrink the working set.** Same advice as chapter 02, and it helps twice
-   here — fewer pages means fewer translations.
+   here: fewer pages means fewer translations.
 2. **Make access sequential.** One translation then serves many accesses within
    the page.
-3. **Consider huge pages** for large, long-lived, randomly accessed regions —
-   a database buffer pool is the textbook case. Check whether you `fork()`
-   first.
+3. **Consider huge pages** for large, long-lived, randomly accessed regions. A
+   database buffer pool is the textbook case. Check whether you `fork()` first.
 4. **Pre-fault if latency matters.** `MAP_POPULATE` or a warm-up pass moves the
    fault cost off the critical path.
 
 </Sub>
 
-<SectionHeading n="07" cmd="git init ./weekend-project" id="build">Build this</SectionHeading>
+<Sub n="7.3" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `dTLB-load-misses` high, `cache-misses` fine | Working set past TLB reach | Huge pages, or sequential access |
+| RSS climbs while the code does nothing that allocates | First touch of reserved pages, or copy-on-write after `fork()` | Expected; pre-fault with `MAP_POPULATE` if latency matters |
+| Everything slow, measurements make no sense | High major fault rate: swapping | Stop the swapping first |
+| Millisecond stalls on page faults | THP compaction | Check `transparent_hugepage/enabled`; use `madvise` for chosen regions |
+| Memory spike during a fork-based snapshot | Huge-page COW on a kernel before 5.8 | Upgrade, or disable THP for that process |
+| RSS far above the live set | Page-granular fragmentation | Chapter 05's mitigations |
+
+</Sub>
+
+<SectionHeading n="08" id="summary">Summary</SectionHeading>
+
+1. **Every address your program uses is virtual.** Hardware translates it, page
+   by page, through a table the kernel keeps for each process.
+2. **Translation fixes collisions, protection and contiguity** with one
+   mechanism: each process can only reach the frames in its own table.
+3. **Page tables are trees.** Absent branches cost nothing, so a process can
+   reserve terabytes and consume kilobytes.
+4. **The TLB makes translation nearly free, until it misses.** Reach is entries
+   × page size; 2 MB pages give the same TLB 500× the reach of 4 KB ones.
+5. **Allocation is lazy.** `malloc` reserves addresses; frames arrive on first
+   touch, one minor fault at a time, about 570 ns each on the M4.
+6. **Major faults mean disk.** A high major fault rate means swapping, and
+   nothing else you measure will make sense.
+7. **`fork()` copies page tables, not pages.** A page is duplicated only when
+   one side writes to it.
+8. **Huge-page COW copied 2 MB before Linux 5.8.** Since then it splits and
+   copies 4 KB, so check which reasons for "disable THP" still apply.
+9. **TLB thrashing hides from cache counters.** Look at `dTLB-load-misses`, not
+   just `cache-misses`.
+10. **Page size isn't always 4 KB.** Apple Silicon uses 16 KB; query it.
+
+<SectionHeading n="09" id="build">Build this</SectionHeading>
 
 **Find your machine's TLB reach.**
 
@@ -335,43 +564,14 @@ else you measure will make sense.
   random page order so each translation is on the critical path.
 - Sweep from 4 pages to 16,384 and plot ns per access.
 - On Linux, run it under `perf stat -e dTLB-load-misses` so you can prove the
-  knee is translation and not cache — the thing I couldn't do cleanly on macOS.
+  knee is translation and not cache, the thing I couldn't do cleanly on macOS.
 - Then enable huge pages with `madvise(MADV_HUGEPAGE)` and rerun.
 
 The huge-page run should push the knee out by roughly the page size ratio. Watch
 the first-touch cost go up at the same time, and you'll have both halves of the
 trade in your own numbers.
 
-<SectionHeading n="08" cmd="diff --side-by-side a b" id="tradeoffs">What you give up</SectionHeading>
-
-<Compare
-  cols={["You get", "You pay", "When the bill arrives"]}
-  rows={[
-    ["A private, contiguous-looking address space", "A translation on every access", "As TLB misses nobody profiles for"],
-    ["Allocate now, commit later", "RSS grows while your code appears idle", "When the OOM killer arrives, late"],
-    ["Huge pages, 500× the reach", "Compaction stalls, RSS bloat on sparse data", "The first fault that has to compact memory"],
-    ["Per-page protection and sharing", "Page-granular internal fragmentation", "As RSS far above your live set"],
-  ]}
-/>
-
-<SectionHeading n="09" cmd="grep -ri postmortem ./" id="in-the-wild">Where you meet this in the wild</SectionHeading>
-
-<CardGrid>
-  <WildCard name="Redis and 'disable THP'" verdict="Advice that outlived the kernel behaviour that justified it.">
-    Redis forks for its snapshots, and on kernels before 5.8 a COW fault on a
-    2 MB page copied 512× what a 4 KB one does. That turned a cheap snapshot
-    into a memory spike and a latency cliff, and "disable THP" went into every
-    guide. Linux 5.8 made anonymous-THP COW split and copy 4 KB, citing Redis by
-    name. Compaction stalls and sparse-heap bloat are still real reasons.
-  </WildCard>
-  <WildCard name="Meltdown and KPTI" verdict="If a 2017 syscall benchmark won't reproduce, page-table isolation is a likely reason.">
-    The 2018 mitigation unmapped most kernel pages from the user page table, so
-    every syscall now switches page tables and flushes translations. It made
-    virtual memory bookkeeping visible in ordinary application latency.
-  </WildCard>
-</CardGrid>
-
-<SectionHeading n="10" cmd="./drill --level all" id="interview">Interview questions</SectionHeading>
+<SectionHeading n="10" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="Why does malloc of a gigabyte succeed on a machine with less free RAM?">
 Because allocation reserves addresses, not physical memory. The kernel records
@@ -381,7 +581,7 @@ climbs later, during code that isn't obviously allocating.
 </QA>
 
 <QA level="intermediate" q="What is TLB reach and why do huge pages help?">
-Reach is entries × page size — how much memory you can touch before
+Reach is entries × page size: how much memory you can touch before
 translations start missing. A TLB with 1,500 entries covers about 6 MB with
 4 KB pages and about 3 GB with 2 MB pages. Same hardware, 500× the reach.
 
@@ -391,7 +591,7 @@ access otherwise.
 </QA>
 
 <QA level="intermediate" q="Minor fault versus major fault?">
-A minor fault needs no I/O — the kernel finds a free frame, zeroes it and
+A minor fault needs no I/O. The kernel finds a free frame, zeroes it and
 installs a mapping, or maps a page already in the page cache. I measured about
 570 ns of incremental cost for one on an M4.
 
@@ -423,7 +623,7 @@ Check `dTLB-load-misses` against `dTLB-loads`. If that ratio is high, try huge
 pages, or restructure so access is sequential within a page.
 </QA>
 
-<SectionHeading n="11" cmd="cat REFERENCES.md" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="11" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
   <Q q="What is the base page size on Apple Silicon?">
@@ -446,18 +646,39 @@ pages, or restructure so access is sequential within a page.
 </Quiz>
 
 <CardGrid>
-  <WildCard name="Ulrich Drepper — What Every Programmer Should Know About Memory, part 4">
+  <WildCard name="Ulrich Drepper: What Every Programmer Should Know About Memory, part 4">
     The virtual memory sections, with the clearest page-walk diagrams available.
   </WildCard>
-  <WildCard name="Linux — Documentation/admin-guide/mm/transhuge.rst">
+  <WildCard name="Linux: Documentation/admin-guide/mm/transhuge.rst">
     How THP actually behaves, including the compaction stalls the marketing
     material omits.
   </WildCard>
-  <WildCard name="Gorman — Understanding the Linux Virtual Memory Manager">
+  <WildCard name="Gorman: Understanding the Linux Virtual Memory Manager">
     Dated in its kernel version, unmatched in depth on the data structures.
   </WildCard>
   <WildCard name="perf stat -e dTLB-load-misses">
     One command that separates translation cost from data cost. The measurement
     I could not make cleanly on macOS.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="12" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Memory Hierarchy & Cache Coherence">
+    The cache curve that sits one level below this chapter's TLB curve, and the
+    working-set advice that helps twice here. [Chapter 02](/topics/02-memory-hierarchy).
+  </WildCard>
+  <WildCard name="Allocators & Memory Management">
+    What sits between `mmap`'s pages and your `malloc` calls, and why freed
+    memory doesn't lower RSS. [Chapter 05](/topics/05-allocators).
+  </WildCard>
+  <WildCard name="Processes, Threads & Scheduling">
+    Why a switch between processes costs more than one between threads: the
+    page-table swap. [Chapter 06](/topics/06-processes-scheduling).
+  </WildCard>
+  <WildCard name="Speculative Execution, Spectre & the Mitigation Tax">
+    Meltdown, and the page-table isolation that made every syscall switch page
+    tables. [Chapter 44](/topics/44-speculative-execution).
   </WildCard>
 </CardGrid>
