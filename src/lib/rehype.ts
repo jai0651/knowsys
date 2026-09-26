@@ -9,7 +9,10 @@ import type { PluggableList } from "unified";
 const prettyCode: Options = {
   theme: { dark: "github-dark-default", light: "github-light-default" },
   keepBackground: false,
-  defaultLang: "cpp",
+  /* Blocks default to C++, the house language. Inline code is left alone:
+     highlighting `count++` in the middle of a sentence as C++ made every
+     inline span a different colour from the words around it. */
+  defaultLang: { block: "cpp" },
 };
 
 export const mdxOptions: {

@@ -16,19 +16,16 @@ export const metadata: Metadata = {
     template: "%s · KnowSys",
   },
   description:
-    "The systems underneath, from the cache line up. Operating systems, concurrency, storage engines, distributed systems and cloud infrastructure — every chapter interrogated with the same six questions.",
+    "The systems underneath, from the cache line up. Operating systems, concurrency, storage engines, distributed systems and cloud infrastructure — every chapter built from the problem it solves, with real measurements.",
 };
 
-/* Palette and mode are both set before first paint. Two attributes rather than
-   one: the palette picks the colour family, data-theme picks light or dark
-   within it, and each palette declares its own sensible default mode. */
+/* Mode is set before first paint so there's no flash. Light unless the reader
+   has chosen dark: long-form reading on paper is the default this site is
+   designed around, and the dark theme is tuned separately, not inverted. */
 const boot = `
 try {
-  var p = localStorage.getItem("ks-palette") || "aurora";
   var m = localStorage.getItem("ks-mode");
-  var d = document.documentElement;
-  d.setAttribute("data-palette", p);
-  d.setAttribute("data-theme", m || (p === "blueprint" ? "light" : "dark"));
+  document.documentElement.setAttribute("data-theme", m === "dark" ? "dark" : "light");
 } catch (e) {}
 `;
 
@@ -42,8 +39,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
        the system font. */
     <html
       lang="en"
-      data-palette="aurora"
-      data-theme="dark"
+      data-theme="light"
       className={`${inter.variable} ${mono.variable} ${serif.variable}`}
       suppressHydrationWarning
     >
@@ -51,10 +47,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <script dangerouslySetInnerHTML={{ __html: boot }} />
       </head>
       <body className="min-h-screen">
-        <div className="aurora-bg" aria-hidden />
-        <div className="grid-layer" aria-hidden />
-        <div className="rules-layer" aria-hidden />
-        <div className="grain" aria-hidden />
         {children}
       </body>
     </html>

@@ -1,242 +1,212 @@
 import Link from "next/link";
 import { ArrowRight } from "lucide-react";
 import { TopNav } from "@/components/top-nav";
-import { Terrain } from "@/components/terrain";
-import { groups, topics, labs, livePages, countOf } from "@/lib/manifest";
-import { cn } from "@/lib/utils";
+import { groups, topics, labs, livePages, pageBySlug, type Page } from "@/lib/manifest";
+import { readDoc } from "@/lib/mdx";
 import { allPosts, formatDate } from "@/lib/posts";
+import { cn } from "@/lib/utils";
 
 const DOT: Record<string, string> = {
   machine: "bg-machine", os: "bg-os", conc: "bg-conc", data: "bg-data",
   dist: "bg-dist", cloud: "bg-cloud", ops: "bg-ops", lab: "bg-lab",
 };
-const FROM: Record<string, string> = {
-  machine: "from-machine", os: "from-os", conc: "from-conc", data: "from-data",
-  dist: "from-dist", cloud: "from-cloud", ops: "from-ops", lab: "from-lab",
+const TEXT: Record<string, string> = {
+  machine: "text-machine", os: "text-os", conc: "text-conc", data: "text-data",
+  dist: "text-dist", cloud: "text-cloud", ops: "text-ops", lab: "text-lab",
 };
 
-const SHAPE_CARDS = [
-  {
-    name: "Mechanism",
-    blurb: "A system you can open up and trace one operation through.",
-    steps: "contract → layout → hot path → failure → cost → operating",
-    count: `${countOf("mechanism")} chapters`,
-  },
-  {
-    name: "Decision",
-    blurb: "Several viable options, and the measured point where one overtakes another.",
-    steps: "choice → options → crossover → choosing → mistakes",
-    count: `${countOf("decision")} chapters`,
-  },
-  {
-    name: "Model",
-    blurb: "A small piece of theory that predicts something, and its limits.",
-    steps: "question → model → origin → breaks → applying",
-    count: `${countOf("model")} chapters`,
-  },
-  {
-    name: "Phenomenon",
-    blurb: "An effect you can observe and reproduce, not a component you can open.",
-    steps: "observe → why → controls → measurements → act",
-    count: `${countOf("phenomenon")} chapters`,
-  },
+/* A path through the book for someone who doesn't know where to start: the
+   machine, then what the kernel builds on it, then what goes wrong when
+   threads share it. Each builds on the one before. */
+const START_HERE = [
+  { slug: "01-cpu-architecture", why: "Why the same work can run five times faster" },
+  { slug: "02-memory-hierarchy", why: "The 68× hiding in where your data sits" },
+  { slug: "04-virtual-memory", why: "What an address really is" },
+  { slug: "06-processes-scheduling", why: "Where the missing milliseconds go" },
+  { slug: "13-locks", why: "Why count++ loses updates, and how locks fix it" },
 ];
 
-const RULES = [
-  ["Every number is derived here or attributed.",
-   "Systems writing is full of folklore figures that were true on a 2012 spinning disk. If a latency appears, so does where it came from."],
-  ["Every code block compiles and runs in CI.",
-   "C++ by default, with the compiler, the flags and the kernel named. Shell transcripts say which machine produced them."],
-  ["The real source, quoted.",
-   "Fifteen lines of kernel/futex/core.c beat a paragraph describing it, so that's what you get — linked at a pinned tag."],
-  ["Versions are named.",
-   "Kernel 6.12 scheduling isn't kernel 5.4 scheduling, and a chapter that won't say which will be quietly wrong in two years."],
+const PROMISES = [
+  ["Built from the problem", "Every chapter starts from what breaks without the idea, then builds the fix one step at a time, the way a good lecture does."],
+  ["Measured, not remembered", "Numbers come from programs run on real hardware for the chapter, or they link to where they came from."],
+  ["The real source", "Where it matters you read the actual kernel, glibc or Redis code, pinned to a version, not a paraphrase."],
 ];
 
 export default function Home() {
   const chapterGroups = groups.filter((g) => g.slug !== "the-labs");
   const posts = allPosts().slice(0, 4);
+  const path = START_HERE.map((s) => {
+    const p = pageBySlug(s.slug)!;
+    return { ...s, page: p, time: readDoc("chapters", s.slug)?.frontmatter.readingTime };
+  });
 
   return (
     <>
       <TopNav />
-      <main className="mx-auto max-w-[1180px] px-5 pb-24 sm:px-8">
+      <main className="mx-auto max-w-[1180px] px-5 pb-28 sm:px-8">
         {/* ── hero ─────────────────────────────────────────────────────── */}
-        <section className="pt-12 sm:pt-20">
-          <div className="glass relative overflow-hidden rounded-[28px] p-8 sm:p-14">
-            {/* a soft accent bloom inside the glass, so the panel looks lit */}
-            <div
-              aria-hidden
-              className="pointer-events-none absolute -right-24 -top-32 size-[420px] rounded-full opacity-60 blur-[90px]"
-              style={{ background: "var(--glow)" }}
-            />
-            <Terrain className="pointer-events-none absolute inset-x-0 bottom-0 h-[62%] w-full opacity-[0.55]" />
-            <div className="relative">
-              <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-line bg-surface-2 px-3 py-1.5">
-                <span className="size-1.5 rounded-full bg-accent shadow-[0_0_8px_1px_var(--glow)]" />
-                <span className="tnum font-mono text-[11.5px] text-muted">
-                  {livePages.length} of {topics.length} chapters written
-                </span>
-              </div>
-
-              <h1 className="mb-6 max-w-[16ch] text-[40px] font-bold leading-[1.04] tracking-[-0.03em] text-ink sm:text-[64px]">
-                The systems underneath, from the{" "}
-                <span className="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-transparent">
-                  cache line
-                </span>{" "}
-                up
-              </h1>
-
-              <p className="mb-9 max-w-[58ch] text-[17px] leading-relaxed text-muted">
-                For engineers who already read the docs and the top three blog posts, and
-                found them shallow. Futexes through to consensus, S3 through to the page
-                cache, and the source that implements all of it.
-              </p>
-
-              <div className="flex flex-wrap gap-3">
-                <Link
-                  href="/sections"
-                  className="group inline-flex items-center gap-2 rounded-xl bg-accent px-5 py-3 text-[14.5px] font-semibold text-deep shadow-[0_8px_30px_-8px_var(--glow)] transition-all hover:bg-accent-hover hover:shadow-[0_10px_36px_-6px_var(--glow)]"
-                >
-                  Browse everything
-                  <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
-                </Link>
-                <Link
-                  href="/labs"
-                  className="glass glass-hover inline-flex items-center gap-2 rounded-xl px-5 py-3 text-[14.5px] font-medium text-ink"
-                >
-                  Open a lab
-                </Link>
-              </div>
+        <section className="grid gap-12 pb-20 pt-16 sm:pt-24 lg:grid-cols-[1.35fr_1fr] lg:gap-16">
+          <div>
+            <p className="mb-5 text-[14px] font-medium text-accent">
+              A field guide to the systems underneath your code
+            </p>
+            <h1 className="mb-7 font-[family-name:var(--font-serif)] text-[44px] font-semibold leading-[1.05] tracking-[-0.02em] text-ink sm:text-[62px]">
+              How computers really run your programs
+            </h1>
+            <p className="mb-9 max-w-[54ch] font-[family-name:var(--font-serif)] text-[19px] leading-relaxed text-muted sm:text-[20.5px]">
+              Long-form chapters on CPUs, memory, the kernel, concurrency and storage,
+              for engineers who want to understand what&rsquo;s happening underneath, not just
+              which flag to set. Each one starts from a problem, builds the idea step by
+              step, and measures it on real hardware.
+            </p>
+            <div className="flex flex-wrap items-center gap-3">
+              <Link
+                href="/topics/01-cpu-architecture"
+                className="group inline-flex items-center gap-2 rounded-lg bg-ink px-5 py-3 text-[15px] font-medium text-bg transition-opacity hover:opacity-90"
+              >
+                Start with chapter 01
+                <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
+              </Link>
+              <Link
+                href="/sections"
+                className="inline-flex items-center gap-2 rounded-lg border border-line-2 px-5 py-3 text-[15px] font-medium text-ink transition-colors hover:bg-surface"
+              >
+                Browse all chapters
+              </Link>
             </div>
+            <p className="tnum mt-6 text-[13px] text-faint">
+              {livePages.length} of {topics.length} chapters written · {allPosts().length} field notes
+            </p>
           </div>
+
+          {/* the reading path */}
+          <aside className="self-start rounded-2xl border border-line bg-surface p-6 shadow-[var(--shadow)]">
+            <div className="mb-1 text-[13px] font-semibold text-ink">New here? Start with these</div>
+            <p className="mb-5 text-[13px] leading-relaxed text-faint">
+              Five chapters, in order. Each one builds on the one before.
+            </p>
+            <ol className="space-y-1">
+              {path.map((s, i) => (
+                <li key={s.slug}>
+                  <Link
+                    href={s.page.href}
+                    className="group -mx-2 flex gap-3.5 rounded-lg px-2 py-2.5 transition-colors hover:bg-surface-2"
+                  >
+                    <span className="tnum mt-0.5 grid size-6 shrink-0 place-items-center rounded-full border border-line-2 text-[12px] font-semibold text-muted">
+                      {i + 1}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-[15px] font-medium leading-snug text-ink">
+                        {s.page.short}
+                      </span>
+                      <span className="block text-[13px] leading-snug text-faint">
+                        {s.why}
+                        {s.time && ` · ${s.time.replace(/^~/, "")}`}
+                      </span>
+                    </span>
+                  </Link>
+                </li>
+              ))}
+            </ol>
+          </aside>
         </section>
 
         {/* ── field notes ──────────────────────────────────────────────── */}
         {posts.length > 0 && (
-          <section className="pt-20">
-            <div className="mb-3 text-[10.5px] font-semibold uppercase tracking-[0.15em] text-accent">
-              Field notes
-            </div>
-            <div className="mb-10 flex flex-wrap items-end justify-between gap-4">
-              <h2 className="max-w-[24ch] text-[28px] font-bold leading-tight tracking-[-0.02em] text-ink sm:text-[36px]">
-                Real outages, told start to finish
-              </h2>
-              <Link href="/blog" className="inline-flex items-center gap-1 text-[14px] font-medium text-accent">
-                All of them <ArrowRight className="size-4" />
+          <section className="border-t border-line py-16">
+            <div className="mb-8 flex flex-wrap items-end justify-between gap-4">
+              <div>
+                <h2 className="mb-2 text-[26px] font-bold tracking-[-0.02em] text-ink sm:text-[30px]">
+                  Field notes
+                </h2>
+                <p className="max-w-[56ch] text-[15.5px] leading-relaxed text-muted">
+                  Real outages and bugs, told start to finish, each with a reproduction you
+                  can run.
+                </p>
+              </div>
+              <Link href="/blog" className="inline-flex items-center gap-1 text-[14.5px] font-medium text-accent hover:text-accent-hover">
+                All field notes <ArrowRight className="size-4" />
               </Link>
             </div>
-            <div className="grid gap-3 sm:grid-cols-2">
+            <div className="grid gap-x-10 gap-y-2 sm:grid-cols-2">
               {posts.map((p) => (
-                <Link key={p.slug} href={`/blog/${p.slug}`} className="glass glass-hover group rounded-2xl p-5">
-                  <div className="mb-2 flex items-center gap-2 font-mono text-[10.5px] text-faint">
-                    <span className="uppercase tracking-wider text-accent">{p.kicker}</span>
+                <Link key={p.slug} href={`/blog/${p.slug}`} className="group border-t border-line py-5">
+                  <div className="mb-2 flex items-center gap-2 text-[12.5px] text-faint">
+                    <span className="font-semibold uppercase tracking-[0.06em] text-accent">{p.kicker}</span>
                     <span>{formatDate(p.date)}</span>
                   </div>
-                  <div className="mb-1.5 text-[16px] font-semibold leading-snug text-ink">{p.title}</div>
-                  <p className="text-[13.5px] leading-relaxed text-muted">{p.dek}</p>
+                  <div className="mb-1.5 font-[family-name:var(--font-serif)] text-[22px] font-semibold leading-snug text-ink group-hover:text-accent">
+                    {p.title}
+                  </div>
+                  <p className="text-[15px] leading-relaxed text-muted">{p.dek}</p>
                 </Link>
               ))}
             </div>
           </section>
         )}
 
-        {/* ── the shapes ───────────────────────────────────────────── */}
-        <section className="pt-20">
-          <div className="mb-3 text-[10.5px] font-semibold uppercase tracking-[0.15em] text-accent">
-            How everything here is written
-          </div>
-          <h2 className="mb-4 max-w-[24ch] text-[28px] font-bold leading-tight tracking-[-0.02em] text-ink sm:text-[36px]">
-            Four shapes, and a chapter only gets the one that fits it
+        {/* ── the book ─────────────────────────────────────────────────── */}
+        <section className="border-t border-line py-16">
+          <h2 className="mb-2 text-[26px] font-bold tracking-[-0.02em] text-ink sm:text-[30px]">
+            What&rsquo;s in the book
           </h2>
-          <p className="mb-10 max-w-[62ch] text-[16px] leading-relaxed text-muted">
-            A mutex and a queueing model are not the same kind of subject, so they
-            don&rsquo;t get the same sections. Each chapter declares its shape, and CI
-            fails if the sections don&rsquo;t match &mdash; which is how a template stops
-            being something you can feel.
+          <p className="mb-10 max-w-[60ch] text-[15.5px] leading-relaxed text-muted">
+            {topics.length} chapters in {chapterGroups.length} parts, from the processor up to
+            distributed systems, plus {labs.length} interactive labs. The first two parts are
+            complete; the rest are being written.
           </p>
+          <div className="grid gap-x-10 gap-y-10 sm:grid-cols-2 lg:grid-cols-3">
+            {chapterGroups.map((g) => {
+              const live = g.pages.filter((p) => p.status === "live");
+              return (
+                <div key={g.slug}>
+                  <Link href={`/sections#${g.slug}`} className="mb-3 flex items-center gap-2.5">
+                    <span className={cn("size-2 rounded-full", DOT[g.colour])} />
+                    <span className={cn("text-[15px] font-semibold", TEXT[g.colour])}>{g.name}</span>
+                    <span className="tnum ml-auto text-[12.5px] text-faint">
+                      {live.length}/{g.pages.length}
+                    </span>
+                  </Link>
+                  <ul className="space-y-0.5 border-l border-line">
+                    {g.pages.map((p: Page) => (
+                      <li key={p.slug}>
+                        <Link
+                          href={p.href}
+                          className={cn(
+                            "-ml-px block border-l border-transparent py-1 pl-3.5 text-[14.5px] leading-snug transition-colors hover:border-ink hover:text-ink",
+                            p.status === "live" ? "text-muted" : "text-faint/70",
+                          )}
+                        >
+                          {p.short}
+                          {p.status !== "live" && <span className="ml-1.5 text-[11.5px]">· soon</span>}
+                        </Link>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              );
+            })}
+          </div>
+        </section>
 
-          <div className="grid gap-3 sm:grid-cols-2">
-            {SHAPE_CARDS.map((s) => (
-              <div key={s.name} className="glass rounded-2xl p-5">
-                <div className="mb-1.5 flex items-baseline gap-2.5">
-                  <span className="text-[15.5px] font-semibold text-ink">{s.name}</span>
-                  <span className="tnum font-mono text-[11px] text-faint">{s.count}</span>
-                </div>
-                <p className="mb-3 text-[13.5px] leading-relaxed text-muted">{s.blurb}</p>
-                <div className="font-mono text-[11.5px] leading-relaxed text-accent">
-                  {s.steps}
-                </div>
+        {/* ── why trust it ─────────────────────────────────────────────── */}
+        <section className="border-t border-line py-16">
+          <h2 className="mb-10 text-[26px] font-bold tracking-[-0.02em] text-ink sm:text-[30px]">
+            How it&rsquo;s written
+          </h2>
+          <div className="grid gap-8 sm:grid-cols-3">
+            {PROMISES.map(([head, body]) => (
+              <div key={head}>
+                <div className="mb-2 font-[family-name:var(--font-serif)] text-[19px] font-semibold text-ink">{head}</div>
+                <p className="text-[15px] leading-relaxed text-muted">{body}</p>
               </div>
             ))}
           </div>
         </section>
 
-        {/* ── groups ───────────────────────────────────────────────────── */}
-        <section className="pt-20">
-          <div className="mb-3 text-[10.5px] font-semibold uppercase tracking-[0.15em] text-accent">
-            What&rsquo;s in here
-          </div>
-          <h2 className="mb-4 text-[28px] font-bold tracking-[-0.02em] text-ink sm:text-[36px]">
-            {topics.length} chapters, {labs.length} labs, {chapterGroups.length} groups
-          </h2>
-          <p className="mb-10 max-w-[62ch] text-[16px] leading-relaxed text-muted">
-            {livePages.length === 0
-              ? "None are written yet. The stubs carry their six questions and say so on the page."
-              : `${livePages.length} written so far. The rest are stubs, and they say so on the page.`}{" "}
-            The machine and the operating system are the most complete: that&rsquo;s the layer every other group stands on.
-          </p>
-
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {chapterGroups.map((g) => (
-              <Link
-                key={g.slug}
-                href={`/sections#${g.slug}`}
-                className="glass glass-hover group relative overflow-hidden rounded-2xl p-5"
-              >
-                <span
-                  className={cn(
-                    "absolute inset-x-0 top-0 h-px bg-gradient-to-r to-transparent opacity-60 transition-opacity group-hover:opacity-100",
-                    FROM[g.colour],
-                  )}
-                />
-                <div className="mb-2.5 flex items-center gap-2.5">
-                  <span className={cn("size-2 rounded-full", DOT[g.colour])} />
-                  <span className="text-[15.5px] font-semibold text-ink">{g.name}</span>
-                  <span className="tnum ml-auto font-mono text-[11px] text-faint">
-                    {g.pages.length}
-                  </span>
-                </div>
-                <div className="text-[13px] leading-relaxed text-muted">
-                  {g.pages.slice(0, 3).map((p) => p.short).join(" · ")}
-                  {g.pages.length > 3 && " …"}
-                </div>
-              </Link>
-            ))}
-          </div>
-        </section>
-
-        {/* ── rules ────────────────────────────────────────────────────── */}
-        <section className="pt-20">
-          <div className="mb-3 text-[10.5px] font-semibold uppercase tracking-[0.15em] text-accent">
-            The rules
-          </div>
-          <h2 className="mb-10 text-[28px] font-bold tracking-[-0.02em] text-ink sm:text-[36px]">
-            What this site promises
-          </h2>
-          <div className="grid gap-3 sm:grid-cols-2">
-            {RULES.map(([head, body]) => (
-              <div key={head} className="glass rounded-2xl p-5">
-                <div className="mb-2 text-[14.5px] font-semibold text-ink">{head}</div>
-                <p className="text-[13.5px] leading-relaxed text-muted">{body}</p>
-              </div>
-            ))}
-          </div>
-        </section>
-
-        <footer className="mt-20 border-t border-line pt-8 text-[12.5px] text-faint">
-          <span className="text-accent">KnowSys</span> · a sibling to{" "}
-          <a href="https://knowml.vercel.app" className="transition-colors hover:text-accent">
+        <footer className="border-t border-line pt-8 text-[13px] text-faint">
+          <span className="font-[family-name:var(--font-serif)] font-semibold text-muted">KnowSys</span> · a sibling to{" "}
+          <a href="https://knowml.vercel.app" className="underline decoration-line-2 underline-offset-2 hover:text-ink">
             KnowML
           </a>
         </footer>

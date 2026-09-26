@@ -4,25 +4,33 @@ import { cn } from "@/lib/utils";
    small and dim above the title — present for the reader who wants it, quiet
    enough not to compete with the heading. */
 export function SectionHeading({
-  n, cmd, children, className,
+  n, cmd, id, children, className,
 }: {
   n?: string;
   cmd?: string;
+  /* The anchor the TOC, search and shared links point at. This prop was
+     accepted and then dropped, so no chapter section had an id and every
+     "On this page" link went nowhere. */
+  id?: string;
   children: React.ReactNode;
   className?: string;
 }) {
   return (
-    <div className={cn("mb-6 mt-16 scroll-mt-28 first:mt-0", className)}>
+    <div id={id} className={cn("mb-6 mt-20 scroll-mt-24 first:mt-0", className)}>
+      {n && (
+        <div className="tnum mb-2 font-[family-name:var(--font-inter)] text-[12px] font-semibold uppercase tracking-[0.08em] text-faint">
+          Section {n.replace(/^0/, "")}
+        </div>
+      )}
+      <h2 className="font-[family-name:var(--font-inter)] text-[28px] font-bold leading-[1.15] tracking-[-0.02em] text-ink sm:text-[33px]">
+        {children}
+      </h2>
       {cmd && (
-        <div className="mb-2.5 flex items-center gap-2 font-mono text-[11.5px] text-accent-dim">
-          <span className="text-accent opacity-70">$</span>
+        <div className="mt-2 truncate font-mono text-[12px] text-faint" title="A command that shows this on a real system">
+          <span className="opacity-60">$ </span>
           {cmd}
         </div>
       )}
-      <h2 className="flex items-baseline gap-3 text-[27px] font-bold leading-tight tracking-[-0.015em] text-ink sm:text-[31px]">
-        {n && <span className="tnum font-mono text-[15px] font-medium text-faint">{n}</span>}
-        {children}
-      </h2>
     </div>
   );
 }

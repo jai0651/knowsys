@@ -145,7 +145,7 @@ export function Notes({ title }: { title: string }) {
         data-notes-ui
         onClick={() => setOpen((o) => !o)}
         aria-label="Notes and highlights"
-        className="glass glass-hover fixed bottom-5 right-5 z-40 flex items-center gap-2 rounded-2xl px-3.5 py-2.5 text-[13px] text-ink"
+        className="glass glass-hover fixed bottom-5 right-5 z-40 flex items-center gap-2 rounded-xl px-3.5 py-2.5 text-[13px] text-ink"
       >
         <Highlighter className="size-4 text-accent" />
         <span className="hidden sm:inline">Notes</span>
@@ -249,7 +249,7 @@ export function Notes({ title }: { title: string }) {
             </header>
 
             <div className="flex-1 overflow-y-auto px-5 py-4">
-              <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
+              <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.07em] text-faint">
                 Free notes
               </div>
               <textarea
@@ -259,7 +259,7 @@ export function Notes({ title }: { title: string }) {
                 className="mb-6 min-h-[120px] w-full resize-y rounded-xl border border-line bg-surface-2 p-3 text-[13.5px] leading-relaxed text-ink outline-none placeholder:text-faint focus:border-line-2"
               />
 
-              <div className="mb-2 flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
+              <div className="mb-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.07em] text-faint">
                 Highlights
                 <span className="tnum text-accent">{count}</span>
               </div>

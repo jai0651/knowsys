@@ -95,18 +95,18 @@ export function Search() {
     <>
       <button
         onClick={() => setOpen(true)}
-        className="glass glass-hover flex items-center gap-2 rounded-xl px-3 py-1.5 text-[13px] text-muted"
+        className="flex items-center gap-2 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[13px] text-faint transition-colors hover:border-line-2 hover:text-muted sm:min-w-[180px]"
         aria-label="Search"
       >
         <SearchIcon className="size-3.5" />
-        <span className="hidden md:inline">Search</span>
+        <span className="hidden flex-1 text-left md:inline">Search</span>
         <kbd className="hidden rounded border border-line px-1.5 py-0.5 font-mono text-[10px] md:inline">⌘K</kbd>
       </button>
 
       {open && (
         <>
-          <div className="fixed inset-0 z-[70] bg-deep/70 backdrop-blur-[3px]" onClick={() => setOpen(false)} />
-          <div className="glass-panel fixed left-1/2 top-[12vh] z-[71] w-[min(94vw,640px)] -translate-x-1/2 overflow-hidden rounded-2xl">
+          <div className="fixed inset-0 z-[70] bg-ink/25 backdrop-blur-[2px]" onClick={() => setOpen(false)} />
+          <div className="glass fixed left-1/2 top-[12vh] z-[71] w-[min(94vw,640px)] -translate-x-1/2 overflow-hidden rounded-xl">
             <div className="flex items-center gap-3 border-b border-line px-4">
               <SearchIcon className="size-4 shrink-0 text-faint" />
               <input
@@ -142,7 +142,7 @@ export function Search() {
                       i === cur ? "bg-surface-2" : "hover:bg-surface-2/60",
                     )}
                   >
-                    <span className="tnum mt-0.5 shrink-0 font-mono text-[11px] text-accent">{h.n}</span>
+                    <span className="tnum mt-0.5 shrink-0 font-mono text-[11px] text-faint">{h.n}</span>
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-[14px] text-ink">{h.h ?? h.t}</span>
                       <span className="block truncate text-[11.5px] text-faint">

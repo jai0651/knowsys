@@ -62,7 +62,7 @@ export function PageStats({ pageId }: { pageId: string }) {
 
   return (
     <div className="flex items-center gap-1.5">
-      <span className="flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 font-mono text-[11.5px] text-muted">
+      <span className="flex items-center gap-1.5 px-1.5 py-1 text-[12.5px] text-faint">
         <Eye className="size-3.5" />
         <span className="tnum">{s.views.toLocaleString()}</span>
       </span>
@@ -71,10 +71,10 @@ export function PageStats({ pageId }: { pageId: string }) {
         aria-pressed={liked}
         aria-label={liked ? "Remove like" : "Like this chapter"}
         className={cn(
-          "flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 font-mono text-[11.5px] transition-colors",
+          "flex items-center gap-1.5 rounded-md px-2 py-1 text-[12.5px] transition-colors",
           liked
-            ? "border-accent/40 bg-accent-soft text-accent"
-            : "border-line text-muted hover:border-line-2 hover:text-ink",
+            ? "text-machine"
+            : "text-faint hover:bg-surface-2 hover:text-ink",
         )}
       >
         <Heart className={cn("size-3.5", liked && "fill-current")} />

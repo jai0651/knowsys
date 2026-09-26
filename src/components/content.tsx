@@ -2,7 +2,7 @@ import { cn } from "@/lib/utils";
 import { Panel } from "./terminal-frame";
 
 const FLAT_CODE =
-  "[&_pre]:!my-0 [&_pre]:!border-0 [&_pre]:!bg-transparent [&_pre]:!p-0 [&_figure]:!my-0 [&_pre]:font-mono";
+  "flat-code [&_pre]:!my-0 [&_pre]:!border-0 [&_pre]:!bg-transparent [&_pre]:!p-0 [&_figure]:!my-0 [&_pre]:font-mono";
 
 /* ── Callout ─────────────────────────────────────────────────────────────
    The moment something clicks. The label says what it is — "Why the naive
@@ -15,19 +15,20 @@ export function Callout({
   children: React.ReactNode;
 }) {
   const tone = {
-    teach: { bar: "bg-accent", text: "text-accent", glow: "shadow-[0_0_10px_1px_var(--glow)]" },
-    warn:  { bar: "bg-machine", text: "text-machine", glow: "" },
-    note:  { bar: "bg-os", text: "text-os", glow: "" },
+    teach: { box: "border-accent bg-accent-soft", text: "text-accent" },
+    warn:  { box: "border-machine bg-machine/[0.07]", text: "text-machine" },
+    note:  { box: "border-line-2 bg-surface-2/60", text: "text-muted" },
   }[kind];
 
+  /* A tinted aside with a rule down the left, like a note in a textbook's
+     margin pulled into the column. The body stays in the reading serif. */
   return (
-    <div className="glass relative my-7 overflow-hidden rounded-2xl p-5 pl-6">
-      <span className={cn("absolute inset-y-4 left-0 w-[2.5px] rounded-full", tone.bar, tone.glow)} />
-      <div className={cn("mb-2 text-[10.5px] font-semibold uppercase tracking-[0.12em]", tone.text)}>
+    <aside className={cn("my-8 rounded-r-lg border-l-[3px] px-5 py-4 text-[17.5px] leading-[1.6]", tone.box)}>
+      <div className={cn("mb-1.5 font-[family-name:var(--font-inter)] text-[13px] font-semibold", tone.text)}>
         {label}
       </div>
       <div className="[&>p:first-child]:mt-0 [&>p:last-child]:mb-0">{children}</div>
-    </div>
+    </aside>
   );
 }
 
@@ -64,8 +65,8 @@ export function TryIt({
 export function Output({ children }: { children: React.ReactNode }) {
   return (
     <div className="-mx-5 mt-4 border-t border-line bg-surface-2 px-5 py-4 text-[14px] leading-relaxed [&>p:first-child]:mt-0 [&>p:last-child]:mb-0">
-      <div className="mb-1.5 flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-accent">
-        <span className="size-1 rounded-full bg-accent shadow-[0_0_6px_1px_var(--glow)]" />
+      <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">
+        <span className="size-1 rounded-full bg-accent" />
         output
       </div>
       {children}
@@ -118,14 +119,14 @@ export function Cost({
   items: { what: string; value: string; source: string }[];
 }) {
   return (
-    <div className="glass my-7 grid gap-px overflow-hidden rounded-2xl bg-line sm:grid-cols-2">
+    <div className="my-8 grid gap-px overflow-hidden rounded-xl border border-line bg-line font-[family-name:var(--font-inter)] sm:grid-cols-2">
       {items.map((it, i) => (
-        <div key={i} className="bg-bg/40 p-4 backdrop-blur-sm">
-          <div className="tnum mb-1 text-[22px] font-semibold leading-none tracking-tight text-accent">
+        <div key={i} className={cn("bg-surface p-4", items.length % 2 === 1 && i === items.length - 1 && "sm:col-span-2")}>
+          <div className="tnum mb-1 text-[24px] font-semibold leading-none tracking-tight text-ink">
             {it.value}
           </div>
           <div className="mb-2 text-[13.5px] leading-snug text-ink">{it.what}</div>
-          <div className="font-mono text-[10.5px] leading-snug text-faint">{it.source}</div>
+          <div className="text-[12px] leading-snug text-faint">{it.source}</div>
         </div>
       ))}
     </div>
@@ -148,11 +149,11 @@ export function QA({
   }[level];
 
   return (
-    <details className="group glass mb-2 overflow-hidden rounded-xl">
+    <details className="group mb-2 overflow-hidden rounded-xl border border-line bg-surface">
       <summary className="flex cursor-pointer list-none items-start gap-3 px-4 py-3.5 text-[14.5px] text-ink transition-colors hover:bg-surface-2">
         <span
           className={cn(
-            "mt-[3px] shrink-0 rounded-md px-1.5 py-0.5 font-mono text-[9.5px] uppercase tracking-wider",
+            "mt-[2px] shrink-0 rounded px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-wide",
             tone,
           )}
         >
@@ -180,8 +181,8 @@ export function WildCard({
   verdict?: string;
 }) {
   return (
-    <div className="glass glass-hover rounded-2xl p-4">
-      <div className="mb-1.5 font-mono text-[12.5px] font-semibold text-accent">{name}</div>
+    <div className="glass rounded-xl p-4">
+      <div className="mb-1.5 text-[14px] font-semibold text-ink">{name}</div>
       <div className="text-[13.8px] leading-relaxed text-muted [&>p:first-child]:mt-0 [&>p:last-child]:mb-0">
         {children}
       </div>

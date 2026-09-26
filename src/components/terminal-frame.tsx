@@ -14,15 +14,10 @@ export function Panel({
   children: React.ReactNode;
 }) {
   return (
-    <div className={cn("glass overflow-hidden rounded-2xl", className)}>
+    <div className={cn("overflow-hidden rounded-xl border border-line bg-[var(--code-bg)]", className)}>
       <div className="flex items-center gap-2.5 border-b border-line px-4 py-2.5">
-        <span
-          className={cn(
-            "h-3 w-[2.5px] rounded-full",
-            tone === "accent" ? "bg-accent shadow-[0_0_8px_1px_var(--glow)]" : "bg-faint",
-          )}
-        />
-        <span className="truncate font-mono text-[11.5px] text-muted">{label}</span>
+        <span className={cn("size-1.5 shrink-0 rounded-full", tone === "accent" ? "bg-accent" : "bg-faint")} />
+        <span className="truncate text-[12.5px] font-medium text-muted">{label}</span>
         <div className="flex-1" />
         {right}
       </div>

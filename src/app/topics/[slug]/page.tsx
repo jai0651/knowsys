@@ -13,6 +13,7 @@ import { readDoc, outlineOf } from "@/lib/mdx";
 import { topics, pageBySlug, neighbours, colourOf } from "@/lib/manifest";
 import { shapeOf } from "@/lib/spine";
 import { Notes } from "@/components/notes/notes";
+import { ReadingProgress } from "@/components/reading-progress";
 
 export function generateStaticParams() {
   return topics.map((p) => ({ slug: p.slug }));
@@ -54,11 +55,12 @@ export default async function TopicPage({ params }: { params: Promise<{ slug: st
   return (
     <>
       <TopNav />
-      <div className="mx-auto flex max-w-[1560px] gap-2 px-4 pt-8 sm:px-6">
+      {doc && <ReadingProgress />}
+      <div className="mx-auto flex max-w-[1440px] gap-6 px-5 pt-10 sm:px-8">
         <Sidebar currentSlug={slug} />
 
         <main className="min-w-0 flex-1 pb-24">
-          <div className="mx-auto max-w-[680px] px-1 sm:px-6">
+          <div className="mx-auto max-w-[700px]">
             <ChapterHeader page={page} colour={colour} fm={doc?.frontmatter} />
 
             <article className="prose" id="chapter-body">
@@ -76,13 +78,13 @@ export default async function TopicPage({ params }: { params: Promise<{ slug: st
               )}
             </article>
 
-            <nav className="mt-16 grid gap-3 sm:grid-cols-2">
+            <nav className="mt-20 grid gap-3 border-t border-line pt-8 sm:grid-cols-2">
               {prev ? (
-                <Link href={prev.href} className="glass glass-hover group rounded-2xl p-4">
-                  <div className="mb-1.5 flex items-center gap-1.5 font-mono text-[10.5px] uppercase tracking-wider text-faint">
-                    <ArrowLeft className="size-3" /> previous
+                <Link href={prev.href} className="group rounded-xl p-4 transition-colors hover:bg-surface">
+                  <div className="mb-1 flex items-center gap-1.5 text-[12.5px] text-faint">
+                    <ArrowLeft className="size-3.5 transition-transform group-hover:-translate-x-0.5" /> Previous · {prev.num}
                   </div>
-                  <div className="text-[14.5px] font-medium leading-snug text-ink">{prev.title}</div>
+                  <div className="font-[family-name:var(--font-serif)] text-[18px] font-semibold leading-snug text-ink">{prev.title}</div>
                 </Link>
               ) : (
                 <span />
@@ -90,19 +92,19 @@ export default async function TopicPage({ params }: { params: Promise<{ slug: st
               {next && (
                 <Link
                   href={next.href}
-                  className="glass glass-hover group rounded-2xl p-4 text-right sm:col-start-2"
+                  className="group rounded-xl p-4 text-right transition-colors hover:bg-surface sm:col-start-2"
                 >
-                  <div className="mb-1.5 flex items-center justify-end gap-1.5 font-mono text-[10.5px] uppercase tracking-wider text-faint">
-                    next <ArrowRight className="size-3" />
+                  <div className="mb-1 flex items-center justify-end gap-1.5 text-[12.5px] text-faint">
+                    Next · {next.num} <ArrowRight className="size-3.5 transition-transform group-hover:translate-x-0.5" />
                   </div>
-                  <div className="text-[14.5px] font-medium leading-snug text-ink">{next.title}</div>
+                  <div className="font-[family-name:var(--font-serif)] text-[18px] font-semibold leading-snug text-ink">{next.title}</div>
                 </Link>
               )}
             </nav>
           </div>
         </main>
 
-        <SpineRail spine={railSpine} tail={railTail} title={shape.name} />
+        <SpineRail spine={railSpine} tail={railTail} />
       </div>
 
       <Notes title={page.title} />

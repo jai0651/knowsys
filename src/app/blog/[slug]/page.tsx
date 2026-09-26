@@ -5,6 +5,7 @@ import { TopNav } from "@/components/top-nav";
 import { PageCard } from "@/components/page-card";
 import { Mdx } from "@/components/mdx";
 import { Notes } from "@/components/notes/notes";
+import { ReadingProgress } from "@/components/reading-progress";
 import { allPosts, postBySlug, formatDate } from "@/lib/posts";
 import { pageBySlug, colourOf, type Page } from "@/lib/manifest";
 
@@ -34,28 +35,25 @@ export default async function PostPage({ params }: { params: Promise<{ slug: str
   return (
     <>
       <TopNav />
-      <main className="mx-auto max-w-[720px] px-5 pb-24 pt-12 sm:px-8">
-        <header className="mb-10">
-          <nav className="mb-6 flex items-center gap-1.5 font-mono text-[11.5px] text-faint">
-            <Link href="/" className="transition-colors hover:text-accent">~</Link>
-            <span className="opacity-40">/</span>
-            <Link href="/blog" className="transition-colors hover:text-accent">field notes</Link>
+      <ReadingProgress />
+      <main className="mx-auto max-w-[740px] px-5 pb-28 pt-14 sm:px-8">
+        <header className="mb-12 border-b border-line pb-10">
+          <nav className="mb-8 text-[13px]">
+            <Link href="/blog" className="text-faint transition-colors hover:text-ink">← Field notes</Link>
           </nav>
-          <div className="mb-4 flex flex-wrap items-center gap-x-2.5 gap-y-1 font-mono text-[11px] text-faint">
-            <span className="rounded-md bg-accent-soft px-1.5 py-px uppercase tracking-wider text-accent">
-              {post.kicker}
-            </span>
+          <div className="mb-5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[13px] text-faint">
+            <span className="font-semibold uppercase tracking-[0.06em] text-accent">{post.kicker}</span>
             <span>{formatDate(post.date)}</span>
             {post.readingTime && <span>· {post.readingTime}</span>}
           </div>
-          <h1 className="mb-5 text-[34px] font-bold leading-[1.1] tracking-[-0.02em] text-ink sm:text-[44px]">
+          <h1 className="mb-6 font-[family-name:var(--font-serif)] text-[38px] font-semibold leading-[1.1] tracking-[-0.015em] text-ink sm:text-[50px]">
             {post.title}
           </h1>
-          <p className="max-w-[60ch] text-[18px] leading-relaxed text-muted">{post.dek}</p>
+          <p className="max-w-[60ch] font-[family-name:var(--font-serif)] text-[20px] leading-relaxed text-muted sm:text-[21px]">{post.dek}</p>
           {post.tags.length > 0 && (
             <div className="mt-5 flex flex-wrap gap-1.5">
               {post.tags.map((t) => (
-                <span key={t} className="rounded-md border border-line px-2 py-0.5 font-mono text-[10.5px] text-faint">
+                <span key={t} className="rounded-full bg-surface-2 px-2.5 py-0.5 text-[12px] text-muted">
                   {t}
                 </span>
               ))}
@@ -87,7 +85,7 @@ export default async function PostPage({ params }: { params: Promise<{ slug: str
             </div>
             <div className="flex flex-col gap-3">
               {more.map((p) => (
-                <Link key={p.slug} href={`/blog/${p.slug}`} className="glass glass-hover rounded-2xl p-4">
+                <Link key={p.slug} href={`/blog/${p.slug}`} className="glass glass-hover rounded-xl p-4">
                   <div className="mb-1 font-mono text-[10.5px] uppercase tracking-wider text-faint">{p.kicker}</div>
                   <div className="text-[15px] font-semibold leading-snug text-ink">{p.title}</div>
                 </Link>

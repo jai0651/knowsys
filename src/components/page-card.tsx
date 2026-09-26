@@ -15,7 +15,7 @@ export function PageCard({ page, colour }: { page: Page; colour: string }) {
   return (
     <Link
       href={page.href}
-      className="glass glass-hover group relative flex flex-col overflow-hidden rounded-2xl p-4"
+      className={cn("glass glass-hover group relative flex flex-col overflow-hidden rounded-xl p-4", page.status === "stub" && "opacity-60 shadow-none")}
     >
       {/* group colour as a hairline across the top, lighting up on hover */}
       <span
@@ -25,23 +25,12 @@ export function PageCard({ page, colour }: { page: Page; colour: string }) {
         )}
       />
 
-      <div className="mb-2.5 flex items-center gap-2">
-        <span className={cn("tnum font-mono text-[11px] font-semibold", TEXT[colour])}>
-          {page.num}
-        </span>
-        {page.status === "stub" ? (
-          <span className="rounded-md border border-line px-1.5 py-px font-mono text-[9.5px] uppercase tracking-wider text-faint">
-            stub
-          </span>
-        ) : (
-          <span className="flex items-center gap-1 rounded-md bg-accent-soft px-1.5 py-px font-mono text-[9.5px] uppercase tracking-wider text-accent">
-            <span className="size-1 rounded-full bg-accent" />
-            written
-          </span>
-        )}
+      <div className="mb-2 flex items-center gap-2 text-[12.5px]">
+        <span className={cn("tnum font-semibold", TEXT[colour])}>{page.num}</span>
+        {page.status === "stub" && <span className="text-faint">· not written yet</span>}
       </div>
 
-      <div className="mb-1.5 text-[15px] font-semibold leading-snug text-ink">{page.title}</div>
+      <div className="mb-1.5 text-[15.5px] font-semibold leading-snug text-ink">{page.title}</div>
       <div className="text-[13.2px] leading-relaxed text-muted">{page.hook}</div>
     </Link>
   );

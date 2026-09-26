@@ -20,7 +20,7 @@ export function Sub({
   return (
     <section id={id} className="mt-10 scroll-mt-28">
       <h3 className="mb-3 flex items-baseline gap-2.5 text-[19.5px] font-semibold leading-snug tracking-[-0.01em] text-ink">
-        <span className="tnum font-mono text-[13px] font-medium text-accent">{n}</span>
+        <span className="tnum text-[14px] font-semibold text-faint">{n}</span>
         {title}
       </h3>
       {children}
@@ -42,7 +42,7 @@ export function Approach({
   children: React.ReactNode;
 }) {
   return (
-    <div className="glass my-5 overflow-hidden rounded-2xl">
+    <div className="glass my-5 overflow-hidden rounded-xl">
       <div className="flex items-baseline gap-2.5 border-b border-line px-5 py-3">
         <span className="tnum grid size-6 shrink-0 place-items-center rounded-lg bg-accent-soft font-mono text-[11px] font-semibold text-accent">
           {n}
@@ -56,13 +56,13 @@ export function Approach({
 
       <dl className="grid gap-px border-t border-line bg-line sm:grid-cols-2">
         <div className="bg-bg/40 px-5 py-3.5 backdrop-blur-sm">
-          <dt className="mb-1 font-mono text-[9.5px] uppercase tracking-[0.13em] text-machine">
+          <dt className="mb-1 text-[11px] font-semibold uppercase tracking-[0.07em] text-machine">
             where it breaks
           </dt>
           <dd className="text-[13.5px] leading-snug text-muted">{breaks}</dd>
         </div>
         <div className="bg-bg/40 px-5 py-3.5 backdrop-blur-sm">
-          <dt className="mb-1 font-mono text-[9.5px] uppercase tracking-[0.13em] text-accent">
+          <dt className="mb-1 text-[11px] font-semibold uppercase tracking-[0.07em] text-accent">
             reach for it when
           </dt>
           <dd className="text-[13.5px] leading-snug text-muted">{bestFor}</dd>
@@ -83,7 +83,7 @@ export function Estimate({
   result?: { label: string; value: string };
 }) {
   return (
-    <div className="glass my-6 overflow-hidden rounded-2xl">
+    <div className="glass my-6 overflow-hidden rounded-xl">
       <table className="w-full border-collapse text-[13.5px]">
         <tbody>
           {rows.map((r, i) => (
@@ -125,7 +125,7 @@ export function Figure({
 }) {
   return (
     <figure className="my-7">
-      <div className="glass overflow-x-auto rounded-2xl p-5">{children}</div>
+      <div className="glass overflow-x-auto rounded-xl p-5">{children}</div>
       <figcaption className="mt-2.5 text-[12.5px] leading-relaxed text-faint">
         {caption}
       </figcaption>
@@ -138,10 +138,10 @@ export function Figure({
    section. These are "did the mechanism land". */
 export function Quiz({ children }: { children: React.ReactNode }) {
   return (
-    <div className="glass my-7 overflow-hidden rounded-2xl">
+    <div className="glass my-7 overflow-hidden rounded-xl">
       <div className="flex items-center gap-2 border-b border-line px-5 py-3">
-        <span className="size-1.5 rounded-full bg-accent shadow-[0_0_8px_1px_var(--glow)]" />
-        <span className="font-mono text-[10.5px] uppercase tracking-[0.13em] text-accent">
+        <span className="size-1.5 rounded-full bg-accent" />
+        <span className="text-[11px] font-semibold uppercase tracking-[0.07em] text-accent">
           check yourself
         </span>
       </div>
@@ -175,7 +175,7 @@ export function Compare({
   rows: (string | React.ReactNode)[][];
 }) {
   return (
-    <div className="glass my-6 overflow-x-auto rounded-2xl">
+    <div className="glass my-6 overflow-x-auto rounded-xl">
       <table className="w-full border-collapse text-[13.8px]">
         <thead>
           <tr className="border-b border-line-2">
