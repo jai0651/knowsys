@@ -25,9 +25,11 @@ related: ["06-processes-scheduling", "11-containers"]   # chapter slugs
 There isn't a required one, and that's deliberate. What most good posts here
 end up doing:
 
-1. **Open on the symptom.** A graph that makes no sense, a p99 that doubled
-   when nothing changed, a pager at 3am. Concrete enough that a reader who has
-   seen it recognises it in the first paragraph.
+1. **Set the scene first.** One or two short paragraphs before the incident:
+   what the system is, what the reader already uses it for, and why this
+   failure matters to anyone running it. Then the symptom: a graph that makes
+   no sense, a p99 that doubled when nothing changed. The reader should know
+   why they're reading before the mystery starts.
 2. **The wrong theories, in the order people had them.** This is the fun part
    and the part generated writing skips. The first two explanations everyone
    reaches for are usually plausible and usually wrong, and knowing *why* they

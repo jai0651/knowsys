@@ -102,10 +102,34 @@ Read `~/.claude/skills/tech-blog/references/human-patterns.md` before drafting,
 not after. Everything below comes from it, plus a measurement of where the first
 sixteen chapters failed it.
 
-**Open in the middle of something.** Not with a thesis. Julia Evans opens a
-debugging post with the problem and her own irritation; Karpathy opens by saying
-why he's writing at all. Neither states a thesis in paragraph one. A generated
-post almost always does, and the first sixteen chapters here all did.
+**Teach it the way a good professor would: build it from a problem.** A
+reader arriving at a chapter needs to know what the idea is *for* before they'll
+care about its edge cases, and they learn it best by watching it get invented.
+The opening, before section 01, does that:
+
+- **Start from a world without the idea.** A machine with no virtual memory, a
+  counter two threads increment with no lock, a server with one process per
+  connection. Show what breaks, concretely.
+- **Introduce the idea as the fix,** and name each term only at the moment the
+  reader needs it. Never a paragraph of bolded definitions up front.
+- **Work one small example with real numbers.** An address split into page and
+  offset; two threads interleaving on one cache line.
+- **Then show what the fix costs,** and the next idea that fixes *that*. That
+  chain is usually the chapter's whole argument.
+- **Ask the reader a question and answer it.** "How many translations does 1 GB
+  of random access need?" is how a lecturer checks you're still with them.
+- **Only then connect to real systems,** explained in prose using the model just
+  built. Two or three, each with its *why*. No bullet lists of product names.
+- **Close with one sentence on where the rest of the chapter goes.** Not a
+  bulleted syllabus.
+
+Every chapter's opening should read differently, because every subject starts
+from a different problem. If two openings share a sentence shape ("The simple
+picture:", "Where you'll meet this", "This chapter goes in this order"), one of
+them is a template. The worked reference is chapter 04.
+
+Keep process out of the prose. "Other writers' experiments on the same VM" is
+about how the chapter got made, not about the subject.
 
 **Put the author back in.** Measured across those chapters: 0 to 5 first-person
 references each, against a corpus median of 20.9 per 100 sentences. The
