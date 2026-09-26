@@ -1,7 +1,10 @@
 import type { MDXComponents } from "mdx/types";
 import Link from "next/link";
 import { Callout, TryIt, Output, SourceRead, Cost, QA, WildCard, CardGrid, StubNote } from "./content";
-import { SectionHeading } from "./section";
+import { SectionHeading, Why } from "./section";
+import { Steps, StepSequence } from "./steps";
+import { Predict } from "./predict";
+import { RaceLab } from "./labs/race-lab";
 import { Sub, Approach, Estimate, Figure, Quiz, Q, Compare } from "./scaffold";
 import { MemoryLayout, Flow, Sequence, Tree, Cells, Plot } from "./diagrams";
 import { Panel } from "./terminal-frame";
@@ -18,6 +21,11 @@ export const mdxComponents: MDXComponents = {
   CardGrid,
   StubNote,
   SectionHeading,
+  Why,
+  Steps,
+  StepSequence,
+  Predict,
+  RaceLab,
   Panel,
   Sub,
   Approach,

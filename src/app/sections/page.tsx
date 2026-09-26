@@ -22,8 +22,8 @@ export default function SectionsPage() {
       <div className="mx-auto flex max-w-[1560px] gap-2 px-4 pt-8 sm:px-6">
         <Sidebar />
         <main className="min-w-0 flex-1 pb-24 sm:px-6">
-          <h1 className="mb-3 font-[family-name:var(--font-serif)] text-[40px] font-semibold tracking-[-0.015em] text-ink sm:text-[50px]">
-            Every chapter
+          <h1 className="mb-3 text-[42px] font-extrabold tracking-[-0.035em] text-ink sm:text-[52px]">
+            Every <span className="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-transparent">chapter</span>
           </h1>
           <p className="mb-14 max-w-2xl text-[16.5px] leading-relaxed text-muted">
             {topics.length} chapters in {groups.length - 1} parts, and {labs.length} labs. Parts build on

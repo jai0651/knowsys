@@ -18,9 +18,9 @@ export function Sub({
 }) {
   const id = `s${n.replace(/\./g, "-")}`;
   return (
-    <section id={id} className="mt-10 scroll-mt-28">
-      <h3 className="mb-3 flex items-baseline gap-2.5 text-[19.5px] font-semibold leading-snug tracking-[-0.01em] text-ink">
-        <span className="tnum text-[14px] font-semibold text-faint">{n}</span>
+    <section id={id} className="mt-12 scroll-mt-24">
+      <h3 className="mb-4 flex items-baseline gap-2.5 text-[21px] font-bold leading-snug tracking-[-0.015em] text-ink">
+        <span className="tnum shrink-0 font-mono text-[14px] font-medium text-faint">{n}</span>
         {title}
       </h3>
       {children}
@@ -179,9 +179,9 @@ export function Compare({
       <table className="w-full border-collapse text-[13.8px]">
         <thead>
           <tr className="border-b border-line-2">
-            {cols.map((c) => (
+            {cols.map((c, ci) => (
               <th
-                key={c}
+                key={ci}
                 className="px-4 py-3 text-left font-mono text-[10.5px] font-semibold uppercase tracking-[0.1em] text-muted"
               >
                 {c}

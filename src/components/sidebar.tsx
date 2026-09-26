@@ -1,54 +1,56 @@
+"use client";
+
 import Link from "next/link";
+import { Check } from "lucide-react";
 import { groups } from "@/lib/manifest";
+import { useDone } from "@/lib/progress";
 import { cn } from "@/lib/utils";
 
-const DOT: Record<string, string> = {
-  machine: "bg-machine", os: "bg-os", conc: "bg-conc", data: "bg-data",
-  dist: "bg-dist", cloud: "bg-cloud", ops: "bg-ops", lab: "bg-lab",
-};
-
-/* The table of contents for the whole book. Plain type on the page, no box:
-   it's there to orient you, and it shouldn't compete with the chapter. The
-   group you're in is open; the others fold to one line each. */
+/* The course outline. Each chapter carries a status ring: ticked when the
+   reader marked it complete, filled when it's the one open, faint when it
+   isn't written yet. Groups fold except the one you're in. */
 export function Sidebar({ currentSlug }: { currentSlug?: string }) {
+  const done = useDone();
   return (
-    <aside className="hidden w-[250px] shrink-0 lg:block">
-      <nav className="sticky top-20 max-h-[calc(100vh-6rem)] overflow-y-auto pb-10 pr-4 text-[13.5px]">
+    <aside className="hidden w-[256px] shrink-0 lg:block">
+      <nav className="sticky top-16 max-h-[calc(100vh-4rem)] overflow-y-auto py-7 pr-2 text-[14px]">
         {groups.map((g) => {
           const open = g.pages.some((p) => p.slug === currentSlug) || !currentSlug;
-          const written = g.pages.filter((p) => p.status === "live").length;
+          const complete = g.pages.filter((p) => done.includes(p.slug)).length;
           return (
-            <details key={g.slug} open={open} className="group mb-1">
-              <summary className="flex cursor-pointer list-none items-center gap-2 rounded-md py-1.5 pr-1 text-[12px] font-semibold uppercase tracking-[0.06em] text-muted transition-colors hover:text-ink">
-                <span className={cn("size-[7px] shrink-0 rounded-full", DOT[g.colour])} />
-                <span className="flex-1 leading-tight">{g.name}</span>
-                <span className="tnum text-[11px] font-normal normal-case tracking-normal text-faint">
-                  {written}/{g.pages.length}
-                </span>
+            <details key={g.slug} open={open} className="mb-3">
+              <summary className="mb-1 flex cursor-pointer list-none items-center justify-between px-2.5 py-1 text-[11.5px] font-semibold uppercase tracking-[0.08em] text-faint hover:text-muted">
+                <span>{g.name}</span>
+                <span className="tnum font-medium normal-case tracking-normal">{complete}/{g.pages.length}</span>
               </summary>
-              <div className="mb-3 ml-[3px] border-l border-line">
-                {g.pages.map((p) => {
-                  const active = p.slug === currentSlug;
-                  const stub = p.status === "stub";
-                  return (
-                    <Link
-                      key={p.slug}
-                      href={p.href}
-                      aria-current={active ? "page" : undefined}
+              {g.pages.map((p) => {
+                const active = p.slug === currentSlug;
+                const isDone = done.includes(p.slug);
+                const stub = p.status === "stub";
+                return (
+                  <Link
+                    key={p.slug}
+                    href={p.href}
+                    aria-current={active ? "page" : undefined}
+                    className={cn(
+                      "flex items-center gap-2.5 rounded-lg px-2.5 py-[7px] leading-snug transition-colors",
+                      active ? "bg-accent-soft font-semibold text-ink" : "text-muted hover:bg-surface-2 hover:text-ink",
+                      stub && !active && "text-faint",
+                    )}
+                  >
+                    <span
                       className={cn(
-                        "relative -ml-px block border-l py-[5px] pl-3.5 leading-snug transition-colors",
-                        active
-                          ? "border-accent font-medium text-ink"
-                          : "border-transparent hover:border-line-2 hover:text-ink",
-                        !active && (stub ? "text-faint/70" : "text-muted"),
+                        "grid size-4 shrink-0 place-items-center rounded-full border-[1.5px]",
+                        isDone ? "border-ok bg-ok text-white" : active ? "border-accent" : "border-line-2",
                       )}
                     >
-                      <span className="tnum mr-2 text-[11px] text-faint">{p.num}</span>
-                      {p.short}
-                    </Link>
-                  );
-                })}
-              </div>
+                      {isDone ? <Check className="size-2.5" strokeWidth={3.5} /> : active ? <span className="size-2 rounded-full bg-accent" /> : null}
+                    </span>
+                    <span className="min-w-0 flex-1">{p.short}</span>
+                    {stub && <span className="text-[10.5px] text-faint">soon</span>}
+                  </Link>
+                );
+              })}
             </details>
           );
         })}

@@ -15,19 +15,22 @@ export function Callout({
   children: React.ReactNode;
 }) {
   const tone = {
-    teach: { box: "border-accent bg-accent-soft", text: "text-accent" },
-    warn:  { box: "border-machine bg-machine/[0.07]", text: "text-machine" },
-    note:  { box: "border-line-2 bg-surface-2/60", text: "text-muted" },
+    teach: { box: "border-accent/30 bg-accent/[0.06]", ic: "bg-accent", text: "text-accent", glyph: "!" },
+    warn:  { box: "border-bad/30 bg-bad/[0.06]", ic: "bg-bad", text: "text-bad", glyph: "⚠" },
+    note:  { box: "border-line bg-surface-2", ic: "bg-faint", text: "text-muted", glyph: "i" },
   }[kind];
 
-  /* A tinted aside with a rule down the left, like a note in a textbook's
-     margin pulled into the column. The body stays in the reading serif. */
+  /* "Design implication", "Common mistake", "Why this matters": the label is
+     the point the paragraph makes, and the tint says how much it matters. */
   return (
-    <aside className={cn("my-8 rounded-r-lg border-l-[3px] px-5 py-4 text-[17.5px] leading-[1.6]", tone.box)}>
-      <div className={cn("mb-1.5 font-[family-name:var(--font-inter)] text-[13px] font-semibold", tone.text)}>
-        {label}
+    <aside className={cn("my-8 flex gap-3.5 rounded-xl border px-5 py-4", tone.box)}>
+      <span className={cn("mt-0.5 grid size-[30px] shrink-0 place-items-center rounded-lg text-[14px] font-extrabold text-bg", tone.ic)}>
+        {tone.glyph}
+      </span>
+      <div className="min-w-0 text-[15.5px] leading-relaxed">
+        <div className={cn("mb-1 text-[14px] font-bold", tone.text)}>{label}</div>
+        <div className="text-ink [&>p:last-child]:mb-0 [&>p]:mb-2">{children}</div>
       </div>
-      <div className="[&>p:first-child]:mt-0 [&>p:last-child]:mb-0">{children}</div>
     </aside>
   );
 }

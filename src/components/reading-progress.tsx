@@ -30,8 +30,8 @@ export function ReadingProgress({ target = "chapter-body" }: { target?: string }
   }, [target]);
 
   return (
-    <div className="pointer-events-none fixed inset-x-0 top-14 z-50 h-[2px]" aria-hidden>
-      <div ref={bar} className="reading-progress h-full bg-accent" style={{ transform: "scaleX(0)" }} />
+    <div className="pointer-events-none fixed inset-x-0 top-16 z-50 h-[2px]" aria-hidden>
+      <div ref={bar} className="reading-progress h-full bg-gradient-to-r from-accent to-accent-2" style={{ transform: "scaleX(0)" }} />
     </div>
   );
 }

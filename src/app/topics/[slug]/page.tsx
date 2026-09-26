@@ -41,13 +41,12 @@ export default async function TopicPage({ params }: { params: Promise<{ slug: st
      to the generic skeleton, which is also exactly what it renders. */
   const shape = shapeOf(page.archetype);
   const parsed = doc ? outlineOf(doc.body) : [];
-  const spineIds = new Set(shape.spine.map((s) => s.id));
-  const railSpine = parsed.length
-    ? parsed.filter((s) => spineIds.has(s.id))
-    : shape.spine.map((s) => ({ ...s, n: "", subs: [] }));
-  const railTail = parsed.length
-    ? parsed.filter((s) => !spineIds.has(s.id))
-    : shape.tail.map((s) => ({ ...s, n: "", subs: [] }));
+  /* Every numbered section goes in the rail, in page order. The archetype
+     spine used to split them into two lists; the new chapter format is
+     organised by topic, so there's one list. */
+  const railSpine = parsed.length ? parsed : shape.spine.map((s) => ({ ...s, n: "", subs: [] }));
+  const railTail = parsed.length ? [] : shape.tail.map((s) => ({ ...s, n: "", subs: [] }));
+  const minutes = parseInt(doc?.frontmatter.readingTime?.replace(/\D/g, "") ?? "", 10) || undefined;
   const allSections = [...shape.spine, ...shape.tail];
   const { prev, next } = neighbours(slug);
   const colour = colourOf(page);
@@ -56,12 +55,12 @@ export default async function TopicPage({ params }: { params: Promise<{ slug: st
     <>
       <TopNav />
       {doc && <ReadingProgress />}
-      <div className="mx-auto flex max-w-[1440px] gap-6 px-5 pt-10 sm:px-8">
+      <div className="mx-auto flex max-w-[1480px] gap-10 px-5 sm:px-6">
         <Sidebar currentSlug={slug} />
 
-        <main className="min-w-0 flex-1 pb-24">
-          <div className="mx-auto max-w-[700px]">
-            <ChapterHeader page={page} colour={colour} fm={doc?.frontmatter} />
+        <main className="min-w-0 flex-1 pb-28 pt-9">
+          <div className="mx-auto max-w-[740px]">
+            <ChapterHeader page={page} colour={colour} fm={doc?.frontmatter} outline={parsed} />
 
             <article className="prose" id="chapter-body">
               {doc ? (
@@ -80,11 +79,11 @@ export default async function TopicPage({ params }: { params: Promise<{ slug: st
 
             <nav className="mt-20 grid gap-3 border-t border-line pt-8 sm:grid-cols-2">
               {prev ? (
-                <Link href={prev.href} className="group rounded-xl p-4 transition-colors hover:bg-surface">
+                <Link href={prev.href} className="group rounded-xl border border-line bg-surface p-4 shadow-[var(--shadow)] transition hover:border-accent">
                   <div className="mb-1 flex items-center gap-1.5 text-[12.5px] text-faint">
                     <ArrowLeft className="size-3.5 transition-transform group-hover:-translate-x-0.5" /> Previous · {prev.num}
                   </div>
-                  <div className="font-[family-name:var(--font-serif)] text-[18px] font-semibold leading-snug text-ink">{prev.title}</div>
+                  <div className="text-[16.5px] font-bold leading-snug text-ink">{prev.title}</div>
                 </Link>
               ) : (
                 <span />
@@ -92,19 +91,19 @@ export default async function TopicPage({ params }: { params: Promise<{ slug: st
               {next && (
                 <Link
                   href={next.href}
-                  className="group rounded-xl p-4 text-right transition-colors hover:bg-surface sm:col-start-2"
+                  className="group rounded-xl border border-line bg-surface p-4 text-right shadow-[var(--shadow)] transition hover:border-accent sm:col-start-2"
                 >
                   <div className="mb-1 flex items-center justify-end gap-1.5 text-[12.5px] text-faint">
                     Next · {next.num} <ArrowRight className="size-3.5 transition-transform group-hover:translate-x-0.5" />
                   </div>
-                  <div className="font-[family-name:var(--font-serif)] text-[18px] font-semibold leading-snug text-ink">{next.title}</div>
+                  <div className="text-[16.5px] font-bold leading-snug text-ink">{next.title}</div>
                 </Link>
               )}
             </nav>
           </div>
         </main>
 
-        <SpineRail spine={railSpine} tail={railTail} />
+        <SpineRail spine={railSpine} tail={railTail} minutes={minutes} />
       </div>
 
       <Notes title={page.title} />

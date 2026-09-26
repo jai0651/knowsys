@@ -8,6 +8,8 @@ export interface Frontmatter {
   title?: string;
   dek?: string;
   readingTime?: string;
+  /** Beginner, Intermediate or Advanced */
+  level?: string;
   prereqs?: string;
   versions?: string;
   updated?: string;

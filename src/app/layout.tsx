@@ -1,13 +1,12 @@
 import type { Metadata } from "next";
-import { Inter, JetBrains_Mono, Source_Serif_4 } from "next/font/google";
+import { JetBrains_Mono, Plus_Jakarta_Sans } from "next/font/google";
 import "./globals.css";
 
-const inter = Inter({ subsets: ["latin"], variable: "--font-inter", display: "swap" });
+/* Plus Jakarta Sans everywhere, for interface and prose alike: a modern
+   humanist sans with open counters that stays readable at 17px over a long
+   chapter. JetBrains Mono for code. */
+const jakarta = Plus_Jakarta_Sans({ subsets: ["latin"], variable: "--font-jakarta", display: "swap" });
 const mono = JetBrains_Mono({ subsets: ["latin"], variable: "--font-jetbrains", display: "swap" });
-/* Chapter prose is set in a serif. Measured against KnowML, which runs Source
-   Serif 4 at a 66-character measure: sans at 82 characters per line was the
-   readability gap, not contrast, which is near identical between the two. */
-const serif = Source_Serif_4({ subsets: ["latin"], variable: "--font-serif", display: "swap" });
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://knowsys.vercel.app"),
@@ -40,7 +39,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html
       lang="en"
       data-theme="light"
-      className={`${inter.variable} ${mono.variable} ${serif.variable}`}
+      className={`${jakarta.variable} ${mono.variable}`}
       suppressHydrationWarning
     >
       <head>

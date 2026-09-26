@@ -1,81 +1,80 @@
-import Link from "next/link";
 import type { Page } from "@/lib/manifest";
-import type { Frontmatter } from "@/lib/mdx";
+import type { Frontmatter, Outline } from "@/lib/mdx";
+import Link from "next/link";
 import { PageStats } from "./page-stats";
-import { cn } from "@/lib/utils";
+import { ChapterActions } from "./chapter-actions";
 
-const TEXT: Record<string, string> = {
-  machine: "text-machine", os: "text-os", conc: "text-conc", data: "text-data",
-  dist: "text-dist", cloud: "text-cloud", ops: "text-ops", lab: "text-lab",
-};
-const BG: Record<string, string> = {
-  machine: "bg-machine", os: "bg-os", conc: "bg-conc", data: "bg-data",
-  dist: "bg-dist", cloud: "bg-cloud", ops: "bg-ops", lab: "bg-lab",
-};
-
-/* A title page, not a datasheet. It used to open with a four-cell spec grid,
-   which made every chapter look like a dashboard before the first sentence.
-   The facts are still here (how long, what it assumes, which versions) but
-   as one quiet line under the title, where a book would put them. */
+/* The chapter's front page: where it sits, what it's called, why you'd read
+   it, what it costs you in time, and what's in it. The last word or two of
+   the title carries the accent gradient. */
 export function ChapterHeader({
-  page, colour, fm,
+  page, fm, outline,
 }: {
   page: Page;
   colour: string;
   fm?: Frontmatter;
+  outline?: Outline[];
 }) {
-  const stub = page.status !== "live";
+  const words = page.title.split(" ");
+  const cut = words.length > 3 ? words.length - 2 : Math.max(words.length - 1, 1);
+  const head = words.slice(0, cut).join(" ");
+  const tail = words.slice(cut).join(" ");
+  const pills = [
+    fm?.readingTime && `⏱ ${fm.readingTime.replace(/^~/, "")} read`,
+    fm?.level && `◆ ${fm.level}`,
+    fm?.prereqs && `Assumes: ${fm.prereqs}`,
+  ].filter(Boolean) as string[];
+  const sections = (outline ?? []).filter((o) => o.n);
 
   return (
-    <header className="mb-12">
-      <div className="mb-6 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px]">
-        <span className={cn("size-2 rounded-full", BG[colour])} />
+    <header className="relative mb-10 border-b border-line pb-10 pt-2">
+      <div aria-hidden className="hero-glow -top-16 h-[380px]" />
+      <div className="mb-5 flex flex-wrap items-center gap-2.5 text-[13px]">
         <Link
           href={`/sections#${page.groupSlug}`}
-          className={cn("font-medium transition-opacity hover:opacity-75", TEXT[colour])}
+          className="inline-flex items-center gap-1.5 rounded-full bg-accent-soft px-2.5 py-1 font-semibold text-accent"
         >
+          <span className="size-1.5 rounded-full bg-accent" />
           {page.group}
         </Link>
-        <span className="text-faint">·</span>
         <span className="tnum text-faint">Chapter {page.num}</span>
-        {stub && (
-          <span className="ml-1 rounded border border-line px-1.5 py-px text-[11px] text-faint">
-            not written yet
-          </span>
-        )}
+        {page.status !== "live" && <span className="text-faint">· not written yet</span>}
         <span className="flex-1" />
         <PageStats pageId={page.slug} />
       </div>
 
-      <h1 className="mb-5 font-[family-name:var(--font-serif)] text-[38px] font-semibold leading-[1.1] tracking-[-0.015em] text-ink sm:text-[50px]">
-        {page.title}
+      <h1 className="mb-4 text-[38px] font-extrabold leading-[1.06] tracking-[-0.035em] text-ink sm:text-[52px]">
+        {head}{" "}
+        <span className="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-transparent">{tail}</span>
       </h1>
 
-      <p className="mb-7 max-w-[60ch] font-[family-name:var(--font-serif)] text-[19px] leading-relaxed text-muted sm:text-[21px]">
-        {fm?.dek ?? page.hook}
-      </p>
+      <p className="mb-6 max-w-[62ch] text-[18px] leading-relaxed text-muted sm:text-[19px]">{fm?.dek ?? page.hook}</p>
 
-      <dl className="flex flex-wrap gap-x-6 gap-y-2 border-y border-line py-3 text-[13px]">
-        {fm?.readingTime && (
-          <div className="flex gap-1.5">
-            <dt className="text-faint">Read</dt>
-            <dd className="text-muted">{fm.readingTime.replace(/^~/, "")}</dd>
-          </div>
-        )}
-        {fm?.prereqs && (
-          <div className="flex gap-1.5">
-            <dt className="text-faint">Assumes</dt>
-            <dd className="text-muted">{fm.prereqs}</dd>
-          </div>
-        )}
-        {fm?.versions && (
-          <div className="flex min-w-0 gap-1.5">
-            <dt className="shrink-0 text-faint">Versions</dt>
-            <dd className="text-muted">{fm.versions}</dd>
-          </div>
-        )}
-        {!fm && <dd className="text-faint">{page.hook}</dd>}
-      </dl>
+      {pills.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {pills.map((p) => (
+            <span key={p} className="rounded-full border border-line bg-surface px-3 py-1.5 text-[13px] text-muted">{p}</span>
+          ))}
+        </div>
+      )}
+
+      {fm && <ChapterActions slug={page.slug} firstId={sections[0]?.id} />}
+
+      {sections.length > 0 && (
+        <nav className="mt-8 rounded-xl border border-line bg-surface p-5 shadow-[var(--shadow)]">
+          <div className="mb-2.5 text-[12.5px] font-semibold uppercase tracking-[0.07em] text-faint">In this chapter</div>
+          <ol className="grid gap-x-8 gap-y-1 text-[15px] sm:grid-cols-2">
+            {sections.map((s) => (
+              <li key={s.id}>
+                <a href={`#${s.id}`} className="flex gap-2.5 py-0.5 text-muted transition-colors hover:text-accent">
+                  <span className="tnum w-5 shrink-0 font-mono text-[13px] text-faint">{s.n.replace(/^0/, "")}</span>
+                  {s.label}
+                </a>
+              </li>
+            ))}
+          </ol>
+        </nav>
+      )}
     </header>
   );
 }

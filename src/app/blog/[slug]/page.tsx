@@ -36,24 +36,25 @@ export default async function PostPage({ params }: { params: Promise<{ slug: str
     <>
       <TopNav />
       <ReadingProgress />
-      <main className="mx-auto max-w-[740px] px-5 pb-28 pt-14 sm:px-8">
+      <main className="relative mx-auto max-w-[760px] px-5 pb-28 pt-14 sm:px-8">
+        <div aria-hidden className="hero-glow -top-10 h-[420px]" />
         <header className="mb-12 border-b border-line pb-10">
           <nav className="mb-8 text-[13px]">
             <Link href="/blog" className="text-faint transition-colors hover:text-ink">← Field notes</Link>
           </nav>
           <div className="mb-5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[13px] text-faint">
-            <span className="font-semibold uppercase tracking-[0.06em] text-accent">{post.kicker}</span>
+            <span className="rounded-full bg-accent-soft px-2.5 py-0.5 font-semibold text-accent">{post.kicker}</span>
             <span>{formatDate(post.date)}</span>
             {post.readingTime && <span>· {post.readingTime}</span>}
           </div>
-          <h1 className="mb-6 font-[family-name:var(--font-serif)] text-[38px] font-semibold leading-[1.1] tracking-[-0.015em] text-ink sm:text-[50px]">
+          <h1 className="mb-6 text-[38px] font-extrabold leading-[1.08] tracking-[-0.035em] text-ink sm:text-[50px]">
             {post.title}
           </h1>
-          <p className="max-w-[60ch] font-[family-name:var(--font-serif)] text-[20px] leading-relaxed text-muted sm:text-[21px]">{post.dek}</p>
+          <p className="max-w-[60ch] text-[18.5px] leading-relaxed text-muted sm:text-[19.5px]">{post.dek}</p>
           {post.tags.length > 0 && (
             <div className="mt-5 flex flex-wrap gap-1.5">
               {post.tags.map((t) => (
-                <span key={t} className="rounded-full bg-surface-2 px-2.5 py-0.5 text-[12px] text-muted">
+                <span key={t} className="rounded-full border border-line bg-surface px-3 py-1 text-[12.5px] font-medium text-muted">
                   {t}
                 </span>
               ))}
@@ -85,8 +86,8 @@ export default async function PostPage({ params }: { params: Promise<{ slug: str
             </div>
             <div className="flex flex-col gap-3">
               {more.map((p) => (
-                <Link key={p.slug} href={`/blog/${p.slug}`} className="glass glass-hover rounded-xl p-4">
-                  <div className="mb-1 font-mono text-[10.5px] uppercase tracking-wider text-faint">{p.kicker}</div>
+                <Link key={p.slug} href={`/blog/${p.slug}`} className="rounded-xl border border-line bg-surface p-4 shadow-[var(--shadow)] transition hover:border-accent">
+                  <div className="mb-1 text-[12px] font-semibold text-accent">{p.kicker}</div>
                   <div className="text-[15px] font-semibold leading-snug text-ink">{p.title}</div>
                 </Link>
               ))}

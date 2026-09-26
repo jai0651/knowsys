@@ -95,11 +95,11 @@ export function Search() {
     <>
       <button
         onClick={() => setOpen(true)}
-        className="flex items-center gap-2 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[13px] text-faint transition-colors hover:border-line-2 hover:text-muted sm:min-w-[180px]"
+        className="flex items-center gap-2.5 rounded-[10px] border border-line bg-surface px-3 py-2 text-[13.5px] text-faint transition-colors hover:border-line-2 hover:text-muted sm:min-w-[240px]"
         aria-label="Search"
       >
         <SearchIcon className="size-3.5" />
-        <span className="hidden flex-1 text-left md:inline">Search</span>
+        <span className="hidden flex-1 text-left md:inline">Search chapters…</span>
         <kbd className="hidden rounded border border-line px-1.5 py-0.5 font-mono text-[10px] md:inline">⌘K</kbd>
       </button>
 
