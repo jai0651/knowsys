@@ -1,4 +1,5 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
+import { SITE } from "@/lib/site";
 import { JetBrains_Mono, Plus_Jakarta_Sans } from "next/font/google";
 import "./globals.css";
 
@@ -9,13 +10,34 @@ const jakarta = Plus_Jakarta_Sans({ subsets: ["latin"], variable: "--font-jakart
 const mono = JetBrains_Mono({ subsets: ["latin"], variable: "--font-jetbrains", display: "swap" });
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://knowsys.vercel.app"),
-  title: {
-    default: "KnowSys — systems engineering, in depth",
-    template: "%s · KnowSys",
+  metadataBase: new URL(SITE.url),
+  title: { default: SITE.title, template: "%s · KnowSys" },
+  description: SITE.description,
+  applicationName: SITE.name,
+  keywords: SITE.keywords,
+  authors: [{ name: "KnowSys" }],
+  creator: "KnowSys",
+  category: "technology",
+  alternates: { canonical: "/" },
+  openGraph: {
+    type: "website",
+    siteName: SITE.name,
+    title: SITE.title,
+    description: SITE.description,
+    url: "/",
+    locale: "en_US",
   },
-  description:
-    "The systems underneath, from the cache line up. Operating systems, concurrency, storage engines, distributed systems and cloud infrastructure — every chapter built from the problem it solves, with real measurements.",
+  twitter: { card: "summary_large_image", title: SITE.title, description: SITE.description },
+  robots: { index: true, follow: true, googleBot: { index: true, follow: true, "max-image-preview": "large", "max-snippet": -1 } },
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  themeColor: [
+    { media: "(prefers-color-scheme: dark)", color: "#0c0a16" },
+    { media: "(prefers-color-scheme: light)", color: "#fbfaff" },
+  ],
 };
 
 /* Mode is set before first paint so there's no flash. Dark unless the reader

@@ -29,12 +29,12 @@ export function Milestone({
   children: React.ReactNode;
 }) {
   return (
-    <section id={`m${n}`} className="relative my-6 scroll-mt-24 pl-14">
-      <span className="absolute bottom-[-24px] left-[17px] top-11 w-px bg-line" aria-hidden />
-      <span className="absolute left-0 top-0 grid size-9 place-items-center rounded-xl bg-gradient-to-br from-accent to-accent-2 text-[14px] font-extrabold text-white shadow-[0_8px_20px_-8px_var(--accent)]">
+    <section id={`m${n}`} className="relative my-6 scroll-mt-24 pl-10 sm:pl-14">
+      <span className="absolute bottom-[-24px] left-[13px] top-9 w-px bg-line sm:left-[17px] sm:top-11" aria-hidden />
+      <span className="absolute left-0 top-0 grid size-7 place-items-center rounded-lg text-[12px] sm:size-9 sm:rounded-xl bg-gradient-to-br from-accent to-accent-2 text-[14px] font-extrabold text-white shadow-[0_8px_20px_-8px_var(--accent)]">
         {n}
       </span>
-      <div className="rounded-2xl border border-line bg-surface p-5 shadow-[var(--shadow)]">
+      <div className="rounded-2xl border border-line bg-surface p-4 shadow-[var(--shadow)] sm:p-5">
         <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
           <h3 className="text-[19px] font-bold tracking-[-0.015em] text-ink">{title}</h3>
           {time && <span className="rounded-full bg-accent-soft px-2.5 py-0.5 text-[12px] font-semibold text-accent">{time}</span>}

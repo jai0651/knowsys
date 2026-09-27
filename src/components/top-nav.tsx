@@ -3,6 +3,7 @@ import { Search } from "./search";
 import { ThemeToggle } from "./theme-toggle";
 import { MobileMenu } from "./mobile-menu";
 import { ProgressPill } from "./progress-pill";
+import { Logo } from "./logo";
 import { groups, livePages } from "@/lib/manifest";
 
 const LINKS = [
@@ -18,7 +19,7 @@ export function TopNav() {
       <div className="mx-auto flex h-16 max-w-[1480px] items-center gap-3 px-4 sm:px-6">
         <MobileMenu groups={groups.map((g) => ({ slug: g.slug, name: g.name, pages: g.pages }))} />
         <Link href="/" className="flex items-center gap-2.5 text-[17px] font-bold tracking-[-0.02em] text-ink">
-          <span className="size-[26px] rounded-lg bg-gradient-to-br from-accent to-accent-2 shadow-[0_0_20px_-4px_var(--accent)]" />
+          <Logo className="size-[28px] drop-shadow-[0_4px_14px_rgba(124,58,237,0.45)]" />
           KnowSys
         </Link>
         <nav className="ml-4 hidden items-center gap-1 sm:flex">

@@ -5,6 +5,8 @@ import { TopNav } from "@/components/top-nav";
 import { PageCard } from "@/components/page-card";
 import { Mdx } from "@/components/mdx";
 import { Notes } from "@/components/notes/notes";
+import { JsonLd } from "@/components/json-ld";
+import { SITE } from "@/lib/site";
 import { ReadingProgress } from "@/components/reading-progress";
 import { allPosts, postBySlug, formatDate } from "@/lib/posts";
 import { pageBySlug, colourOf, type Page } from "@/lib/manifest";
@@ -21,7 +23,15 @@ export async function generateMetadata({
   const { slug } = await params;
   const post = postBySlug(slug);
   if (!post) return {};
-  return { title: post.title, description: post.dek };
+  const url = `/blog/${post.slug}`;
+  return {
+    title: post.title,
+    description: post.dek,
+    keywords: post.tags,
+    alternates: { canonical: url },
+    openGraph: { type: "article", title: post.title, description: post.dek, url, publishedTime: post.date, tags: post.tags },
+    twitter: { card: "summary_large_image", title: post.title, description: post.dek },
+  };
 }
 
 export default async function PostPage({ params }: { params: Promise<{ slug: string }> }) {
@@ -34,6 +44,20 @@ export default async function PostPage({ params }: { params: Promise<{ slug: str
 
   return (
     <>
+      <JsonLd
+        data={{
+          "@context": "https://schema.org",
+          "@type": "BlogPosting",
+          headline: post.title,
+          description: post.dek,
+          datePublished: post.date,
+          url: `${SITE.url}/blog/${post.slug}`,
+          image: `${SITE.url}/blog/${post.slug}/opengraph-image`,
+          keywords: post.tags.join(", "),
+          author: { "@type": "Organization", name: SITE.name, url: SITE.url },
+          publisher: { "@type": "Organization", name: SITE.name, url: SITE.url },
+        }}
+      />
       <TopNav />
       <ReadingProgress />
       <main className="relative mx-auto max-w-[760px] px-5 pb-28 pt-14 sm:px-8">

@@ -5,6 +5,7 @@ import { ArrowLeft, ArrowRight } from "lucide-react";
 import { TopNav } from "@/components/top-nav";
 import { Sidebar } from "@/components/sidebar";
 import { SpineRail } from "@/components/spine-rail";
+import { MobileToc } from "@/components/mobile-toc";
 import { ChapterHeader } from "@/components/chapter-header";
 import { SectionHeading } from "@/components/section";
 import { StubNote } from "@/components/content";
@@ -13,6 +14,8 @@ import { readDoc, outlineOf } from "@/lib/mdx";
 import { topics, pageBySlug, neighbours, colourOf } from "@/lib/manifest";
 import { shapeOf } from "@/lib/spine";
 import { Notes } from "@/components/notes/notes";
+import { JsonLd } from "@/components/json-ld";
+import { SITE } from "@/lib/site";
 import { ReadingProgress } from "@/components/reading-progress";
 
 export function generateStaticParams() {
@@ -27,7 +30,16 @@ export async function generateMetadata({
   const { slug } = await params;
   const page = pageBySlug(slug);
   if (!page) return {};
-  return { title: page.title, description: page.hook };
+  const fm = readDoc("chapters", slug)?.frontmatter;
+  const description = fm?.dek ?? page.hook;
+  return {
+    title: page.title,
+    description,
+    keywords: [page.title, page.short, page.group, "systems engineering", "tutorial"],
+    alternates: { canonical: page.href },
+    openGraph: { type: "article", title: page.title, description, url: page.href, section: page.group, modifiedTime: fm?.updated },
+    twitter: { card: "summary_large_image", title: page.title, description },
+  };
 }
 
 export default async function TopicPage({ params }: { params: Promise<{ slug: string }> }) {
@@ -51,8 +63,39 @@ export default async function TopicPage({ params }: { params: Promise<{ slug: st
   const { prev, next } = neighbours(slug);
   const colour = colourOf(page);
 
+  const ld = doc
+    ? [
+        {
+          "@context": "https://schema.org",
+          "@type": "TechArticle",
+          headline: page.title,
+          description: doc.frontmatter.dek ?? page.hook,
+          url: `${SITE.url}${page.href}`,
+          image: `${SITE.url}${page.href}/opengraph-image`,
+          dateModified: doc.frontmatter.updated,
+          articleSection: page.group,
+          proficiencyLevel: doc.frontmatter.level,
+          timeRequired: doc.frontmatter.readingTime ? `PT${parseInt(doc.frontmatter.readingTime.replace(/\D/g, ""), 10) || 20}M` : undefined,
+          isAccessibleForFree: true,
+          inLanguage: "en",
+          author: { "@type": "Organization", name: SITE.name, url: SITE.url },
+          publisher: { "@type": "Organization", name: SITE.name, url: SITE.url, logo: { "@type": "ImageObject", url: `${SITE.url}/icons/icon-512.png` } },
+        },
+        {
+          "@context": "https://schema.org",
+          "@type": "BreadcrumbList",
+          itemListElement: [
+            { "@type": "ListItem", position: 1, name: "KnowSys", item: SITE.url },
+            { "@type": "ListItem", position: 2, name: page.group, item: `${SITE.url}/sections#${page.groupSlug}` },
+            { "@type": "ListItem", position: 3, name: page.title, item: `${SITE.url}${page.href}` },
+          ],
+        },
+      ]
+    : null;
+
   return (
     <>
+      {ld && <JsonLd data={ld} />}
       <TopNav />
       {doc && <ReadingProgress />}
       <div className="mx-auto flex max-w-[1480px] gap-10 px-5 sm:px-6">
@@ -106,6 +149,7 @@ export default async function TopicPage({ params }: { params: Promise<{ slug: st
         <SpineRail spine={railSpine} tail={railTail} minutes={minutes} />
       </div>
 
+      {railSpine.length > 0 && <MobileToc items={railSpine} />}
       <Notes title={page.title} />
     </>
   );

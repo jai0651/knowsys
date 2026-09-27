@@ -6,6 +6,7 @@ import { groups, topics, labs } from "@/lib/manifest";
 import { cn } from "@/lib/utils";
 
 export const metadata: Metadata = {
+  alternates: { canonical: "/sections" },
   title: "Browse every chapter",
   description: "Every chapter and lab, grouped by subject.",
 };

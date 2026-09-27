@@ -6,6 +6,7 @@ import { Difficulty } from "@/components/difficulty";
 import { allProjects } from "@/lib/projects";
 
 export const metadata: Metadata = {
+  alternates: { canonical: "/projects" },
   title: "Build it yourself",
   description: "Game engines, browsers, kernels, containers, databases: the projects that teach systems best, with a roadmap for each.",
 };

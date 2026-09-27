@@ -5,6 +5,7 @@ import { TopNav } from "@/components/top-nav";
 import { allPosts, formatDate } from "@/lib/posts";
 
 export const metadata: Metadata = {
+  alternates: { canonical: "/blog" },
   title: "Field notes",
   description: "Outages, reproductions and wrong numbers, each told start to finish.",
 };

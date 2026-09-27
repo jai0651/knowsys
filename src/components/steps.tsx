@@ -177,7 +177,8 @@ export function StepSequence({
 
   return (
     <Frame title={title} hint={hint} caption={messages[st.i].note} n={messages.length} {...st}>
-      <svg viewBox={`0 0 ${W} ${H}`} className="mx-auto block w-full max-w-[680px]" role="img" aria-label={title}>
+      <div className="-mx-5 overflow-x-auto px-5 pb-1 sm:mx-0 sm:px-0">
+      <svg viewBox={`0 0 ${W} ${H}`} className="mx-auto block w-full max-w-[680px]" style={{ minWidth: Math.max(actors.length * 128, 320) }} role="img" aria-label={title}>
         <defs>
           <marker id="seq-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0 0 L10 5 L0 10 z" fill="#e2e8f0" />
@@ -225,6 +226,7 @@ export function StepSequence({
           );
         })}
       </svg>
+      </div>
     </Frame>
   );
 }

@@ -5,6 +5,9 @@ import { groups, topics, labs, livePages, pageBySlug } from "@/lib/manifest";
 import { readDoc } from "@/lib/mdx";
 import { allPosts, formatDate } from "@/lib/posts";
 import { StartPath } from "@/components/start-path";
+import { JsonLd } from "@/components/json-ld";
+import { Logo } from "@/components/logo";
+import { SITE } from "@/lib/site";
 import { allProjects } from "@/lib/projects";
 import { Difficulty } from "@/components/difficulty";
 import { cn } from "@/lib/utils";
@@ -49,6 +52,12 @@ export default function Home() {
 
   return (
     <>
+      <JsonLd
+        data={[
+          { "@context": "https://schema.org", "@type": "WebSite", name: SITE.name, url: SITE.url, description: SITE.description, inLanguage: "en" },
+          { "@context": "https://schema.org", "@type": "Organization", name: SITE.name, url: SITE.url, logo: `${SITE.url}/icons/icon-512.png` },
+        ]}
+      />
       <TopNav />
       <main className="mx-auto max-w-[1200px] px-5 pb-28 sm:px-8">
         {/* ── hero ─────────────────────────────────────────────────────── */}
@@ -213,7 +222,7 @@ export default function Home() {
         )}
 
         <footer className="flex flex-wrap items-center gap-3 border-t border-line pt-8 text-[13.5px] text-faint">
-          <span className="size-5 rounded-md bg-gradient-to-br from-accent to-accent-2" />
+          <Logo className="size-5" />
           <span className="font-semibold text-muted">KnowSys</span>
           <span>· a sibling to</span>
           <a href="https://knowml.vercel.app" className="font-medium text-muted hover:text-accent">KnowML</a>

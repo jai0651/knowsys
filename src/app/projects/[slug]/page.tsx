@@ -4,10 +4,13 @@ import { notFound } from "next/navigation";
 import { TopNav } from "@/components/top-nav";
 import { Mdx } from "@/components/mdx";
 import { SpineRail } from "@/components/spine-rail";
+import { MobileToc } from "@/components/mobile-toc";
 import { ReadingProgress } from "@/components/reading-progress";
 import { PageCard } from "@/components/page-card";
 import { Difficulty } from "@/components/difficulty";
 import { Notes } from "@/components/notes/notes";
+import { JsonLd } from "@/components/json-ld";
+import { SITE } from "@/lib/site";
 import { allProjects, projectBySlug } from "@/lib/projects";
 import { outlineOf } from "@/lib/mdx";
 import { pageBySlug, colourOf, type Page } from "@/lib/manifest";
@@ -19,7 +22,17 @@ export function generateStaticParams() {
 export async function generateMetadata({ params }: { params: Promise<{ slug: string }> }): Promise<Metadata> {
   const { slug } = await params;
   const p = projectBySlug(slug);
-  return p ? { title: `Build ${p.title}`, description: p.tagline } : {};
+  if (!p) return {};
+  const url = `/projects/${p.slug}`;
+  const title = `Build ${p.title}`;
+  return {
+    title,
+    description: p.tagline,
+    keywords: [title, `${p.title} from scratch`, "build your own", "systems project", ...p.languages],
+    alternates: { canonical: url },
+    openGraph: { type: "article", title, description: p.tagline, url },
+    twitter: { card: "summary_large_image", title, description: p.tagline },
+  };
 }
 
 export default async function ProjectPage({ params }: { params: Promise<{ slug: string }> }) {
@@ -34,6 +47,17 @@ export default async function ProjectPage({ params }: { params: Promise<{ slug: 
 
   return (
     <>
+      <JsonLd
+        data={{
+          "@context": "https://schema.org",
+          "@type": "HowTo",
+          name: `Build ${p.title}`,
+          description: p.tagline,
+          url: `${SITE.url}/projects/${p.slug}`,
+          image: `${SITE.url}/projects/${p.slug}/opengraph-image`,
+          step: [...p.body.matchAll(/<Milestone\s+n=\{(\d+)\}\s+title="([^"]+)"/g)].map((m) => ({ "@type": "HowToStep", position: Number(m[1]), name: m[2], url: `${SITE.url}/projects/${p.slug}#m${m[1]}` })),
+        }}
+      />
       <TopNav />
       <ReadingProgress />
       <div className="mx-auto flex max-w-[1320px] gap-10 px-5 sm:px-6">
@@ -87,6 +111,7 @@ export default async function ProjectPage({ params }: { params: Promise<{ slug: 
         </main>
         <SpineRail spine={outline} />
       </div>
+      {outline.length > 0 && <MobileToc items={outline} />}
       <Notes title={p.title} />
     </>
   );
