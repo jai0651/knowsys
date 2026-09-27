@@ -18,16 +18,14 @@ export const metadata: Metadata = {
     "The systems underneath, from the cache line up. Operating systems, concurrency, storage engines, distributed systems and cloud infrastructure — every chapter built from the problem it solves, with real measurements.",
 };
 
-/* Mode is set before first paint so there's no flash. Light unless the reader
-   has chosen dark: long-form reading on paper is the default this site is
-   designed around, and the dark theme is tuned separately, not inverted. */
+/* Mode is set before first paint so there's no flash. Dark unless the reader
+   has switched to light; their choice is remembered in localStorage. */
 const boot = `
 try {
   var m = localStorage.getItem("ks-mode");
-  document.documentElement.setAttribute("data-theme", m === "dark" ? "dark" : "light");
+  document.documentElement.setAttribute("data-theme", m === "light" ? "light" : "dark");
 } catch (e) {}
 `;
-
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     /* The font variables must live on <html>, not <body>. Tailwind declares
@@ -38,7 +36,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
        the system font. */
     <html
       lang="en"
-      data-theme="light"
+      data-theme="dark"
       className={`${jakarta.variable} ${mono.variable}`}
       suppressHydrationWarning
     >
