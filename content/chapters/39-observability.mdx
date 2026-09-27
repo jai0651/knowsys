@@ -1,0 +1,1034 @@
+---
+title: Observability
+dek: "What metrics, logs and traces each cost and each answer, and how the systems that store them work inside. Prometheus's data model and TSDB down to the bit encoding, why cardinality is the bill, how histogram percentiles are estimated, and how OpenTelemetry carries a trace across services and decides which ones to keep."
+readingTime: "~30 min"
+level: "Intermediate"
+versions: "Prometheus v3.9.1 source and binary · opentelemetry-go v1.38.0 · W3C Trace Context 1.0 · measured on linuxkit 6.10.14 aarch64 and Apple M4"
+prereqs: "HTTP services, basic statistics"
+updated: "2026-09-27"
+---
+
+Every production service eventually has a bad hour nobody can explain. Latency
+is up but CPU is normal. Errors come from one customer but you can't see
+which. A request takes four seconds and every service it touched says it
+answered in forty milliseconds.
+
+Observability is whatever lets you answer those questions from the outside,
+without shipping new code. In practice it's three kinds of telemetry
+(metrics, logs and traces), the systems that store them, and knowing which one
+to reach for. Each has a different cost model, and most observability bills,
+and most outages of the monitoring itself, come from using the wrong one.
+
+This chapter takes each signal in turn. It spends the most time on metrics,
+because Prometheus's design explains most of what you'll run into: series,
+labels, cardinality, the TSDB and histogram percentiles. Then it covers logs,
+then traces, with OpenTelemetry's context propagation and sampling, and ends
+with how to tie the three together.
+
+<SectionHeading n="01" id="signals">Three signals, three questions</SectionHeading>
+
+The three signals aren't three views of the same data. They record different
+things, at different granularity, and they cost differently.
+
+<Sub n="1.1" title="What each one is for">
+
+| Signal | What it records | Answers | Cost grows with |
+|---|---|---|---|
+| **Metrics** | Numbers aggregated over time, per label set | Is something wrong, and how much? | Number of distinct series |
+| **Logs** | One record per event, with its details | What exactly happened to this request? | Number of events × size |
+| **Traces** | A tree of timed spans for one request across services | Where did the time go, and which service? | Number of requests traced × spans each |
+
+<Why>Why not just log everything and compute metrics from the logs?</Why>
+
+Because the costs scale with different things. A metric's cost depends on how
+many series you have, not how much traffic you serve. A counter of HTTP
+requests costs the same at ten requests a second as at a million. A log line
+costs every time it's written.
+
+Here's what that means for one service at 1,000 requests a second:
+
+<Estimate
+  rows={[
+    { label: "One structured log line per request", math: "a 262-byte JSON line (example in section 6)", value: "262 B" },
+    { label: "Logs per day", math: "262 B × 1,000/s × 86,400 s", value: "22.6 GB" },
+    { label: "Metrics: 500 series scraped every 15 s", math: "500 / 15 s", value: "33 samples/s" },
+    { label: "At 1.87 B per counter sample (measured, section 3)", math: "33 × 1.87 B × 86,400 s", value: "5.4 MB/day" },
+  ]}
+  result={{ label: "logs versus metrics for the same service", value: "≈ 4,000×" }}
+/>
+
+That ratio is why metrics are what you alert on and graph, and why logs and
+traces are sampled, filtered or kept for a short time.
+
+<Callout label="Design implication">
+Use each signal for what it's cheap at. Metrics tell you *that* something is
+wrong. Traces tell you *where*. Logs tell you *what*, for the few requests you
+end up looking at. A design that asks one signal to do all three pays for it.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="02" id="prometheus-model">Metrics: the Prometheus data model</SectionHeading>
+
+Prometheus is the reference design for metrics in most stacks, and its model
+has been copied by nearly everything since, including OpenTelemetry's metrics
+and most hosted backends.
+
+<Sub n="2.1" title="A series is a name plus labels">
+
+A **time series** is identified by a metric name and a set of label pairs.
+Each unique combination is a separate series, with its own stream of
+timestamped values:
+
+```text
+http_requests_total{method="GET", route="/api/orders", status="200"}  → 1027 @ t1, 1051 @ t2, …
+http_requests_total{method="GET", route="/api/orders", status="500"}  → 3 @ t1, 3 @ t2, …
+http_requests_total{method="POST", route="/api/orders", status="201"} → 88 @ t1, 90 @ t2, …
+```
+
+Inside Prometheus the name is just one more label, `__name__`. A series is its
+full label set, sorted, and a **sample** is one `(timestamp, float64)` pair on
+it.
+
+There are four metric types, but only at the client. On the wire and in the
+database they're all float series:
+
+| Type | What it is | How it's stored | How you query it |
+|---|---|---|---|
+| **Counter** | Only goes up (resets to 0 on restart) | One series | `rate()`, `increase()` |
+| **Gauge** | Goes up and down | One series | As is, or `avg_over_time()` |
+| **Histogram** | Counts of observations per bucket | One series per bucket, plus `_sum` and `_count` | `histogram_quantile()` |
+| **Summary** | Quantiles computed in the client | One series per quantile, plus `_sum` and `_count` | As is; can't be aggregated |
+
+</Sub>
+
+<Sub n="2.2" title="Pull: the scrape">
+
+Prometheus pulls. Each target exposes its current values over HTTP, usually
+at `/metrics`, and Prometheus fetches them on a fixed interval:
+
+```text
+# HELP http_requests_total Requests handled.
+# TYPE http_requests_total counter
+http_requests_total{method="GET",route="/api/orders",status="200"} 1027
+http_requests_total{method="GET",route="/api/orders",status="500"} 3
+```
+
+Here's what happens to one scrape:
+
+<Steps
+  title="One scrape, from /metrics to disk"
+  lanes={[
+    { t: "Target", s: "/metrics", icon: "◉" },
+    { t: "Scrape loop", s: "parse · relabel", icon: "⇅" },
+    { t: "Head", s: "memSeries in RAM", icon: "▦" },
+    { t: "WAL", s: "128 MB segments", icon: "≡" },
+    { t: "Chunks", s: "120 samples each", icon: "▤" },
+    { t: "Block", s: "2 h, immutable", icon: "⬚" },
+  ]}
+  steps={[
+    [0, "Every `scrape_interval`, Prometheus fetches the target's `/metrics` page. The target just prints its current counter values; it keeps **no history**."],
+    [1, "The scrape loop parses each line, applies `metric_relabel_configs` (which can drop series or labels), and attaches `job`, `instance` and target labels. It also writes `up` and `scrape_duration_seconds`."],
+    [2, "Each sample is appended to its series in the **head block**, the in-memory part of the database. A series seen for the first time gets a new `memSeries` and entries in the label index."],
+    [3, "The batch is written to the **write-ahead log** as it's committed, so a restarted Prometheus can replay what the head held in memory."],
+    [4, "Each series' samples are compressed into a **chunk**. A chunk is cut at about 120 samples, then memory-mapped to disk so the head keeps only the chunk being filled in RAM."],
+    [5, "When the head spans more than 1.5 × the block range (3 hours by default), the oldest 2 hours are written out as an **immutable block**: chunks plus an index. Background compaction later merges blocks."],
+  ]}
+/>
+
+<Why>Why pull instead of having services push?</Why>
+
+Pull gives Prometheus the list of what *should* exist. If a target is down,
+the scrape fails and `up` becomes 0, and you can alert on that. With push, a dead
+service just goes quiet, and silence looks the same as no traffic. Pull also
+puts the rate under the server's control: a misbehaving client can't flood it.
+
+The price is that short-lived jobs and targets behind NAT need help: the
+Pushgateway for batch jobs, or an agent that scrapes locally and forwards with
+`remote_write`.
+
+</Sub>
+
+<Sub n="2.3" title="rate() and counter resets">
+
+Counters only go up, so their raw value is almost never what you graph.
+`rate(x[5m])` takes the samples in the last five minutes and computes the
+per-second increase.
+
+<Why>Why doesn't a restart break the graph?</Why>
+
+Because `rate()` treats any decrease as a reset. If a counter goes 1000, 1040,
+12, 50, it assumes the process restarted and counted from zero, and adds the
+12 to the increase. That's why you must never use `rate()` on a gauge: every
+drop looks like a reset.
+
+`rate()` also extrapolates to the edges of the window, so `increase()` over a
+window often returns a non-integer for an integer counter. And it needs at
+least two samples in the window, so the range should be at least four scrape
+intervals to survive one failed scrape.
+
+<Callout label="Common mistake" kind="warn">
+`rate()` with a range shorter than about twice the scrape interval. At a
+15-second interval, `rate(x[15s])` usually has one sample or none, and the
+graph has gaps exactly when scrapes are slow, and that's usually during an
+incident.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="03" id="tsdb">Inside the Prometheus TSDB</SectionHeading>
+
+The storage engine is the reason Prometheus can hold millions of series on
+one machine. Its design follows Fabian Reinartz's
+[Writing a Time Series Database from Scratch](https://web.archive.org/web/2023/https://fabxc.org/tsdb/) (2017),
+and its compression follows Facebook's Gorilla.
+
+<Sub n="3.1" title="Gorilla compression">
+
+A raw sample is 16 bytes: an int64 timestamp and a float64 value. The
+[Gorilla paper](https://www.vldb.org/pvldb/vol8/p1816-teller.pdf) (Pelkonen et
+al., VLDB 2015) observed two things about monitoring data and compressed each:
+
+- **Timestamps are regular.** Scrapes happen every 15 seconds, so the delta
+  between samples is nearly constant, and the delta *of the delta* is usually
+  zero. Gorilla stored "about 96% of all time stamps" in a single bit.
+- **Values change slowly.** XOR a value with the previous one and most bits are
+  zero; store only the meaningful bits in the middle. In Gorilla's data,
+  "roughly 51% of all values are compressed to a single bit" because they
+  hadn't changed.
+
+Together that took Facebook's data "down from 16 bytes to an average of 1.37
+bytes" per point. Here's Prometheus's version of the timestamp half:
+
+<SourceRead
+  file="tsdb/chunkenc/xor.go"
+  repo="prometheus/prometheus"
+  tag="v3.9.1"
+  href="https://github.com/prometheus/prometheus/blob/v3.9.1/tsdb/chunkenc/xor.go#L161"
+>
+```go
+func (a *xorAppender) Append(t int64, v float64) {
+	var tDelta uint64
+	num := binary.BigEndian.Uint16(a.b.bytes())
+	switch num {
+	case 0:   /* first sample: full timestamp (varint) and full 64-bit value */
+	case 1:   /* second: timestamp delta, then XOR'd value */
+	default:
+		tDelta = uint64(t - a.t)
+		dod := int64(tDelta - a.tDelta)
+
+		// Gorilla has a max resolution of seconds, Prometheus milliseconds.
+		// Thus we use higher value range steps with larger bit size.
+		switch {
+		case dod == 0:
+			a.b.writeBit(zero)
+		case bitRange(dod, 14):
+			a.b.writeByte(0b10<<6 | (uint8(dod>>8) & (1<<6 - 1))) // 0b10 size code combined with 6 bits of dod.
+			a.b.writeByte(uint8(dod))                             // Bottom 8 bits of dod.
+		case bitRange(dod, 17):
+			a.b.writeBits(0b110, 3)
+			a.b.writeBits(uint64(dod), 17)
+		case bitRange(dod, 20):
+			a.b.writeBits(0b1110, 4)
+			a.b.writeBits(uint64(dod), 20)
+		default:
+			a.b.writeBits(0b1111, 4)
+			a.b.writeBits(uint64(dod), 64)
+		}
+
+		a.writeVDelta(v)
+	}
+	/* ... */
+}
+```
+</SourceRead>
+
+A perfectly regular scrape costs **one bit** of timestamp per sample. A scrape
+that's a few milliseconds late costs 16 bits, because Prometheus timestamps are
+in milliseconds and the smallest non-zero bucket is 14 bits plus a 2-bit code.
+
+</Sub>
+
+<Sub n="3.2" title="What a sample really costs">
+
+Prometheus's [storage docs](https://prometheus.io/docs/prometheus/latest/storage/)
+say it stores "an average of only 1-2 bytes per sample". That average hides a
+wide range. To see it, I generated 2,000 series of 480 samples each (two hours
+at 15 s) in four shapes, built blocks with `promtool tsdb
+create-blocks-from openmetrics`, and divided the chunk bytes by the sample
+count:
+
+<Compare
+  cols={["Series shape", "Timestamps", "Chunk bytes per sample"]}
+  rows={[
+    ["Constant value (e.g. a build-info gauge)", "exactly every 15 s", "0.45"],
+    ["Counter, increasing by 0–20 per scrape", "exactly every 15 s", "1.87"],
+    ["Same counter", "±50 ms jitter", "3.71"],
+    ["Random float gauge (worst case)", "exactly every 15 s", "7.98"],
+  ]}
+/>
+
+Prometheus v3.9.1 `promtool`, linuxkit 6.10.14 aarch64. The index adds roughly 75–90 bytes per series per block on top.
+
+<Why>Why does timestamp jitter double the size?</Why>
+
+Because it moves every timestamp out of the one-bit case. With ±50 ms of
+jitter the delta-of-delta is almost never zero, so each sample pays 16 bits of
+timestamp instead of 1: roughly the 1.8-byte difference between the second
+and third rows. A random float is worse again: its XOR with the previous value
+has few zero bits to drop.
+
+<Callout label="Design implication">
+Disk and memory for Prometheus scale with samples, and samples scale with
+series × scrape frequency. Halving the scrape interval doubles the bill for
+every series. The capacity formula from the docs is
+`retention_seconds × samples_per_second × bytes_per_sample`, with bytes per
+sample closer to 2 than 1 for real counters.
+</Callout>
+
+</Sub>
+
+<Sub n="3.3" title="The index: postings lists">
+
+A query names series by label, not by ID: `http_requests_total{status="500"}`.
+To find them, Prometheus keeps an inverted index, the same structure a search
+engine uses. For each label pair it stores a sorted list of the series that
+have it, called a **postings list**:
+
+<SourceRead
+  file="tsdb/index/postings.go"
+  repo="prometheus/prometheus"
+  tag="v3.9.1"
+  href="https://github.com/prometheus/prometheus/blob/v3.9.1/tsdb/index/postings.go#L60"
+>
+```go
+// MemPostings holds postings list for series ID per label pair. They may be written
+// to out of order.
+// EnsureOrder() must be called once before any reads are done. This allows for quick
+// unordered batch fills on startup.
+type MemPostings struct {
+	mtx sync.RWMutex
+
+	// m holds the postings lists for each label-value pair, indexed first by label name, and then by label value.
+	/* ... */
+	m map[string]map[string][]storage.SeriesRef
+	/* ... */
+}
+```
+</SourceRead>
+
+A selector with several matchers intersects their lists:
+
+<Steps
+  title='Evaluating sum(rate(http_requests_total{job="api",status="500"}[5m]))'
+  lanes={[
+    { t: "Postings", s: "label → series IDs", icon: "≡" },
+    { t: "Intersect", s: "sorted merge", icon: "⋂" },
+    { t: "Series", s: "labels + chunk refs", icon: "▦" },
+    { t: "Chunks", s: "decode XOR", icon: "▤" },
+    { t: "PromQL", s: "rate · sum", icon: "∑" },
+  ]}
+  steps={[
+    [0, "Look up three postings lists: `__name__=\"http_requests_total\"`, `job=\"api\"` and `status=\"500\"`. Each is a sorted list of series IDs."],
+    [1, "Intersect them by walking all three lists in step, like a merge join. The result is the IDs of series that have **all three** labels. Its cost depends on the length of the lists, not on the total number of series."],
+    [2, "For each matching ID, load the series' full label set and the references to its chunks that overlap the last 5 minutes plus the lookback."],
+    [3, "Decode just those chunks: replay the delta-of-delta timestamps and XOR'd values from the start of each chunk to the end of the range."],
+    [4, "PromQL computes `rate()` per series, then `sum()` across them. Only the final vector is returned."],
+  ]}
+/>
+
+<Why>Why are regex matchers slow?</Why>
+
+An equality matcher is one map lookup. A regex such as `route=~"/api/.*"` has to
+test every value of the `route` label against the regex, then merge all the
+matching postings lists. With a few values that's nothing. With 100,000 values
+of a label, which is the cardinality problem in the next section, it's the
+query.
+
+</Sub>
+
+<SectionHeading n="04" id="cardinality">Cardinality is the bill</SectionHeading>
+
+Almost every Prometheus outage and surprise invoice has the same cause: too
+many series. The docs put the rule plainly: "every unique combination of
+key-value label pairs represents a new time series."
+
+<Sub n="4.1" title="Labels multiply">
+
+The number of series for one metric is, at worst, the product of the number of
+values of each label.
+
+<Predict
+  q="A request counter has labels method (5 values), route (50), status (10) and pod (40). Someone adds customer_id, with 10,000 customers. Roughly how many series can the metric have now?"
+  options={[
+    "About 110,000: the old series plus one per customer",
+    "About 1 million",
+    "About 100 million",
+    "About 1 billion",
+  ]}
+  answer={3}
+>
+Before: 5 × 50 × 10 × 40 = 100,000 possible series. Each label multiplies, so
+adding customer_id makes it 100,000 × 10,000 = **one billion**. In practice
+most combinations never occur (not every customer hits every route on every
+pod), but even 1% of that is ten million series: about 29 GB of memory at the
+per-series cost measured below.
+</Predict>
+
+The Prometheus [naming guide](https://prometheus.io/docs/practices/naming/)
+says it directly: "Do not use labels to store dimensions with high cardinality
+(many different label values), such as user IDs, email addresses, or other
+unbounded sets of values."
+
+</Sub>
+
+<Sub n="4.2" title="What a series costs in memory">
+
+Every series in the head block costs RAM: the `memSeries` struct, its label
+set, its entries in the postings index, and the chunk being filled. To measure
+it, I served a static `/metrics` page with N series of a five-label counter,
+scraped it every 5 seconds with Prometheus 3.9.1 for 90 seconds, and read the
+server's resident memory:
+
+<Compare
+  cols={["Active series", "Prometheus RSS (median of 3)", "Per added series"]}
+  rows={[
+    ["≈ 0 (1 series)", "72 MB", "—"],
+    ["100,000", "357 MB", "≈ 2.9 KB"],
+    ["200,000", "646 MB", "≈ 2.9 KB"],
+  ]}
+/>
+
+Shared 4-CPU container, linuxkit 6.10.14 aarch64; RSS includes Go's garbage
+collector headroom, which is part of what you have to provision.
+
+<Estimate
+  rows={[
+    { label: "The metric from 4.1 without customer_id", math: "100,000 series × 2.9 KB", value: "≈ 290 MB" },
+    { label: "With customer_id, if 1% of combinations occur", math: "10M series × 2.9 KB", value: "≈ 29 GB" },
+  ]}
+  result={{ label: "one label added to one metric", value: "100× the memory" }}
+/>
+
+<Why>Why does cardinality hurt even when the traffic doesn't change?</Why>
+
+Because the cost is per series, and series churn. Every pod restart in
+Kubernetes creates a new `pod` label value, so a new set of series. The old ones
+stay in the head until it's compacted, up to about three hours. A rollout
+that replaces 40 pods briefly doubles the series count of every metric that
+carries a `pod` label.
+
+</Sub>
+
+<Sub n="4.3" title="Finding and fixing it">
+
+Three queries find most cardinality problems:
+
+```promql
+# Which metric names have the most series?
+topk(10, count by (__name__) ({__name__=~".+"}))
+
+# Which label on one metric has the most values?
+count(count by (customer_id) (http_requests_total))
+
+# Is the head growing? (Prometheus's own metrics)
+prometheus_tsdb_head_series
+rate(prometheus_tsdb_head_series_created_total[5m])
+```
+
+Offline, `promtool tsdb analyze <data-dir>` lists the labels with the most
+values and the highest churn in a block.
+
+| Fix | How | Keeps |
+|---|---|---|
+| Drop the label at scrape time | `metric_relabel_configs` with `action: labeldrop` | The metric, aggregated over that label |
+| Drop the metric | `action: drop` on `__name__` | Nothing; for metrics nobody queries |
+| Bucket the value | Replace a raw path with the route template, a user ID with a tier | A bounded label |
+| Pre-aggregate | A recording rule that sums away `pod`, then drop the raw series in long-term storage | The aggregate |
+| Move it to another signal | Put `customer_id` on spans and logs, and link with an exemplar (section 7) | Per-request detail, at trace cost |
+
+<Callout label="Common mistake" kind="warn">
+Using the raw URL path as a label. `/users/81723/orders` makes every user a
+new series. Label by the route template your router matched
+(`/users/:id/orders`), which has as many values as you have routes.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="05" id="histograms">Histograms and percentiles</SectionHeading>
+
+Latency is the metric that most needs percentiles, and percentiles are the
+thing metrics are worst at. How Prometheus estimates them decides how far you
+can trust a p99 on a dashboard.
+
+<Sub n="5.1" title="Histograms aggregate, summaries don't">
+
+A **summary** computes quantiles inside each process and exports them. It's
+accurate for that process, but you can't combine them: the p99 of ten servers
+isn't the average of their p99s, or any other function of them.
+
+A **histogram** exports counts per bucket. Buckets from many servers can be
+added, and the percentile computed from the total. That's why the Prometheus
+[histogram guide](https://prometheus.io/docs/practices/histograms/) recommends
+histograms whenever you need to aggregate, which for a service with more than
+one replica is always.
+
+</Sub>
+
+<Sub n="5.2" title="How histogram_quantile() estimates">
+
+A histogram only knows how many observations fell in each bucket. To estimate
+a quantile, `histogram_quantile()` finds the bucket containing the target rank
+and assumes observations are spread **evenly** inside it:
+
+<SourceRead
+  file="promql/quantile.go"
+  repo="prometheus/prometheus"
+  tag="v3.9.1"
+  href="https://github.com/prometheus/prometheus/blob/v3.9.1/promql/quantile.go#L108"
+>
+```go
+	observations := buckets[len(buckets)-1].Count
+	/* ... */
+	rank := q * observations
+	b := sort.Search(len(buckets)-1, func(i int) bool { return buckets[i].Count >= rank })
+
+	if b == len(buckets)-1 {
+		return buckets[len(buckets)-2].UpperBound, forcedMonotonic, fixedPrecision
+	}
+	/* ... */
+	var (
+		bucketStart float64
+		bucketEnd   = buckets[b].UpperBound
+		count       = buckets[b].Count
+	)
+	if b > 0 {
+		bucketStart = buckets[b-1].UpperBound
+		count -= buckets[b-1].Count
+		rank -= buckets[b-1].Count
+	}
+	return bucketStart + (bucketEnd-bucketStart)*(rank/count), forcedMonotonic, fixedPrecision
+```
+</SourceRead>
+
+Two consequences are visible in the code. The estimate is a straight-line
+interpolation inside one bucket. And if the rank lands in the last, `+Inf`
+bucket, the answer is simply the highest finite bound: a p99 can never report
+more than your largest bucket.
+
+<Why>How wrong can it be?</Why>
+
+With wide buckets, probably more wrong than you'd guess. I drew 200,000 latencies from three
+distributions, bucketed them with the default buckets of the official client
+libraries (5 ms, 10, 25, 50, 100, 250, 500 ms, 1 s, 2.5, 5, 10 s), and compared
+`histogram_quantile()` (reimplemented from the code above) with the true
+percentile:
+
+<Compare
+  cols={["Latency distribution", "True p99", "Estimated p99", "Error"]}
+  rows={[
+    ["Log-normal, median 30 ms", "123 ms", "187 ms", "+52%"],
+    ["Log-normal, median 120 ms", "388 ms", "472 ms", "+22%"],
+    ["Bimodal: 95% near 12 ms, 5% near 300 ms", "325 ms", "448 ms", "+38%"],
+  ]}
+/>
+
+Python 3.14.6 on Apple M4, one seed. The p50 of the bimodal case was off by 36%
+too.
+
+The first row's p99 falls in the 100–250 ms bucket, and interpolating
+linearly across a bucket that wide lands the estimate far from the real value.
+The fix is buckets that are narrow where your SLO threshold is. If the SLO is
+"99% under 300 ms", put a bucket boundary at exactly 300 ms, and the question
+"what fraction was under 300 ms?" has an exact answer, even when the p99
+estimate doesn't.
+
+</Sub>
+
+<Sub n="5.3" title="Native histograms">
+
+Classic histograms make you choose buckets up front, and each bucket is a
+separate series. **Native histograms** store a whole histogram as one sample,
+with exponentially spaced buckets chosen automatically by a resolution
+parameter, and only the non-empty buckets stored.
+
+In [Prometheus 3.8](https://github.com/prometheus/prometheus/releases/tag/v3.8.0)
+they became a stable feature, enabled per scrape config with
+`scrape_native_histograms: true`; in 3.9.1 the old feature flag is gone from
+the list. The client library has to expose them too.
+
+<Callout label="Design implication">
+Pick histogram buckets from your SLO, not from the library defaults. A bucket
+boundary at the SLO threshold makes the SLI exact; everything else is an
+estimate. If both your client and server support native histograms, they
+remove most of the estimation error for the same series cost.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="06" id="logs">Logs</SectionHeading>
+
+Logs are the oldest signal and the most expensive per unit of information.
+They're also the only one that records exactly what happened to one request,
+with whatever detail you chose to write.
+
+<Sub n="6.1" title="Structured, with IDs">
+
+A log line that a machine can't parse is a log line you'll search with
+regular expressions at 3 a.m. Emit one JSON object per event, with fixed field
+names:
+
+```json
+{"ts":"2026-09-27T09:41:07.118Z","level":"info","msg":"request done",
+ "service":"checkout","route":"/api/v1/orders","method":"POST","status":201,
+ "duration_ms":48.2,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736",
+ "span_id":"00f067aa0ba902b7","customer_id":"c_81723"}
+```
+
+That's 262 bytes on one line. The fields that matter most are the ones that
+join it to other signals: `trace_id` and `span_id` link it to the trace, and
+`route` and `status` match the labels on the metrics.
+
+<Why>Why is customer_id fine here but not on a metric?</Why>
+
+Because a log line's cost doesn't depend on how many distinct values a field
+has. Each line is stored once either way. High-cardinality detail is exactly
+what logs and traces are for; it's metrics where each new value creates new
+storage.
+
+</Sub>
+
+<Sub n="6.2" title="Two ways to index logs">
+
+How a log store indexes decides what it costs and what you can ask it:
+
+| Design | Indexes | Fast at | Costs |
+|---|---|---|---|
+| Full-text (Elasticsearch, OpenSearch) | Every token in every line, in an inverted index | Arbitrary text search across everything | Index size and ingest CPU grow with every token written |
+| Label-only (Grafana Loki) | A small set of labels per stream; lines stored compressed | Queries that start from a label selector, then grep | Scans the lines of every matching stream |
+
+Loki's [overview](https://grafana.com/docs/loki/latest/get-started/overview/)
+states the trade: it "does not index the contents of the logs, but only indexes
+metadata about your logs as a set of labels for each log stream." That makes
+Loki's stream labels subject to exactly the cardinality rules of section 4.
+
+</Sub>
+
+<Sub n="6.3" title="Controlling volume">
+
+| Technique | What it does | Watch out for |
+|---|---|---|
+| Levels | Keep `info` and above in production | A `debug` switch you can flip at runtime is worth more than always-on debug |
+| Sampling | Keep 1 in N successful requests, all errors | Sample by trace ID so the logs and trace for a request are kept together |
+| Rate limiting | Cap identical messages per second | A loop logging one error a million times still needs to show up once |
+| Short retention | Days for raw logs, longer for aggregates | Audit logs have legal retention; keep them separate |
+
+<Callout label="Common mistake" kind="warn">
+Logging inside a hot loop on the request path. At high request rates a
+synchronous log write, with its formatting and a lock on the output, becomes
+the latency, and a slow disk or a full pipe to the log shipper blocks every
+request thread.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="07" id="traces">Traces</SectionHeading>
+
+A metric tells you the checkout endpoint's p99 went from 200 ms to 4 seconds. A
+trace of one slow checkout shows you that 3.7 of those seconds were a single
+call to the inventory service, waiting on a lock.
+
+<Sub n="7.1" title="Spans and trace context">
+
+A **trace** is a tree of **spans**. Each span is one timed operation (a
+request handled, a query run, a call made) with a start, a duration,
+attributes and a parent. All spans of one request share a **trace ID**.
+
+For that to work across services, each call has to carry the trace ID and the
+caller's span ID. The standard way is the W3C
+[Trace Context](https://www.w3.org/TR/trace-context/) `traceparent` header:
+
+```text
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             │  │                                │                └ flags: 01 = sampled
+             │  │                                └ parent span ID (8 bytes)
+             │  └ trace ID (16 bytes)
+             └ version
+```
+
+<StepSequence
+  title="One checkout request, traced across three services"
+  actors={["Browser", "Gateway", "Checkout", "Inventory", "Collector"]}
+  messages={[
+    { from: 0, to: 1, label: "POST /checkout", note: "No `traceparent` on the incoming request, so the gateway starts a **new trace**: it generates a 16-byte trace ID and makes the sampling decision." },
+    { from: 1, to: 2, label: "traceparent: 00-4bf9…-a1b2…-01", note: "The gateway's span ID goes in the parent field. Flag `01` says **this trace is sampled**, so everything downstream should record too." },
+    { from: 2, to: 3, label: "traceparent: 00-4bf9…-c3d4…-01", note: "Checkout creates a child span for its outgoing call and passes **its own** span ID as the new parent. The trace ID never changes." },
+    { from: 3, to: 2, label: "200 after 3.7 s", note: "Inventory's server span records 3.7 s, most of it inside a child span for a database lock wait." },
+    { from: 2, to: 4, label: "spans (batched)", dashed: true, note: "Every service exports its **own** spans, asynchronously, to a collector. No service ever sees the whole trace." },
+    { from: 4, to: 4, label: "assemble by trace ID", note: "The backend joins spans with the same trace ID into a tree, using each span's parent ID. Only now does the 3.7-second lock wait appear in context." },
+  ]}
+/>
+
+<Why>Why does one uninstrumented service break the whole trace?</Why>
+
+Because propagation is hop by hop. If a service in the middle doesn't read
+`traceparent` from its incoming request and write it on its outgoing ones,
+the services after it start new traces. You get two half-traces with no link
+between them. Proxies, queues and thread pools are the usual culprits: the
+context has to be carried across every asynchronous hand-off, too.
+
+</Sub>
+
+<Sub n="7.2" title="Inside the OpenTelemetry SDK">
+
+OpenTelemetry splits instrumentation into an **API** (what libraries call to
+create spans, and a no-op if nothing's installed) and an **SDK** (what the
+application installs to sample, batch and export them). A span's path out of
+the process:
+
+<Steps
+  title="One span, from start() to the backend"
+  lanes={[
+    { t: "API", s: "tracer.Start()", icon: "◉" },
+    { t: "Sampler", s: "ParentBased", icon: "⚖" },
+    { t: "Span", s: "attributes · events", icon: "▭" },
+    { t: "Batch processor", s: "queue 2048", icon: "≡" },
+    { t: "Exporter", s: "OTLP", icon: "⇆" },
+    { t: "Collector", s: "process · export", icon: "▣" },
+  ]}
+  steps={[
+    [0, "Code calls `tracer.Start(ctx, \"GET /orders\")`. The API asks the SDK for a span, passing the parent context from `ctx`."],
+    [1, "The **sampler** decides: `DROP`, `RECORD_ONLY` or `RECORD_AND_SAMPLE`. The common default, **ParentBased**, follows the parent's sampled flag, and uses its root sampler only when there's no parent."],
+    [2, "A sampled span records attributes, events and status in memory while the operation runs. An unsampled one is a cheap no-op that still propagates context."],
+    [3, "On `End()`, the span is handed to the **batch span processor**, which puts it on a bounded queue (2,048 by default) and returns immediately."],
+    [4, "A background goroutine exports batches of up to **512** every **5 seconds**, or sooner when a batch fills. Exports time out after 30 s."],
+    [5, "The **Collector** receives OTLP, runs processors (batching, attribute scrubbing, tail sampling), and exports to one or more backends."],
+  ]}
+/>
+
+What happens when that queue is full is the key design decision. In
+opentelemetry-go, by default, the span is dropped and counted:
+
+<SourceRead
+  file="sdk/trace/batch_span_processor.go"
+  repo="open-telemetry/opentelemetry-go"
+  tag="v1.38.0"
+  href="https://github.com/open-telemetry/opentelemetry-go/blob/v1.38.0/sdk/trace/batch_span_processor.go#L483"
+>
+```go
+func (bsp *batchSpanProcessor) enqueueDrop(ctx context.Context, sd ReadOnlySpan) bool {
+	if !sd.SpanContext().IsSampled() {
+		return false
+	}
+
+	select {
+	case bsp.queue <- sd:
+		return true
+	default:
+		atomic.AddUint32(&bsp.dropped, 1)
+		/* ... self-observability counter, error type queueFull ... */
+	}
+	return false
+}
+```
+</SourceRead>
+
+<Why>Why drop spans instead of waiting?</Why>
+
+Because telemetry must never take the service down with it. If the exporter
+is slow or the collector is unreachable, blocking would make every request
+wait on the tracing pipeline. The
+[SDK spec](https://opentelemetry.io/docs/specs/otel/trace/sdk/) defines the
+defaults (queue 2,048, batch 512, delay 5,000 ms, timeout 30,000 ms) and says
+plainly that once the queue is full, "spans are dropped." There's a
+`WithBlocking()` option for the rare case where losing spans is worse than
+latency.
+
+</Sub>
+
+<Sub n="7.3" title="Head sampling and tail sampling">
+
+Tracing every request is usually too expensive, so most are dropped. The
+question is when the decision is made.
+
+**Head sampling** decides at the start, at the root span, and propagates the
+decision in the `traceparent` flags. It's cheap: an unsampled request records
+nothing anywhere. Dapper, Google's tracing system, started this way; its
+[2010 paper](https://research.google.com/archive/papers/dapper-2010-1.pdf)
+describes a first production version averaging one sampled trace for every
+1,024 candidates.
+
+The weakness is that the decision is made before anything interesting has
+happened. At 1 in 1,024, a failure that affects one request in 10,000 is captured
+about once every ten million requests.
+
+**Tail sampling** decides after the trace is complete: keep every trace with an
+error, every trace slower than a threshold, and a small share of the rest.
+The OpenTelemetry Collector's
+[tail sampling processor](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/tailsamplingprocessor/README.md)
+does this, with policies such as `status_code`, `latency`, `probabilistic` and
+`rate_limiting`.
+
+| | Head sampling | Tail sampling |
+|---|---|---|
+| Decides | At the root span, before the work | After the trace completes |
+| Cost when dropped | Nearly zero in every service | Every span is created, exported and buffered |
+| Keeps errors and slow traces | Only by chance | By policy |
+| Infrastructure | Nothing extra | Collectors that see whole traces, with memory to buffer them |
+
+<Why>Why does tail sampling need two layers of collectors?</Why>
+
+Because a decision about a trace needs every span of it, and spans arrive from
+many services at different collectors. The processor's README says all spans
+of a trace "MUST be received by the same collector instance". The standard
+deployment is a first layer running the **load-balancing exporter**, which
+routes by trace ID, in front of a second layer running tail sampling. That
+second layer buffers every trace for `decision_wait` (30 s by default) and
+holds up to `num_traces` (50,000 by default) in memory.
+
+<Callout label="Design implication">
+Most teams end up combining both: head-sample a generous fraction in the
+SDKs to keep export costs bounded, then tail-sample in the Collector to keep
+all errors and slow traces from that fraction. Start with ParentBased head
+sampling everywhere, so services never disagree about whether a trace is
+sampled.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="08" id="together">Using the signals together</SectionHeading>
+
+<Sub n="8.1" title="Exemplars: from a spike to a trace">
+
+The three signals are only useful together if you can get from one to the
+next. The link from metrics to traces is an **exemplar**: a trace ID attached to
+one observation in a histogram bucket.
+
+```text
+http_request_duration_seconds_bucket{le="0.5"} 1204 # {trace_id="4bf92f3577b34da6a3ce929d0e0e4736"} 0.43
+```
+
+That's OpenMetrics syntax: after the `#`, one example observation of 0.43
+seconds, and the trace it came from. A dashboard can show it as a dot on the
+latency graph that links straight to that request's trace. In Prometheus 3.9.1,
+storing exemplars still needs `--enable-feature=exemplar-storage`.
+
+The link from traces to logs is the `trace_id` field on every log line. The link
+from logs back to metrics is using the same names for the same things: `route`,
+`status`, `service`.
+
+</Sub>
+
+<Sub n="8.2" title="What to measure first">
+
+Two checklists cover most services. **RED**, for anything that serves
+requests: Rate, Errors, Duration. **USE**, from Brendan Gregg, for anything that
+is a resource: Utilisation, Saturation, Errors.
+
+| Thing | Method | The three metrics |
+|---|---|---|
+| HTTP or RPC service | RED | Requests/s by route; error ratio; latency histogram |
+| Queue consumer | RED | Messages/s; failures; processing time, plus queue age |
+| Connection pool | USE | In use / size; waiters and wait time; timeouts |
+| Disk, CPU, NIC | USE | Busy %; queue depth or run queue; device errors |
+
+Alert on the RED metrics users feel, through SLO burn rates
+([chapter 40](/topics/40-reliability)), and use the USE metrics to explain the
+alert once you're looking.
+
+</Sub>
+
+<Sub n="8.3" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Prometheus OOM-killed, or memory climbing | Series count grew: a new high-cardinality label, or pod churn | `topk` by `__name__`, `promtool tsdb analyze`; drop or relabel |
+| Slow dashboards, query timeouts | Regex matchers on high-cardinality labels; long ranges over raw series | Recording rules; equality matchers; fewer series |
+| Gaps in `rate()` graphs | Range shorter than about 4 scrape intervals | Use at least `[1m]` at a 15 s interval |
+| p99 on the dashboard doesn't match user reports | Wide histogram buckets; or averaged summaries | Bucket at the SLO threshold; native histograms; never average quantiles |
+| Traces broken into pieces | A hop not propagating `traceparent` (proxy, queue, thread pool) | Instrument the hop; carry context across async hand-offs |
+| Spans missing under load | Batch processor queue full; spans dropped | Raise queue size, export faster, check the dropped-span count |
+| Tail sampling keeps partial traces | Spans of one trace reaching different collectors | Load-balancing exporter by trace ID in front |
+| Logging bill doubling | Debug level left on, or logs in a hot loop | Runtime-switchable levels; sample successes by trace ID |
+
+</Sub>
+
+<SectionHeading n="09" id="summary">Summary</SectionHeading>
+
+1. **Each signal has its own cost model.** Metrics cost per series, logs per
+   event, traces per traced request; the same service can differ 4,000× in
+   volume between them.
+2. **A Prometheus series is a name plus a label set.** Every new combination of
+   label values is a new series with its own storage.
+3. **Pull makes absence visible.** A failed scrape sets `up` to 0; a dead pusher
+   just goes quiet.
+4. **Gorilla encoding makes regular data cheap.** A perfectly regular timestamp
+   costs one bit; measured counters cost 1.87 bytes a sample, jittered ones
+   3.71, random floats 7.98.
+5. **Postings lists make label queries fast.** Selectors intersect sorted lists
+   of series IDs; regexes over huge label sets don't.
+6. **Cardinality is the bill.** In this test each active series cost about
+   2.9 KB of RAM, and one unbounded label can multiply a metric 10,000×.
+7. **Histogram percentiles are interpolations.** With default buckets the p99
+   was off by 22–52%; put a boundary at your SLO threshold.
+8. **Logs are for high-cardinality detail.** Structure them, put the trace ID on
+   every line, and sample successes.
+9. **Trace context propagates hop by hop.** One hop that drops `traceparent`
+   splits the trace.
+10. **Head sampling is cheap, tail sampling is smart.** Tail sampling needs
+    every span of a trace at one collector, so it needs a routing layer.
+
+<SectionHeading n="10" id="build">Build this</SectionHeading>
+
+**A cardinality lab.**
+
+- Run Prometheus locally with a static `/metrics` file you generate, as in
+  section 4.2. Measure RSS at 10k, 100k and 500k series and fit a per-series
+  cost for your version.
+- Add a label with high churn (a new value every scrape) and watch
+  `prometheus_tsdb_head_series` and memory until the next head compaction.
+- Write a histogram with default buckets and one with a boundary at your SLO,
+  feed both the same latencies, and compare `histogram_quantile(0.99, …)` and the
+  fraction under the threshold against the truth.
+- Instrument two small services with OpenTelemetry, break propagation in one
+  hop, and find the split trace in the backend.
+
+<SectionHeading n="11" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What's the difference between a counter and a gauge, and why does it matter for rate()?">
+A counter only increases, except for resets to zero on restart. A gauge goes up
+and down. `rate()` treats any decrease as a counter reset, adding the new value
+to the increase, so on a gauge every drop is misread as a restart. Use `rate()`
+and `increase()` on counters, and `deriv()` or `delta()` on gauges.
+</QA>
+
+<QA level="beginner" q="Why shouldn't you put a user ID in a Prometheus label?">
+Every unique combination of label values is a separate series, stored and
+indexed separately in memory. A user ID multiplies the series count by the
+number of users. In a test on Prometheus 3.9.1 each active series cost about
+2.9 KB of RAM, so ten million series is roughly 29 GB. Put per-user detail on
+logs and traces instead.
+</QA>
+
+<QA level="intermediate" q="Why can you aggregate histograms across instances but not summaries?">
+A histogram exports counts per bucket, and counts add: sum the buckets across
+instances and compute the quantile from the total. A summary exports quantiles
+already computed per instance, and quantiles don't combine; the average of ten
+p99s isn't the p99 of anything.
+</QA>
+
+<QA level="intermediate" q="How does Prometheus compress samples?">
+With Gorilla's scheme. Timestamps are stored as delta-of-delta, so a perfectly
+regular scrape costs one bit per sample, with larger bit buckets for jitter
+(14, 17, 20 or 64 bits plus a prefix, since Prometheus uses milliseconds).
+Values are XORed with the previous value and only the meaningful bits are
+stored. Chunks hold about 120 samples. Real counters come out near 2 bytes per
+sample; in a test, random floats took about 8.
+</QA>
+
+<QA level="intermediate" q="How does a trace ID get from one service to the next?">
+In the W3C `traceparent` header: version, 16-byte trace ID, 8-byte parent span
+ID and flags, where the low bit means sampled. Each service reads it from the
+incoming request, creates its own span as a child, and writes a new
+`traceparent` with the same trace ID and its own span ID on outgoing calls.
+Each service exports its own spans; the backend joins them by trace ID.
+</QA>
+
+<QA level="deep" q="What's the trade-off between head and tail sampling?">
+Head sampling decides at the root and propagates the decision, so dropped
+traces cost almost nothing, but it can't know which requests will fail or be
+slow. Tail sampling decides after the trace is complete, so it can keep every
+error and slow trace, but every span must be created and exported, and all
+spans of a trace must reach the same collector, which needs a load-balancing
+layer routing by trace ID and memory to buffer traces for the decision wait.
+</QA>
+
+<QA level="deep" q="A dashboard p99 says 190 ms, but users report 130 ms. What's going on?">
+Probably histogram interpolation. `histogram_quantile()` assumes observations
+are spread evenly inside the bucket that holds the target rank, so if p99 falls
+in a wide bucket such as 100–250 ms the estimate can land far from the truth.
+In a test with a log-normal distribution the true p99 was 123 ms and the
+estimate 187 ms. Add bucket boundaries near the values you care about,
+especially the SLO threshold, or use native histograms.
+</QA>
+
+<QA level="deep" q="Why does the OpenTelemetry batch span processor drop spans instead of blocking?">
+So that the tracing pipeline can't add latency to or take down the service. If
+the exporter is slow or the collector unreachable, blocking on a full queue
+would make request threads wait on telemetry. The spec's defaults (queue 2,048,
+batch 512, 5 s delay) bound memory, and overflow is counted as dropped. Blocking
+is available as an opt-in for the rare cases where completeness matters more.
+</QA>
+
+<SectionHeading n="12" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Your metric has labels with 4, 20 and 300 values. What's the most series it can have?">
+    24,000: 4 × 20 × 300. Labels multiply.
+  </Q>
+  <Q q="Scrapes run every 15 s but arrive with ±50 ms jitter. What happens to storage?">
+    The delta-of-delta is almost never zero, so each timestamp costs 16 bits
+    instead of 1. In the test, a counter went from 1.87 to 3.71 bytes a sample.
+  </Q>
+  <Q q="Where does histogram_quantile() put p99 if it lands in the +Inf bucket?">
+    At the highest finite bucket bound. It can never report a value above your
+    largest bucket.
+  </Q>
+  <Q q="Why use a ParentBased sampler in every service?">
+    So a child follows its parent's decision. Otherwise services sampling
+    independently keep different subsets of the same traces, and most kept
+    traces are incomplete.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Pelkonen et al., Gorilla: A Fast, Scalable, In-Memory Time Series Database (VLDB 2015)" verdict="The compression scheme inside Prometheus, and most TSDBs since.">
+    Delta-of-delta timestamps and XOR values, with the distribution data that
+    justifies each. [PDF](https://www.vldb.org/pvldb/vol8/p1816-teller.pdf)
+  </WildCard>
+  <WildCard name="Fabian Reinartz, Writing a Time Series Database from Scratch (2017)">
+    The design note behind Prometheus 2's storage: blocks, the head, the WAL
+    and postings. [archived copy](https://web.archive.org/web/2023/https://fabxc.org/tsdb/)
+  </WildCard>
+  <WildCard name="Sigelman et al., Dapper (Google, 2010)">
+    The paper most tracing systems descend from, including the case for
+    sampling. [PDF](https://research.google.com/archive/papers/dapper-2010-1.pdf)
+  </WildCard>
+  <WildCard name="prometheus/prometheus: tsdb/ and promql/quantile.go">
+    The chunk encoding, head block and quantile code quoted here.
+    [v3.9.1](https://github.com/prometheus/prometheus/tree/v3.9.1/tsdb)
+  </WildCard>
+  <WildCard name="Prometheus docs: Histograms and summaries">
+    When to use which, and a worked example of interpolation error.
+    [prometheus.io](https://prometheus.io/docs/practices/histograms/)
+  </WildCard>
+  <WildCard name="OpenTelemetry trace SDK specification">
+    Samplers, span processors and their defaults.
+    [opentelemetry.io](https://opentelemetry.io/docs/specs/otel/trace/sdk/)
+  </WildCard>
+  <WildCard name="W3C Trace Context">
+    The `traceparent` and `tracestate` headers, byte by byte.
+    [w3.org](https://www.w3.org/TR/trace-context/)
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="13" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Reliability Engineering">
+    What to do with these signals: SLIs, error budgets and burn-rate alerts.
+    [Chapter 40](/topics/40-reliability).
+  </WildCard>
+  <WildCard name="Contention, Queueing & Tail Latency">
+    Why percentiles don't average, and how load generators hide the tail.
+    [Chapter 16](/topics/16-contention-tail-latency).
+  </WildCard>
+  <WildCard name="eBPF: Running Your Code in the Kernel">
+    Telemetry without changing the application: kernel tracing, off-CPU
+    profiling and packet drops. [Chapter 48](/topics/48-ebpf).
+  </WildCard>
+  <WildCard name="The System Design Method">
+    Where observability goes in a design, and the numbers to size it with.
+    [Chapter 38](/topics/38-system-design-method).
+  </WildCard>
+</CardGrid>

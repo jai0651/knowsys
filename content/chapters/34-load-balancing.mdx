@@ -1,0 +1,864 @@
+---
+title: Load Balancing & Traffic Management
+dek: "How traffic for one address gets spread across hundreds of servers, from routers hashing packets to proxies choosing a backend per request. You'll see how ECMP and Maglev keep connections in place while the fleet changes, why the choice of algorithm matters most when one server is sick, how to drain a server without dropping requests, and how a health check can say a server is fine when it isn't."
+readingTime: "~30 min"
+level: "Intermediate"
+versions: "HAProxy 2.8.16 · Envoy API at v1.31.0 · measured on linuxkit 6.10.14 aarch64 (shared 4-CPU container) and Apple M4"
+prereqs: "TCP connections, HTTP keep-alive, hashing"
+updated: "2026-09-27"
+---
+
+Every service with more than one server has a load balancer in front of it,
+whether it's an AWS ALB, an nginx or HAProxy you run, Envoy in a service mesh,
+or kube-proxy's rules on every Kubernetes node. Most of the time it does its job
+invisibly: requests arrive, servers answer.
+
+It probably only becomes visible in the bad moments. One slow server drags the p99 of the
+whole fleet. A deploy drops a few hundred requests every time. A server that
+can't reach its database keeps receiving traffic because its health check says
+it's fine, and it answers errors faster than its healthy neighbours can
+answer successes.
+
+This chapter starts from the job a load balancer does, then follows traffic
+down two layers: packets spread by routers and L4 balancers like Maglev, and
+requests spread by L7 proxies. Its measurements use HAProxy and small Python backends in a shared Linux container, and a hashing simulation on an M4.
+
+<SectionHeading n="01" id="the-job">What a load balancer decides</SectionHeading>
+
+A load balancer owns one address that clients know, a **VIP** (virtual IP),
+and a set of **backends** that do the work. For each new unit of work it makes
+one decision: which backend gets it.
+
+<Sub n="1.1" title="Three jobs in one decision">
+
+That decision carries three different jobs:
+
+| Job | What it means | What goes wrong without it |
+|---|---|---|
+| **Spread load** | Keep every backend about equally busy | One server saturates while others idle |
+| **Hide failures** | Stop sending work to backends that can't do it | Some fraction of users see errors |
+| **Allow change** | Add, remove and replace backends without clients noticing | Every deploy or scale-down drops connections |
+
+They pull against each other. Hiding failures means reacting fast to
+bad signals, and allowing change means *not* moving traffic that's
+fine where it is. Most of this chapter is about that tension.
+
+</Sub>
+
+<Sub n="1.2" title="Layer 4 or layer 7">
+
+Your biggest design choice is what the balancer looks at.
+
+| | Layer 4 (transport) | Layer 7 (application) |
+|---|---|---|
+| **Sees** | IP addresses, ports, TCP/UDP | HTTP method, path, headers, gRPC service |
+| **Unit it balances** | A connection (really, a flow of packets) | A request |
+| **TLS** | Passes it through | Usually terminates it |
+| **Cost per unit** | Tiny: a hash and a table lookup per packet | Parse, maybe decrypt, route, re-encrypt |
+| **Examples** | AWS NLB, Google Maglev, Facebook Katran, IPVS, kube-proxy | AWS ALB, Envoy, nginx, HAProxy in `mode http` |
+| **Can do** | Millions of packets a second per core, any protocol | Retries, path routing, header rewrites, per-request balancing |
+
+<Why>Why do large sites run both?</Why>
+
+Because each is good at what the other can't do. An L4 tier can take a huge
+packet rate and spread it across a fleet of L7 proxies without understanding
+any of it. Those L7 proxies then make the per-request decisions. Google's
+[Maglev paper](https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud)
+describes exactly that stack, and Cloudflare, Facebook and GitHub run the same
+shape.
+
+<Predict
+  q="A gRPC client opens one HTTP/2 connection to a Kubernetes Service backed by five pods, then sends 10,000 requests over it. How are the requests spread?"
+  options={[
+    "Evenly: about 2,000 per pod",
+    "All 10,000 go to one pod",
+    "Randomly, with some pods getting more",
+    "Round-robin across pods, one request each",
+  ]}
+  answer={1}
+>
+All to one pod. A ClusterIP Service is balanced by kube-proxy at L4, so the
+decision is made once, when the connection opens. HTTP/2 multiplexes every
+request over that connection, so every request lands on the same pod. The
+Kubernetes blog's
+[gRPC Load Balancing on Kubernetes without Tears](https://kubernetes.io/blog/2018/11/07/grpc-load-balancing-on-kubernetes-without-tears/)
+covers the fixes: client-side balancing across many connections, or an L7
+proxy that balances per request.
+</Predict>
+
+<Callout label="Design implication">
+Match the balancer's unit to your traffic's unit. Long-lived, multiplexed
+connections (gRPC, HTTP/2, WebSockets, database pools) need L7 balancing or
+client-side balancing; an L4 balancer spreads the connections evenly and the
+work however it happens to fall.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="02" id="layer-4">Layer 4: spreading packets</SectionHeading>
+
+Start at the bottom. A VIP might receive tens of gigabits a second, more than
+any one machine can handle. So the first spreading happens in the network
+itself.
+
+<Sub n="2.1" title="ECMP: the router spreads the load">
+
+Routers support **equal-cost multi-path** routing (ECMP): if several next hops
+reach a destination at the same cost, the router picks one per packet by
+hashing the packet's **5-tuple** (source IP, source port, destination IP,
+destination port, protocol). The same flow always hashes to the same next hop,
+so a TCP connection's packets arrive in order. [RFC 2992](https://datatracker.ietf.org/doc/html/rfc2992)
+analyses the common "hash-threshold" method.
+
+So a whole fleet of load balancers can announce the same VIP over BGP, each
+at equal cost, and the router spreads flows across them. Maglev's authors
+describe moving to this from active-passive pairs: "we can multiply the
+capacity of a VIP by the maximum ECMP set size of the routers, and all
+machines can be fully utilized."
+
+<Steps
+  title="One packet to a VIP, through ECMP and Maglev"
+  lanes={[
+    { t: "Client", s: "SYN to VIP:443", icon: "◉" },
+    { t: "Router", s: "ECMP hash", icon: "⇆" },
+    { t: "Maglev", s: "conn table · hash", icon: "⌗" },
+    { t: "Backend", s: "decap · serve", icon: "▤" },
+    { t: "Return path", s: "direct to router", icon: "↩" },
+  ]}
+  steps={[
+    [0, "A client sends a packet to the VIP. Several load-balancer machines announce that VIP at equal cost."],
+    [1, "The router hashes the 5-tuple and picks one load-balancer machine. Every packet of this connection hashes the same way, so they all go to that machine while the ECMP set is stable."],
+    [2, "Maglev looks the 5-tuple up in its **connection tracking table**. On a miss, it picks a backend with **Maglev hashing** and records the choice."],
+    [2, "It wraps the packet in **GRE** with an outer header addressed to the backend. The inner packet, still addressed to the VIP, is untouched."],
+    [3, "The backend unwraps the packet and its kernel accepts it, because the VIP is configured locally. Your server sees the client's real IP."],
+    [4, "The reply goes **straight to the router** with the VIP as its source (direct server return). Replies are usually far larger than requests, and they never touch the load balancer."],
+  ]}
+/>
+
+</Sub>
+
+<Sub n="2.2" title="Three ways to deliver a packet to a backend">
+
+| Method | How it works | Client IP at the backend | Return traffic |
+|---|---|---|---|
+| **NAT** (IPVS NAT, kube-proxy, NLB by default) | Rewrite the destination to the backend's IP | Preserved, unless source NAT is added too | Must come back through the balancer to be un-rewritten |
+| **Tunnel + DSR** (Maglev, Katran, GLB) | Encapsulate (GRE, IP-in-IP, GUE); backend decapsulates | Preserved | Direct to the client |
+| **Proxy** (any L7, and L4 proxies like HAProxy `mode tcp`) | Terminate the connection, open a new one | Lost; pass it in `X-Forwarded-For` or the PROXY protocol | Through the proxy |
+
+<Why>Why doesn't the load balancer need to see replies?</Why>
+
+With DSR, a load balancer only handles the small inbound half of each
+connection. Maglev's paper puts the reason plainly: DSR means "Maglev does not
+need to handle returning packets, which are typically larger in size." It
+also means the balancer can't observe the connection's end, which matters
+for the next problem.
+
+</Sub>
+
+<Sub n="2.3" title="The problem: the set changes">
+
+ECMP keeps a flow on one load balancer only while the set of next hops is
+stable. Add a load-balancer machine, or lose one, and the router's hash maps
+some existing flows to a *different* machine. That machine has never seen the
+connection.
+
+It happens one level down too. If each load balancer picks a backend
+with `hash(5-tuple) % N`, removing one backend changes `N` and moves almost
+every connection.
+
+<Why>Can't the new machine just look up the connection?</Why>
+
+Only if connection state is shared, and sharing per-connection state between
+load balancers at millions of packets a second is what these designs avoid. So
+they make the backend choice a *function of the packet* that every load
+balancer computes identically, and they choose that function so a change in
+the backend set moves as few flows as possible. Maglev combines both: a local
+connection table for flows it has seen, and consistent hashing so a
+*different* Maglev machine makes the same choice for flows it hasn't.
+
+</Sub>
+
+<Sub n="2.4" title="Maglev hashing">
+
+Maglev builds a lookup table of prime size `M` (65,537 in the paper's
+experiments) and fills every slot with a backend. Each backend has its own
+pseudo-random permutation of slot numbers, derived from two hashes of its name:
+an `offset` and a `skip`. Backends take turns claiming their next preferred
+slot that's still empty, until the table is full.
+
+Envoy's implementation of the paper's Pseudocode 1 is short enough to read:
+
+<SourceRead
+  file="source/extensions/load_balancing_policies/maglev/maglev_lb.cc"
+  repo="envoyproxy/envoy"
+  tag="v1.31.0"
+  href="https://github.com/envoyproxy/envoy/blob/v1.31.0/source/extensions/load_balancing_policies/maglev/maglev_lb.cc#L112"
+>
+```cpp
+  // Implementation of pseudocode listing 1 in the paper (see header file for more info).
+    table_build_entries.emplace_back(host, HashUtil::xxHash64(key_to_hash) % table_size_,
+                                     (HashUtil::xxHash64(key_to_hash, 1) % (table_size_ - 1)) + 1,
+                                     weight);
+  // ...
+  // Iterate through the table build entries as many times as it takes to fill up the table.
+  uint64_t table_index = 0;
+  for (uint32_t iteration = 1; table_index < table_size_; ++iteration) {
+    for (uint64_t i = 0; i < table_build_entries.size() && table_index < table_size_; i++) {
+      TableBuildEntry& entry = table_build_entries[i];
+      // ... skip this round if the host's weight says it's had its share ...
+      entry.target_weight_ += max_normalized_weight;
+      uint64_t c = permutation(entry);
+      while (table_[c] != nullptr) {
+        entry.next_++;
+        c = permutation(entry);
+      }
+
+      table_[c] = entry.host_;
+      entry.next_++;
+      entry.count_++;
+      table_index++;
+    }
+  }
+
+uint64_t MaglevTable::permutation(const TableBuildEntry& entry) {
+  return (entry.offset_ + (entry.skip_ * entry.next_)) % table_size_;
+}
+```
+</SourceRead>
+
+A lookup is then `table[hash(5-tuple) % M]`: one hash and one array read per
+new flow. Because `M` is prime and `skip` is between 1 and `M − 1`, each
+backend's permutation visits every slot. Each backend ends up, the paper notes,
+with either ⌊M/N⌋ or ⌈M/N⌉ slots, and recommends "M to be larger than 100 × N to
+ensure at most a 1% difference". Envoy's default table size is also 65,537
+([`maglev.proto`](https://github.com/envoyproxy/envoy/blob/v1.31.0/api/envoy/extensions/load_balancing_policies/maglev/v3/maglev.proto)).
+
+Here's how it compares with plain modulo and with a classic consistent-hash
+ring, on 500,000 random flow hashes, when one backend is removed:
+
+<TryIt what="Modulo, ring and Maglev hashing: balance, and flows moved when one backend leaves" lang="python" toolchain="Python 3.14.6, Apple M4">
+```python
+def maglev(backends, M=65537):
+    offset = {b: h(b, 1) % M for b in backends}
+    skip   = {b: h(b, 2) % (M - 1) + 1 for b in backends}
+    nxt = {b: 0 for b in backends}; table = [None] * M; filled = 0
+    while True:
+        for b in backends:                      # Pseudocode 1 in the Maglev paper
+            c = (offset[b] + nxt[b] * skip[b]) % M
+            while table[c] is not None:
+                nxt[b] += 1; c = (offset[b] + nxt[b] * skip[b]) % M
+            table[c] = b; nxt[b] += 1; filled += 1
+            if filled == M: return lambda k: table[k % M]
+
+for f in flows:                                 # 500,000 random 64-bit flow hashes
+    a, b = before(f), after(f)                  # tables built with and without one backend
+    if a != b:
+        moved += 1
+        if a != gone: needless += 1             # moved although its backend is still alive
+```
+
+<Output>
+```text
+N=10  modulo            load max/min 1.006/0.989  flows moved 90.01%  of which needlessly 79.96%
+N=10  ring, 100 vnodes  load max/min 1.128/0.873  flows moved  9.87%  of which needlessly  0.00%
+N=10  maglev M=65537    load max/min 1.003/0.993  flows moved 10.28%  of which needlessly  0.26%
+N=100 modulo            load max/min 1.033/0.955  flows moved 99.01%  of which needlessly 97.99%
+N=100 ring, 100 vnodes  load max/min 1.324/0.776  flows moved  1.01%  of which needlessly  0.00%
+N=100 maglev M=65537    load max/min 1.031/0.967  flows moved  1.60%  of which needlessly  0.60%
+```
+
+"Load max/min" is the busiest and idlest backend relative to a perfect share,
+measured over the flows, so it includes sampling noise. Modulo balances well
+and moves nearly everything. The ring moves only the flows it must, but with
+100 backends its busiest one carries 1.32× its share. Maglev is nearly as
+even as modulo and moves only 0.6% of flows unnecessarily.
+</Output>
+</TryIt>
+
+<Why>Why would Maglev accept moving any flows needlessly?</Why>
+
+Because uneven load costs money every second, and disruption only costs when
+the set changes. Its authors say so directly: earlier schemes "prioritize minimal
+disruption over load balancing", and "Maglev takes the opposite approach". A
+backend that gets 1.32× its share forces you to overprovision the whole fleet by
+that much. Those few flows Maglev moves needlessly are caught by the connection
+table on the machine that already has them.
+
+</Sub>
+
+<Sub n="2.5" title="Other L4 designs">
+
+| System | Data plane | Keeping connections through changes |
+|---|---|---|
+| **Maglev** (Google, [NSDI 2016](https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud)) | Kernel-bypass user-space forwarder; the paper reports saturating 10 Gbit/s with small packets | Maglev hashing plus a local connection table |
+| **Katran** (Facebook, [2018](https://engineering.fb.com/2018/05/22/open-source/open-sourcing-katran-a-scalable-network-load-balancer/)) | XDP in the kernel driver | "An extended version of the Maglev hash" plus an LRU connection table |
+| **GLB Director** (GitHub, [2018](https://github.blog/engineering/infrastructure/glb-director-open-source-load-balancer/)) | DPDK | Rendezvous hashing picks a primary and a secondary; a packet the primary doesn't know gets a "second chance" at the secondary |
+| **Unimog** (Cloudflare, [2020](https://blog.cloudflare.com/unimog-cloudflares-edge-load-balancer/)) | XDP on every edge server, no separate tier | "Daisy chaining" from the Beamer paper: a server forwards packets for connections it doesn't own to the previous owner |
+
+Every one of them solves the same problem from section 2.3: the set of
+servers changes all the time, and existing connections must not notice.
+
+</Sub>
+
+<SectionHeading n="03" id="layer-7">Layer 7: choosing a backend per request</SectionHeading>
+
+An L7 proxy terminates the client's connection and sends each request to a
+backend over its own pool of connections. Now the unit is a request, and the
+proxy can see how each backend is doing.
+
+<Sub n="3.1" title="The algorithms">
+
+| Algorithm | Picks | Uses | Weakness |
+|---|---|---|---|
+| **Round robin** (weighted) | The next backend in turn | Nothing about the backends | Keeps feeding a slow backend its full share |
+| **Least connections / least request** | The backend with the fewest in flight | A counter per backend | Needs a global view; a fast-failing backend looks idle |
+| **Power of two choices** (P2C) | The less loaded of two random backends | The same counter, for two backends | Slightly less exact than least-request |
+| **Consistent hash** (ring, Maglev) | A backend determined by a key (user, session) | The key | Hot keys make hot backends |
+| **Peak EWMA** (Finagle, Linkerd) | Lowest recent latency × load | Latency history | Needs tuning; reacts to noise |
+
+<Why>Why pick from two random backends instead of the best one?</Why>
+
+Because "the best one" needs a fresh global view, and when many proxies share
+one stale view, they all pick the same "best" backend at once and overload it.
+Picking two at random and taking the less loaded avoids the worst choices
+without a herd. Michael Mitzenmacher's
+[The Power of Two Choices in Randomized Load Balancing](https://www.eecs.harvard.edu/~michaelm/postscripts/tpds2001.pdf)
+shows the second choice cuts the expected maximum load roughly exponentially, from
+about `log n / log log n` to `log log n / log 2`.
+
+Envoy's `LEAST_REQUEST` does exactly this: its `choice_count` "Defaults to 2
+so that we perform two-choice selection"
+([`least_request.proto`](https://github.com/envoyproxy/envoy/blob/v1.31.0/api/envoy/extensions/load_balancing_policies/least_request/v3/least_request.proto)).
+HAProxy's `balance random(2)` picks "the least loaded of these servers" after
+two draws.
+
+</Sub>
+
+<Sub n="3.2" title="One slow server, three algorithms">
+
+Algorithms only differ when backends differ, so here's a fleet with one sick
+member: four backends behind HAProxy, three answering in 2 ms and one in 50 ms
+(a GC pause, a noisy neighbour, a cold cache).
+
+<TryIt what="HAProxy, 4 backends, one 25× slower: roundrobin vs leastconn vs random(2)" lang="shell" toolchain="HAProxy 2.8.16, wrk 4.1, linuxkit 6.10.14 aarch64">
+```shell
+# backend be
+#     balance roundrobin | leastconn | random(2)
+#     server s1 127.0.0.1:18401 check      # 2 ms
+#     server s2 127.0.0.1:18402 check      # 2 ms
+#     server s3 127.0.0.1:18403 check      # 2 ms
+#     server s4 127.0.0.1:18404 check      # 50 ms
+wrk -t2 -c32 -d10s --latency http://127.0.0.1:18400/
+echo "show stat" | socat - /tmp/lb34.sock    # requests per server
+```
+
+<Output>
+```text
+rep1 roundrobin p50=10.38ms p90=50.99ms p99=51.23ms rps=2127.50 s1=5345 s2=5345 s3=5344 s4=5344
+rep1 leastconn p50=3.04ms p90=27.08ms p99=50.98ms rps=7981.47 s1=26097 s2=26140 s3=26097 s4=1568
+rep1 random(2) p50=3.11ms p90=43.95ms p99=51.10ms rps=4637.40 s1=15961 s2=12366 s3=14489 s4=3768
+rep2 roundrobin p50=13.38ms p90=50.98ms p99=51.30ms rps=2124.17 s1=5336 s2=5336 s3=5335 s4=5335
+rep2 leastconn p50=3.04ms p90=27.31ms p99=50.97ms rps=8070.82 s1=26417 s2=26419 s3=26393 s4=1569
+rep2 random(2) p50=3.13ms p90=43.83ms p99=51.23ms rps=4537.18 s1=15612 s2=12034 s3=14203 s4=3692
+rep3 roundrobin p50=16.73ms p90=50.98ms p99=51.29ms rps=2118.80 s1=5318 s2=5318 s3=5317 s4=5317
+rep3 leastconn p50=3.15ms p90=33.23ms p99=53.37ms rps=5830.76 s1=18927 s2=18973 s3=19043 s4=1496
+rep3 random(2) p50=3.18ms p90=43.30ms p99=53.69ms rps=4183.33 s1=14286 s2=11121 s3=13000 s4=3543
+```
+</Output>
+</TryIt>
+
+Medians of the three runs:
+
+<Compare
+  cols={["Algorithm", "p50", "p90", "p99", "Requests/s", "Share to the slow server"]}
+  rows={[
+    ["roundrobin", "13.4 ms", "51.0 ms", "51.3 ms", "2,124", "25%"],
+    ["random(2)", "3.1 ms", "43.8 ms", "51.2 ms", "4,537", "8.1%"],
+    ["leastconn", "3.0 ms", "27.3 ms", "51.0 ms", "7,981", "2.0%"],
+  ]}
+/>
+
+<Why>Why is round robin's median four times worse, when three servers are fast?</Why>
+
+Because wrk is a closed loop: 32 connections, each sending its next request only
+after the last one returns. Round robin keeps handing the slow server a quarter
+of the requests, so connections spend most of their time waiting on it, and
+the whole fleet runs at the slow server's pace. That's also true of any client
+pool with a fixed concurrency, such as a thread pool calling a service.
+
+Least-connections notices that requests pile up on the slow server and sends it
+2% of the traffic. `random(2)` sits between the two: with four servers, the
+slow one is in half of all random pairs, and it only loses the comparison when
+it actually has more in flight. The uneven `s1`/`s2`/`s3` counts under
+`random(2)` come from HAProxy drawing through a consistent-hash map, which it
+documents; `hash-balance-factor` evens it out. And the p99 of every algorithm stays
+at 51 ms, because the slow server still gets *some* requests. Only removing it
+fixes the tail.
+
+<Callout label="Design implication">
+Round robin is fine when backends are identical and healthy, which is exactly
+when you don't need a clever balancer. On the day one backend degrades, a
+load-aware algorithm (least-request or P2C) is the difference between one sick
+server and a slow fleet. Make it the default.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="04" id="health-checks">Health checks that lie</SectionHeading>
+
+Load-aware algorithms move traffic away from slow servers. Taking servers out
+entirely is the job of health checks, and it's where load balancers most
+often get it wrong.
+
+<Sub n="4.1" title="Active and passive checks">
+
+| | Active health check | Passive (outlier detection) |
+|---|---|---|
+| **How** | The balancer probes `GET /health` every few seconds | The balancer watches real responses: 5xx, resets, timeouts |
+| **Sees** | Whatever `/health` checks | What users actually get |
+| **Blind spot** | Anything `/health` doesn't exercise | Backends with no traffic yet |
+| **Examples** | ALB/NLB target health, Kubernetes readiness probes, HAProxy `check` | Envoy outlier detection, HAProxy `observe layer7`, Linkerd failure accrual |
+
+</Sub>
+
+<Sub n="4.2" title="The check that says 200">
+
+Here's the most common lie. The server's `/health` handler returns 200 as long
+as the process is up. Its real endpoint needs a database connection, and this
+server has lost it, so every real request gets a 500.
+
+<Steps
+  title="How a shallow health check keeps a broken server in rotation"
+  lanes={[
+    { t: "Database", s: "unreachable from s4", icon: "▤" },
+    { t: "Server s4", s: "/ and /health", icon: "◉" },
+    { t: "Health check", s: "GET /health", icon: "♥" },
+    { t: "Balancer", s: "server list", icon: "⇆" },
+    { t: "Users", s: "1 in 4 requests", icon: "✕" },
+  ]}
+  steps={[
+    [0, "s4 loses its connection to the database: a bad credential rotation, a full connection pool, a network rule."],
+    [1, "Every real request to s4 now fails with a 500. But `/health` only checks that the process can answer HTTP."],
+    [2, "The balancer's probe gets **200 OK** every second, so s4 stays marked healthy."],
+    [3, "The balancer keeps sending s4 its share. With round robin that's a quarter of all traffic."],
+    [4, "A quarter of users get errors, and every dashboard of **backend health** shows green."],
+  ]}
+/>
+
+Measured with the same HAProxy setup, s4 now answering 500 to real requests
+and 200 to `/health`:
+
+<TryIt what="A lying health check, with and without passive observation" lang="shell" toolchain="HAProxy 2.8.16, wrk 4.1, linuxkit 6.10.14 aarch64">
+```shell
+#   server s4 127.0.0.1:18404 check inter 1s                    # first run
+#   server s4 127.0.0.1:18404 check inter 1s \
+#          observe layer7 error-limit 10 on-error mark-down     # second run
+wrk -t2 -c32 -d10s http://127.0.0.1:18400/
+```
+
+<Output>
+```text
+== server option: '(none)'
+  78761 requests in 10.01s, 9.18MB read
+  Non-2xx or 3xx responses: 19691
+  s4 status=UP check=L7OK sessions=19697 5xx=19697
+== server option: 'observe layer7 error-limit 10 on-error mark-down'
+  76254 requests in 10.00s, 8.51MB read
+  Non-2xx or 3xx responses: 104
+  s4 status=DOWN check=HANA sessions=104 5xx=104
+```
+
+Without observation, 25% of requests failed while s4 reported `L7OK`. Watching
+real responses cut the errors to 104. A second run of the observed setup
+showed `chkdown=6`: s4 was marked down six times in about 13 seconds, because
+the passing `/health` check kept bringing it back, and each return cost about
+ten more errors.
+</Output>
+</TryIt>
+
+<Callout label="Common mistake" kind="warn">
+Letting a passive check and a lying active check fight. Your server flaps: passive
+detection ejects it, the active check readmits it, and users pay a burst of
+errors each cycle. Either make `/health` reflect the thing that broke, or use
+ejection with backoff, as Envoy does: the ejection time "is equal to the base
+time multiplied by the number of times the host has been ejected"
+([`outlier_detection.proto`](https://github.com/envoyproxy/envoy/blob/v1.31.0/api/envoy/config/cluster/v3/outlier_detection.proto)).
+</Callout>
+
+</Sub>
+
+<Sub n="4.3" title="The black hole">
+
+It gets worse with a load-aware algorithm. A server that fails *fast*, because
+it rejects requests before doing any work, finishes requests sooner than its
+healthy neighbours. To least-connections, that looks like the least busy server
+in the fleet.
+
+David Yanacek describes this in the Amazon Builders' Library article
+[Implementing health checks](https://aws.amazon.com/builders-library/implementing-health-checks/):
+"some load-balancing algorithms, such as 'least requests,' give more work to
+the fastest server. When a server fails, it often begins failing requests
+quickly, creating a 'black hole' in the service fleet by attracting more
+requests than healthy servers."
+
+<Predict
+  q="Four backends behind HAProxy. s4's database is down, so it answers every request with an immediate 500; the other three take 2 ms to answer correctly. The health check passes on all four. What share of requests does leastconn send to s4?"
+  options={["About 2%", "About 25%", "About 50%", "0%: HAProxy notices the 500s"]}
+  answer={2}
+>
+About half. In three 10-second runs, leastconn sent s4 51.6%, 51.9% and 48.4%
+of all requests, where round robin sent it exactly 25%. The failing server
+never has requests in flight, so it always looks least loaded. The same
+algorithm that protected the fleet from a slow server in section 3.2 doubles
+the damage from a fast-failing one.
+</Predict>
+
+<Why>So is least-connections a bad idea?</Why>
+
+No. It's the right default for slow servers, which are the common case. It needs
+a partner that counts *failures*, not just load: outlier detection that
+ejects a backend on consecutive 5xx. Yanacek also mentions a blunter fix used at
+Amazon: "slowing down failed requests to match the average latency of
+successful requests", so a broken server stops looking attractive.
+
+</Sub>
+
+<Sub n="4.4" title="The check that takes everyone out">
+
+An obvious fix for a shallow check is a **deep** one: have `/health` query the
+database too. Now the lie is gone, but a new failure appears. When the database
+has a bad minute, *every* server's deep check fails at once, and a balancer
+that believes them removes the whole fleet, turning a partial outage into a
+total one.
+
+| Check depth | Catches | Risk |
+|---|---|---|
+| **Liveness**: the process answers | Crashed or hung processes | Misses everything else (section 4.2) |
+| **Local health**: disk writable, config loaded, workers alive | Problems on this one server | Misses broken dependencies |
+| **Dependency health**: can reach the database, caches, downstreams | Server-specific connectivity failures | A shared dependency failing fails every server's check together |
+
+Balancers defend against the last row by refusing to believe that everything
+is broken:
+
+| Balancer | Behaviour when too many backends look unhealthy |
+|---|---|
+| AWS NLB, ALB | **Fail open**: "when all servers fail health checks at the same time, the load balancer fails open, allowing traffic to all servers" (Yanacek; for ALB see [target health checks](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/target-group-health-checks.html)) |
+| Envoy | **Panic mode**: below 50% healthy by default, it balances across all hosts, healthy or not ([`cluster.proto`](https://github.com/envoyproxy/envoy/blob/v1.31.0/api/envoy/config/cluster/v3/cluster.proto)) |
+| Envoy outlier detection | Never ejects more than 10% of a cluster by default (`max_ejection_percent`) |
+
+<Callout label="Design implication">
+Make health checks precise about *this server*, and let the balancer's fail-open
+or panic threshold handle *everyone*. A good `/health` checks the things only
+this instance can get wrong (its own pool to the database, its disk, its
+config) and treats a shared dependency's outage as "not my fault". Then a
+database blip doesn't empty the fleet, and one server's broken pool still gets
+it removed.
+</Callout>
+
+Envoy's outlier-detection defaults, all from `outlier_detection.proto` at
+v1.31.0, show what a reasonable passive check looks like:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `consecutive_5xx` | 5 | Consecutive errors before ejection |
+| `interval` | 10 s | How often ejections are analysed |
+| `base_ejection_time` | 30 s | Ejection length, multiplied by the number of times ejected |
+| `max_ejection_percent` | 10% | Ceiling on how much of the cluster can be ejected |
+
+</Sub>
+
+<SectionHeading n="05" id="draining">Draining: removing a server without dropping requests</SectionHeading>
+
+Allowing change was the third job. Every deploy removes every server at least
+once, so how you remove one decides whether deploys are invisible.
+
+<Sub n="5.1" title="What draining means">
+
+**Draining** a backend means: stop sending it new work, let in-flight work
+finish, then stop it. It sounds simple. It's hard because "stop sending it new
+work" has to reach every balancer, proxy and client-side pool that knows about
+the backend, and they don't all find out at the same moment.
+
+| Layer | How it drains | Default wait |
+|---|---|---|
+| AWS ALB / NLB target groups | Target goes to `draining`; no new requests or connections | `deregistration_delay.timeout_seconds`: 300 s ([docs](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-target-group-attributes.html)) |
+| HAProxy | `set server be/s1 state drain` on the runtime API | Until connections close |
+| Kubernetes | Pod marked `Terminating`; endpoint marked not ready | `terminationGracePeriodSeconds`: 30 s |
+| Your process | Stop accepting, finish requests, close keep-alive connections | Whatever you code |
+
+</Sub>
+
+<Sub n="5.2" title="The Kubernetes race">
+
+On Kubernetes, two things happen when a pod is deleted, and the
+[pod lifecycle docs](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)
+are explicit that they happen "at the same time": the kubelet starts shutting
+the pod down, and the control plane starts removing it from the Service's
+EndpointSlices.
+
+<StepSequence
+  title="Why a pod gets requests after it's told to stop"
+  actors={["API server", "Kubelet", "Your pod", "Proxies & LBs"]}
+  messages={[
+    { from: 0, to: 1, label: "pod Terminating", note: "A rollout deletes the pod. The API server records a deletion deadline, 30 seconds by default." },
+    { from: 1, to: 2, label: "SIGTERM", note: "The kubelet runs any `preStop` hook, then sends **SIGTERM**. A naive server exits within milliseconds." },
+    { from: 0, to: 3, label: "endpoint not ready", note: "In parallel, the EndpointSlice is updated. kube-proxy on every node, ingress controllers and mesh sidecars each learn about it **in their own time**." },
+    { from: 3, to: 2, label: "new request", dashed: true, note: "Until they've all updated, some still send new connections to the pod. If it has already exited, those requests get **connection refused or reset**." },
+    { from: 2, to: 2, label: "preStop: sleep", note: "The fix: delay shutdown. A `preStop` sleep of a few seconds keeps the pod serving while the endpoint removal propagates." },
+    { from: 2, to: 3, label: "drain, then exit", note: "Then on SIGTERM, stop accepting, finish in-flight requests, close idle keep-alive connections, and exit well inside the grace period." },
+  ]}
+/>
+
+<Callout label="Common mistake" kind="warn">
+Treating SIGTERM as "exit now". SIGTERM arrives before the rest of the
+cluster has stopped routing to you. Keep serving for a few seconds after
+SIGTERM (or add a `preStop` sleep, which Kubernetes supports natively as a
+`sleep` hook action since 1.30), then drain. Keep the total below `terminationGracePeriodSeconds`,
+or the kubelet sends SIGKILL.
+</Callout>
+
+</Sub>
+
+<Sub n="5.3" title="Keep-alive connections don't drain themselves">
+
+An L7 balancer that marks a backend as draining stops sending *new* requests.
+But clients talking to your server directly, or proxies holding a pool of
+keep-alive connections to it, will keep reusing connections they already have.
+
+<Why>How does a server tell a keep-alive client to go away?</Why>
+
+By saying so in the protocol, on the next response. HTTP/1.1 has
+`Connection: close`: send it on each response while draining, and the client
+opens its next request on a new connection, which the balancer sends
+elsewhere. HTTP/2 and gRPC have `GOAWAY`, which tells the client the highest
+stream ID the server will process and that it should open new streams on a new
+connection. Most servers probably send it on graceful shutdown, but check that yours does.
+
+</Sub>
+
+<Sub n="5.4" title="Filling: the other half of a deploy">
+
+A freshly started server is probably slower than its neighbours for a while: cold caches, a
+JIT that hasn't compiled the hot paths, connection pools still empty. A
+least-connections balancer sees it idle and sends it a flood.
+
+**Slow start** ramps a new backend's share up over time. In HAProxy,
+`slowstart` makes the weight grow "linearly from 0 to 100%" over the given
+time ([configuration manual](https://docs.haproxy.org/2.8/configuration.html)).
+ALB target groups and Envoy have equivalents.
+
+</Sub>
+
+<SectionHeading n="06" id="operating">Running it</SectionHeading>
+
+<Sub n="6.1" title="What to watch">
+
+| Signal | Why it matters |
+|---|---|
+| Per-backend request rate and error rate | A black hole shows as one backend with a high share *and* a high error rate |
+| Per-backend latency, not just the aggregate | The fleet p99 hides which server is slow |
+| Health-check state changes per minute | Flapping means an active and a passive check disagree |
+| 5xx generated by the balancer itself (ALB `HTTPCode_ELB_5XX_Count`, Envoy `upstream_cx_none_healthy`) | Distinguishes "no healthy backend" from "the backend errored" |
+| Errors during deploys | Non-zero means draining is broken somewhere |
+
+</Sub>
+
+<Sub n="6.2" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| p50 fine, p90/p99 bad, one backend slow | Round robin feeding a degraded backend | Least-request or P2C; per-backend latency alerts |
+| Error rate exactly 1/N, all health checks green | Shallow health check on a broken server | Check what the server needs; add outlier detection |
+| One backend has far more traffic and far more errors | Black hole: least-request attracted to fast failures | Outlier ejection on 5xx; slow down failures |
+| All backends removed during a database blip | Deep dependency health checks | Local-only checks; rely on fail-open or panic threshold |
+| A backend bounces in and out every few seconds | Passive ejection and active check disagree | Fix `/health`, or ejection with backoff |
+| Errors on every deploy | Process exits on SIGTERM before endpoints update | `preStop` sleep, graceful drain, `Connection: close` or `GOAWAY` |
+| One pod hot, others idle, with gRPC | L4 balancing of multiplexed connections | L7 balancing or client-side balancing |
+| Connections reset when an L4 balancer scales | ECMP set change without consistent hashing | Maglev-style hashing plus connection tracking |
+| A new instance overloaded right after it starts | Least-connections sending a cold server a burst | Slow start |
+
+</Sub>
+
+<SectionHeading n="07" id="summary">Summary</SectionHeading>
+
+1. **A load balancer spreads load, hides failures and allows change**, and those
+   jobs pull against each other.
+2. **L4 balances connections; L7 balances requests.** Multiplexed protocols like
+   gRPC need L7 or client-side balancing.
+3. **ECMP lets routers spread a VIP across a fleet of balancers**, as long as the
+   fleet doesn't change.
+4. **Consistent hashing keeps flows in place when backends change.** Removing one
+   of 100 backends moved 99% of flows with modulo and 1.6% with Maglev.
+5. **Maglev chooses even load over minimal disruption**, and relies on its
+   connection table for the difference.
+6. **Load-aware algorithms matter when one server is sick.** With one 25× slower
+   backend, leastconn cut p50 from 13.4 to 3.0 ms and gave it 2% of traffic.
+7. **Power of two choices gets most of the benefit without a herd**, which is why
+   it's Envoy's default for least-request.
+8. **A shallow health check hides a broken server**, and a deep one can take out
+   the fleet. Check what's local, and let fail-open handle the rest.
+9. **Least-connections turns fast failures into a black hole.** It sent about
+   half of all traffic to a server answering instant 500s.
+10. **Draining is a race between shutdown and routing updates.** Keep serving
+    after SIGTERM, then close keep-alive connections deliberately.
+
+<SectionHeading n="08" id="build">Build this</SectionHeading>
+
+**A load balancer you can break.**
+
+- Write a small L7 proxy in the language you use at work, with round robin,
+  least-request and P2C, and per-backend counters for in-flight requests,
+  errors and latency.
+- Put four backends behind it with injectable faults: extra latency, instant
+  500s, and a `/health` that lies. Reproduce section 3.2's table and section
+  4.3's black hole.
+- Add outlier detection with an ejection time that doubles on each ejection,
+  and a cap on how much of the fleet can be ejected. Show that it stops the
+  black hole without flapping, and that a failure on all four backends doesn't
+  eject them all.
+- Add draining: an admin endpoint that stops new requests to a backend and sends
+  `Connection: close` on its responses. Run a rolling restart under load and
+  get the error count to zero.
+
+<SectionHeading n="09" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What's the difference between an L4 and an L7 load balancer?">
+L4 works on connections: it sees IPs and ports, picks a backend when a flow
+starts, and forwards packets without parsing them. It's cheap and
+protocol-agnostic. L7 terminates the connection and parses the application
+protocol, usually HTTP, so it can balance per request, route on path or
+headers, retry, and terminate TLS, at a much higher cost per unit of work.
+</QA>
+
+<QA level="beginner" q="What does connection draining do?">
+It stops sending new work to a backend while letting in-flight work finish,
+before the backend is stopped. On AWS target groups the default deregistration
+delay is 300 seconds. On Kubernetes, draining has to cover the gap between
+SIGTERM and every proxy removing the endpoint, usually with a `preStop` sleep
+and graceful shutdown in the server.
+</QA>
+
+<QA level="intermediate" q="Why is round robin a poor default?">
+It ignores backend state, so a degraded backend keeps receiving its full
+share. Any client with bounded concurrency then spends most of its time waiting
+on that backend. In the test here, one 25× slower backend of four took round
+robin's p50 to 13.4 ms against 3.0 ms for least-connections, which sent it 2%
+of traffic. Least-request or power of two choices are better defaults.
+</QA>
+
+<QA level="intermediate" q="Explain the power of two choices.">
+Pick two backends at random and send the request to the one with fewer
+requests in flight. It avoids the worst backends without every balancer
+herding onto the same "best" one from a stale view. Mitzenmacher showed the
+second choice reduces the maximum load exponentially compared with a single
+random choice. Envoy's least-request uses two choices by default.
+</QA>
+
+<QA level="intermediate" q="A service has a 25% error rate and all four backends pass health checks. What's going on?">
+Probably one backend is broken in a way `/health` doesn't test, such as a lost
+database connection, and round robin keeps giving it a quarter of the traffic.
+Look at per-backend error rates. Fix the health check to cover what that server
+needs, and add passive outlier detection on 5xx so the balancer reacts to what
+users see.
+</QA>
+
+<QA level="deep" q="How does Maglev hashing work, and why is it preferred over a hash ring for L4 balancing?">
+Each backend gets a permutation of the slots of a prime-sized table, derived
+from an offset and a skip hashed from its name. Backends take turns claiming
+their next free preferred slot until the table is full, so each gets ⌊M/N⌋ or
+⌈M/N⌉ slots. Lookup is one hash and one array read. A ring with virtual nodes
+moves fewer flows on changes but balances unevenly; in the simulation here, the
+ring's busiest of 100 backends carried 1.32× its share against 1.03× for Maglev.
+Maglev covers its extra disruption with a connection-tracking table.
+</QA>
+
+<QA level="deep" q="What's a load-balancing black hole?">
+A backend that fails fast, returning errors without doing work, looks idle to a
+least-connections or least-request balancer, so it attracts more traffic than
+healthy backends. In the test here, leastconn sent about half of all requests to
+the failing one of four servers. Defences are outlier ejection on consecutive
+errors, slowing failures down to normal latency, and alerting on
+per-backend share combined with error rate.
+</QA>
+
+<QA level="deep" q="Should a health check test the database?">
+Test this server's ability to use it, not the database's health. If every
+server's check fails when the shared database blips, the balancer removes the
+whole fleet and a partial outage becomes total. Check local things (own pool,
+disk, config, worker threads), and rely on the balancer's fail-open or panic
+threshold, such as NLB failing open or Envoy's 50% panic threshold, for failures
+that hit every server at once.
+</QA>
+
+<SectionHeading n="10" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Removing one of 100 backends with hash % N moves how many flows?">
+    About 99% in the simulation. Every flow whose hash modulo 100 differs from its
+    hash modulo 99 moves, which is nearly all of them.
+  </Q>
+  <Q q="Why is Maglev's table size prime?">
+    So that any skip between 1 and M − 1 generates a permutation that visits
+    every slot exactly once.
+  </Q>
+  <Q q="Envoy is ejecting hosts for 5xx. How much of a cluster can it eject by default?">
+    10%, set by max_ejection_percent. Below 50% healthy, the panic threshold
+    makes it balance across all hosts anyway.
+  </Q>
+  <Q q="A pod exits within 50 ms of SIGTERM. Why do some requests fail?">
+    Endpoint removal happens in parallel with SIGTERM, so proxies and nodes keep
+    routing to the pod until they catch up. Keep serving for a few seconds first.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Eisenbud et al., Maglev (NSDI 2016)">
+    ECMP, GRE, direct server return, connection tracking and the hashing scheme,
+    with production measurements.
+    [USENIX](https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud).
+  </WildCard>
+  <WildCard name="Mitzenmacher, The Power of Two Choices (IEEE TPDS 2001)">
+    The analysis behind P2C, and why a second random choice is worth so much
+    more than a third. [PDF](https://www.eecs.harvard.edu/~michaelm/postscripts/tpds2001.pdf).
+  </WildCard>
+  <WildCard name="Yanacek, Implementing health checks (Amazon Builders' Library)">
+    Liveness, local and dependency checks, fail open, black holes and outlier
+    detection, from operating Amazon's fleets.
+    [aws.amazon.com](https://aws.amazon.com/builders-library/implementing-health-checks/).
+  </WildCard>
+  <WildCard name="envoyproxy/envoy: maglev_lb.cc and outlier_detection.proto">
+    The Maglev table build and every outlier-detection knob, with defaults.
+    [v1.31.0](https://github.com/envoyproxy/envoy/blob/v1.31.0/source/extensions/load_balancing_policies/maglev/maglev_lb.cc).
+  </WildCard>
+  <WildCard name="Cloudflare: Unimog, Cloudflare's edge load balancer">
+    L4 balancing with no separate tier, in XDP on every server, and daisy
+    chaining to survive changes.
+    [blog.cloudflare.com](https://blog.cloudflare.com/unimog-cloudflares-edge-load-balancer/).
+  </WildCard>
+  <WildCard name="GitHub: GLB Director">
+    Rendezvous hashing with a primary and a secondary per bucket, and the
+    "second chance" that lets proxies drain.
+    [github.blog](https://github.blog/engineering/infrastructure/glb-director-open-source-load-balancer/).
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="11" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="The Linux Networking Stack">
+    The accept queue, SYN retries and XDP underneath every load balancer and
+    backend in this chapter. [Chapter 10](/topics/10-linux-networking).
+  </WildCard>
+  <WildCard name="Contention, Queueing & Tail Latency">
+    Why one slow server dominates the tail, and the queueing behind section
+    3.2's numbers. [Chapter 16](/topics/16-contention-tail-latency).
+  </WildCard>
+  <WildCard name="VPC & Cloud Networking">
+    Where NLBs and ALBs sit in a VPC, and the cross-AZ bill for balancing across
+    zones. [Chapter 33](/topics/33-vpc-networking).
+  </WildCard>
+  <WildCard name="eBPF: Running Your Code in the Kernel">
+    The XDP programs that Katran and Unimog are built on.
+    [Chapter 48](/topics/48-ebpf).
+  </WildCard>
+</CardGrid>

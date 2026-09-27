@@ -1,0 +1,1095 @@
+---
+title: Caching, Properly
+dek: "A cache is a bet that the past predicts the future, and a promise that stale data is acceptable for a while. This chapter covers how eviction policies place the bet, from LRU to W-TinyLFU, then the three ways caches hurt you: stampedes when a hot key expires, races that leave stale data behind, and a fleet of local copies that disagree."
+readingTime: "~32 min"
+level: "Intermediate"
+versions: "Caffeine v3.1.8 · PostgreSQL REL_16_4 · golang.org/x/sync v0.8.0 · Redis 7.0.15 and PostgreSQL 16 on linuxkit 6.10.14 · simulations in Python 3.14 on Apple M4"
+prereqs: "hash tables, a key-value store such as Redis, basic SQL"
+updated: "2026-09-27"
+---
+
+Almost every backend grows a cache. A Postgres query gets slow, someone puts
+Redis in front of it, and the graphs go green. A year later that cache holds
+sessions, feature flags and rendered pages. It's also behind the worst outage
+of the quarter: the one where it restarted empty and the database fell over.
+
+Trouble is, "put a cache in front of it" hides three separate design
+decisions. What do you keep when memory runs out? What happens at the instant
+an entry disappears? And who tells every copy that the data changed?
+
+This chapter takes those in order. It starts with the arithmetic of hit rates,
+then covers eviction policies, including the admission trick that makes
+Caffeine's W-TinyLFU beat LRU. It ends with stampedes, invalidation races and
+coherence across a fleet of servers, and what to do about each.
+
+<SectionHeading n="01" id="what-a-cache-buys">What a cache actually buys you</SectionHeading>
+
+A cache is a smaller, faster copy of some slower source of truth. Every read
+either **hits** (the copy has it) or **misses** (you go to the source and,
+usually, keep a copy of the answer).
+
+<Sub n="1.1" title="Hit rate arithmetic">
+
+A read's average cost is a weighted sum:
+
+`average = hit_rate × hit_cost + (1 − hit_rate) × miss_cost`
+
+When the miss is much more expensive than the hit, the second term dominates.
+So the number to watch isn't the hit rate. It's the **miss rate**, because
+that's what your backend actually sees.
+
+<Estimate
+  rows={[
+    { label: "Hit rate 90%: misses reaching the database", math: "10,000 reads/s × 0.10", value: "1,000 /s" },
+    { label: "Hit rate 95%", math: "10,000 × 0.05", value: "500 /s" },
+    { label: "Hit rate 99%", math: "10,000 × 0.01", value: "100 /s" },
+    { label: "Hit rate drops from 99% to 90% during an incident", math: "1,000 / 100", value: "10× the load" },
+  ]}
+  result={{ label: "Going from 90% to 95% halves the database load", value: "2×" }}
+/>
+
+<Why>Why does a five-point drop in hit rate take the database down?</Why>
+
+Because you sized the database for the misses, not for the reads. At 99% the
+database sees one read in a hundred. At 90% it sees one in ten, ten times as
+many, and most databases probably have far less headroom than that.
+
+</Sub>
+
+<Sub n="1.2" title="What a hit and a miss cost">
+
+Here are three tiers measured from the same Python process: a dict in
+process memory, Redis over loopback, and Postgres over a Unix socket. The
+Postgres row is a primary-key lookup on a 100,000-row table that fits in
+`shared_buffers`, and the Redis row includes decoding the JSON value.
+
+| Read path | p50 | p99 |
+|---|---|---|
+| In-process dict | 0.17 µs | 0.25 µs |
+| Redis `GET` + `json.loads`, loopback | 65 µs | 153 µs |
+| Postgres primary-key lookup, Unix socket | 64 µs | 143 µs |
+| Postgres `GROUP BY` over the whole table | 141 ms | 278 ms |
+
+<small>Shared 4-CPU container, linuxkit 6.10.14 aarch64, Redis 7.0.15, PostgreSQL 16, redis-py 8.1, psycopg 3; 20,000 random reads per row (200 for the `GROUP BY`), median of three runs.</small>
+
+<Why>Why was Redis no faster than Postgres here?</Why>
+
+Because the Postgres lookup was already a hit, in Postgres's own buffer cache.
+Both calls are one round trip to another process, and the round trip is most of
+the cost. A remote cache only saves latency when the miss path does real work:
+a join, an aggregate, a call to another service. The `GROUP BY` row is the kind
+of thing you'd cache.
+
+<Callout label="Design implication">
+Decide what the cache is for before building it. If it's there to save
+latency, it has to sit closer than the source (in process, or on the same host)
+or skip expensive work. If it's there to offload the database, then the
+database's capacity depends on the hit rate, and a cold or failed cache is a
+database outage waiting to happen.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="02" id="patterns">Where the cache sits: read and write patterns</SectionHeading>
+
+There are two questions here. Who fills the cache on a miss? And what happens to
+the cache when the data is written?
+
+<Sub n="2.1" title="Five patterns">
+
+| Pattern | On a read miss | On a write | Good for | Watch out for |
+|---|---|---|---|---|
+| **Cache-aside** (look-aside) | The application reads the database, then sets the cache | The application writes the database, then deletes the key | Most application caches in front of a database | Races between a slow reader and a writer (section 7) |
+| **Read-through** | The cache library calls a loader you supply | Usually paired with one of the write patterns | In-process caches like Caffeine's `LoadingCache` | Loader errors and timeouts now live inside the cache |
+| **Write-through** | As read-through | Writes go to the cache, which writes the database synchronously | Data that's read right after it's written | Every write pays both latencies; the cache fills with data nobody reads |
+| **Write-behind** (write-back) | As read-through | The cache acknowledges, then writes the database later | Absorbing write bursts, counters | The cache holds the only copy for a while. A crash loses acknowledged writes |
+| **Write-around** | As cache-aside | Writes skip the cache entirely; entries age out by TTL | Write-heavy data that's rarely re-read | Readers see old data until the TTL expires |
+
+Write-behind is the only one that changes durability. The others treat the
+cache as disposable, which is what lets you evict from it, restart it and flush
+it without losing anything.
+
+</Sub>
+
+<Sub n="2.2" title="Cache-aside, step by step">
+
+Facebook's memcache paper describes the most common shape precisely: "a
+demand-filled look-aside cache"
+([Nishtala et al., NSDI 2013](https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf)).
+Step through it:
+
+<StepSequence
+  title="Cache-aside: one read miss, then one write"
+  actors={["App server", "Cache", "Database"]}
+  messages={[
+    { from: 0, to: 1, label: "GET user:42", note: "The application asks the cache first, by a string key it builds from the query." },
+    { from: 1, to: 0, label: "miss", note: "The key isn't there, because it was never loaded, it expired, or it was evicted.", dashed: true },
+    { from: 0, to: 2, label: "SELECT … id=42", note: "The application reads the **source of truth**. This is the expensive step the cache exists to avoid." },
+    { from: 0, to: 1, label: "SET user:42 (TTL)", note: "It stores what it read, usually with a TTL as a backstop against missed invalidations." },
+    { from: 0, to: 2, label: "UPDATE … id=42", note: "Later, a write. The database is updated **first**, so a crash here leaves the cache stale but the data safe." },
+    { from: 0, to: 1, label: "DELETE user:42", note: "Then the key is **deleted, not updated**. The next reader misses and loads the new row." },
+  ]}
+/>
+
+<Why>Why delete the key instead of writing the new value into it?</Why>
+
+Facebook's answer is short: "We choose to delete cached data instead of
+updating it because deletes are idempotent." Two deletes in any order leave the
+same result, an empty slot. Two sets that arrive in the wrong order leave the
+*older* value in the cache, with nothing to correct it until the TTL runs out.
+
+<Callout label="Common mistake" kind="warn">
+Updating the cache on the write path and deleting it on no path at all. Two
+concurrent writers, A then B in the database, can reach the cache as B then A,
+and the cache holds A indefinitely. Delete on write, and let readers refill.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="03" id="eviction">Eviction: deciding what to forget</SectionHeading>
+
+A cache is smaller than the data behind it, so every insert into a full cache
+evicts something. An eviction policy is a guess about which entry you're least
+likely to need again.
+
+A perfect guess exists, but you can't build it. **Belady's algorithm** (OPT)
+evicts the entry whose next use is furthest in the future. It needs to know the
+future, so it's only useful in a simulator, as the ceiling every real policy is
+measured against.
+
+<Sub n="3.1" title="LRU, and why nobody implements it exactly">
+
+**Least recently used** evicts the entry that was touched longest ago. The
+textbook version is a hash map plus a doubly linked list. A hit moves the entry
+to the head, and eviction takes the tail. Both are O(1).
+
+<Why>So what's wrong with a linked list?</Why>
+
+Every hit is a *write*. Moving an entry to the head changes pointers that every
+other thread also wants to change, so a concurrent LRU needs a lock on every
+read. That's a bottleneck on a many-core server, and it's the reason most
+production caches approximate LRU instead.
+
+Probably the oldest approximation is **CLOCK**. Entries sit in a circular array with a
+reference bit. A hit just sets the bit, and eviction sweeps a "hand" around the
+array, clearing bits until it finds one already clear. Postgres's buffer
+manager uses a version of it with a small counter instead of a bit, capped at
+`BM_MAX_USAGE_COUNT` = 5:
+
+<SourceRead
+  file="src/backend/storage/buffer/freelist.c"
+  repo="postgres/postgres"
+  tag="REL_16_4"
+  href="https://github.com/postgres/postgres/blob/REL_16_4/src/backend/storage/buffer/freelist.c#L314"
+>
+```c
+	/* Nothing on the freelist, so run the "clock sweep" algorithm */
+	trycounter = NBuffers;
+	for (;;)
+	{
+		buf = GetBufferDescriptor(ClockSweepTick());
+
+		/*
+		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
+		 * it; decrement the usage_count (unless pinned) and keep scanning.
+		 */
+		local_buf_state = LockBufHdr(buf);
+
+		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+		{
+			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
+			{
+				local_buf_state -= BUF_USAGECOUNT_ONE;
+				trycounter = NBuffers;
+			}
+			else
+			{
+				/* Found a usable buffer */
+				/* ... */
+				return buf;
+			}
+		}
+		/* ... all buffers pinned: error out ... */
+		UnlockBufHdr(buf, local_buf_state);
+	}
+```
+</SourceRead>
+
+A hit costs one increment on the buffer header, with no list to reorder. A
+buffer touched five times survives five passes of the hand, so the counter adds
+a little frequency to the recency. Redis approximates LRU differently, by
+sampling five keys and evicting the oldest of them;
+[chapter 22](/topics/22-redis) covers that.
+
+</Sub>
+
+<Sub n="3.2" title="Where recency fails: scans and loops">
+
+LRU assumes that what you touched recently, you'll touch again. Two common
+access patterns break that.
+
+- **A scan.** A batch job, a backup or a report reads a million keys once each.
+  Under LRU every one becomes "most recent" and pushes out the hot set.
+- **A loop slightly larger than the cache.** The access you need next is always
+  the one LRU evicted a moment ago.
+
+<Predict
+  q="A cache holds 1,000 entries. A job reads keys 0 to 1,099 in order, then starts again, 500,000 reads in total. What hit rate does LRU get?"
+  options={[
+    "About 91%, since 1,000 of 1,100 keys fit",
+    "About 50%",
+    "About 9%",
+    "0%",
+  ]}
+  answer={3}
+>
+Zero. When key 1,000 arrives, LRU evicts key 0, the oldest. Key 0 is exactly
+what the loop needs 100 reads later, and by then it's gone, as is everything
+after it. In the simulator from section 3.4, LRU scored **0.0%** on this trace.
+W-TinyLFU scored 79.3%, S3-FIFO 76.1%, and the unattainable optimum 90.7%.
+</Predict>
+
+Databases defend against scans explicitly. When Postgres sequentially scans a
+table bigger than a quarter of `shared_buffers`, it doesn't use the main buffer
+pool's replacement at all. It cycles the scan through a private 256 KB **ring**
+of buffers (`BAS_BULKREAD` in the same `freelist.c`), so a big report can't
+evict everyone else's pages. Linux's classic page reclaim splits pages into
+active and inactive lists for the same reason: a page normally has to be
+touched twice before it's promoted to the active list.
+
+</Sub>
+
+<Sub n="3.3" title="LFU, and why frequency goes stale">
+
+**Least frequently used** evicts the entry with the fewest hits. It shrugs off
+scans, because a key read once has a count of one and leaves first.
+
+<Why>Then why isn't LFU the default everywhere?</Why>
+
+Two reasons. The first is memory: exact LFU needs a counter for every key,
+including keys that have left the cache, or a returning key starts from zero.
+The second is **staleness**. Counts only go up, so yesterday's popular keys
+keep today's newcomers out.
+
+You can see the second one in the simulator. When the trace's hot set changes
+halfway through, an LFU that counts only while a key is cached falls from 44% to
+**25.5%**, well below LRU's 34%. Old keys have counts in the thousands, and
+the new ones can't catch up before they're evicted.
+
+Any usable frequency policy therefore needs **aging**: counts that decay, so
+popularity has a half-life. Redis's LFU uses a logarithmic 8-bit counter that
+decays by `lfu-decay-time`. W-TinyLFU halves every counter periodically, as
+section 4 shows.
+
+</Sub>
+
+<Sub n="3.4" title="The field of policies, and a measured comparison">
+
+Most modern policies combine recency and frequency somehow:
+
+| Policy | Idea | Used in |
+|---|---|---|
+| **LRU** | Evict the least recently used | Most libraries' default; the baseline |
+| **CLOCK** | LRU approximation with a reference bit or counter and a sweeping hand | Postgres buffers, OS page replacement |
+| **2Q / SLRU** | New entries go to a probation area; a second hit promotes them | Postgres 8.0.2 briefly; the main region of W-TinyLFU |
+| **ARC** ([Megiddo and Modha, FAST 2003](https://www.usenix.org/legacy/events/fast03/tech/full_papers/megiddo/megiddo.pdf)) | Balances a recency list and a frequency list, adapting the split using "ghost" lists of evicted keys | ZFS. Postgres shipped it in 8.0 and replaced it in 8.0.2 to avoid an IBM patent ([release notes](https://www.postgresql.org/docs/release/8.0.2/)) |
+| **W-TinyLFU** ([Einziger, Friedman and Manes](https://arxiv.org/abs/1512.00727)) | An LRU window, an SLRU main region, and a frequency sketch that decides *admission* | Caffeine (Java), Ristretto (Go) |
+| **S3-FIFO** ([Yang et al., SOSP 2023](https://www.cs.cmu.edu/~rvinayak/papers/s3-fifo-sosp-2023-fifo-queues-are-all-you-need-for-cache-eviction.pdf)) | A small FIFO (10%) filters one-hit wonders before a main FIFO (90%); a ghost queue remembers recent evictions | Newer; lock-free friendly because FIFOs need no reordering on a hit |
+
+S3-FIFO's authors found that across 6,594 production traces, the median share
+of objects accessed only once was 26%, and much higher over short windows
+([blog summary](https://s3fifo.com/blog/2023/08/01/fifo-queues-are-all-you-need-for-cache-eviction/)).
+A policy that keeps those one-hit wonders out of the main cache wins most of the
+available hit rate.
+
+To compare them on equal terms, I wrote a simulator for five policies and ran
+three synthetic traces through it. Each trace has 2 million requests drawn from
+100,000 keys with Zipf skew 0.9, and the cache holds 1,000 entries (1% of the
+keys). LRU and in-cache LFU are textbook. S3-FIFO follows the paper's
+description, and W-TinyLFU follows Caffeine's constants without the hill
+climber.
+
+<Compare
+  cols={["Trace", "LRU", "LFU", "S3-FIFO", "W-TinyLFU", "OPT (ceiling)"]}
+  rows={[
+    ["Zipf 0.9, stable", "34.2%", "44.3%", "45.1%", "45.1%", "53.3%"],
+    ["Zipf + a 2,000-key scan every 10,000 reads", "33.2%", "44.2%", "45.1%", "44.9%", "53.3%"],
+    ["Hot set replaced halfway", "34.2%", "25.5%", "44.9%", "44.9%", "53.3%"],
+    ["Loop over 1,100 keys", "0.0%", "0.0%", "76.1%", "79.3%", "90.7%"],
+    ["Zipf 0.9, stable, cache of 5,000", "51.5%", "59.3%", "60.0%", "60.5%", "69.6%"],
+  ]}
+/>
+
+<small>Simulated in Python 3.14 on an Apple M4. Hit rates exclude the scan requests themselves, which can never hit. One seed; the policies are deterministic given the trace.</small>
+
+Read it this way. On a skewed workload, the gap between LRU and a
+frequency-aware policy is roughly **ten points of hit rate**. At a cache of 1,000
+that's a miss rate of 66% against 55%, a sixth less backend load. Plain LFU
+matches the modern policies until popularity moves, then falls apart. S3-FIFO
+and W-TinyLFU stay close to each other and to the ceiling on every trace.
+
+The scan row is smaller than you might expect: on this trace, scans cost LRU
+roughly a point. With
+Zipf skew, the hot keys come back within a few thousand requests, so the damage
+from a flush is short-lived. Scans hurt LRU most when misses are expensive and
+the hot set is large, which is the buffer-pool case Postgres defends against.
+
+</Sub>
+
+<SectionHeading n="04" id="w-tinylfu">W-TinyLFU: admission, not just eviction</SectionHeading>
+
+Every policy so far answers "which entry leaves?" TinyLFU adds a second
+question: **should the new entry get in at all?** If a newcomer is less
+popular than the entry it would replace, it's better to drop the newcomer.
+
+<Sub n="4.1" title="The three parts">
+
+- **A window** (1% of capacity at the start) is a small LRU that every new
+  entry enters. It gives a burst of new keys somewhere to live while they prove
+  themselves.
+- **A main region** (the other 99%) is a segmented LRU: 20% *probation* and 80%
+  *protected*. A hit in probation promotes the entry to protected.
+- **A frequency sketch** counts accesses for every key it has seen, cached or
+  not, in a few bits per counter.
+
+When the window overflows, its oldest entry becomes a **candidate**. Meanwhile the main
+region's eviction victim is the oldest entry in probation. The sketch compares
+the two, and only the more frequent one stays.
+
+<Steps
+  title="One new key trying to get into a full W-TinyLFU cache"
+  lanes={[
+    { t: "Access", s: "every get or put", icon: "◉" },
+    { t: "Sketch", s: "count-min, 4-bit", icon: "▦" },
+    { t: "Window", s: "LRU, 1%", icon: "▭" },
+    { t: "Admission", s: "candidate vs victim", icon: "⚖" },
+    { t: "Probation", s: "SLRU, 20%", icon: "≡" },
+    { t: "Protected", s: "SLRU, 80%", icon: "★" },
+  ]}
+  steps={[
+    [0, "A read misses on key **K**. The loader fetches it, and the cache stores it."],
+    [1, "The access **increments K's counters** in the frequency sketch. The sketch sees every access, hit or miss, so it remembers keys the cache doesn't hold."],
+    [2, "K goes into the **window**, a small LRU. If K is part of a burst, it can get hits here without disturbing the main region."],
+    [3, "The window is full, so its oldest entry, the **candidate**, has to move on. The victim is the oldest entry in probation. The sketch estimates both frequencies."],
+    [3, "If the candidate's estimate is **higher**, it's admitted and the victim is evicted. Otherwise the **candidate is dropped** and the main region doesn't change at all. A scan's keys all have a count of 1, so they die here."],
+    [4, "An admitted entry lives in **probation**. It's the first thing evicted unless it's used again."],
+    [5, "A hit in probation promotes it to **protected**. When protected overflows, its oldest entry drops back to probation, not out of the cache."],
+  ]}
+/>
+
+<Why>Why is the window there, if the sketch already filters newcomers?</Why>
+
+Because pure frequency admission is too harsh on a burst. A key that's about to
+be read a hundred times in the next second has a count of one on its first
+read, and would be rejected. A window lets it collect hits and a count before
+it has to compete. That's the "W" the paper adds to plain TinyLFU.
+
+</Sub>
+
+<Sub n="4.2" title="The sketch: 4-bit counters that halve themselves">
+
+Counting every key exactly would cost more memory than the cache. Instead,
+Caffeine uses a **count-min sketch**: each key hashes to four counters, an
+increment bumps all four, and the estimate is the smallest of them. Collisions
+can only inflate a count, and taking the minimum limits the damage.
+
+<SourceRead
+  file="caffeine/src/main/java/com/github/benmanes/caffeine/cache/FrequencySketch.java"
+  repo="ben-manes/caffeine"
+  tag="v3.1.8"
+  href="https://github.com/ben-manes/caffeine/blob/v3.1.8/caffeine/src/main/java/com/github/benmanes/caffeine/cache/FrequencySketch.java#L145"
+>
+```java
+  public void increment(E e) {
+    /* ... */
+    int[] index = new int[8];
+    int blockHash = spread(e.hashCode());
+    int counterHash = rehash(blockHash);
+    int block = (blockHash & blockMask) << 3;
+    for (int i = 0; i < 4; i++) {
+      int h = counterHash >>> (i << 3);
+      index[i] = (h >>> 1) & 15;
+      int offset = h & 1;
+      index[i + 4] = block + offset + (i << 1);
+    }
+    boolean added =
+          incrementAt(index[4], index[0])
+        | incrementAt(index[5], index[1])
+        | incrementAt(index[6], index[2])
+        | incrementAt(index[7], index[3]);
+
+    if (added && (++size == sampleSize)) {
+      reset();
+    }
+  }
+
+  /** Reduces every counter by half of its original value. */
+  void reset() {
+    int count = 0;
+    for (int i = 0; i < table.length; i++) {
+      count += Long.bitCount(table[i] & ONE_MASK);
+      table[i] = (table[i] >>> 1) & RESET_MASK;
+    }
+    size = (size - (count >>> 2)) >>> 1;
+  }
+```
+</SourceRead>
+
+Four details are there on purpose:
+
+| Detail | What it does |
+|---|---|
+| Sixteen 4-bit counters per `long` | A counter saturates at 15. You only need to know "more popular than the victim", not the exact count |
+| All four counters in one 64-byte block | One cache miss per lookup instead of four, as the class comment explains |
+| `sampleSize = 10 × maximum` | After ten increments per cache slot, `reset()` halves every counter. That's the aging that section 3.3 said LFU needs |
+| `table` sized to the cache's maximum, rounded to a power of two | One `long` per entry: roughly 8 MB of sketch for a million-entry cache |
+
+Halving is what fixes LFU's staleness. A key that was hot an hour ago loses
+half its count every sampling period, so new popularity wins within a few
+periods. In the "hot set replaced" trace, W-TinyLFU lost almost nothing.
+
+</Sub>
+
+<Sub n="4.3" title="Tuning itself, and defending against attacks">
+
+The 1% window suits frequency-heavy workloads, but it's too small for
+recency-heavy ones. Caffeine adjusts it at run time with a **hill climber**. It
+moves the split between window and main by a step (starting at 6.25% of
+capacity, decaying by 0.98 each time), keeps going while the hit rate
+improves, reverses when it drops, and restarts if the hit rate shifts by more
+than 5%. Those are the `HILL_CLIMBER_*` constants in
+[`BoundedLocalCache.java`](https://github.com/ben-manes/caffeine/blob/v3.1.8/caffeine/src/main/java/com/github/benmanes/caffeine/cache/BoundedLocalCache.java#L214).
+
+Admission also opens an attack. If an attacker can make the victim look
+popular, for instance by crafting keys that collide in the sketch, no new entry
+is ever admitted. Caffeine's `admit()` answers with a little randomness:
+
+<SourceRead
+  file="caffeine/src/main/java/com/github/benmanes/caffeine/cache/BoundedLocalCache.java"
+  repo="ben-manes/caffeine"
+  tag="v3.1.8"
+  href="https://github.com/ben-manes/caffeine/blob/v3.1.8/caffeine/src/main/java/com/github/benmanes/caffeine/cache/BoundedLocalCache.java#L884"
+>
+```java
+  boolean admit(K candidateKey, K victimKey) {
+    int victimFreq = frequencySketch().frequency(victimKey);
+    int candidateFreq = frequencySketch().frequency(candidateKey);
+    if (candidateFreq > victimFreq) {
+      return true;
+    } else if (candidateFreq >= ADMIT_HASHDOS_THRESHOLD) {
+      // The maximum frequency is 15 and halved to 7 after a reset to age the history. An attack
+      // exploits that a hot candidate is rejected in favor of a hot victim. The threshold of a warm
+      // candidate reduces the number of random acceptances to minimize the impact on the hit rate.
+      int random = ThreadLocalRandom.current().nextInt();
+      return ((random & 127) == 0);
+    }
+    return false;
+  }
+```
+</SourceRead>
+
+A warm candidate (count of 6 or more) that loses still gets in one time in 128.
+That's rare enough not to hurt the hit rate and often enough that a pinned
+victim can't hold its slot for long.
+
+<Callout label="Design implication">
+If you run on the JVM, use Caffeine and don't write your own LRU. In Go,
+Ristretto implements the same TinyLFU admission. What you get is roughly the
+ten-point gap in the table above, for no change to your code.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="05" id="expiry">Expiry: how long is stale acceptable?</SectionHeading>
+
+Eviction is about space. **Expiry** is about time: a TTL says how long a copy
+may be served without checking the source.
+
+<Sub n="5.1" title="What a TTL really promises">
+
+A TTL is an upper bound on staleness, *if* nothing else invalidates the entry.
+With a 60-second TTL and no invalidation, a user can see data up to 60 seconds
+old. With invalidation, the TTL is the backstop for the invalidations you'll
+eventually lose to a crash, a bug or a dropped message.
+
+<Why>Why keep a TTL at all, if every write deletes the key?</Why>
+
+Because deletes get lost. A process can crash between committing to the
+database and deleting the key. A network partition can swallow the delete. A
+new code path can write the table and forget the cache. Without a TTL, each of
+those leaves a wrong value in the cache forever. With one, it's wrong for a
+bounded time.
+
+</Sub>
+
+<Sub n="5.2" title="Three habits for TTLs">
+
+| Habit | Why |
+|---|---|
+| **Add jitter**: TTL × random(0.9, 1.1) | Keys written together (a warm-up job, a deploy, a bulk import) otherwise expire together, and the misses arrive as one burst |
+| **Cache misses too** (negative caching), with a short TTL | A lookup for a key that doesn't exist otherwise hits the database every time. That's also the easiest way to attack a cache: request random IDs |
+| **Separate soft and hard expiry** | Past the soft TTL, serve the old value and refresh in the background. Past the hard TTL, block and reload. This is `stale-while-revalidate` (section 6.4) |
+
+</Sub>
+
+<SectionHeading n="06" id="stampedes">Stampedes: the instant a hot key expires</SectionHeading>
+
+At the moment a popular key expires, every request for it misses at once. Each
+one goes to the database and runs the same expensive query, and each one sets
+the same value when it's done. That's a **cache stampede**, also called a
+thundering herd or dog-piling.
+
+<Sub n="6.1" title="What a stampede looks like">
+
+I measured one. Eight processes with eight threads each read a single hot key
+from Redis in a loop, with 5 ms of think time between reads. The value takes 50
+ms to compute and lives for 2 seconds. Over a 10-second run the key expires four
+times.
+
+<Compare
+  cols={["Strategy", "Backend calls in 10 s", "Most at once", "Reader p999 (median of 3)"]}
+  rows={[
+    ["Naive cache-aside", "256", "64", "52 ms"],
+    ["singleflight, per process", "32", "8", "52 ms"],
+    ["Redis lock (SET NX), losers poll every 10 ms", "6", "1", "58 ms"],
+    ["XFetch, β = 1", "10–11", "3–4", "36 ms"],
+    ["Stale-while-revalidate, one refresher", "5–6", "1", "24 ms"],
+  ]}
+/>
+
+<small>Shared 4-CPU container, linuxkit 6.10.14 aarch64, Redis 7.0.15, redis-py 8.1. The key was pre-filled, so these are expiry stampedes, not a cold start. Call counts were identical across three runs; tail latencies varied by 2–3× between runs on the shared box.</small>
+
+Naive cache-aside made **64 backend calls per expiry**, one for every reader
+thread, all at the same moment. Scale that to maybe a few hundred servers
+and a query that takes a second, and the database sees a burst of hundreds of
+identical queries every time the TTL fires.
+
+<Why>Why did every thread miss, not just the first?</Why>
+
+Because the key stays missing for the whole 50 ms the first reader spends
+computing it. Every read that lands in that window also misses, and at this
+rate, that's every thread. A longer recompute means a bigger herd.
+
+</Sub>
+
+<Sub n="6.2" title="Coalescing: one fetch per key">
+
+A first fix is to make concurrent misses for the same key share one fetch.
+Go's `singleflight` is the smallest version of the idea:
+
+<SourceRead
+  file="singleflight/singleflight.go"
+  repo="golang/sync"
+  tag="v0.8.0"
+  href="https://github.com/golang/sync/blob/v0.8.0/singleflight/singleflight.go#L91"
+>
+```go
+// Do executes and returns the results of the given function, making
+// sure that only one execution is in-flight for a given key at a
+// time. If a duplicate comes in, the duplicate caller waits for the
+// original to complete and receives the same results.
+// The return value shared indicates whether v was given to multiple callers.
+func (g *Group) Do(key string, fn func() (interface{}, error)) (v interface{}, err error, shared bool) {
+	g.mu.Lock()
+	if g.m == nil {
+		g.m = make(map[string]*call)
+	}
+	if c, ok := g.m[key]; ok {
+		c.dups++
+		g.mu.Unlock()
+		c.wg.Wait()
+		/* ... re-panic or Goexit if the leader did ... */
+		return c.val, c.err, true
+	}
+	c := new(call)
+	c.wg.Add(1)
+	g.m[key] = c
+	g.mu.Unlock()
+
+	g.doCall(c, key, fn)
+	return c.val, c.err, c.dups > 0
+}
+```
+</SourceRead>
+
+Whoever calls first for a key registers a `call` and runs `fn`. Everyone who
+arrives while it's running waits on the same `WaitGroup` and gets the same
+result. Caffeine's `LoadingCache` does the same per key inside the cache.
+
+<Why>Why did singleflight still make 8 calls per expiry?</Why>
+
+Because it only coalesces within one process. Eight processes meant eight
+leaders. That's a pretty big improvement, 64 down to 8, but the database still sees
+one query per *server* on every expiry. To get to one per *fleet*, the
+coordination has to live somewhere shared: the cache itself.
+
+A lock in Redis (`SET lock:K 1 NX PX 1000`) does that, and cut the calls to 6
+for 4 expiries. The two extra calls came from a loser that saw the miss, then
+won the lock a moment after the winner had filled the key and released it. Check
+the cache again after taking the lock and those go away. Losers also have to
+wait for the winner, and polling on a timer cost them the worst tail in the
+table. And the lock needs a timeout, in case the winner dies holding it.
+
+</Sub>
+
+<Sub n="6.3" title="Leases: Facebook's version">
+
+Facebook's memcache built the lock into the cache server and called it a
+**lease**. On a miss, memcached hands the client a 64-bit token bound to that
+key. Only a `SET` carrying a valid token is accepted.
+
+<StepSequence
+  title="A memcache lease during a stampede"
+  actors={["Client A", "Client B", "memcached", "Database"]}
+  messages={[
+    { from: 0, to: 2, label: "get K", note: "Client A misses. memcached returns **a lease token** with the miss: A is now the one allowed to fill K." },
+    { from: 1, to: 2, label: "get K", note: "Client B misses a few milliseconds later. memcached hands out a token for a key at most **once every 10 seconds**, so B gets no token." },
+    { from: 2, to: 1, label: "wait and retry", note: "Instead, B gets a special reply telling it to wait a short time and retry. B doesn't touch the database.", dashed: true },
+    { from: 0, to: 3, label: "SELECT", note: "Only A queries the database." },
+    { from: 0, to: 2, label: "set K (token)", note: "A sets K with its token. memcached checks the token is still valid and stores the value." },
+    { from: 1, to: 2, label: "get K", note: "B retries and hits. In Facebook's words, \"typically, the client with the lease will have successfully set the data within a few milliseconds.\"" },
+  ]}
+/>
+
+On a set of keys prone to thundering herds, Facebook measured the peak database
+query rate from cache misses at **17K/s without leases and 1.3K/s with them**,
+over one week
+([NSDI 2013, section 3.2.1](https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf)).
+That same token also fixes the stale-set race in section 7, because a delete
+invalidates any outstanding token.
+
+</Sub>
+
+<Sub n="6.4" title="Refreshing before expiry: XFetch and stale-while-revalidate">
+
+Both fixes so far still make readers wait during the recompute. The other
+family avoids the miss entirely, by refreshing *before* the key expires.
+
+**Probabilistic early expiration** has each reader decide, at random, to
+recompute a little early, with the odds rising as expiry approaches. Vattani,
+Chierichetti and Lowenstein proved the optimal shape and called it XFetch
+([VLDB 2015](https://cseweb.ucsd.edu/~avattani/papers/cache_stampede.pdf)):
+
+```text
+function XFetch(key, ttl; β = 1)
+    value, Δ, expiry ← CacheRead(key)
+    if !value or Time() − Δ·β·log(rand()) ≥ expiry then
+        start ← Time()
+        value ← RecomputeValue()
+        Δ ← Time() − start
+        CacheWrite(key, (value, Δ), ttl)
+    return value
+```
+
+`Δ` is roughly how long the last recompute took, so slow values refresh earlier.
+`log(rand())` is negative, which pushes each reader's idea of "now" forward by a
+random, exponentially distributed amount. Most readers see a fresh value. A few
+see it as expired shortly before it is, and one of them usually refreshes it
+first. There's no lock and no coordination, just three numbers stored with the
+value.
+
+<Why>Why did XFetch still make two or three calls per expiry?</Why>
+
+Because with sixty-four readers polling every few milliseconds, several of them
+roll "expired" within the same 50 ms recompute. The paper's β = 1 default
+trades some duplicate work for zero coordination. Raising β refreshes earlier
+and cuts the overlap. Even so, it went from 64 calls per expiry to under 3, with
+readers never blocked.
+
+**Stale-while-revalidate** is the version HTTP caches use
+([RFC 5861](https://www.rfc-editor.org/rfc/rfc5861)). Past a soft deadline, the
+cache keeps serving the old value while exactly one refresher (holding a lock)
+fetches the new one. It had the best tail in the test, because no reader ever
+waited for the backend once the key existed.
+
+| Technique | Coordination | Readers wait? | Cost |
+|---|---|---|---|
+| Coalescing (`singleflight`, `LoadingCache`) | In-process | Yes, for the one fetch | One fetch per process per expiry |
+| Lock or lease in the cache | Shared | Yes, and they poll | A lock timeout to tune; the holder can die |
+| XFetch | None | Rarely | A few duplicate fetches; store `Δ` and expiry with the value |
+| Stale-while-revalidate | A lock for the refresher | No | Serves data past its TTL; needs a hard TTL too |
+
+<Callout label="Common mistake" kind="warn">
+Fixing the expiry stampede and forgetting the **cold start**. A cache that
+restarts empty, or a new cluster with no data, turns every read into a miss at
+once, and none of these techniques helps when nothing is cached. Facebook warms
+a cold cluster by filling misses from a warm one, which takes "a few hours
+instead of a few days", and issues deletes to it with a two-second hold-off to
+avoid racing the fill (NSDI 2013, section 4.3). At minimum, rate-limit misses
+to the database when the hit rate collapses.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="07" id="invalidation">Invalidation: keeping the copy honest</SectionHeading>
+
+Once data changes, every cached copy of it is wrong until someone removes it.
+Sending the delete isn't the hard part. It's the ordering between the delete
+and a reader that was already halfway through filling the cache.
+
+<Sub n="7.1" title="The stale-set race">
+
+This is the classic cache-aside race. It needs only one slow reader and one
+writer:
+
+<StepSequence
+  title="How cache-aside leaves a stale value behind"
+  actors={["Reader", "Cache", "Database", "Writer"]}
+  messages={[
+    { from: 0, to: 1, label: "GET K → miss", note: "The reader misses on K, which is not cached right now." },
+    { from: 0, to: 2, label: "SELECT → v1", note: "It reads the current value, **v1**, from the database. Then it stalls: a GC pause, a slow network, a descheduled thread." },
+    { from: 3, to: 2, label: "UPDATE → v2", note: "Meanwhile a writer commits **v2** to the database." },
+    { from: 3, to: 1, label: "DELETE K", note: "The writer deletes K from the cache, correctly. There's nothing to delete, since K isn't there yet." },
+    { from: 0, to: 1, label: "SET K = v1", note: "The reader wakes up and sets **v1**. The cache now holds an old value, and no future write is coming to remove it." },
+    { from: 1, to: 0, label: "v1 until TTL", note: "Every reader sees v1 until the TTL expires. Without a TTL, forever.", dashed: true },
+  ]}
+/>
+
+<Why>Why doesn't deleting twice fix it?</Why>
+
+The "delayed double delete" (delete, wait a moment, delete again) narrows the
+window but doesn't close it. It works only if the stalled reader wakes up before
+the second delete, and you can't bound a GC pause or a network stall. It
+makes the race rarer, not impossible.
+
+</Sub>
+
+<Sub n="7.2" title="Closing the race">
+
+The race closes when the cache can tell that a set is based on data older than
+a delete it has already seen. There are three ways to give it that
+information.
+
+| Approach | How it works | Where you see it |
+|---|---|---|
+| **Leases** | A miss issues a token; a delete invalidates it; a set with an invalid token is refused | memcache at Facebook (section 6.3), which the paper compares to load-link/store-conditional |
+| **Versioned values** | Store the row's version (an `updated_at` or a counter) with the value, and only set if it's newer than what's there, using a Lua script or `WATCH` in Redis | Any cache where rows carry a version column |
+| **Invalidate from the commit log** | A daemon tails the database's replication log and issues deletes after each commit, in commit order | Facebook's `mcsqueal`; Debezium or another change-data-capture pipeline elsewhere |
+
+Facebook's `mcsqueal` runs on every database, reads the SQL statements that
+commit, extracts the keys to delete, and broadcasts the deletes to every
+front-end cluster in the region. Because it reads the log, a delete can't be
+lost to an application crash between commit and delete. Facebook also notes
+that "only 4% of all deletes issued result in the actual invalidation of
+cached data": most of the time the key wasn't cached anyway.
+
+<Callout label="Design implication">
+If your cache must be correct, not just fast, drive invalidation from the
+database's log, not from application code. Application-issued deletes are lost
+whenever the process dies between the commit and the delete. A log is the one
+place every change is recorded in order.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="08" id="fleet">Coherence across a fleet</SectionHeading>
+
+The fastest cache is in your process: section 1.2 measured it at 0.17 µs
+against 65 µs for Redis. But with 200 application servers, there are 200
+copies of every hot key, and a write has to reach all of them.
+
+<Sub n="8.1" title="Four ways to keep local copies in line">
+
+| Approach | Staleness | Cost | Fails how |
+|---|---|---|---|
+| **Short TTL only** (seconds) | Up to one TTL | Nothing to build; more misses | Wrong for up to a TTL after every write |
+| **Broadcast invalidations** (Redis pub/sub, Kafka) | One message delay | A publish per write, a subscription per server | A server that misses a message stays stale until the TTL |
+| **Server-assisted tracking** (Redis `CLIENT TRACKING`, Redis 6+) | One message delay | Server memory per tracked key and client | As above, plus forced invalidations when the tracking table fills |
+| **Versioned keys** (`user:42:v17`) | None for readers who know the version | An extra lookup to learn the current version | The version lookup is itself a cache problem |
+
+Redis's tracking has two modes
+([docs](https://redis.io/docs/latest/develop/reference/client-side-caching/)).
+In the default mode, the server remembers which clients read which keys and
+sends each client invalidations only for its keys. In **broadcasting** mode
+(`BCAST PREFIX user:`), it remembers nothing and sends every change under the
+prefix to every subscriber.
+
+<Why>Why would Redis invalidate a key that didn't change?</Why>
+
+Because the table of who read what, the **invalidation table**, has a size
+limit (`tracking-table-max-keys`). When it's full, Redis evicts an entry "by
+pretending that such key was modified", and sends the invalidation anyway. The
+client loses a good cached copy, but it never keeps a stale one. When a
+coherence mechanism runs out of memory, it should fail toward more misses, as
+this one does, not toward stale data.
+
+</Sub>
+
+<Sub n="8.2" title="The races that come with local caches">
+
+Local caches bring the race from section 7 back in a new form. The Redis docs
+describe it for a client that reads data on one connection and receives
+invalidations on another:
+
+```text
+[D] client -> server: GET foo
+[I] server -> client: Invalidate foo (somebody else touched it)
+[D] server -> client: "bar" (the reply of "GET foo")
+```
+
+The invalidation overtakes the reply, so the client caches a value that's
+already been invalidated. Their fix is a placeholder: mark `foo` as
+"caching in progress" before sending the `GET`, let an invalidation delete the
+placeholder, and don't store the reply if the placeholder is gone. It's more or less a local
+version of Facebook's lease.
+
+A second rule from the same docs: **if you lose the invalidation connection,
+flush the local cache.** You can't know what you missed. Ping the invalidation
+channel periodically, and treat a silent channel as a lost one.
+
+<Callout label="Common mistake" kind="warn">
+Adding an in-process cache "for the hot keys" with no invalidation and no TTL.
+It works in testing, where there's one server. In production each server keeps
+its copy until restart, and users see different values depending on which
+server the load balancer picks.
+</Callout>
+
+</Sub>
+
+<Sub n="8.3" title="Hot keys and failed cache servers">
+
+A distributed cache spreads keys across servers by hashing, usually consistent
+hashing, so one server's failure moves only its share. Two things break that
+tidy picture.
+
+**Hot keys.** Hashing spreads keys, not load. Facebook noted that "a single key
+can account for 20% of a server's requests." A celebrity's profile or a
+homepage config lands on one cache server, and that server saturates while the
+others idle. Usual fixes are a small local cache in front for the hottest
+keys, or storing *N* copies under `K#1` … `K#N` and reading a random one.
+
+**Failed servers.** When a cache server dies, the obvious fix is to rehash its
+keys onto the survivors. Facebook deliberately didn't do that, because a hot key
+could then overload the server it moved to, and so on down the ring. Instead,
+failed requests go to **Gutter**, a pool of idle servers about 1% of the
+cluster's size, whose entries expire quickly. That turned 10–25% of failures
+into hits and cut client-visible failures by 99% (NSDI 2013, section 3.3).
+
+</Sub>
+
+<SectionHeading n="09" id="operating">Operating a cache</SectionHeading>
+
+<Sub n="9.1" title="What to measure">
+
+- **Hit rate per key family.** A global number hides a 20% hit rate on the one
+  prefix that matters.
+- **Misses per second reaching the source.** That's the load the database is
+  provisioned for.
+- **Evictions against expirations.** Lots of evictions means the cache is
+  smaller than the working set.
+- **Recompute time** of expensive values, since it sets the stampede window.
+
+</Sub>
+
+<Sub n="9.2" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Database load spikes on a regular beat | Hot keys expiring together, or one key stampeding | Jittered TTLs, coalescing, XFetch or stale-while-revalidate |
+| Database overloaded after a cache restart or deploy | Cold cache; nothing to coalesce | Warm from a peer, ramp traffic, rate-limit misses at the source |
+| Hit rate falls after a nightly job | A scan evicting the hot set under LRU | A scan-resistant policy (W-TinyLFU, S3-FIFO, Redis `allkeys-lfu`), or bypass the cache for batch reads |
+| Users occasionally see old data that never goes away | The stale-set race, and no TTL | Add a TTL now; then leases, versioned sets or log-driven invalidation |
+| Different servers show different values | Local caches with no invalidation | Short TTL, broadcast invalidation, or Redis client tracking |
+| One cache node at 100% CPU, others idle | A hot key | Local cache for that key, or replicate it under several names |
+| Lots of lookups for IDs that don't exist | No negative caching; possibly an enumeration attack | Cache "not found" with a short TTL |
+| Hit rate fine, latency not improved | Caching something that was already cheap | Cache the expensive computation, or move the cache in process |
+
+</Sub>
+
+<SectionHeading n="10" id="summary">Summary</SectionHeading>
+
+1. **Watch the miss rate, not the hit rate.** Going from 90% to 95% halves the
+   load on the database; dropping from 99% to 90% multiplies it by ten.
+2. **A remote cache is a network hop.** In the test here, Redis on loopback cost
+   the same as a Postgres primary-key lookup; cache remotely only
+   what's expensive to miss.
+3. **Delete on write, don't update.** Deletes are idempotent; out-of-order sets
+   leave old values behind.
+4. **LRU is simple and fragile.** It's defeated by loops and hurt by scans, and a
+   concurrent LRU writes on every read.
+5. **Frequency needs aging.** Plain LFU collapsed from 44% to 25.5% when the hot
+   set changed; periodic halving fixes it.
+6. **W-TinyLFU decides admission, not just eviction.** A newcomer only gets in if
+   the sketch says it's more popular than the victim.
+7. **A stampede is one miss multiplied by every concurrent reader.** Naive
+   cache-aside made 64 backend calls per expiry in the test here.
+8. **Coalesce in-process, coordinate in the cache, or refresh early.**
+   singleflight, leases and locks, XFetch and stale-while-revalidate each trade
+   waiting against duplicate work.
+9. **Every TTL is a staleness budget and a safety net.** Keep one even when you
+   invalidate, because invalidations get lost.
+10. **Local caches need an invalidation path and a flush on disconnect.**
+    Otherwise every server keeps its own version of the truth.
+
+<SectionHeading n="11" id="build">Build this</SectionHeading>
+
+**A cache policy simulator, and a stampede you can watch.**
+
+- Implement LRU, LFU with periodic halving, S3-FIFO and W-TinyLFU against one
+  interface: `access(key) -> hit`. Add Belady's OPT from a precomputed next-use
+  array, as the ceiling.
+- Generate a Zipf trace, then add scans, a loop and a popularity shift, and
+  reproduce the table in section 3.4. Then find a public trace (the S3-FIFO
+  repository links several) and see whether the ranking holds.
+- Put Redis in front of a function that sleeps 50 ms. Run 64 reader threads
+  against one key with a 2-second TTL, count backend calls per expiry, and add
+  singleflight, a `SET NX` lock, XFetch and stale-while-revalidate one at a time.
+- Finally, reproduce the stale-set race of section 7.1 deterministically by
+  adding a sleep between the reader's `SELECT` and its `SET`. Then close it with a
+  version check.
+
+<SectionHeading n="12" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What's the difference between cache-aside and write-through?">
+In cache-aside, the application owns the cache: on a miss it reads the
+database and sets the key, and on a write it updates the database and deletes
+the key. In write-through, writes go through the cache, which writes the
+database synchronously, so the cache always holds the latest written value. It
+costs both latencies on every write and fills the cache with data that may
+never be read.
+</QA>
+
+<QA level="beginner" q="Why do you delete a cache key on write instead of setting the new value?">
+Because deletes are idempotent and sets aren't. Two concurrent writers can
+reach the cache in the opposite order to the database, and a set-on-write
+leaves the older value cached. Two deletes in any order leave the key empty,
+and the next reader loads the current row. Facebook's memcache paper gives
+exactly this reason.
+</QA>
+
+<QA level="intermediate" q="What's a cache stampede, and how do you prevent one?">
+A popular key expires, and every concurrent reader misses and recomputes it at
+once. In a test with 64 readers and a 50 ms recompute, naive cache-aside made
+64 backend calls per expiry. Fixes: coalesce misses in-process (singleflight,
+a loading cache); coordinate through the cache with a lock or lease so one
+client refills; refresh early at random (XFetch); or serve stale while one
+refresher runs (stale-while-revalidate). Also jitter TTLs, so keys written
+together don't expire together.
+</QA>
+
+<QA level="intermediate" q="Why does LRU perform badly on a scan, and what do real systems do about it?">
+Every key the scan touches becomes most-recently-used, and each one pushes an
+entry of the hot set toward eviction. A loop slightly bigger than the cache is
+worse: LRU scored 0% on one in simulation. Postgres runs large sequential scans
+through a private 256 KB buffer ring. Linux's page reclaim promotes a page to
+its active list only on a second touch. Caffeine's W-TinyLFU rejects newcomers less popular than the
+victim, and S3-FIFO filters one-hit wonders through a small FIFO.
+</QA>
+
+<QA level="intermediate" q="How does W-TinyLFU work?">
+New entries enter a small LRU window, about 1% of capacity. When the window
+overflows, its oldest entry becomes a candidate, and the main region's
+eviction victim is the oldest in probation. A count-min sketch with 4-bit
+counters, which sees every access including misses, estimates both
+frequencies, and only the more frequent one stays. Counters are halved after
+ten increments per cache slot, so popularity ages. Caffeine tunes the window
+size with a hill climber and adds a small random admission against hash
+collision attacks.
+</QA>
+
+<QA level="deep" q="Describe the stale-set race in cache-aside, and two ways to close it.">
+A reader misses, reads v1 from the database, and stalls. A writer commits v2
+and deletes the key, which isn't cached yet. The reader wakes and sets v1, and
+it stays there until the TTL. A delayed double delete narrows the window but
+doesn't close it. To close it: leases, where a miss issues a token, a delete
+invalidates it, and a set with a dead token is refused; or versioned sets, where
+the value carries the row version and a set only succeeds if it's newer than
+what's cached.
+</QA>
+
+<QA level="deep" q="You add an in-process cache to 200 servers. How do you keep them coherent, and what can go wrong?">
+Options: a short TTL alone; broadcasting invalidations over pub/sub or Kafka;
+Redis client tracking, per-key or broadcast by prefix; or versioned keys. What
+can go wrong: an invalidation can overtake the reply it's meant to invalidate
+if they travel on different connections, which a placeholder entry fixes. A
+lost subscription leaves a server stale, so flush on disconnect and ping the
+channel. And a full tracking table forces invalidations, costing hit rate, not
+correctness. Keep a TTL as the backstop in every case.
+</QA>
+
+<QA level="deep" q="A cache server dies. Why might rehashing its keys onto the others make things worse?">
+Load isn't spread evenly across keys. A hot key can carry a large share of one
+server's traffic (Facebook cites 20%), and moving it onto a neighbour can
+overload that neighbour, which fails in turn. Facebook sends failed requests to
+a small Gutter pool, about 1% of the cluster, with short-lived entries. That
+converted 10–25% of failures into hits and cut client-visible failures by 99%.
+</QA>
+
+<SectionHeading n="13" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="A 10,000 reads/s service's hit rate drops from 99% to 95%. How much more load does the database see?">
+    Five times as much: misses go from 100/s to 500/s.
+  </Q>
+  <Q q="In Caffeine's frequency sketch, what's the largest count a key can have?">
+    15. Counters are 4 bits, and they're halved every 10 × maximum-size
+    increments, so an old count of 15 becomes 7.
+  </Q>
+  <Q q="Why did per-process singleflight make 8 backend calls per expiry in the test?">
+    There were eight processes. singleflight coalesces within one process, so
+    each process elected its own leader.
+  </Q>
+  <Q q="In XFetch, what is Δ and why is it stored with the value?">
+    How long the last recompute took. Slow values need to refresh earlier, and
+    the random early-expiry gap is scaled by Δ.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Nishtala et al., Scaling Memcache at Facebook (NSDI 2013)">
+    Look-aside caching at scale: leases, Gutter, mcsqueal, cold-cluster warm-up
+    and cross-region consistency. [PDF](https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf).
+  </WildCard>
+  <WildCard name="Einziger, Friedman and Manes, TinyLFU: A Highly Efficient Cache Admission Policy">
+    The W-TinyLFU design and its evaluation on real traces.
+    [arXiv 1512.00727](https://arxiv.org/abs/1512.00727), later in ACM
+    Transactions on Storage.
+  </WildCard>
+  <WildCard name="Vattani, Chierichetti and Lowenstein, Optimal Probabilistic Cache Stampede Prevention (VLDB 2015)">
+    The proof behind XFetch, and why the exponential gap is optimal.
+    [PDF](https://cseweb.ucsd.edu/~avattani/papers/cache_stampede.pdf).
+  </WildCard>
+  <WildCard name="Yang et al., FIFO Queues Are All You Need for Cache Eviction (SOSP 2023)">
+    S3-FIFO, one-hit wonders, and 6,594 production traces.
+    [PDF](https://www.cs.cmu.edu/~rvinayak/papers/s3-fifo-sosp-2023-fifo-queues-are-all-you-need-for-cache-eviction.pdf).
+  </WildCard>
+  <WildCard name="Caffeine: FrequencySketch.java and BoundedLocalCache.java">
+    The best-documented production cache policy you can read. Start at
+    `admit()` and `FrequencySketch`, then the hill climber.
+    [v3.1.8](https://github.com/ben-manes/caffeine/tree/v3.1.8/caffeine/src/main/java/com/github/benmanes/caffeine/cache).
+  </WildCard>
+  <WildCard name="Redis: client-side caching reference">
+    Tracking, broadcasting, the invalidation table, and the two races every
+    near-cache must handle.
+    [redis.io](https://redis.io/docs/latest/develop/reference/client-side-caching/).
+  </WildCard>
+  <WildCard name="Megiddo and Modha, ARC (FAST 2003)">
+    The adaptive policy with ghost lists that most later work compares against.
+    [PDF](https://www.usenix.org/legacy/events/fast03/tech/full_papers/megiddo/megiddo.pdf).
+  </WildCard>
+  <WildCard name="RFC 5861: HTTP Cache-Control Extensions for Stale Content">
+    `stale-while-revalidate` and `stale-if-error`, the HTTP names for serving
+    old data on purpose. [rfc-editor.org](https://www.rfc-editor.org/rfc/rfc5861).
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="14" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Redis Internals">
+    Sampled LRU and the logarithmic LFU counter, expiry, and why a `volatile-*`
+    policy can refuse writes. [Chapter 22](/topics/22-redis).
+  </WildCard>
+  <WildCard name="Memory Hierarchy & Cache Coherence">
+    The same problems in hardware: cache lines, eviction and MESI keeping many
+    copies coherent. [Chapter 02](/topics/02-memory-hierarchy).
+  </WildCard>
+  <WildCard name="Contention, Queueing & Tail Latency">
+    Why a stampede's burst of identical queries turns into a p99 spike on the
+    database. [Chapter 16](/topics/16-contention-tail-latency).
+  </WildCard>
+  <WildCard name="Time, Clocks & Ordering">
+    Why "newer" is harder to decide than it looks, which matters for versioned
+    sets and last-write-wins. [Chapter 26](/topics/26-time-and-ordering).
+  </WildCard>
+</CardGrid>

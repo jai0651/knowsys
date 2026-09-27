@@ -1,0 +1,1164 @@
+---
+title: Storage Engine Internals
+dek: "What happens between an INSERT and the disk: slotted pages, B+trees and their splits, the write-ahead log that makes a crash survivable, the buffer pool that keeps hot pages in RAM, and the LSM tree that trades all of it for fast writes. Measured on Postgres 16 and RocksDB 8.9."
+readingTime: "~34 min"
+level: "Intermediate"
+versions: "PostgreSQL 16.15 (source at REL_16_4) · RocksDB 8.9.1 db_bench · measured in a shared container, linuxkit 6.10.14 aarch64 on an Apple M4"
+prereqs: "files and fsync, the page cache, big-O"
+updated: "2026-09-27"
+---
+
+Every database you use has a storage engine at the bottom. Postgres has its
+heap and nbtree, MySQL has InnoDB, MongoDB has WiredTiger, and Cassandra,
+CockroachDB and TiKV sit on log-structured merge trees. From the SQL on top
+they look alike. Underneath, they make very different bets.
+
+Those bets explain things you've probably seen from the outside. A table
+with a random UUID key grows faster than one with a sequence. WAL volume jumps
+right after every checkpoint. A single analytics query doesn't wipe out the
+cache, but a bad eviction policy would. An LSM database writes several times
+more bytes to disk than you gave it.
+
+This chapter builds a storage engine from the problem up. It starts with the
+page, grows a B+tree out of pages, adds a log so a crash can't corrupt
+anything, adds a cache so reads don't hit the disk, and then looks at the LSM
+tree, which answers the same questions in a completely different way. Every
+number in it was measured on Postgres 16 or RocksDB, or links to its source.
+
+<SectionHeading n="01" id="the-job">What a storage engine has to do</SectionHeading>
+
+A storage engine takes keys and values from the layer above and keeps them on
+a device that only reads and writes whole blocks. It has to find any key
+quickly, survive a crash at any instant, and do both while many transactions
+run at once.
+
+<Sub n="1.1" title="The interface">
+
+Strip away SQL and an engine offers a small interface:
+
+| Operation | What it must do | Hard part |
+|---|---|---|
+| `get(key)` | Return the current value, or nothing | Touch as few blocks as possible |
+| `put(key, value)` | Make the new value visible, then durable at commit | Don't rewrite a whole block for a 100-byte change |
+| `delete(key)` | Make the key disappear | Space comes back later, not now |
+| `scan(from, to)` | Return keys in order | Keys must be stored sorted, or sortable cheaply |
+| `commit()` | Everything in the transaction survives a crash, or nothing does | A crash can happen between any two writes |
+
+Postgres calls its version the table access method and index access method
+APIs. RocksDB exposes almost exactly the list above, plus iterators.
+
+</Sub>
+
+<Sub n="1.2" title="Why everything is a page">
+
+Disks and SSDs move data in blocks: 512 bytes or 4 KB at the device, and the
+kernel's page cache works in 4 KB pages. Reading one byte costs the same as
+reading the block it's in. So engines store data in fixed-size **pages** and
+make every read and write a whole page.
+
+<Why>Why do engines pick 8 or 16 KB instead of 4?</Why>
+
+Bigger pages mean fewer levels in a tree and fewer I/Os per lookup, at the
+price of rewriting more bytes per small change. Postgres uses 8 KB, InnoDB 16
+KB by default, SQLite 4 KB. None of them match the device exactly, and section
+4 shows the problem that causes.
+
+</Sub>
+
+<Sub n="1.3" title="Three costs you can't all minimise">
+
+Every design pays three kinds of amplification, and you can compare engines by
+where they put the cost:
+
+| Cost | Definition | Who pays most |
+|---|---|---|
+| **Read amplification** | Blocks read per logical read | LSM trees: a key may live in any of several files |
+| **Write amplification** | Bytes written to the device per byte of user data | B+trees rewrite whole pages; LSM trees rewrite data during compaction |
+| **Space amplification** | Bytes on disk per byte of live data | B+trees leave pages part-empty; LSM trees keep stale versions until compaction |
+
+Athanassoulis and colleagues called this the
+[RUM conjecture](https://openproceedings.org/2016/conf/edbt/paper-12.pdf)
+(EDBT 2016): an access method that's optimal for two of read, update and memory
+overhead can't be optimal for the third. Keep the table in mind. Every design
+choice in this chapter moves cost between its rows.
+
+</Sub>
+
+<SectionHeading n="02" id="pages">Inside a page</SectionHeading>
+
+A page has to hold variable-length rows, let them grow and shrink, and let
+other structures point at a row without caring where in the page it sits. The
+standard answer is the **slotted page**, and Postgres uses a textbook version.
+
+<Sub n="2.1" title="The slotted page">
+
+A page starts with a small header. After it comes an array of **line
+pointers** (slots) growing forward, and the rows themselves are packed from
+the end of the page growing backward. Free space is the gap in the middle.
+
+<SourceRead
+  file="src/include/storage/bufpage.h"
+  repo="postgres/postgres"
+  tag="REL_16_4"
+  href="https://github.com/postgres/postgres/blob/REL_16_4/src/include/storage/bufpage.h#L155"
+>
+```c
+typedef struct PageHeaderData
+{
+	/* XXX LSN is member of *any* block, not only page-organized ones */
+	PageXLogRecPtr pd_lsn;		/* LSN: next byte after last byte of xlog
+								 * record for last change to this page */
+	uint16		pd_checksum;	/* checksum */
+	uint16		pd_flags;		/* flag bits, see below */
+	LocationIndex pd_lower;		/* offset to start of free space */
+	LocationIndex pd_upper;		/* offset to end of free space */
+	LocationIndex pd_special;	/* offset to start of special space */
+	uint16		pd_pagesize_version;
+	TransactionId pd_prune_xid; /* oldest prunable XID, or zero if none */
+	ItemIdData	pd_linp[FLEXIBLE_ARRAY_MEMBER]; /* line pointer array */
+} PageHeaderData;
+```
+</SourceRead>
+
+Each line pointer is 4 bytes: a 15-bit offset, a 15-bit length and 2 bits of
+state (`itemid.h`). Here's a real page with three rows in it:
+
+<TryIt what="Inspect a heap page with three rows" lang="sql" toolchain="PostgreSQL 16.15, pageinspect">
+```sql
+create table users(id int primary key, name text, age int);
+insert into users values (1,'ada',36),(2,'grace',45),(3,'linus',28);
+
+select lower, upper, special, pagesize from page_header(get_raw_page('users',0));
+select lp, lp_off, lp_len, t_xmin, t_ctid from heap_page_items(get_raw_page('users',0));
+```
+
+<Output>
+```text
+ lower | upper | special | pagesize
+-------+-------+---------+----------
+    36 |  8072 |    8192 |     8192
+
+ lp | lp_off | lp_len | t_xmin | t_ctid
+----+--------+--------+--------+--------
+  1 |   8152 |     36 |    732 | (0,1)
+  2 |   8112 |     40 |    732 | (0,2)
+  3 |   8072 |     40 |    732 | (0,3)
+```
+
+`pd_lower` is 36: a 24-byte header plus three 4-byte slots. `pd_upper` is
+8072, where the third row starts. The 8,036 bytes between them are free. Row 1
+sits at the very end of the page, and each later row sits just in front of the
+one before.
+</Output>
+</TryIt>
+
+<Why>Why the extra layer of line pointers?</Why>
+
+So that nothing outside the page needs to know a row's byte offset. An index
+entry points at `(page 0, slot 2)`, called a **TID** or `ctid` in Postgres.
+So the engine can compact the page, sliding rows around to merge free space,
+and only the slot array changes. Every index pointing into the page stays
+valid.
+
+</Sub>
+
+<Sub n="2.2" title="What a row costs">
+
+Rows aren't free inside a page. In Postgres each one carries a 23-byte header
+(padded to 24) holding the transaction IDs that created and deleted it, plus a
+4-byte slot. That header is how MVCC works, and
+[chapter 19](/topics/19-transactions-isolation) takes it apart.
+
+So a table of one `bigint` column pays 24 + 8 + 4 = 36 bytes per 8-byte value.
+In a 10-million-row test table, page 0 held **226 rows**, which is what
+`8168 / 36` predicts, and the table came to 346 MB for 80 MB of integers.
+
+<Callout label="Design implication">
+Narrow rows are dominated by per-row overhead. If you store billions of tiny
+rows (events, edges, time-series points), the header costs more than the data.
+That's one reason time-series and analytics systems batch rows into columnar
+blocks instead.
+</Callout>
+
+</Sub>
+
+<Sub n="2.3" title="Updating a row in place, or not">
+
+When a row changes size, a slotted page can usually absorb it: write the new
+version into free space and repoint the slot. When the page is full, the row
+has to move to another page.
+
+Postgres never overwrites a row in place at all. An `UPDATE` writes a new
+version and marks the old one dead:
+
+```text
+ lp | lp_off | t_xmin | t_xmax | t_ctid
+----+--------+--------+--------+--------
+  1 |   8152 |    732 |    733 | (0,4)     <- old version, deleted by xact 733
+  4 |   8032 |    733 |      0 | (0,4)     <- new version, written by xact 733
+```
+
+That's the same page after `update users set age=37 where id=1`. InnoDB takes
+the other path: it updates the row in place in the clustered index and writes
+the old version to an **undo log**. Both are MVCC; they just keep old versions
+in different places, and that choice decides who has to clean up afterwards
+(vacuum in Postgres, the purge thread in InnoDB).
+
+</Sub>
+
+<SectionHeading n="03" id="btree">B+trees: sorted pages you can search</SectionHeading>
+
+Pages hold rows. Now you need to find the one page holding a given key among
+millions, in a handful of reads. The structure almost every relational engine
+uses is the B+tree, described by Bayer and McCreight in 1972 and surveyed by
+Comer in [The Ubiquitous B-Tree](https://dl.acm.org/doi/10.1145/356770.356776)
+(1979).
+
+<Sub n="3.1" title="The shape">
+
+A B+tree is a tree of pages. **Leaf pages** hold keys in sorted order, each
+with its value or a pointer to the row, and each leaf links to its right
+neighbour for range scans. **Internal pages** hold separator keys and child
+pointers: "keys below 5,000 are in child A, keys from 5,000 on are in B".
+
+<Why>Why is the tree so shallow?</Why>
+
+Because each page holds hundreds of entries, so the tree fans out by hundreds
+at every level. Here's the arithmetic for the 10-million-row index measured
+below:
+
+<Estimate
+  rows={[
+    { label: "Keys per leaf page (bigint, measured)", math: "bt_page_stats live_items", value: "367" },
+    { label: "Leaf pages for 10M keys", math: "10,000,000 / 367", value: "≈ 27,250" },
+    { label: "Children per internal page (measured)", math: "bt_page_stats live_items", value: "285" },
+    { label: "Internal pages above the leaves", math: "27,250 / 285", value: "≈ 96" },
+    { label: "Root page", math: "96 children fit in one page", value: "1" },
+  ]}
+  result={{ label: "Levels for 10 million keys (one more for 1 billion)", value: "3" }}
+/>
+
+Postgres agreed: `bt_metap` reported the root at level 2 (levels 0, 1 and 2)
+with **97** entries, and the index had 27,422 pages. At a billion keys it's
+one level more. Four page reads to find any of a billion rows, and the top two
+levels are always in cache.
+
+</Sub>
+
+<Sub n="3.2" title="One lookup, page by page">
+
+Here's what a lookup of `id = 5000001` touched in that index, step by step:
+
+<Steps
+  title="SELECT id FROM t WHERE id = 5000001, through a 3-level B+tree"
+  lanes={[
+    { t: "Metapage", s: "block 0", icon: "⌂" },
+    { t: "Root", s: "level 2", icon: "▲" },
+    { t: "Internal", s: "level 1", icon: "△" },
+    { t: "Leaf", s: "level 0", icon: "▦" },
+    { t: "Visibility map", s: "or the heap", icon: "✓" },
+  ]}
+  steps={[
+    [0, "The **metapage** says which block is the root. Postgres caches it in the relation cache, so it's usually not read at all."],
+    [1, "Binary search the **root** page's 97 separator keys to find the child whose range covers 5,000,001. One buffer."],
+    [2, "Binary search the chosen **internal** page's 285 entries and follow the downlink. Two buffers."],
+    [3, "Binary search the **leaf** for the key itself. It holds the value and a TID pointing at the row in the heap. Three buffers."],
+    [4, "An index-only scan checks the **visibility map** instead of the heap: if the page is all-visible, it skips the heap. Four buffers in total."],
+  ]}
+/>
+
+And here's Postgres reporting exactly that:
+
+```text
+ Index Only Scan using t_id on t (actual rows=1 loops=1)
+   Index Cond: (id = 5000001)
+   Heap Fetches: 0
+   Buffers: shared hit=4
+```
+
+Three index pages and one visibility-map page. If the leaf had to go to the
+heap, it would be one more.
+
+</Sub>
+
+<Sub n="3.3" title="Inserts, and the page split">
+
+An insert finds the right leaf the same way and adds the key. If the leaf is
+full, it **splits**: half the entries move to a new page, and a separator for
+the new page goes into the parent. If the parent is full, it splits too, and a
+split of the root makes the tree one level taller.
+
+<Steps
+  title="Inserting into a full leaf (Postgres nbtree)"
+  lanes={[
+    { t: "Search", s: "root to leaf", icon: "↓" },
+    { t: "Full leaf", s: "page L", icon: "▦" },
+    { t: "New page", s: "page R", icon: "▧" },
+    { t: "Parent", s: "internal", icon: "△" },
+    { t: "WAL", s: "one record", icon: "≡" },
+  ]}
+  steps={[
+    [0, "Descend to the leaf that should hold the new key, holding a lock on only one page at a time."],
+    [1, "The leaf has no room. Pick a **split point**: normally the middle, but on the rightmost page, leave the left page 90% full."],
+    [2, "Allocate page R, move the upper half of the keys into it, and set L's **high key** and **right-link** to point at R."],
+    [4, "Log the split as one WAL record, so a crash can't leave half of it on disk."],
+    [3, "Insert a downlink for R into the **parent**. Until this lands, readers reach R through L's right-link."],
+  ]}
+/>
+
+<Why>How do readers survive a split happening under them?</Why>
+
+With the trick from Lehman and Yao's 1981 paper. Every page has a right-link
+to its sibling and a high key, the largest key that belongs on it. A reader
+that lands on a page and finds its key above the high key knows a split moved
+it, and follows the right-link. Postgres's nbtree is built on it:
+
+<SourceRead
+  file="src/backend/access/nbtree/README"
+  repo="postgres/postgres"
+  tag="REL_16_4"
+  href="https://github.com/postgres/postgres/blob/REL_16_4/src/backend/access/nbtree/README"
+>
+```text
+Compared to a classic B-tree, L&Y adds a right-link pointer to each page,
+to the page's right sibling.  It also adds a "high key" to each page, which
+is an upper bound on the keys that are allowed on that page.  These two
+additions make it possible to detect a concurrent page split, which allows
+the tree to be searched without holding any read locks (except to keep a
+single page from being modified while reading it).
+```
+</SourceRead>
+
+</Sub>
+
+<Sub n="3.4" title="Random keys and half-empty pages">
+
+Where you split matters more than it looks. A middle split leaves two pages
+half full. If keys arrive in increasing order (a sequence, a timestamp), only
+the rightmost leaf ever splits, and Postgres special-cases it: it leaves the
+left page at the fillfactor, 90% for leaves
+([`nbtsplitloc.c`](https://github.com/postgres/postgres/blob/REL_16_4/src/backend/access/nbtree/nbtsplitloc.c#L94)).
+Random keys split pages all over the tree and leave them part-empty.
+
+<Predict
+  q="Two tables, two million bigint primary keys each. One gets keys 1, 2, 3 in order; the other gets random 64-bit values. How much bigger is the random table's index?"
+  options={[
+    "About the same size",
+    "About 35% bigger",
+    "About twice as big",
+    "About ten times bigger",
+  ]}
+  answer={1}
+>
+Measured on Postgres 16: **43 MB for sequential keys, 59 MB for random keys**,
+37% bigger. `REINDEX` on the random one brought it back to 43 MB, because a
+fresh build packs pages to the fillfactor. Theory predicts roughly this: Yao showed
+in 1978 that random insertions leave B-tree pages about 69% (ln 2) full on
+average, against 90% here for the sequential case.
+</Predict>
+
+Size isn't the only cost. A random key sends each insert to a different leaf,
+so the working set is the whole index. With sequential keys, inserts hit the
+same few rightmost pages, which stay in cache.
+
+<Callout label="Common mistake" kind="warn">
+Random UUIDv4 primary keys on a large, insert-heavy table. Every insert lands
+on a random leaf, pages sit a third empty, and once the index outgrows memory
+each insert is a random read. Use a bigint sequence, or a time-ordered
+UUIDv7 ([RFC 9562](https://www.rfc-editor.org/rfc/rfc9562); Postgres 18 added
+a built-in `uuidv7()`), which inserts at the right edge like a sequence.
+</Callout>
+
+</Sub>
+
+<Sub n="3.5" title="Where the row lives: heap or clustered index">
+
+There are two ways to connect a B+tree to the rows:
+
+| Layout | Used by | Primary key lookup | Secondary index holds | Cost |
+|---|---|---|---|---|
+| **Heap + indexes** | Postgres | Index, then heap page by TID | A TID (page, slot) | Every index points at the physical row, so moving a row touches every index |
+| **Clustered index** | InnoDB, SQLite (rowid tables), SQL Server with a clustered key | The primary key B+tree's leaves *are* the rows | The primary key value | A secondary lookup is two tree searches; a wide primary key bloats every secondary index |
+
+Postgres softens its downside with **HOT updates** (heap-only tuples): if no
+indexed column changed and the new version fits on the same page, no index
+entry is added. The WAL dump in section 4 shows two `HOT_UPDATE` records for
+exactly that reason.
+
+</Sub>
+
+<SectionHeading n="04" id="wal">The write-ahead log</SectionHeading>
+
+A B+tree insert can change three pages: the leaf, a new sibling and the
+parent. If the machine loses power after writing one of them, the tree on disk
+is corrupt. And even one page isn't safe: an 8 KB Postgres page is two 4 KB
+filesystem blocks, and a crash can land between them, a **torn page**.
+
+<Sub n="4.1" title="The rule">
+
+Fix it by describing every change in a sequential log before touching the
+data pages, and make the log durable first. After a crash, replay the log and
+every page ends up as it should be.
+
+<SourceRead
+  file="src/backend/access/transam/README"
+  repo="postgres/postgres"
+  tag="REL_16_4"
+  href="https://github.com/postgres/postgres/blob/REL_16_4/src/backend/access/transam/README"
+>
+```text
+A basic assumption of a write AHEAD log is that log entries must reach stable
+storage before the data-page changes they describe.  This ensures that
+replaying the log to its end will bring us to a consistent state where there
+are no partially-performed transactions.  To guarantee this, each data page
+(either heap or index) is marked with the LSN (log sequence number --- in
+practice, a WAL file location) of the latest XLOG record affecting the page.
+Before the bufmgr can write out a dirty page, it must ensure that xlog has
+been flushed to disk at least up to the page's LSN.
+```
+</SourceRead>
+
+That LSN is `pd_lsn`, the first field of the page header in section 2. It ties
+each page to the log.
+
+<Why>Why is writing everything twice faster than writing it once?</Why>
+
+Because the log write is sequential and small, and the page writes can wait.
+A commit only needs its log records on disk, a few hundred bytes appended to
+one file. Dirty 8 KB pages stay in memory and get written later, in bulk,
+possibly after many more changes to the same page. Without a log, every commit
+would have to force every page it touched.
+
+</Sub>
+
+<Sub n="4.2" title="What a commit waits for">
+
+Here's a single-row `UPDATE` with autocommit, from the client to the disk:
+
+<StepSequence
+  title="One UPDATE and its commit in Postgres"
+  actors={["Client", "Backend", "Shared buffers", "WAL buffers", "WAL on disk"]}
+  messages={[
+    { from: 0, to: 1, label: "UPDATE …", note: "The backend finds the row through the index and pins its heap page in **shared buffers**." },
+    { from: 1, to: 2, label: "modify page", note: "It writes the new row version into the page **in memory** and marks the buffer dirty. Nothing has touched disk." },
+    { from: 1, to: 3, label: "XLogInsert", note: "It appends a `HOT_UPDATE` record to the in-memory **WAL buffers** and stamps the record's LSN into the page's `pd_lsn`." },
+    { from: 1, to: 3, label: "COMMIT record", note: "At commit it appends a 34-byte `COMMIT` record." },
+    { from: 3, to: 4, label: "write + fdatasync", note: "`XLogFlush` writes the WAL up to the commit record and calls `fdatasync`. **This is the only disk wait in the commit.**" },
+    { from: 1, to: 0, label: "COMMIT ok", note: "Only now does the client hear success. The dirty heap page is written much later by the checkpointer or background writer." },
+  ]}
+/>
+
+And here is what that looks like in the log itself, from `pg_waldump`, for two
+updates to the same row straight after a checkpoint:
+
+```text
+rmgr: Heap        len (rec/tot): 65/ 309, tx: 545604, desc: HOT_UPDATE ... blkref #0: rel 1663/5/16437 blk 0 FPW
+rmgr: Transaction len (rec/tot): 34/  34, tx: 545604, desc: COMMIT 2026-09-27 04:12:29.911940 UTC
+rmgr: Heap        len (rec/tot): 71/  71, tx: 545605, desc: HOT_UPDATE ... blkref #0: rel 1663/5/16437 blk 0
+rmgr: Transaction len (rec/tot): 34/  34, tx: 545605, desc: COMMIT 2026-09-27 04:12:29.975972 UTC
+```
+
+That same change cost 309 bytes the first time and 71 the second. The
+difference is the `FPW` flag, and section 4.4 explains it.
+
+</Sub>
+
+<Sub n="4.3" title="Group commit, and turning the wait off">
+
+If every commit waits for its own `fdatasync`, a single connection can commit
+at most once per flush. On the test box `pg_test_fsync` measured a median of
+**185 µs per 8 KB `fdatasync`**, on a Docker Desktop host mount that may not
+reach real flash on every call, so treat it as a floor, and probably an optimistic one.
+
+<Why>How do 16 clients commit faster than one flush allows?</Why>
+
+**Group commit.** While one backend is inside `fdatasync`, others append their
+commit records behind it. When the flush finishes, the next one flushes all of
+them at once. `pg_stat_wal` shows it directly: WAL syncs per committed
+transaction fall as clients are added.
+
+| pgbench clients | Commits in 10 s | WAL syncs | Syncs per commit |
+|---|---|---|---|
+| 1 | 5,425 | 5,423 | 1.00 |
+| 4 | 15,329 | 12,017 | 0.78 |
+| 16 | 23,637 | 7,598 | 0.32 |
+| 32 | 20,518 | 6,604 | 0.32 |
+
+That's one run per row, TPC-B-like pgbench at scale 10 on a shared container,
+so the absolute throughput is noisy. What's stable is the ratio: at
+16 clients about three commits share each flush.
+
+You can also stop waiting. `synchronous_commit = off` returns success before
+the flush. In three 15-second runs each at 16 clients, the median went from
+**2,258 tps with it on to 4,351 with it off**. The
+[Postgres docs](https://www.postgresql.org/docs/16/wal-async-commit.html) are
+precise about the price: the risk window is at most "three times
+`wal_writer_delay`" (200 ms by default), and "the risk that is taken by using
+asynchronous commit is of data loss, not data corruption."
+
+<Callout label="Design implication">
+`synchronous_commit = off` can be set per transaction. Turn it off for writes
+you can afford to lose after a crash (a page-view counter, a cache table) and
+leave it on for money. It's nothing like `fsync = off`, which can corrupt the
+whole cluster.
+</Callout>
+
+</Sub>
+
+<Sub n="4.4" title="Full-page writes and checkpoints">
+
+Replaying a log record assumes the page it applies to is intact. A torn page
+breaks that. Postgres's answer: the **first time a page is changed after a
+checkpoint**, the WAL record carries a copy of the whole page. Replay restores
+that image and applies later records on top. That's the `FPW` in the dump
+above.
+
+<Why>Why does WAL volume spike after every checkpoint?</Why>
+
+Because every page touched for the first time since the checkpoint costs a
+full page image. Measured with pgbench (4 clients, 8,000 transactions per run,
+median of three runs):
+
+| Run | Full-page images | WAL bytes per transaction |
+|---|---|---|
+| Straight after `CHECKPOINT` | 6,572 | **6,906** |
+| The next 8,000 transactions | 4,051 | 4,443 |
+| After `CHECKPOINT`, `full_page_writes = off` | 0 | **408** |
+
+Full-page images made up over 90% of the WAL here. It seems high, but the data set was a 1 million-row table, big enough that most updates still hit a page that hadn't
+been imaged yet.
+
+<Callout label="Common mistake" kind="warn">
+Setting `checkpoint_timeout` short or `max_wal_size` small "so recovery is
+fast". Each checkpoint restarts the full-page-image cycle, so frequent
+checkpoints multiply WAL volume, replication traffic and archive size. Size
+`max_wal_size` so checkpoints are triggered by time, not by WAL volume, and
+watch `checkpoints_req` in `pg_stat_bgwriter`.
+</Callout>
+
+`full_page_writes = off` is only safe on storage that can't tear an 8 KB
+write, such as a copy-on-write filesystem like ZFS. InnoDB solves the same problem differently, with
+a **doublewrite buffer**: each dirty page is first written to a separate area,
+flushed, and only then written to its real location, so an intact copy exists
+somewhere.
+
+A **checkpoint** is what lets the log be truncated. It writes every dirty
+buffer to the data files, then records "everything before LSN X is on disk".
+Recovery starts from X, and WAL older than X can be recycled.
+
+</Sub>
+
+<Sub n="4.5" title="Crash recovery, step by step">
+
+To watch recovery happen, I killed Postgres with `pg_ctl stop -m immediate`
+(no shutdown checkpoint) five seconds into a pgbench run, then started it:
+
+<Steps
+  title="Postgres crash recovery"
+  lanes={[
+    { t: "Control file", s: "pg_control", icon: "⌂" },
+    { t: "Redo start", s: "checkpoint's LSN", icon: "⏵" },
+    { t: "Replay", s: "record by record", icon: "↻" },
+    { t: "End of WAL", s: "first bad record", icon: "⏹" },
+    { t: "Checkpoint", s: "end of recovery", icon: "✓" },
+  ]}
+  steps={[
+    [0, "Startup reads `pg_control` and sees the cluster wasn't shut down cleanly: **automatic recovery in progress**."],
+    [1, "It finds the last checkpoint's redo pointer: **redo starts at 0/8A8C7EA0**."],
+    [2, "It reads each WAL record, fetches the page, and applies the change **only if the page's `pd_lsn` is older than the record**. Full-page images replace the page outright."],
+    [3, "It stops at the first record that fails its checks: **invalid record length at 0/8D19EE88: expected at least 24, got 0**. That's where the log ended when the power went."],
+    [4, "It runs an end-of-recovery checkpoint (5,112 buffers written) and starts accepting connections. 41.8 MB of WAL replayed in **0.45 s**."],
+  ]}
+/>
+
+<Why>What about transactions that were running at the crash?</Why>
+
+The classic algorithm, [ARIES](https://dl.acm.org/doi/10.1145/128765.128770)
+(Mohan et al., 1992), replays everything (redo) and then rolls back the
+losers using undo records. InnoDB follows that shape, with its undo log.
+Postgres skips the undo phase entirely: a crashed transaction's row versions
+stay on disk, but its XID never got a commit record, so every reader treats
+them as invisible and vacuum removes them later. MVCC doubles as undo.
+
+</Sub>
+
+<SectionHeading n="05" id="buffer-pool">The buffer pool</SectionHeading>
+
+Reading a page from disk costs microseconds on NVMe and milliseconds on
+network storage. Reading it from RAM costs nanoseconds. So every B+tree engine
+keeps a cache of pages in its own memory, the **buffer pool** (`shared_buffers`
+in Postgres, `innodb_buffer_pool_size` in InnoDB).
+
+<Sub n="5.1" title="Frames, pins and dirty bits">
+
+The buffer pool is an array of page-sized **frames**, a hash table from (file,
+block number) to frame, and a small header per frame:
+
+| Field | What it's for |
+|---|---|
+| **Tag** | Which page is in this frame |
+| **Pin count** | How many backends are using it right now. A pinned page can't be evicted |
+| **Usage count** | How recently and often it was used. Drives eviction |
+| **Dirty bit** | Changed since it was read. Must be written, after its WAL, before the frame is reused |
+| **Content lock** | A shared/exclusive lock held while reading or changing the bytes |
+
+Every access in the previous sections went through this: look up the tag, pin
+the frame, lock it, read, unlock, unpin. The `shared hit=4` in section 3.2
+counts exactly those pins.
+
+</Sub>
+
+<Sub n="5.2" title="Choosing a victim: the clock sweep">
+
+When a new page needs a frame, something has to go. Least-recently-used is
+the obvious choice, but true LRU moves a page to the head of a list on
+**every** hit, and that list is a lock every backend fights over.
+
+Postgres uses a **clock sweep** instead. Each frame has a usage count, capped at
+5 (`BM_MAX_USAGE_COUNT`). A hit just bumps the count. To find a victim, a hand
+sweeps the frames, decrementing counts, and takes the first unpinned frame at
+zero:
+
+<SourceRead
+  file="src/backend/storage/buffer/freelist.c"
+  repo="postgres/postgres"
+  tag="REL_16_4"
+  href="https://github.com/postgres/postgres/blob/REL_16_4/src/backend/storage/buffer/freelist.c#L314"
+>
+```c
+	/* Nothing on the freelist, so run the "clock sweep" algorithm */
+	trycounter = NBuffers;
+	for (;;)
+	{
+		buf = GetBufferDescriptor(ClockSweepTick());
+
+		/*
+		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
+		 * it; decrement the usage_count (unless pinned) and keep scanning.
+		 */
+		local_buf_state = LockBufHdr(buf);
+
+		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+		{
+			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
+			{
+				local_buf_state -= BUF_USAGECOUNT_ONE;
+
+				trycounter = NBuffers;
+			}
+			else
+			{
+				/* Found a usable buffer */
+				if (strategy != NULL)
+					AddBufferToRing(strategy, buf);
+				*buf_state = local_buf_state;
+				return buf;
+			}
+		}
+		/* ... error if every buffer is pinned ... */
+		UnlockBufHdr(buf, local_buf_state);
+	}
+```
+</SourceRead>
+
+A page used five times survives roughly five passes of the hand. A page used once
+survives one. That approximates LRU with a counter update per hit instead of a
+list operation.
+
+</Sub>
+
+<Sub n="5.3" title="Why one big scan doesn't flush the cache">
+
+A full scan of a table bigger than the cache would, under plain LRU or clock,
+evict every hot page to make room for pages it reads once. Both big engines
+defend against that.
+
+<Why>So what happens to a 346 MB scan with a 128 MB cache?</Why>
+
+Postgres gives any sequential scan of a table larger than a quarter of
+`shared_buffers` a **ring buffer** of 256 KB, 32 frames, and recycles those
+frames instead of taking new ones
+([`heapam.c`](https://github.com/postgres/postgres/blob/REL_16_4/src/backend/access/heap/heapam.c#L270),
+[`freelist.c`](https://github.com/postgres/postgres/blob/REL_16_4/src/backend/storage/buffer/freelist.c#L557)).
+Measured straight after a restart:
+
+<TryIt what="Scan a 346 MB table through a 128 MB buffer pool, then count what stayed" lang="sql" toolchain="PostgreSQL 16.15, pg_buffercache">
+```sql
+select count(*) from t;          -- 10M rows, 44,248 pages, parallel seq scan
+
+select c.relname, count(*) as buffers
+from pg_buffercache b join pg_class c on c.relfilenode = b.relfilenode
+where c.relname = 't' group by 1;
+```
+
+<Output>
+```text
+   Buffers: shared read=44248
+
+ relname | buffers
+---------+---------
+ t       |      96
+```
+
+All 44,248 pages were read, and 96 stayed: three rings of 32, one for the
+leader and one for each of the two parallel workers. Of 16,384 frames, 16,126
+were still empty afterwards.
+</Output>
+</TryIt>
+
+InnoDB uses **midpoint insertion** instead. Its LRU list is split: new pages
+enter at the head of the "old" sublist, 3/8 of the pool
+(`innodb_old_blocks_pct = 37`), and only move to the young end if touched
+again more than `innodb_old_blocks_time` (1,000 ms) later
+([MySQL 8.4 manual](https://dev.mysql.com/doc/refman/8.4/en/innodb-performance-midpoint_insertion.html)).
+A scan touches each page several times within a second, then never again, so
+its pages age out of the old sublist without disturbing the young one.
+
+Index scans get no ring. After the scan above, a range query over three
+million keys pulled **64 MB** of the index into the pool, as it should: index
+pages are the ones worth caching.
+
+</Sub>
+
+<Sub n="5.4" title="Two caches: shared_buffers and the page cache">
+
+Postgres reads and writes through the kernel, so a page can sit in both
+`shared_buffers` and the OS page cache ([chapter 08](/topics/08-filesystems)).
+The [docs](https://www.postgresql.org/docs/16/runtime-config-resource.html)
+suggest starting at 25% of RAM and say more than 40% is unlikely to help,
+"because PostgreSQL also relies on the operating system cache". InnoDB
+bypasses the page cache: `innodb_flush_method` defaults to `O_DIRECT` on
+Linux as of MySQL 8.4
+([manual](https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html)),
+and the buffer pool is given most of the machine's memory instead.
+
+| | Postgres | InnoDB |
+|---|---|---|
+| I/O path | Buffered, through the page cache | `O_DIRECT` (8.4 default on Linux) |
+| Typical pool size | 25% of RAM | Most of RAM on a dedicated server |
+| Eviction | Clock sweep, rings for scans, vacuum and bulk writes | LRU with midpoint insertion |
+| Torn-page defence | Full-page images in WAL | Doublewrite buffer |
+| Old row versions | In the heap, removed by vacuum | In undo logs, removed by purge |
+
+</Sub>
+
+<SectionHeading n="06" id="lsm">LSM trees: never update in place</SectionHeading>
+
+A B+tree does random writes. Each insert modifies a leaf somewhere in the
+tree, and eventually that 8 KB page is written back, often for a change of a
+few bytes. O'Neil, Cheng, Gawlick and O'Neil's
+[log-structured merge-tree](https://www.cs.umb.edu/~poneil/lsmtree.pdf)
+(1996) starts from the opposite premise: buffer writes in memory, then write
+them out as large, sorted, immutable files, and merge those files in the
+background.
+
+RocksDB (from Google's LevelDB) is the engine most LSM systems use or copy:
+MyRocks, CockroachDB's Pebble, TiKV, Kafka Streams state stores. Cassandra and
+ScyllaDB have their own.
+
+<Sub n="6.1" title="The write path">
+
+<Steps
+  title="One put() in RocksDB"
+  lanes={[
+    { t: "WAL", s: "append", icon: "≡" },
+    { t: "Memtable", s: "skiplist in RAM", icon: "◇" },
+    { t: "Immutable", s: "memtable", icon: "◆" },
+    { t: "L0 SST", s: "flushed file", icon: "▤" },
+    { t: "L1 … Ln", s: "compacted files", icon: "▥" },
+  ]}
+  steps={[
+    [0, "The write is appended to the **WAL**, exactly as in section 4. This is the only I/O on the write path."],
+    [1, "It's inserted into the **memtable**, a sorted skiplist in memory. The put is done: no page was read, nothing was overwritten."],
+    [2, "When the memtable reaches `write_buffer_size` it becomes **immutable**, and a fresh memtable takes new writes."],
+    [3, "A background thread writes it out as a sorted string table (**SST**) in level 0. L0 files can overlap each other in key range."],
+    [4, "**Compaction** merges L0 into L1, and each level into the next when it outgrows its target, 10× the level above by default. Newer values win and deleted keys are dropped."],
+  ]}
+/>
+
+<Why>Why is this fast for writes?</Why>
+
+Every disk write is a large sequential write of a sorted file, and no write
+waits for a read. A B+tree insert into a cold part of the tree has to read the
+leaf first. An LSM insert never reads anything.
+
+</Sub>
+
+<Sub n="6.2" title="The read path, and bloom filters">
+
+You pay for it on reads. A key can be in the memtable, in any L0 file, or in one
+file per level below. A lookup has to check them newest first and stop at the
+first hit:
+
+<Steps
+  title="One get() in RocksDB"
+  lanes={[
+    { t: "Memtables", s: "active + immutable", icon: "◇" },
+    { t: "L0", s: "every file", icon: "▤" },
+    { t: "L1 … Ln", s: "one file per level", icon: "▥" },
+    { t: "Bloom filter", s: "per file", icon: "◌" },
+    { t: "Index → block", s: "4 KB data block", icon: "▦" },
+  ]}
+  steps={[
+    [0, "Look in the active and immutable **memtables**. A hit returns immediately with the newest value."],
+    [1, "Check **every L0 file** whose key range covers the key, newest first, because L0 files overlap."],
+    [2, "In each deeper level, files don't overlap, so a binary search on file boundaries picks **one file per level**."],
+    [3, "Before reading that file, ask its **bloom filter**. \"Definitely not here\" (the common answer) skips the file with no I/O."],
+    [4, "\"Maybe here\" means read the file's index, then the one **data block** that could hold the key. Found, or a false positive, and move to the next level."],
+  ]}
+/>
+
+A bloom filter with 10 bits per key and 7 hash functions has a false-positive
+rate of `(1 − e^(−7/10))^7`, about 0.8%. I measured it in RocksDB 8.9 with
+`db_bench`: 2 million random puts, then 200,000 reads of existing keys and
+200,000 reads of missing ones.
+
+| Counter | Value |
+|---|---|
+| Filter said "not here" (`bloom.filter.useful`) | 541,082 |
+| Filter said "maybe", key really there | 126,434 |
+| Filter said "maybe", key not there | 5,127 |
+| **False-positive rate** | **0.94%** |
+
+Then I built the same database with `--bloom_bits=0` and ran the same reads.
+Without filters, the 400,000 lookups needed **627,884 data-block reads**
+instead of 147,099, 4.3 times as many. Lookups of missing keys, which have to
+check every level, averaged **5.8 µs without filters and 1.1 µs with them**.
+The existing-key timings weren't comparable between the two runs (the first
+ran against a colder cache), so they're left out.
+
+<Callout label="Design implication">
+LSM point reads are fast only while the filters and index blocks fit in
+memory. Ten bits per key is 1.25 bytes per key: 1.25 GB of filter for a
+billion keys. MyRocks skipped filters on the last level, where 90% of the data
+lives, and cut total filter size by 90%
+([Matsunobu et al., VLDB 2020](https://www.vldb.org/pvldb/vol13/p3217-matsunobu.pdf)).
+</Callout>
+
+</Sub>
+
+<Sub n="6.3" title="Compaction and write amplification">
+
+Compaction is where the LSM tree pays for its cheap writes. Each byte you put
+is written to the WAL, then to L0, and then rewritten each time it's merged
+down a level.
+
+In the 5-million-put `db_bench` run (100-byte values, 4 MB memtables, a 16 MB
+L1), RocksDB's own compaction statistics reported:
+
+| Level | Size | Written by compaction | Level's write amplification |
+|---|---|---|---|
+| L0 | 6.6 MB | 0.6 GB (flushes) | 1.0 |
+| L1 | 13.6 MB | 1.1 GB | 2.0 |
+| L2 | 157.6 MB | 2.2 GB | 4.4 |
+| L3 | 270.4 MB | 0.1 GB | 1.4 |
+| **Total** | **448 MB** | **3.9 GB** | **6.8** |
+
+0.61 GB of user data turned into 3.9 GB of compaction writes, plus the WAL.
+This tree only reached three levels, and L3 wasn't full yet. RocksDB's
+[leveled compaction page](https://github.com/facebook/rocksdb/wiki/Leveled-Compaction)
+says write amplification for leveled compaction "is often larger than 10" on
+bigger trees.
+
+<Why>What can you trade to write less?</Why>
+
+The compaction style. **Leveled** compaction keeps one sorted run per level,
+which keeps reads and space tight but rewrites data up to the fan-out (10) per
+level. **Tiered** compaction (RocksDB's "universal", Cassandra's
+size-tiered) lets several runs pile up in a level before merging them all at
+once. That writes each byte fewer times, but reads check more files and space
+can temporarily double during a big merge.
+
+| Compaction | Write amp | Read amp | Space amp | Used by |
+|---|---|---|---|---|
+| **Leveled** | High (roughly fan-out per level) | Low: one file per level | Low, ~10% stale | RocksDB default, LevelDB, Pebble |
+| **Tiered / universal** | Low | Higher: several runs per level | High during merges | Cassandra STCS, RocksDB universal, ScyllaDB |
+
+</Sub>
+
+<Sub n="6.4" title="Deletes are writes">
+
+An LSM tree can't remove a key from an immutable file. A delete writes a
+**tombstone**, a marker saying "this key is gone", which shadows older values
+until compaction drops both. Until then, every scan that crosses the deleted
+range reads the tombstones and skips them.
+
+<Callout label="Common mistake" kind="warn">
+Using an LSM store as a queue: insert at one end, delete from the other, scan
+for the oldest. Every scan starts by walking through all the tombstones of
+already-consumed items, and it gets slower as the queue churns. DataStax
+wrote it up as
+[an anti-pattern](https://www.datastax.com/blog/cassandra-anti-patterns-queues-and-queue-datasets)
+for Cassandra, and MyRocks added
+single-delete and tombstone-triggered compaction for the same reason (section
+3.2.2.2 of the VLDB paper).
+</Callout>
+
+</Sub>
+
+<SectionHeading n="07" id="choosing">B+tree or LSM</SectionHeading>
+
+Neither structure wins everywhere. Here's how they line up on the three costs
+from section 1:
+
+| | B+tree (Postgres, InnoDB) | LSM (RocksDB, leveled) |
+|---|---|---|
+| Point read | One path, 3–4 pages, top levels cached | Memtable, then one bloom check per level, then usually one block |
+| Range scan | Walk sorted leaves | Merge iterators over every level |
+| Write path | Read the leaf, change it, write the page later | Append to WAL and memtable, nothing read |
+| Write amplification | A whole page per change, plus full-page images | Rewrite per level in compaction, ~7 to 10+ |
+| Space | Pages 69–90% full; old versions until vacuum/purge | Compresses well; stale data until compaction |
+| Latency tail | Checkpoint I/O bursts | Compaction stalls when L0 fills (write stalls) |
+
+<Why>When does the difference decide a migration?</Why>
+
+When writes or disk space dominate the bill. Facebook moved its main MySQL
+user database (UDB) from InnoDB to MyRocks in 2017. The
+[VLDB 2020 paper](https://www.vldb.org/pvldb/vol13/p3217-matsunobu.pdf)
+reports the instance size fell by **62.3% compared to compressed InnoDB**,
+bytes written to flash went down 75%, and the server count fell to less than
+half. It comes down to the table above: InnoDB "wasted 25-30% space in
+fragmentation", and compressed 16 KB pages still had to align to 8 KB on disk,
+while RocksDB stores a block compressed to 5 KB in 5 KB.
+
+For read-heavy workloads whose working set fits in memory, a B+tree is simpler
+to reason about, has no compaction to tune, and gives steadier latency. That
+covers most OLTP applications, and it's why Postgres and InnoDB remain the
+default.
+
+<SectionHeading n="08" id="operating">Operating a storage engine</SectionHeading>
+
+<Sub n="8.1" title="Where to look">
+
+```sql
+-- Postgres: what's in the buffer pool, by relation
+create extension pg_buffercache;
+select c.relname, count(*) from pg_buffercache b
+  join pg_class c on c.relfilenode = b.relfilenode group by 1 order by 2 desc limit 10;
+
+-- Cache hit ratio per table (heap and index)
+select relname, heap_blks_hit, heap_blks_read, idx_blks_hit, idx_blks_read
+from pg_statio_user_tables order by heap_blks_read desc limit 10;
+
+-- WAL volume, full-page images and syncs since the last reset
+select wal_records, wal_fpi, wal_bytes, wal_sync from pg_stat_wal;
+
+-- Checkpoints forced by WAL volume, not by time
+select checkpoints_timed, checkpoints_req from pg_stat_bgwriter;
+
+-- Index fill and tree height
+create extension pageinspect;
+select * from bt_metap('my_index');
+```
+
+```shell
+# The WAL records between two LSNs
+pg_waldump -p $PGDATA/pg_wal -s 0/8D19EFB0 -e 0/8D19F180
+
+# RocksDB: per-level compaction stats and stall counters are in the LOG file
+grep -A 12 'Compaction Stats' /path/to/db/LOG | tail -14
+```
+
+</Sub>
+
+<Sub n="8.2" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Index much bigger than a fresh `REINDEX` would give | Random-key inserts splitting pages; dead entries | `REINDEX CONCURRENTLY`; switch to sequential or UUIDv7 keys |
+| WAL volume and replica lag jump after each checkpoint | Full-page images | Raise `max_wal_size` and `checkpoint_timeout`; `wal_compression` |
+| `checkpoints_req` climbing | `max_wal_size` too small for the write rate | Raise it so checkpoints are timed |
+| Commit latency tracks disk latency, one client | One `fdatasync` per commit | Batch commits, more concurrency (group commit), or `synchronous_commit = off` for losable writes |
+| Hit ratio drops during a batch job | Index scans over a cold range pulling pages in | Run it on a replica, or accept it: seq scans already use rings |
+| RocksDB write stalls, "too many L0 files" | Compaction can't keep up with the write rate | More compaction threads, bigger memtables, tiered compaction |
+| LSM range scans slow after bulk deletes | Tombstones not yet compacted | `DeleteRange`, manual compaction of the range, avoid queue patterns |
+
+<Callout label="Common mistake" kind="warn">
+Reading a 99% buffer-cache hit ratio as "the database fits in memory". In
+Postgres, a miss in `shared_buffers` may still be a hit in the OS page cache,
+and a 1% miss rate on a busy table can be all your disk I/O. Look at
+`blks_read` as a rate and at device latency, not the ratio.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="09" id="summary">Summary</SectionHeading>
+
+1. **Every engine trades read, write and space amplification.** You can
+   minimise two; the design decides which.
+2. **Pages are slotted.** Line pointers give each row a stable (page, slot)
+   address, so rows can move within the page without touching any index.
+3. **Per-row overhead dominates narrow rows.** A one-`bigint` Postgres row
+   costs 36 bytes, 226 to a page.
+4. **B+trees are shallow.** Fan-out in the hundreds puts 10 million keys three
+   levels deep and a billion four deep.
+5. **Random keys cost space and cache.** Random bigints made an index 37%
+   larger than sequential ones; UUIDv7 or a sequence avoids it.
+6. **The WAL rule makes crashes survivable.** Log before data, stamp each page
+   with its LSN, and a commit only waits for a sequential flush.
+7. **Group commit shares that flush.** At 16 clients about three commits
+   shared each `fdatasync`.
+8. **Full-page images are most of the WAL after a checkpoint.** 6.9 KB per
+   transaction right after one, 408 bytes without them.
+9. **The buffer pool resists scans.** A 346 MB scan left 96 pages behind in a
+   128 MB pool.
+10. **LSM trees write fast and pay later.** Bloom filters keep point reads
+    cheap (0.94% false positives at 10 bits per key); compaction rewrote 6.8×
+    the data on a three-level tree.
+
+<SectionHeading n="10" id="build">Build this</SectionHeading>
+
+**A storage engine in two weekends.**
+
+- Write a slotted-page file: 8 KB pages, a header with `lower` and `upper`, a
+  slot array, and `insert`, `get(slot)`, `delete(slot)` and `compact()`.
+  Check with a fuzzer that TIDs survive compaction.
+- Put a B+tree on top of it with fixed-size keys. Measure leaf fill after
+  inserting a million keys in order, then in random order, and compare with
+  the 69% theory.
+- Add a WAL: append a redo record before each page change, stamp the page with
+  its LSN, flush at commit. Then `kill -9` it in a loop during inserts and
+  check the tree after every restart.
+- Build the LSM version of the same interface: a sorted map as the memtable,
+  flush to sorted files, a bloom filter per file, and a two-level compaction.
+  Count bytes written per byte inserted and compare with the RocksDB numbers in
+  section 6.3.
+
+<SectionHeading n="11" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Why do databases write a log in addition to the data files?">
+So a commit only has to wait for a small sequential write, and so a crash
+can't leave the data files inconsistent. Every change is described in the WAL
+first, and the log is flushed before the changed pages are allowed to reach
+disk. After a crash, replaying the log from the last checkpoint brings every
+page up to date. The data pages can be written lazily, in bulk.
+</QA>
+
+<QA level="beginner" q="What's the difference between a B-tree and a B+tree?">
+In a B+tree all values (or row pointers) live in the leaves, internal nodes
+hold only separator keys, and the leaves are linked in key order. That makes
+internal pages denser, so the tree is shallower, and it makes range scans a
+walk along the leaves. Database "B-tree" indexes, Postgres's included, are
+B+trees in this sense.
+</QA>
+
+<QA level="intermediate" q="Why can a random UUID primary key hurt insert performance?">
+Each insert goes to a random leaf. Leaves split in the middle and end up
+around 69% full on average, against about 90% for sequential keys (measured
+here: 59 MB vs 43 MB for two million bigints). And the whole index becomes the
+working set, so once it outgrows memory most inserts need a random read.
+Time-ordered keys (a sequence, UUIDv7) insert at the right edge instead.
+</QA>
+
+<QA level="intermediate" q="What are full-page writes, and why do they make WAL volume spike after checkpoints?">
+A crash can tear an 8 KB page, and replaying a small redo record onto a torn
+page doesn't repair it. So the first change to each page after a checkpoint
+logs the whole page image, and replay starts from that. Right after a
+checkpoint nearly every change is a first change, so WAL grows fast: 6.9 KB
+per pgbench transaction right after a checkpoint, 408 bytes with full-page
+writes off. InnoDB solves the same problem with its doublewrite buffer.
+</QA>
+
+<QA level="intermediate" q="How does an LSM tree answer a point read, and what keeps it fast?">
+Memtables first, then every overlapping L0 file, then one file per deeper
+level, newest first, stopping at the first hit. Each file has a bloom filter,
+so levels that don't contain the key are skipped without I/O; at 10 bits per
+key the false-positive rate is about 1% (0.94% measured). Filters and index
+blocks need to stay in memory for this to work.
+</QA>
+
+<QA level="deep" q="Why does Postgres use a clock sweep with ring buffers instead of LRU?">
+True LRU moves a page to the head of a shared list on every hit, which needs
+a lock that every backend contends on. The clock sweep only increments a
+per-buffer usage count (capped at 5) on a hit; eviction decrements counts
+until it finds an unpinned zero. And scans of tables bigger than a quarter of
+`shared_buffers` get a 256 KB ring they recycle, so a big scan doesn't evict
+the working set: 96 buffers remained after a 346 MB scan with three
+processes.
+</QA>
+
+<QA level="deep" q="Postgres recovery has no undo phase. How are uncommitted changes from before a crash handled?">
+With MVCC. Each row version carries the XID that created it, and visibility
+checks consult the commit log. A transaction that was running at the crash
+never wrote a commit record, so its versions are invisible to every snapshot
+and vacuum reclaims them later. ARIES-style engines like InnoDB instead roll
+the losers back from undo records after redo.
+</QA>
+
+<QA level="deep" q="When would you pick an LSM engine over a B+tree for OLTP?">
+When writes or storage cost dominate: high insert and update rates, data much
+larger than memory, flash endurance or space as the constraint. Facebook's
+move from InnoDB to MyRocks cut instance size by 62.3% and flash writes by
+75%. You pay with compaction to tune, write stalls if it falls behind,
+tombstone-heavy scans, and more complex read paths. For read-heavy workloads
+that fit in memory, a B+tree is simpler and has steadier latency.
+</QA>
+
+<SectionHeading n="12" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="A Postgres heap page has pd_lower = 36. How many rows does it hold?">
+    Three. The header is 24 bytes and each line pointer is 4.
+  </Q>
+  <Q q="Why does the first UPDATE to a page after a checkpoint write so much more WAL?">
+    It carries a full-page image, so replay can rebuild the page even if a
+    crash tore it. The second update to the same page logs only the change.
+  </Q>
+  <Q q="Where do the bytes of a RocksDB put go before it's acknowledged?">
+    The WAL (a sequential append) and the in-memory memtable. SST files are
+    written later by flush and compaction.
+  </Q>
+  <Q q="What does a leaf page's high key tell a Postgres index scan?">
+    The largest key allowed on the page. A search key above it means the page
+    split concurrently, and the scan follows the right-link.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Petrov, Database Internals (O'Reilly, 2019)">
+    Part I is the best single book on storage engines: page layouts, B-tree
+    variants, WAL, buffer management and LSM trees, with the papers behind
+    each.
+  </WildCard>
+  <WildCard name="O'Neil et al., The Log-Structured Merge-Tree (1996)">
+    The original LSM paper, with the cost model that explains why merging
+    sorted runs beats random page writes.
+  </WildCard>
+  <WildCard name="Lehman & Yao, Efficient Locking for Concurrent Operations on B-Trees (TODS 1981)">
+    The right-link and high-key trick every production B-tree uses to let
+    readers run through splits without locks.
+  </WildCard>
+  <WildCard name="Mohan et al., ARIES (TODS 1992)">
+    Write-ahead logging, LSNs on pages, redo then undo. The recovery design
+    InnoDB, SQL Server and DB2 descend from.
+  </WildCard>
+  <WildCard name="Matsunobu, Dong & Lee, MyRocks (VLDB 2020)">
+    Facebook's migration of its user database from InnoDB to an LSM engine,
+    with the space, write and CPU numbers and what went wrong in production.
+  </WildCard>
+  <WildCard name="Postgres source: nbtree/README and transam/README">
+    Plain-text design notes next to the code: Lehman and Yao as implemented,
+    and the WAL rules every page change follows.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="13" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Filesystems & the Page Cache">
+    What `fdatasync` promises, fsyncgate, and the second cache Postgres reads
+    through. [Chapter 08](/topics/08-filesystems).
+  </WildCard>
+  <WildCard name="Block Devices & SSDs">
+    The device under the engine: why flash has its own write amplification on
+    top of compaction's. [Chapter 09](/topics/09-storage-devices).
+  </WildCard>
+  <WildCard name="Transactions & Isolation Levels">
+    The `xmin` and `xmax` in every row header, snapshots, and what each
+    isolation level lets through. [Chapter 19](/topics/19-transactions-isolation).
+  </WildCard>
+  <WildCard name="Query Planning & Execution">
+    How the planner decides between the index lookup from section 3 and a
+    sequential scan with a ring buffer. [Chapter 20](/topics/20-query-execution).
+  </WildCard>
+</CardGrid>

@@ -1,0 +1,1219 @@
+---
+title: Compute Abstractions
+dek: "What you actually rent when you pick a VM, a microVM, a container or a function, what a cold start is made of, and how Kubernetes decides which node runs your pod. You'll learn to read each layer's costs and pick the rung that fits the workload."
+readingTime: "~30 min"
+level: "Intermediate"
+versions: "Kubernetes v1.37.0 source · Firecracker v1.17.0 source · AWS Lambda docs, September 2026 · measured on linuxkit 6.10.14 aarch64 (shared 4-CPU container) and Apple M4, macOS 26.5.1"
+prereqs: "processes, containers, basic virtualization"
+updated: "2026-09-27"
+---
+
+Every service you run sits on some compute abstraction: a bare server, a
+virtual machine, a microVM, a container, or a function that exists only while
+a request is in flight. Most teams pick one early and stop thinking about it.
+
+It keeps showing up anyway. It's in the p99 spike after a quiet
+period, in the pod that sits in `Pending` while the cluster dashboard shows
+half the CPU free, and in the Java function that takes six seconds to answer
+its first request.
+
+This chapter walks up the ladder from machines to functions. For each rung it
+shows what you're renting and what it costs to start one. Then it takes apart
+a Lambda cold start and a Kubernetes scheduling decision, step by step, so you
+can tell which part of the delay is yours to fix.
+
+<SectionHeading n="01" id="ladder">The ladder of compute abstractions</SectionHeading>
+
+Each rung on the ladder hides one more thing from you. A VM hides the
+hardware. A container hides the operating system install. A function hides
+the process, and even the decision of whether anything is running at all.
+
+<Sub n="1.1" title="What you rent at each rung">
+
+It's most useful to compare them by what they isolate, who manages the kernel,
+and how long a new one takes to exist.
+
+| Rung | Isolation boundary | You manage | Time to a new one | Billed by |
+|---|---|---|---|---|
+| **Bare metal** | A physical machine | Everything from firmware up | Minutes to hours | The month or hour |
+| **VM** (EC2, GCE) | A hypervisor; your own kernel | The guest OS and up | Tens of seconds | The second, with a 60-second minimum on EC2 Linux ([2017](https://aws.amazon.com/about-aws/whats-new/2017/10/announcing-amazon-ec2-per-second-billing)) |
+| **microVM** (Firecracker) | A minimal hypervisor; your own kernel | Usually nothing: a platform runs it for you | Under 125 ms to guest init ([NSDI 2020](https://www.usenix.org/conference/nsdi20/presentation/agache)) | Whatever the platform on top charges |
+| **Container** | Namespaces and cgroups; a shared kernel | The image and up | Tens of milliseconds (`runc run` took 48 ms in [chapter 11](/topics/11-containers)), plus the image pull | The node it runs on |
+| **Function** (Lambda) | A microVM per execution environment | Your handler | As little as 50 ms ([Brooker et al. 2023](https://www.usenix.org/conference/atc23/presentation/brooker)); seconds for heavy runtimes | The millisecond, since [December 2020](https://aws.amazon.com/about-aws/whats-new/2020/12/aws-lambda-changes-duration-billing-granularity-from-100ms-to-1ms) |
+
+Each lower rung's mechanics have their own chapter. How a hypervisor
+traps a guest and what each exit costs is in
+[chapter 47](/topics/47-virtualization). How namespaces, cgroups and overlayfs
+make a container is in [chapter 11](/topics/11-containers). This chapter is
+about the rungs as products: what they promise and what they charge.
+
+<Why>Why not always pick the top rung?</Why>
+
+Because each rung up trades control for convenience, and the price of that
+trade is paid in latency you can't see coming. A function has no idle cost,
+but the platform decides when to throw your warm process away. A container
+starts fast, but it shares a kernel with its neighbours.
+
+A long-running service with steady traffic gets little from a function's
+scale-to-zero, and pays for every cold start. A burst of short, unrelated jobs
+gets a lot.
+
+</Sub>
+
+<Sub n="1.2" title="Two questions that pick the rung">
+
+Most choices come down to two questions.
+
+1. **Whose kernel is it?** If you don't trust your neighbours, or they don't
+   trust you, you want a separate kernel per tenant. That's a VM or microVM.
+   A container's boundary is the shared kernel's syscall surface.
+2. **Who keeps it warm?** If you keep processes running, you pay for idle time
+   but never wait for a start. If the platform keeps them, you pay only for
+   work, and sometimes wait.
+
+<Callout label="Design implication">
+Serverless platforms don't give up the separate kernel to get density. Lambda
+and Fargate both put each tenant's code in its own microVM: Fargate documents
+that each task "does not share the underlying kernel, CPU resources, memory
+resources, or elastic network interface with another task"
+([ECS docs](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html)).
+When you compare a function with a container, you're comparing a microVM plus
+a managed lifecycle against a process on a shared kernel.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="02" id="microvms">VMs, microVMs and snapshots</SectionHeading>
+
+A VM gives you a whole machine, as far as your kernel can tell. That's its
+strength and its cost: a whole machine has to boot.
+
+<Sub n="2.1" title="What a microVM leaves out">
+
+A general-purpose VMM such as QEMU emulates a PC: a BIOS, PCI buses, USB, a
+floppy controller. Firecracker emulates almost nothing. It offers virtio
+network and block devices, a serial console and a keyboard controller used
+only to reset the guest, and it boots a Linux kernel directly.
+
+That's what gets it to guest init in under 125 ms with about 3 MB of memory
+overhead per VM. [Chapter 47, section 7.4](/topics/47-virtualization) has the
+full table from the NSDI paper, including the I/O throughput it gives up.
+
+<Why>If a microVM boots in 125 ms, why are cold starts ever slow?</Why>
+
+Because the kernel is probably the smallest part of what has to start. After the guest
+kernel comes the language runtime, then your code, then everything your code
+does before it can serve a request. For a Java app that loads a framework, the guest boot is maybe a small slice of the wait.
+
+So the platforms stopped booting. They snapshot a machine that has already
+booted and initialised, then restore copies of it.
+
+</Sub>
+
+<Sub n="2.2" title="A snapshot is a paused machine in a file">
+
+A Firecracker snapshot has three parts, per its
+[snapshot docs](https://github.com/firecracker-microvm/firecracker/blob/v1.17.0/docs/snapshotting/snapshot-support.md):
+the guest memory file, the microVM state file (vCPU registers and device
+state), and any disk files, which you manage yourself.
+
+What's interesting is how memory comes back. Firecracker doesn't read the
+memory file into RAM. It maps it:
+
+<SourceRead
+  file="src/vmm/src/vstate/memory.rs"
+  repo="firecracker-microvm/firecracker"
+  tag="v1.17.0"
+  href="https://github.com/firecracker-microvm/firecracker/blob/v1.17.0/src/vmm/src/vstate/memory.rs#L962"
+>
+```rust
+/// Creates a GuestMemoryMmap given a `file` containing the data
+/// and a `state` containing mapping information.
+pub fn snapshot_file(
+    file: File,
+    regions: impl Iterator<Item = (GuestAddress, usize)>,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    /* ... check the regions fit inside the file ... */
+    create(
+        regions.into_iter(),
+        libc::MAP_PRIVATE,
+        Some(file),
+        track_dirty_pages,
+        huge_pages.madvise_flags(),
+    )
+}
+```
+</SourceRead>
+
+`MAP_PRIVATE` on a file means copy-on-write: every restored VM shares the same
+file pages until it writes to one. The docs call the result "runtime on-demand
+loading of memory pages". Restore returns quickly because it has barely loaded
+anything yet.
+
+<Why>Then where does the restore time go?</Why>
+
+Into page faults, later. Every page the guest touches for the first time
+faults, and the host reads it from the snapshot file one page at a time.
+
+Ustiugov et al. measured this in
+[Benchmarking, Analysis, and Optimization of Serverless Function Snapshots](https://arxiv.org/abs/2101.09355)
+(ASPLOS 2021). A function started from a Firecracker snapshot ran **95% longer**,
+on average, than the same function already in memory, and the time went to
+those faults. Functions touched the same pages on every invocation, so their
+REAP prototype recorded that working set once and prefetched it in bulk. That
+cut cold-start delay by **3.7×** on average.
+
+Firecracker's own answer to the same problem is a userfaultfd backend: a
+separate process you supply handles the guest's page faults, and can fetch
+pages from wherever and in whatever order you like.
+
+</Sub>
+
+<SectionHeading n="03" id="lambda-lifecycle">Lambda's execution environment</SectionHeading>
+
+Lambda is the most-used function platform, and AWS documents its lifecycle in
+unusual detail. It's the clearest place to see what "serverless" does between
+your request and your handler.
+
+<Sub n="3.1" title="Init, Invoke, Shutdown">
+
+Lambda runs your code in an **execution environment**: one microVM holding a
+runtime, your code, and any extensions. Each environment handles one request at
+a time. (The newer Lambda Managed Instances, which run on your own instances
+and take concurrent requests, have a
+[different lifecycle](https://docs.aws.amazon.com/lambda/latest/dg/lambda-managed-instances-execution-environment.html).) Its life has three phases, per the
+[lifecycle docs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html):
+
+<Steps
+  title="One execution environment, from creation to shutdown"
+  lanes={[
+    { t: "Init", s: "extensions · runtime · your statics", icon: "▶" },
+    { t: "Invoke", s: "your handler", icon: "λ" },
+    { t: "Frozen", s: "between requests", icon: "❄" },
+    { t: "Shutdown", s: "0 / 500 / 2,000 ms", icon: "■" },
+  ]}
+  steps={[
+    [0, "Lambda starts each **extension**, bootstraps the **runtime** (the JVM, CPython, Node), then runs your **static code**: everything outside the handler. Init is limited to **10 seconds**."],
+    [0, "If Init doesn't finish in 10 seconds, Lambda doesn't fail yet. It **retries Init at the first invocation**, this time under the function's own timeout."],
+    [1, "The runtime asks the Runtime API for the next event and calls your **handler**. The function timeout covers the handler and every extension together."],
+    [2, "When the runtime and extensions all call `Next` again, Lambda **freezes** the environment. Its processes stop getting CPU; memory, `/tmp` and open sockets stay as they were."],
+    [1, "The next request for this function may **thaw** the same environment. Your globals are still initialised, which is why a warm start skips Init entirely."],
+    [3, "Eventually Lambda sends **Shutdown**. Extensions get 0 ms with none registered, 500 ms with an internal one, 2,000 ms with an external one, then `SIGKILL`."],
+  ]}
+/>
+
+A few details from the same page change how you write the code:
+
+- **Frozen means frozen.** Background threads and callbacks that didn't finish
+  before the handler returned resume on the next thaw, possibly minutes later.
+- **`/tmp` survives.** It's 512 MB to 10,240 MB, and it keeps its contents
+  across invocations in one environment. It isn't wiped even when a failed
+  invoke resets the environment.
+- **No environment lives forever.** Lambda "terminates execution environments
+  every few hours" for maintenance, even under continuous traffic.
+- **A crash costs you an Init.** If the handler crashes or times out, Lambda
+  resets the environment and runs Init again on the next request, a
+  *suppressed init* that doesn't get its own log line.
+
+</Sub>
+
+<Sub n="3.2" title="One cold invoke, end to end">
+
+The Lambda paper by Brooker, Danilov, Greenwood and Piwonka
+([USENIX ATC 2023](https://www.usenix.org/conference/atc23/presentation/brooker),
+[arXiv](https://arxiv.org/abs/2305.13162)) describes the invoke path. Here's what
+happens when no warm environment exists:
+
+<StepSequence
+  title="A cold Lambda invoke"
+  actors={["Caller", "Frontend", "Worker Manager", "Worker", "microVM"]}
+  messages={[
+    { from: 0, to: 1, label: "Invoke", note: "A load-balanced, stateless **frontend** receives the request, loads the function's metadata, and does authentication and authorization." },
+    { from: 1, to: 2, label: "capacity?", note: "It asks the **Worker Manager**, a sticky, stateful balancer that knows where every function's warm capacity is." },
+    { from: 2, to: 3, label: "start sandbox", note: "No warm environment exists, so the Worker Manager picks a **worker** with free CPU and RAM and asks it to start one." },
+    { from: 3, to: 4, label: "boot", note: "On the worker, the **Micro Manager** starts a Firecracker microVM with two block devices: a shared root, and your code or image, loaded lazily." },
+    { from: 4, to: 4, label: "Init", note: "Inside the guest: the runtime starts, then your static code runs. **This is usually the longest step**, and it's the part you control." },
+    { from: 1, to: 4, label: "payload", note: "The frontend is told the sandbox is ready and forwards the request payload. Your handler runs." },
+    { from: 4, to: 0, label: "response", note: "The response goes back, and the environment is frozen, now warm for the next request to this function." },
+  ]}
+/>
+
+On a warm invoke the Worker Manager already knows a free environment, and
+everything from "start sandbox" to "Init" is skipped.
+
+</Sub>
+
+<Sub n="3.3" title="Loading a 10 GiB image in milliseconds">
+
+When Lambda launched, functions were zip files of up to 250 MB, downloaded and
+unpacked in full before the microVM could do anything. Container images of up
+to 10 GiB made that impossible, so the paper's system loads images a block at
+a time, on demand.
+
+<Why>How can a 10 GiB image start in tens of milliseconds?</Why>
+
+Because almost none of it is read at startup. Brooker et al. cite Harter et al.'s
+finding that "on average only 6.4% of container data is needed at startup."
+So Lambda flattens each image into one filesystem, cuts it into fixed
+**512 KiB chunks**, and fetches a chunk only when the guest first reads from it.
+
+The guest sees an ordinary virtio block device. Behind it, a per-function agent
+on the worker answers each read from the nearest place that has the chunk:
+
+| Tier | Share of chunks served | Latency from the worker |
+|---|---|---|
+| **Per-worker local cache** | 67% (median, one week, one large region) | Local |
+| **AZ-level distributed cache** | 32% | Median 550 µs, p99.9 3.7 ms |
+| **S3, the origin** | 0.06% | Median 36 ms, p99.9 175 ms |
+
+Two design choices make those hit rates possible:
+
+- **Deduplication without shared keys.** Each chunk is encrypted with a key
+  derived from its own SHA-256 (*convergent encryption*), so identical chunks
+  from different customers become identical ciphertext and are stored once.
+  About 80% of newly uploaded functions had **zero unique chunks**, mostly CI
+  re-uploads; of the rest, the median upload was 2.5% unique.
+- **Erasure coding in the cache.** Chunks are stored in the AZ cache as a
+  4-of-5 code. A reader asks for five stripes and reconstructs from the first
+  four, which costs 25% more storage and requests but cuts tail latency and
+  hides a failed cache node without retries.
+
+<Callout label="Design implication">
+A cache this good is also a hazard. The paper notes that with an end-to-end hit
+rate above 99.8%, an empty cache could send "up to 500 times" normal traffic to
+the origin, and slower loads raise concurrency demand by Little's law, which
+asks for more sandboxes. If you build a cache that your cold path depends on,
+decide in advance what happens the day it's empty.
+</Callout>
+
+</Sub>
+
+<Sub n="3.4" title="Concurrency is the unit you're sold">
+
+Since each environment serves one request at a time, the number of
+environments you need is set by
+[Lambda's concurrency docs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-concurrency.html)
+as:
+
+```text
+concurrency = average requests per second × average duration in seconds
+```
+
+That's Little's law. 100 requests a second at 500 ms each needs 50
+environments. [Chapter 16](/topics/16-contention-tail-latency) shows why the
+average hides the queueing.
+
+Here are the limits that matter, from the same page:
+
+| Limit | Default | What it means |
+|---|---|---|
+| Account concurrency, per Region | 1,000 | Shared by every function without a reservation |
+| Scaling rate, per function | 1,000 new environments every 10 seconds | How fast a burst can be absorbed |
+| Requests per second | 10 × your concurrency quota | Bites for very short functions |
+| Reservable concurrency | Quota minus 100 | 100 always stays unreserved |
+
+<Predict
+  q="A function averages 20 ms, and at peak it gets 30,000 requests per second. The account has the default quota of 1,000. What happens?"
+  options={[
+    "Fine: it needs only 600 concurrent environments",
+    "It throttles, because it needs 30,000 environments",
+    "It throttles, because of the requests-per-second limit",
+    "It throttles until the scaling rate catches up, then it's fine",
+  ]}
+  answer={2}
+>
+Concurrency is 30,000 × 0.02 = 600, under the 1,000 quota. But the account's
+request-rate limit is 10 × 1,000 = 10,000 per second, so two thirds of the
+traffic is throttled. The docs work this exact example: you'd need a quota of
+3,000 or more. Very fast functions hit the rate limit before the concurrency
+limit.
+</Predict>
+
+</Sub>
+
+<SectionHeading n="04" id="cold-starts">What a cold start is made of</SectionHeading>
+
+"Cold start" gets used for any slow first request. It's more useful to split it
+into parts, because each part has a different owner and a different fix.
+
+<Sub n="4.1" title="The pieces, in order">
+
+<Flow
+  wrap={3}
+  steps={[
+    { label: "Placement", sub: "find a host with room" },
+    { label: "Fetch code", sub: "image or zip, lazily" },
+    { label: "Boot or restore", sub: "microVM kernel, or snapshot" },
+    { label: "Runtime start", sub: "JVM, CPython, Node", accent: true },
+    { label: "Your static init", sub: "imports, clients, config", accent: true },
+    { label: "First request", sub: "lazy paths, empty caches" },
+  ]}
+/>
+
+The platform owns the first three. You own the last three, and the
+[Lambda docs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html)
+say plainly which one dominates: "The largest contributor of latency before
+function execution comes from initialization code."
+
+To see the size of the pieces you own, here's the cost of starting processes
+that do progressively more before they're ready, including the classic Python
+Lambda init: importing boto3 and creating an S3 client.
+
+<Callout label="The machines" kind="note">
+**Linux:** kernel 6.10.14-linuxkit, aarch64, a shared 4-CPU container in
+Docker Desktop on an Apple M4; Python 3.12.3, OpenJDK 21.0.12. Load average
+varied between 5 and 30 from other writers' jobs, so these are medians of 21
+runs, repeated three to five times, and the spread is wide.
+**macOS:** the same M4, macOS 26.5.1, Python 3.14.6. boto3 1.43.103 on both.
+</Callout>
+
+<Compare
+  cols={["Start a new process that…", "Linux, venv on local overlay", "Linux, venv on host share", "macOS"]}
+  rows={[
+    ["exec /bin/true", "0.3 ms", "0.3 ms", "2.5 ms"],
+    ["runs python3 -S -c pass", "5.8 ms", "6.0 ms", "18.6 ms"],
+    ["runs python3 -c pass", "7.8 ms", "9.8 ms", "25.8 ms"],
+    ["imports json", "12.4 ms", "17.4 ms", "28.7 ms"],
+    ["imports boto3", "126 ms", "252 ms", "187 ms"],
+    ["imports boto3 and creates an S3 client", "182 ms", "1,040 ms", "277 ms"],
+    ["java -version (class data sharing on)", "18.2 ms", "—", "—"],
+    ["java -version -Xshare:off", "35.0 ms", "—", "—"],
+    ["is forked from a parent that already did all of the above", "0.58 ms", "0.58 ms", "1.50 ms"],
+  ]}
+/>
+
+<Why>Why did the same code take five times longer on one disk?</Why>
+
+The middle column ran the same virtualenv from `/scratch`, a directory shared in
+from the Mac host, where every metadata operation crosses the VM boundary.
+Profiling one client creation there put roughly 65% of its time in `listdir()`:
+botocore's loader called it **895 times** and `stat()` **2,777 times**, scanning
+its bundled service-model directories to find S3's.
+
+That's a cold start in miniature. The interpreter's cost barely moved; the cost
+of your code's *file access pattern* on a slow, lazily loaded disk dominated.
+It's roughly the effect Lambda's chunk caches and REAP's prefetching exist to hide.
+
+There's a second lesson in the last row. A process forked from one that has already
+done the imports is ready in well under a millisecond, roughly 300 times faster than repeating the init. Snapshots apply that trick to a whole machine.
+
+</Sub>
+
+<Sub n="4.2" title="The levers, and what each one costs">
+
+| Lever | What it removes | What it costs you |
+|---|---|---|
+| **Import less, lazily** | Static init time: import only the clients you use, create rarely used ones on first use | Code discipline; the first request down a lazy path pays instead |
+| **More memory** | CPU-bound init time: Lambda allocates CPU in proportion to memory, one vCPU at 1,769 MB ([docs](https://docs.aws.amazon.com/lambda/latest/dg/configuration-memory.html)) | Higher price per millisecond |
+| **Provisioned concurrency** | The whole cold start, for up to N concurrent requests | You pay for the environments while they sit idle |
+| **SnapStart** | Runtime start and static init, replaced by a snapshot restore | Uniqueness bugs (section 4.4); can't be combined with provisioned concurrency |
+| **A smaller image or package** | Fetch time, for cold chunks | Mostly already hidden by lazy loading; helps less than it used to |
+| **A keep-warm ping** | Nothing reliable | It keeps one environment warm, not the N a burst needs |
+
+<Callout label="Common mistake" kind="warn">
+Keeping a function warm with a scheduled ping. A ping keeps one environment
+alive; a burst of 50 concurrent requests still creates 49 new ones. And
+environments are recycled every few hours regardless. If you need a latency
+floor under load, that's what provisioned concurrency is for.
+</Callout>
+
+</Sub>
+
+<Sub n="4.3" title="Provisioned concurrency">
+
+Provisioned concurrency runs Init ahead of time for a fixed number of
+environments and keeps them initialised. From the
+[concurrency docs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-concurrency.html):
+
+- It takes "a minute or two" to come online, and none of the environments are
+  usable until the whole allocation is ready.
+- Past N concurrent requests, traffic spills into ordinary on-demand
+  environments, which cold-start as usual.
+- Lambda still recycles provisioned environments in the background, so you can
+  still see an occasional cold start after a reset.
+- Init for provisioned (and SnapStart) functions may run for up to 15 minutes,
+  not 10 seconds.
+
+<Why>Why does provisioned concurrency sometimes still log a slow first request?</Why>
+
+Because Init finished long before the request arrived, and some work is lazy.
+The docs warn of "variable latency on the first invocation on an initialized
+execution environment". JIT compilation, connection pools that open on first
+use and lazily loaded classes all land on that first request. Warm them up in
+your static init if they matter.
+
+</Sub>
+
+<Sub n="4.4" title="SnapStart, and state that must stay unique">
+
+[SnapStart](https://aws.amazon.com/blogs/aws/new-accelerate-your-lambda-functions-with-lambda-snapstart/)
+(November 2022, Java first; Python 3.12+ and .NET 8+ now) runs Init once when
+you publish a version, takes a Firecracker snapshot of memory and disk, and
+restores new environments from it. AWS's launch example went from an Init of
+over 6 seconds to a start under 200 ms.
+
+Restoring one snapshot into many environments means every one of them starts
+with the same memory. Anything your Init made that was supposed to be unique is
+now shared. Firecracker's docs are blunt about it: without a mechanism that
+keeps unique things unique, they "consider resuming execution from the same
+state more than once insecure."
+
+Here's the problem on one Linux box, using `fork()` as a stand-in for a
+snapshot restore. The parent does the "Init": it creates a random generator and
+an ID prefix. Three children then "invoke".
+
+<TryIt what="Three clones of one initialised process" lang="python" toolchain="Python 3.12.3, linuxkit 6.10.14 aarch64">
+```python
+import os, random, uuid
+
+# "Init": runs once, before the snapshot (here, before fork)
+rng = random.Random()                      # a private generator, seeded now
+request_id_prefix = uuid.uuid4().hex[:8]
+
+for child in range(3):
+    if os.fork() == 0:                     # "restore" a clone
+        print(f"clone {child}: Random()={rng.random():.6f} "
+              f"prefix={request_id_prefix} "
+              f"global random={random.random():.6f} "
+              f"SystemRandom={random.SystemRandom().random():.6f}", flush=True)
+        os._exit(0)
+    os.wait()
+```
+
+<Output>
+```text
+clone 0: Random()=0.695238 prefix=1a8fa67b global random=0.785913 SystemRandom=0.897001
+clone 1: Random()=0.695238 prefix=1a8fa67b global random=0.406180 SystemRandom=0.599397
+clone 2: Random()=0.695238 prefix=1a8fa67b global random=0.310840 SystemRandom=0.585724
+```
+
+Both the private generator and the ID prefix are **identical in every clone**. The
+global `random` differs, and so does `SystemRandom`, which reads the kernel's
+entropy each time.
+</Output>
+</TryIt>
+
+Why does the global generator survive? CPython reseeds it in every forked
+child:
+
+<SourceRead
+  file="Lib/random.py"
+  repo="python/cpython"
+  tag="v3.12.3"
+  href="https://github.com/python/cpython/blob/v3.12.3/Lib/random.py#L989"
+>
+```python
+## ------------------ fork support  ---------------------
+
+if hasattr(_os, "fork"):
+    _os.register_at_fork(after_in_child=_inst.seed)
+```
+</SourceRead>
+
+A VM snapshot restore has no such hook. No `fork()` happens inside the guest,
+so even that global generator would come back identical in every clone. What
+Lambda does provide, per its
+[uniqueness docs](https://docs.aws.amazon.com/lambda/latest/dg/snapstart-uniqueness.html),
+is a reseed of the kernel's `/dev/random` and `/dev/urandom` on restore. Code
+that reads the kernel every time stays safe; code that cached randomness in
+user space doesn't.
+
+<Callout label="Common mistake" kind="warn">
+Generating IDs, seeds, nonces or temporary credentials in static init and then
+turning on SnapStart. Generate them in the handler, use a CSPRNG that reads the
+kernel (`SecureRandom`, `random.SystemRandom`, Go's `crypto/rand`), or
+regenerate them in an after-restore runtime hook. For Java, AWS publishes a
+SpotBugs rule set that flags the usual offenders.
+</Callout>
+
+</Sub>
+
+<Sub n="4.5" title="Init is billed now">
+
+Until August 2025, Init time for zip-packaged functions on managed runtimes
+wasn't billed. From **August 1, 2025**, it is, the same as it already was for
+container images, custom runtimes and provisioned concurrency
+([AWS blog](https://aws.amazon.com/blogs/compute/aws-lambda-standardizes-billing-for-init-phase/)).
+
+AWS expects the effect to be small, since Init runs for a small fraction of
+invocations; the docs say cold starts "typically occur in under 1% of
+invocations". But a slow Init is now a cost as well as a latency, and
+so is a crash loop that keeps re-running it.
+
+</Sub>
+
+<SectionHeading n="05" id="pod-placement">How a pod gets placed</SectionHeading>
+
+Kubernetes sits one rung down. It doesn't hide the process, but it does hide
+the machine: you describe a pod, and the scheduler decides which node runs it.
+That decision is made from numbers you wrote, not from what the node is
+actually doing.
+
+<Sub n="5.1" title="Requests, limits and QoS">
+
+Each container can declare a **request** and a **limit** for CPU and memory.
+They do different jobs, per the
+[resource management docs](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/):
+
+| | Request | Limit |
+|---|---|---|
+| **Used by** | The scheduler, to pick a node | The kernel, at run time, via the kubelet's cgroup settings |
+| **CPU** | A share of CPU under contention | A CFS quota: the container is throttled when it uses its share of each 100 ms period |
+| **Memory** | Space reserved on the node | A hard ceiling: exceed it and the container is OOM-killed |
+| **If unset** | Copied from the limit, if there is one | None |
+
+<Why>Why can a pod stay Pending on a cluster that's mostly idle?</Why>
+
+Because the scheduler never looks at usage. A node is full when the sum of
+its pods' **requests** reaches its allocatable capacity, however little CPU they
+actually burn. A team that requests 4 CPUs "to be safe" and uses 0.3 has
+reserved the rest of that node from everyone else, which seems harmless until the cluster fills up.
+
+Requests and limits together also set a pod's **QoS class**. Here's
+the rule, per resource:
+
+<SourceRead
+  file="pkg/apis/core/v1/helper/qos/qos.go"
+  repo="kubernetes/kubernetes"
+  tag="v1.37.0"
+  href="https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/apis/core/v1/helper/qos/qos.go#L101"
+>
+```go
+// resourceQOS determines the QOS "shape" of the given resource in the requirements:
+// - BestEffort: Request and Limit are both zero
+// - Burstable: Request != Limit
+// - Guaranteed: Request and Limit are equal and non-zero
+func resourceQOS(resources *v1.ResourceRequirements, res v1.ResourceName) v1.PodQOSClass {
+	req := resources.Requests[res]
+	lim := resources.Limits[res]
+
+	if !req.Equal(lim) {
+		return v1.PodQOSBurstable
+	} else if req.IsZero() {
+		return v1.PodQOSBestEffort
+	} else {
+		return v1.PodQOSGuaranteed
+	}
+}
+```
+</SourceRead>
+
+A pod is Guaranteed only if every container has equal, non-zero requests and
+limits for both CPU and memory. Any mismatch makes it Burstable. The class
+decides who dies first when the node runs out of memory, through the
+`oom_score_adj` the kubelet writes for each container
+([`pkg/kubelet/qos/policy.go`](https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/kubelet/qos/policy.go)):
+
+| QoS class | `oom_score_adj` | Meaning |
+|---|---|---|
+| **Guaranteed** | −997 | Almost never picked by the kernel's OOM killer |
+| **Burstable** | `1000 − 1000 × request ÷ node memory`, clamped to 3–999 | The bigger your request, the safer you are |
+| **BestEffort** | 1000 | Killed first |
+
+<Callout label="Common mistake" kind="warn">
+Setting a tight CPU limit on a latency-sensitive service. The limit is a quota
+per 100 ms period, so a multi-threaded process can burn its quota early and sit
+throttled for the rest of the period, and a request that straddles the gap
+waits. [Chapter 11](/topics/11-containers) measures it. Kernels before 5.4 made
+it worse: unused per-CPU quota expired, so services were throttled while under
+their limit, fixed by
+[de53fd7aedb1](https://github.com/torvalds/linux/commit/de53fd7aedb100f03e5d2231cfce0e4993282425).
+Watch `nr_throttled` in the container's `cpu.stat`.
+</Callout>
+
+</Sub>
+
+<Sub n="5.2" title="The scheduling cycle">
+
+`kube-scheduler` watches for pods with no `nodeName` and gives each one a
+node. It's built as a pipeline of plugins at fixed
+[extension points](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/).
+Here's one pod's trip through it:
+
+<Steps
+  title="One pod, from Pending to running"
+  lanes={[
+    { t: "Queue", s: "activeQ · backoff", icon: "≡" },
+    { t: "Filter", s: "PreFilter · Filter", icon: "⊘" },
+    { t: "Score", s: "PreScore · Score · Normalize", icon: "★" },
+    { t: "Reserve · Permit", s: "in the scheduler's cache", icon: "◧" },
+    { t: "Bind", s: "PreBind · Bind", icon: "⇄" },
+    { t: "Kubelet", s: "admit · sandbox · start", icon: "◉" },
+  ]}
+  steps={[
+    [0, "The pod enters the scheduling queue. **PreEnqueue** plugins (scheduling gates) can hold it back; **QueueSort** orders the queue, by priority by default."],
+    [1, "**PreFilter** computes what it needs once per pod. **Filter** plugins then reject nodes one by one: not enough requested CPU or memory, a taint the pod doesn't tolerate, a port in use, a volume in the wrong zone."],
+    [1, "If no node passes, **PostFilter** runs. The default one is **preemption**: can evicting lower-priority pods make room somewhere? (Section 5.6.)"],
+    [2, "Each feasible node gets a **Score** from 0 to 100 from each scoring plugin. Scores are normalized, weighted and summed, and the highest total wins."],
+    [3, "**Reserve** marks the resources as taken in the scheduler's in-memory cache, so the next pod doesn't count them as free. **Permit** can approve, deny or make the pod wait."],
+    [4, "**Bind** writes the chosen `nodeName` to the API server. Binding runs asynchronously, so the scheduler is already working on the next pod."],
+    [5, "The **kubelet** on that node sees the pod, runs its own admission check, creates the pod sandbox and network, pulls images and starts the containers."],
+  ]}
+/>
+
+<Why>Why is the scheduling cycle serial when binding isn't?</Why>
+
+The docs put it in one line: "Scheduling cycles are run serially, while binding
+cycles may run concurrently." Each decision has to see the reservations of the
+one before it, or two pods could be placed into the same free space. Binding
+involves API writes and maybe volume attachment, which are slow and don't change
+the decision, so they run off the critical path.
+
+Every default plugin is enabled at every extension point it implements, with
+weights for the scoring ones:
+
+<SourceRead
+  file="pkg/scheduler/apis/config/v1/default_plugins.go"
+  repo="kubernetes/kubernetes"
+  tag="v1.37.0"
+  href="https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/scheduler/apis/config/v1/default_plugins.go#L31"
+>
+```go
+// getDefaultPlugins returns the default set of plugins.
+func getDefaultPlugins() *v1.Plugins {
+	plugins := &v1.Plugins{
+		MultiPoint: v1.PluginSet{
+			Enabled: []v1.Plugin{
+				{Name: names.SchedulingGates},
+				{Name: names.PrioritySort},
+				{Name: names.NodeName},
+				{Name: names.NodeUnschedulable},
+				{Name: names.TaintToleration, Weight: ptr.To[int32](3)},
+				{Name: names.NodeAffinity, Weight: ptr.To[int32](2)},
+				{Name: names.NodePorts},
+				{Name: names.NodeResourcesFit, Weight: ptr.To[int32](1)},
+				{Name: names.VolumeRestrictions},
+				{Name: names.NodeVolumeLimits},
+				{Name: names.VolumeBinding},
+				{Name: names.VolumeZone},
+				{Name: names.PodTopologySpread, Weight: ptr.To[int32](2)},
+				{Name: names.InterPodAffinity, Weight: ptr.To[int32](2)},
+				{Name: names.DefaultPreemption},
+				{Name: names.NodeResourcesBalancedAllocation, Weight: ptr.To[int32](1)},
+				{Name: names.ImageLocality, Weight: ptr.To[int32](1)},
+				{Name: names.DefaultBinder},
+			},
+		},
+	}
+	/* ... */
+```
+</SourceRead>
+
+When a pod can't be placed, the Filter plugins' reasons are counted and put in
+the pod's `FailedScheduling` event, in the format
+`0/N nodes are available: <reasons>`. That message is the first thing to read.
+
+</Sub>
+
+<Sub n="5.3" title="Not every node gets looked at">
+
+On a large cluster, running every Filter against every node for every pod is
+too slow. So the scheduler stops once it has found "enough" feasible nodes:
+
+<SourceRead
+  file="pkg/scheduler/schedule_one.go"
+  repo="kubernetes/kubernetes"
+  tag="v1.37.0"
+  href="https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/scheduler/schedule_one.go#L866"
+>
+```go
+func (sched *Scheduler) numFeasibleNodesToFind(percentageOfNodesToScore *int32, numAllNodes int32) (numNodes int32) {
+	if numAllNodes < minFeasibleNodesToFind {       // 100
+		return numAllNodes
+	}
+	/* ... use the profile's percentageOfNodesToScore if set ... */
+	if percentage == 0 {
+		percentage = int32(50) - numAllNodes/125
+		if percentage < minFeasibleNodesPercentageToFind {   // 5
+			percentage = minFeasibleNodesPercentageToFind
+		}
+	}
+
+	numNodes = numAllNodes * percentage / 100
+	if numNodes < minFeasibleNodesToFind {
+		return minFeasibleNodesToFind
+	}
+	return numNodes
+}
+```
+</SourceRead>
+
+Under 100 nodes, it checks all of them. At 1,000 nodes it stops after 420
+feasible ones (42%); at 5,000, after 500 (10%). It walks nodes round-robin
+across zones and resumes where the last pod left off, per the
+[performance tuning docs](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduler-perf-tuning/),
+so the sample moves around the cluster.
+
+<Why>Doesn't that mean the pod might not get the best node?</Why>
+
+Yes, on purpose. The best of 500 random feasible nodes is probably close to the best of 5,000, and it's found ten times faster. Borg made the same
+trade and called it *relaxed randomization* (section 6).
+
+</Sub>
+
+<Sub n="5.4" title="Spread or pack">
+
+For resources, the main scoring plugin is `NodeResourcesFit`, and its default
+strategy is `LeastAllocated`: prefer the node with the most room left.
+
+<SourceRead
+  file="pkg/scheduler/framework/plugins/noderesources/least_allocated.go"
+  repo="kubernetes/kubernetes"
+  tag="v1.37.0"
+  href="https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/scheduler/framework/plugins/noderesources/least_allocated.go#L50"
+>
+```go
+// The unused capacity is calculated on a scale of 0-MaxNodeScore
+// 0 being the lowest priority and `MaxNodeScore` being the highest.
+// The more unused resources the higher the score is.
+func leastRequestedScore(requested, capacity int64) int64 {
+	if capacity == 0 {
+		return 0
+	}
+	if requested > capacity {
+		return 0
+	}
+
+	return ((capacity - requested) * fwk.MaxNodeScore) / capacity
+}
+```
+</SourceRead>
+
+Spreading leaves headroom on every node for a load spike and limits the blast
+radius of one node dying. It has a cost, though:
+
+<Predict
+  q="Ten nodes with 4 allocatable CPUs each. Twenty pods requesting 1 CPU each arrive one at a time and are placed with LeastAllocated. Then a pod requesting 3 CPUs arrives. Where does it go?"
+  options={[
+    "On any node: 20 of the 40 CPUs are free",
+    "Nowhere: it stays Pending",
+    "On the node with the fewest pods",
+    "It preempts one of the small pods",
+  ]}
+  answer={1}
+>
+Spreading puts two pods on every node, leaving 2 free CPUs on each: 20 free in
+total, but never 3 in one place, so every node fails the Filter and the pod
+stays Pending. (With equal priorities, preemption finds no victims.) Packing
+the same twenty pods onto five nodes would leave five empty ones. The
+`MostAllocated` strategy does that, and it's what cluster autoscalers want,
+since empty nodes can be removed.
+</Predict>
+
+Borg's paper describes the same tension. Its original scorer spread load
+("we sometimes call this 'worst fit'") and fragmented machines for large
+tasks. Pure best fit packed tightly but "penalizes any mis-estimations in
+resource requirements". The hybrid it settled on tries to minimise *stranded*
+resources, capacity left unusable because another resource on the machine is
+full, and gave "about 3–5% better packing efficiency" than best fit.
+
+</Sub>
+
+<Sub n="5.5" title="Taints, tolerations and affinity">
+
+Resource fit decides whether a pod *can* go on a node. Four more mechanisms
+decide whether it *should*:
+
+| Mechanism | Set on | Hard or soft | Typical use |
+|---|---|---|---|
+| **Taint** `NoSchedule` / `PreferNoSchedule` | The node | Hard / soft | Keep general pods off GPU or dedicated nodes |
+| **Taint** `NoExecute` | The node | Hard, and evicts running pods | Node problems: `not-ready`, `unreachable` |
+| **Toleration** | The pod | — | Let a pod onto a tainted node; it doesn't attract it there |
+| **Node affinity** | The pod | `required…` or `preferred…` (weight 1–100) | Pin to a zone, an instance type, an architecture |
+| **Pod (anti-)affinity** | The pod | Either | Co-locate with a cache; keep replicas apart |
+| **Topology spread** | The pod | `maxSkew`, hard or soft | Even replicas across zones |
+
+A few details from the
+[taints](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/)
+and [affinity](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)
+docs catch people:
+
+- **A toleration isn't an attraction.** It permits a pod onto a tainted node.
+  To keep a pod on dedicated nodes, you need a taint *and* node affinity.
+- **`IgnoredDuringExecution` means what it says.** Change a node's labels after
+  scheduling and its pods keep running.
+- **Every pod tolerates dead nodes for five minutes.** The `DefaultTolerationSeconds`
+  admission controller adds 300-second tolerations for `not-ready` and
+  `unreachable`, so pods on a lost node aren't evicted for five minutes.
+- **Inter-pod affinity is expensive.** The docs say it "require[s] substantial
+  amounts of processing" and "we do not recommend using them in clusters larger
+  than several hundred nodes." Topology spread constraints cover most of the
+  same needs.
+
+</Sub>
+
+<Sub n="5.6" title="Preemption">
+
+When Filter finds no node, the default PostFilter plugin looks for
+lower-priority pods it could evict. Priority comes from a `PriorityClass`;
+user classes go up to 1,000,000,000, and the two system classes sit above
+that, per the
+[priority docs](https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/).
+
+<StepSequence
+  title="A high-priority pod preempts its way onto a node"
+  actors={["High-priority pod", "Scheduler", "API server", "Victim pods"]}
+  messages={[
+    { from: 0, to: 1, label: "schedule me", note: "Filter rejects every node. **PostFilter** runs the default preemption plugin." },
+    { from: 1, to: 1, label: "find victims", note: "For each node it asks: if I removed lower-priority pods, would this pod fit? It prefers the node whose victims break the **fewest PodDisruptionBudgets** and have the **lowest priority**." },
+    { from: 1, to: 2, label: "nominatedNodeName", note: "It records the chosen node in the pod's `status.nominatedNodeName`. The pod isn't bound yet." },
+    { from: 1, to: 3, label: "delete", note: "The victims are deleted and get their **graceful termination period** (30 seconds by default) to shut down." },
+    { from: 0, to: 1, label: "retry", note: "Once the space is free, the pod goes through the scheduling cycle again. **It isn't guaranteed to land on the nominated node**; another node may have freed up first." },
+  ]}
+/>
+
+<Why>Why doesn't preemption just bind the pod straight away?</Why>
+
+Because the space isn't free until the victims have exited, which can take
+their full grace period. Recording a nomination and retrying lets the scheduler
+keep working, and lets the pod take a better spot if one opens up.
+
+PodDisruptionBudgets are respected only on a best-effort basis: if no other
+option exists, preemption will violate one. A class with
+`preemptionPolicy: Never` gets its place in the queue by priority but never
+evicts anything.
+
+<Callout label="Design implication">
+Priority is a capacity-planning tool, not a label. If every team marks its pods
+high priority, nothing is. Give batch and preemptible work the lowest class,
+keep the headroom for your serving tier, and cap high-priority pods per
+namespace with a `ResourceQuota`, which the docs recommend for exactly this.
+</Callout>
+
+</Sub>
+
+<Sub n="5.7" title="The kubelet has the last word">
+
+Binding only writes a node name. The kubelet on that node then runs its own
+admission check against its own view of the node, and it can refuse. The
+reasons are fixed strings in
+[`pkg/kubelet/lifecycle/predicate.go`](https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/kubelet/lifecycle/predicate.go):
+`OutOfcpu`, `OutOfmemory`, `OutOfephemeral-storage`, `OutOfpods`. A pod
+rejected here goes to `Failed`, and its controller creates a replacement.
+
+After admission the kubelet does the pod's cold start: create the sandbox and
+its network namespace through the CRI and CNI, pull images, run init
+containers, start the app containers, and wait for readiness probes. Image
+pulls are serialised by default: `serializeImagePulls` defaults to true unless
+you set `maxParallelImagePulls` to 2 or more
+([defaults.go](https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/kubelet/apis/config/v1beta1/defaults.go)).
+One large image can hold up every other pod starting on the node.
+
+Later, under memory or disk pressure, the kubelet evicts pods itself, with no
+PDBs and no grace period for hard thresholds (`memory.available` under 100 Mi by
+default). It goes first for pods using more than they requested, then by
+priority, then by how far over their request they are, per the
+[node-pressure eviction docs](https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/).
+
+</Sub>
+
+<SectionHeading n="06" id="lineage">Borg, Omega, and why the scheduler looks like this</SectionHeading>
+
+Kubernetes' scheduler descends from two Google systems with public papers, a
+lineage its authors describe in
+[Borg, Omega, and Kubernetes](https://queue.acm.org/detail.cfm?id=2898444)
+(ACM Queue, 2016). The papers explain design choices that look arbitrary on
+their own.
+
+<Sub n="6.1" title="Borg: feasibility, scoring, and shortcuts">
+
+[Large-scale cluster management at Google with Borg](https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/)
+(Verma et al., EuroSys 2015) describes a scheduler in two parts, "feasibility
+checking, to find machines on which the task could run, and scoring, which
+picks one of the feasible machines". Kubernetes' Filter and Score are the same
+split.
+
+The paper's median cell was about 10,000 machines, and three shortcuts made
+that tractable:
+
+| Borg technique | What it does | Kubernetes' version |
+|---|---|---|
+| **Score caching** | Keep a machine's score until the machine or task changes | The scheduler's cache and per-cycle state |
+| **Equivalence classes** | Score one task per group of identical tasks | An equivalence cache, [removed in 2018](https://github.com/kubernetes/kubernetes/issues/71013); now `OpportunisticBatching` (KEP-5598, beta and on by default since 1.35) reuses one pod's ranked nodes for the next pod with the same signature |
+| **Relaxed randomization** | Examine machines in random order until "enough" are feasible | `percentageOfNodesToScore` (section 5.3) |
+
+Without them, scheduling a cell's whole workload from scratch "did not finish
+after more than 3 days"; with them it took "a few hundred seconds".
+
+<Why>What did Borg find was the slow part of starting a task?</Why>
+
+Not the scheduler. Median task startup was "about 25 s", and package
+installation took "about 80% of the total". So Borg's scorer preferred machines
+that already had the task's packages. That's the `ImageLocality` score plugin in
+Kubernetes, and it's the same lesson as section 4: fetching code dominates.
+
+Borg also over-committed on purpose. It reserved what a task was predicted to
+use, not what it asked for, and "about 20% of the workload" ran in the
+reclaimed gap. Kubernetes' requests and limits are a simpler form of that idea:
+the request is what you're promised, and the gap up to the limit is borrowed.
+
+</Sub>
+
+<Sub n="6.2" title="Omega: shared state and optimistic placement">
+
+[Omega](https://research.google/pubs/omega-flexible-scalable-schedulers-for-large-compute-clusters/)
+(Schwarzkopf et al., EuroSys 2013) compared three architectures: a
+**monolithic** scheduler, a **two-level** design like Mesos where a central
+allocator offers resources to framework schedulers, and its own **shared
+state**, where several schedulers see the whole cluster and commit placements
+with "lock-free optimistic concurrency control". A conflicting commit is
+retried.
+
+Kubernetes is mostly monolithic, with an Omega flavour. One scheduler makes
+decisions serially, but the cluster state lives in the API server and every
+write is a compare-and-swap on `resourceVersion`. You can run a second
+scheduler beside the default one, and both commit through the API server. But
+nothing in the API server checks a node's capacity when a pod is bound, so two
+schedulers can place pods into the same free space. The kubelet's admission
+check (section 5.7) catches the loser.
+
+</Sub>
+
+<SectionHeading n="07" id="operating">Operating it</SectionHeading>
+
+<Sub n="7.1" title="Where to look">
+
+```shell
+# Kubernetes: why is this pod Pending?
+kubectl describe pod web-7d9f -n prod | sed -n '/Events/,$p'   # "0/N nodes are available: ..."
+kubectl get events -A --field-selector reason=FailedScheduling
+kubectl describe node ip-10-0-3-7 | sed -n '/Allocated resources/,/Events/p'  # requests vs allocatable
+
+# Is a container throttled?
+cat /sys/fs/cgroup/cpu.stat          # from inside it: nr_periods, nr_throttled, throttled_usec
+
+# Lambda: which invocations were cold, and how long was Init?
+#   REPORT lines carry "Init Duration: … ms" only on cold starts.
+#   INIT_REPORT lines appear on Init timeouts and failures, and always with SnapStart or provisioned concurrency.
+aws logs filter-log-events --log-group-name /aws/lambda/my-fn --filter-pattern '"Init Duration"'
+```
+
+In Python, `python -X importtime -c 'import yourmodule'` prints the time each
+import took, which is usually where a function's static init goes.
+
+</Sub>
+
+<Sub n="7.2" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Pod `Pending`, cluster CPU graphs show plenty free | Requests, not usage, fill nodes | Right-size requests from real usage; look at `Allocated resources` on nodes |
+| Pod `Pending` with enough total free, but no single node fits | Fragmentation from spreading | `MostAllocated` scoring, bigger nodes, or a descheduler; let the autoscaler add a node |
+| `0/N nodes are available: N node(s) had untolerated taint` | Missing toleration, or a node still tainted `not-ready` | Add the toleration, or fix the node |
+| Latency spikes, CPU usage well under the limit | CFS throttling within 100 ms periods | Raise or remove the CPU limit; check `nr_throttled`; kernel 5.4 or later |
+| BestEffort pods die first under pressure | `oom_score_adj` 1000 and eviction order | Set requests; memory request = limit for anything important |
+| New pods on one node start slowly | Serialised image pulls behind one large image | Smaller images, pre-pulled images, `maxParallelImagePulls` |
+| Lambda p99 bad after quiet periods, fine under steady load | Cold starts on scale-out and after recycling | Trim static init, then provisioned concurrency or SnapStart |
+| Lambda throttles well under the concurrency quota | The 10× requests-per-second limit, or the scaling rate | Raise the quota; smooth the burst with a queue |
+| Duplicate IDs or identical random values after enabling SnapStart | Uniqueness generated during Init | Generate in the handler, use a kernel CSPRNG, or an after-restore hook |
+| A function "occasionally" doubles its duration after an error | Suppressed init after a crash reset | Fix the crash; watch for Init time inside the REPORT duration |
+
+</Sub>
+
+<Sub n="7.3" title="What you give up">
+
+<Compare
+  cols={["You get", "You pay", "When the bill arrives"]}
+  rows={[
+    ["A kernel of your own (VM, microVM)", "Boot or restore time, and memory for a second kernel", "Every scale-out, unless something is kept warm"],
+    ["Density on a shared kernel (containers)", "A boundary that's the kernel's syscall surface", "The next kernel escape CVE"],
+    ["Scale to zero (functions)", "Cold starts, and a platform that recycles your process", "The first request after a quiet period, or a burst"],
+    ["Snapshots instead of init", "Clones that share every byte of state", "The day two requests get the same ID"],
+    ["A scheduler that places for you", "Decisions made from requests, not usage", "The first time a Pending pod meets an idle dashboard"],
+    ["Spreading by default", "Fragmented free space", "When a large pod arrives"],
+  ]}
+/>
+
+</Sub>
+
+<SectionHeading n="08" id="summary">Summary</SectionHeading>
+
+1. **Each rung hides one more layer.** VMs hide hardware, containers hide the
+   OS install, functions hide the process and whether it's running at all.
+2. **Serverless platforms keep the separate kernel.** Lambda and Fargate give
+   each tenant a Firecracker microVM; density comes from making VMs small, not
+   from sharing a kernel.
+3. **Booting isn't the slow part; initialising is.** A microVM reaches init in
+   under 125 ms. Runtime start and your static code usually cost more.
+4. **Snapshots replace init with page faults.** Memory is mapped copy-on-write
+   and loaded as touched; prefetching the working set is what makes restores
+   fast.
+5. **Lambda loads code lazily and from caches.** 512 KiB chunks, deduplicated
+   by convergent encryption, served 99.9% from worker and AZ caches.
+6. **Concurrency is Little's law.** Requests per second × duration, with a
+   separate 10× requests-per-second limit that fast functions hit first.
+7. **Clones share everything, including secrets.** With SnapStart, anything
+   unique created during Init is duplicated in every environment.
+8. **The scheduler reads requests, never usage.** Pods go Pending on idle
+   clusters, and requests versus limits also set the QoS class that decides who
+   gets OOM-killed.
+9. **Filter, then score, on a sample.** Large clusters score only a slice of
+   nodes, and the default scorer spreads, which fragments free space.
+10. **Placement isn't finished at bind.** The kubelet can still reject the pod,
+    pull images one at a time, and later evict it under pressure.
+
+<SectionHeading n="09" id="build">Build this</SectionHeading>
+
+**A cold-start budget for one service.**
+
+- Pick a real function or service and break its start into the six pieces of
+  section 4.1. Measure your part with `python -X importtime`, `-Xlog:startuptime`
+  or `--cpu-prof`, whichever fits your runtime.
+- Build a "zygote": a parent that does all static init, then forks a child per
+  request. Compare its time-to-first-byte with a fresh start, as in section 4.1.
+- Add the uniqueness test from section 4.4 to your code base: fork after init
+  and assert that every ID, seed and token differs between the children.
+- On a kind or minikube cluster with three small nodes, reproduce the Predict in
+  section 5.4, then switch `NodeResourcesFit` to `MostAllocated` in a scheduler
+  profile and watch the large pod fit.
+
+<SectionHeading n="10" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What's the difference between a request and a limit in Kubernetes?">
+The scheduler uses requests to place pods: a node is full when the sum of
+requests reaches its allocatable capacity. Limits are enforced at run time: a
+CPU limit becomes a CFS quota and throttles, and a memory limit is a ceiling
+past which the container is OOM-killed. If you set only a limit, the request
+defaults to it. Together they set the QoS class.
+</QA>
+
+<QA level="beginner" q="What is a Lambda cold start?">
+A request that arrives when no initialised execution environment is free.
+Lambda has to place a new microVM, load the code, start the runtime and run the
+function's static initialisation before the handler runs. The static init is
+usually the biggest part, and the part you control. Warm requests reuse a
+frozen environment and skip all of it.
+</QA>
+
+<QA level="intermediate" q="A pod is Pending, but the cluster's CPU usage is 30%. Why?">
+Probably requests. The scheduler compares requests, not usage, against allocatable capacity, so
+nodes can be "full" of reservations while idle. Or the free capacity is
+fragmented: plenty in total, but no single node has enough, which the default
+spreading scorer makes likely. Read the `FailedScheduling` event, then compare
+`Allocated resources` with actual usage on the nodes.
+</QA>
+
+<QA level="intermediate" q="Provisioned concurrency or SnapStart: how do you choose?">
+Provisioned concurrency keeps N environments fully initialised, so the first N
+concurrent requests never see a cold start, at a cost for idle time. SnapStart
+restores new environments from a post-init snapshot, which cuts the cold start
+instead of removing it, at no extra charge, but it duplicates any state that
+Init made unique. You can't use both on one version. Pick provisioned
+concurrency for a predictable floor, SnapStart for a heavy init with bursty
+traffic.
+</QA>
+
+<QA level="intermediate" q="How does Lambda start a 10 GiB container image quickly?">
+It doesn't download it. The image is flattened and split into 512 KiB chunks,
+and the microVM sees a block device whose reads are served lazily, chunk by
+chunk, from a worker-local cache, then an AZ-level cache, then S3. Containers
+read only a small fraction of their data at startup, and convergent encryption
+lets identical chunks across customers be stored and cached once.
+</QA>
+
+<QA level="deep" q="What goes wrong when you restore many VMs from one snapshot?">
+Every clone starts with identical memory, so every generator state, cached
+random bytes, UUID and nonce created before the snapshot is shared. Unlike
+`fork()`, a VM restore runs no at-fork hooks in the guest's processes. Lambda
+reseeds the kernel's `/dev/random` and `/dev/urandom` on restore, so code
+reading the kernel every time is safe; user-space RNGs and anything cached at
+init need regenerating in the handler or an after-restore hook.
+</QA>
+
+<QA level="deep" q="Why does kube-scheduler not score every node in a 5,000-node cluster?">
+Filtering and scoring every node for every pod doesn't scale. By default it
+stops after finding a percentage of feasible nodes, `50 − nodes/125`, floored at
+5% and at 100 nodes: 500 nodes at 5,000. It walks nodes round-robin across
+zones and resumes where it left off. The best of a large random sample is close
+to the global best. Borg did the same and called it relaxed randomization.
+</QA>
+
+<QA level="deep" q="Why can a pod that the scheduler bound still fail to start on the node?">
+Binding only records a node name. The kubelet runs its own admission against
+its own view of the node's resources and can reject with `OutOfcpu`,
+`OutOfmemory` or `OutOfpods`, for example when a second scheduler or a static
+pod used the same space. The shared state is optimistic, in Omega's sense, and
+the kubelet is the final check.
+</QA>
+
+<SectionHeading n="11" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="A container requests 500m CPU and 1 Gi memory, and has limits of 1 CPU and 1 Gi. What's its QoS class?">
+    Burstable. Memory's request equals its limit, but CPU's doesn't, and any
+    mismatch in any resource makes the pod Burstable.
+  </Q>
+  <Q q="Your Lambda's static init takes 12 seconds. What happens on a cold start?">
+    Init is cut off at 10 seconds, then retried at the first invocation under the
+    function's own timeout. Provisioned concurrency and SnapStart functions can
+    run Init for much longer.
+  </Q>
+  <Q q="How many nodes does the default scheduler look for in a 1,000-node cluster?">
+    420: the percentage is 50 − 1000/125 = 42%.
+  </Q>
+  <Q q="What does a Firecracker snapshot restore read from the memory file up front?">
+    Almost nothing. It maps the file MAP_PRIVATE, so pages are loaded on first
+    touch and copied on first write.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Brooker et al., On-demand Container Loading in AWS Lambda (USENIX ATC 2023)">
+    Best paper. Lazy block loading, convergent encryption, tiered caches, erasure
+    coding in the cache, and the metastability risk of a very good cache.
+    [arXiv](https://arxiv.org/abs/2305.13162).
+  </WildCard>
+  <WildCard name="Agache et al., Firecracker: Lightweight Virtualization for Serverless Applications (NSDI 2020)">
+    Why Lambda moved from containers in per-customer VMs to microVMs, and what
+    the minimal device model buys.
+    [USENIX](https://www.usenix.org/conference/nsdi20/presentation/agache).
+  </WildCard>
+  <WildCard name="Ustiugov et al., Benchmarking, Analysis, and Optimization of Serverless Function Snapshots (ASPLOS 2021)">
+    Where snapshot restore time goes (page faults) and how recording a working
+    set fixes it. [arXiv](https://arxiv.org/abs/2101.09355).
+  </WildCard>
+  <WildCard name="Verma et al., Large-scale cluster management at Google with Borg (EuroSys 2015)">
+    Feasibility and scoring, relaxed randomization, resource reclamation, and the
+    25-second task start. [Google Research](https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/).
+  </WildCard>
+  <WildCard name="Schwarzkopf et al., Omega (EuroSys 2013)">
+    Monolithic, two-level and shared-state schedulers compared on Google traces.
+    [Google Research](https://research.google/pubs/omega-flexible-scalable-schedulers-for-large-compute-clusters/).
+  </WildCard>
+  <WildCard name="Shahrad et al., Serverless in the Wild (USENIX ATC 2020)">
+    Azure Functions' production workload: 81% of applications invoked at most
+    once a minute on average, and a histogram keep-alive policy that beats a
+    fixed timeout. [arXiv](https://arxiv.org/abs/2003.03423).
+  </WildCard>
+  <WildCard name="pkg/scheduler/schedule_one.go">
+    The scheduling cycle itself: `schedulePod`, `findNodesThatFitPod`,
+    `prioritizeNodes`. [v1.37.0](https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/scheduler/schedule_one.go).
+  </WildCard>
+  <WildCard name="Lambda execution environment lifecycle">
+    The primary source for section 3.1, including suppressed inits and the
+    shutdown limits. [AWS docs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html).
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="12" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Virtualization, Hypervisors & microVMs">
+    The mechanism under the VM and microVM rungs: exits, nested paging, virtio,
+    and Firecracker's numbers. [Chapter 47](/topics/47-virtualization).
+  </WildCard>
+  <WildCard name="Containers from Scratch">
+    Namespaces, cgroups and overlayfs, and a measured CPU limit.
+    [Chapter 11](/topics/11-containers).
+  </WildCard>
+  <WildCard name="Contention, Queueing & Tail Latency">
+    Little's law and why the average hides the cold-start tail.
+    [Chapter 16](/topics/16-contention-tail-latency).
+  </WildCard>
+  <WildCard name="Processes, Threads & Scheduling">
+    The kernel's scheduler, one level below kube-scheduler: CFS, quotas and
+    run queues. [Chapter 06](/topics/06-processes-scheduling).
+  </WildCard>
+</CardGrid>

@@ -1,0 +1,958 @@
+---
+title: Query Planning & Execution
+dek: "What a database does with your SQL after it parses it: how operators pull rows through a plan one at a time or a thousand at a time, how the three join algorithms work and when each wins, how the planner prices a plan from statistics, and why its row estimates are the thing to check first when a query goes slow."
+readingTime: "~33 min"
+level: "Intermediate"
+versions: "PostgreSQL 16.15 (source at REL_16_4) · DuckDB 1.5.5 · SQLite 3.45.1 · measured in a shared container, linuxkit 6.10.14 aarch64 on an Apple M4"
+prereqs: "SQL joins, B+tree indexes (chapter 18)"
+updated: "2026-09-27"
+---
+
+SQL says what you want, not how to get it. Between your `SELECT` and the
+rows coming back, the database has to choose which indexes to use, which
+table to read first, how to join each pair, and in what order. For a
+five-table query there are thousands of valid ways to do it, and the fastest
+can be a thousand times quicker than the slowest.
+
+That choice is the planner's. It's made from statistics and a cost model,
+before any row is read, and it's probably right most of the time. When a query that
+ran in 5 ms starts taking 30 seconds, it's usually because one of the
+planner's row estimates was wrong and it picked the wrong join or the wrong
+scan.
+
+This chapter follows a query from parsed SQL to running operators. It shows
+how operators execute, measures the three join algorithms and the index-scan
+crossover on the same 5-million-row table, takes the cost model apart
+against the Postgres source, and ends with how to read `EXPLAIN ANALYZE`
+when something's slow.
+
+<SectionHeading n="01" id="pipeline">From SQL to a running plan</SectionHeading>
+
+Every relational database runs a query through the same four stages. The
+names differ; the jobs don't.
+
+<Sub n="1.1" title="Four stages">
+
+<Steps
+  title="One SELECT through Postgres"
+  lanes={[
+    { t: "Parser", s: "text → tree", icon: "¶" },
+    { t: "Analyzer", s: "names → objects", icon: "⌕" },
+    { t: "Rewriter", s: "views, rules", icon: "↺" },
+    { t: "Planner", s: "cheapest plan", icon: "⚖" },
+    { t: "Executor", s: "run the tree", icon: "▶" },
+  ]}
+  steps={[
+    [0, "The **parser** turns the SQL text into a raw parse tree. It checks grammar only: it doesn't know yet whether `orders` exists."],
+    [1, "**Parse analysis** resolves every name against the catalog, assigns types and produces a `Query` tree. Now `o.amount` is column 3 of a particular table."],
+    [2, "The **rewriter** expands views into their definitions and applies rules. A query on a view becomes a query on its base tables."],
+    [3, "The **planner** generates candidate plans (access paths per table, join methods, join orders), prices each with the cost model, and keeps the cheapest."],
+    [4, "The **executor** builds a tree of plan nodes and pulls rows from the root until it returns nothing. This is the only stage that reads table data."],
+  ]}
+/>
+
+Planning is roughly a millisecond or less for simple queries; the rest of the chapter is about
+what the planner chooses and how the executor runs it.
+
+</Sub>
+
+<Sub n="1.2" title="A plan is a tree of operators">
+
+`EXPLAIN` prints the plan the planner kept. Each line is one operator (a plan
+node), and children are indented under their parent:
+
+```text
+ Aggregate  (cost=107056.82..107056.83 rows=1 width=32)
+   ->  Hash Join  (cost=2011.25..106804.31 rows=101001 width=6)
+         Hash Cond: (o.customer_id = c.id)
+         ->  Seq Scan on orders o  (cost=0.00..91667.40 rows=5000040 width=10)
+         ->  Hash  (cost=1986.00..1986.00 rows=2020 width=4)
+               ->  Seq Scan on customers c  (cost=0.00..1986.00 rows=2020 width=4)
+                     Filter: (country = 'country_7'::text)
+```
+
+| Field | Meaning |
+|---|---|
+| `cost=A..B` | Estimated cost before the first row (A) and for all rows (B), in the planner's arbitrary units |
+| `rows` | Estimated rows this node will return |
+| `width` | Estimated average row width in bytes |
+
+<Why>Why estimates, not facts?</Why>
+
+Because the plan has to be chosen before anything runs. The planner can't
+know how many customers are in `country_7` without reading the table, so it
+guesses from statistics gathered by `ANALYZE`. Everything in this chapter
+follows from that: the choices are only as good as the guesses.
+
+All the tests use one database with two tables. `customers` has 100,000
+rows (736 pages), and `orders` has 5 million (41,667 pages, 326 MB) with
+indexes on `customer_id`, `created_at`, `status` and a random integer column
+`r`. Unless noted, queries ran with parallelism and JIT off, so each number is
+one core running one plan, and all data was in memory.
+
+</Sub>
+
+<SectionHeading n="02" id="execution-models">How operators run</SectionHeading>
+
+A plan tree says what to compute. An execution model says how rows move
+between the nodes, and it decides how much CPU each row costs.
+
+<Sub n="2.1" title="The Volcano model: one row at a time">
+
+Almost every row-store database, Postgres, MySQL and SQL Server included, uses
+the iterator model Graefe described in
+[Volcano](https://ieeexplore.ieee.org/document/273032) (1994). Each node has
+one main method, "give me your next row". A node calls `next()` on its
+children as often as it needs to, does its work, and returns one row to its
+parent.
+
+In Postgres that method is `ExecProcNode`, a function pointer per node:
+
+<SourceRead
+  file="src/include/executor/executor.h"
+  repo="postgres/postgres"
+  tag="REL_16_4"
+  href="https://github.com/postgres/postgres/blob/REL_16_4/src/include/executor/executor.h#L267"
+>
+```c
+static inline TupleTableSlot *
+ExecProcNode(PlanState *node)
+{
+	if (node->chgParam != NULL) /* something changed? */
+		ExecReScan(node);		/* let ReScan handle this */
+
+	return node->ExecProcNode(node);
+}
+```
+</SourceRead>
+
+And here's a whole join algorithm written against it. A nested loop pulls
+one outer row, rescans the inner side, and pulls inner rows until they run
+out:
+
+<SourceRead
+  file="src/backend/executor/nodeNestloop.c"
+  repo="postgres/postgres"
+  tag="REL_16_4"
+  href="https://github.com/postgres/postgres/blob/REL_16_4/src/backend/executor/nodeNestloop.c#L100"
+>
+```c
+	for (;;)
+	{
+		if (node->nl_NeedNewOuter)
+		{
+			outerTupleSlot = ExecProcNode(outerPlan);
+			if (TupIsNull(outerTupleSlot))
+				return NULL;                    /* join is complete */
+			/* ... pass outer values to the inner side as parameters ... */
+			ExecReScan(innerPlan);
+		}
+
+		innerTupleSlot = ExecProcNode(innerPlan);
+		if (TupIsNull(innerTupleSlot))
+		{
+			node->nl_NeedNewOuter = true;
+			continue;
+		}
+
+		if (ExecQual(joinqual, econtext))
+			/* ... project and return one joined row ... */
+	}
+```
+</SourceRead>
+
+<Why>Why has this design lasted thirty years?</Why>
+
+Because it composes. Any node can sit under any other, and rows stream up the
+tree without being stored in between. A `LIMIT 10` at the top stops pulling
+after ten rows, and nothing below it does any more work.
+
+</Sub>
+
+<Sub n="2.2" title="What one row at a time costs">
+
+You pay per row. Each `next()` is an indirect call through a
+function pointer, each expression like `a % 7 = 3` is interpreted from a tree,
+and every column is extracted from the row format one at a time. None of that
+is the actual arithmetic.
+
+Boncz, Zukowski and Nes measured it in
+[MonetDB/X100](https://www.cidrdb.org/cidr2005/papers/P19.pdf) (CIDR 2005).
+Profiling TPC-H query 1 on MySQL, the operations doing the real work
+"correspond to only 10% of total execution time". An addition cost 38
+instructions. Everything else went to hash-table work for the aggregate and to
+functions that "navigate through MySQL's record representation and copy data
+in and out of it".
+
+</Sub>
+
+<Sub n="2.3" title="Vectorized and compiled execution">
+
+Two designs remove that overhead:
+
+| Model | Idea | Systems | Strength |
+|---|---|---|---|
+| **Volcano** | One row per `next()` call, interpreted expressions | Postgres, MySQL, SQL Server row mode, SQLite (a bytecode VM with the same row-at-a-time shape) | Simple, composable, low memory |
+| **Vectorized** | `next()` returns a batch (roughly a thousand values per column); each operator is a tight loop over arrays | MonetDB/X100 → Vectorwise, DuckDB, ClickHouse, Velox, SQL Server batch mode | Per-row overhead paid once per batch; loops the compiler can unroll and turn into SIMD |
+| **Compiled** | Generate machine code for each query pipeline, keeping rows in registers between operators | HyPer, Umbra, Spark's whole-stage codegen | Fewest instructions per row |
+
+Neumann's [VLDB 2011 paper](https://www.vldb.org/pvldb/vol4/p539-neumann.pdf)
+introduced the compiled approach using LLVM, with code that "frequently rivals
+the performance of hand-written C++ code". When Kersten and colleagues
+[built both in one system](https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf)
+(VLDB 2018), they found "both are efficient": vectorization "is better at
+hiding cache miss latency", while compilation "requires fewer CPU
+instructions".
+
+Postgres has a small piece of the compiled idea. Since version 11 it can JIT
+expressions and tuple deforming with LLVM, for queries whose estimated cost
+passes `jit_above_cost` (100,000 by default).
+
+</Sub>
+
+<Sub n="2.4" title="The same query, three engines">
+
+One query over the same 5 million rows (an integer and a double per row,
+loaded from one CSV): `select sum(b), count(*) from t5 where a % 7 = 3`.
+Median of five warm runs:
+
+<Compare
+  cols={["Engine", "Execution model", "Time", "ns per row"]}
+  rows={[
+    ["Postgres 16, 1 core, JIT off", "Volcano, row store", "145 ms", "29"],
+    ["Postgres 16, 1 core, JIT on", "Volcano + compiled expressions", "130 ms", "26"],
+    ["SQLite 3.45", "Bytecode VM, row store", "111 ms", "22"],
+    ["Postgres 16, 4 parallel workers", "Volcano, parallel", "86 ms", "17"],
+    ["DuckDB 1.5.5, 1 thread", "Vectorized, column store", "8 ms", "1.6"],
+    ["DuckDB 1.5.5, 4 threads", "Vectorized, column store", "3 ms", "0.6"],
+  ]}
+/>
+
+DuckDB on one thread was **18 times faster** than Postgres on one core. That
+probably isn't all execution model: DuckDB stores each column contiguously and only
+touches the two columns the query needs, while Postgres walks 5 million row
+headers across 27,028 pages. Both effects point the same way, and they're why
+analytical engines combine columnar storage with vectorized execution.
+
+<Callout label="Design implication">
+Row-at-a-time execution is fine when a query touches a few hundred rows
+through an index, which is most OLTP. It's the wrong tool for scanning
+millions of rows to aggregate them. If your Postgres dashboards spend their
+time in sequential scans and aggregates, the fix is an analytical engine
+alongside it (DuckDB, ClickHouse, a warehouse), not more tuning.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="03" id="access-paths">Access paths: how to read one table</SectionHeading>
+
+Before any join, the planner decides how to read each table. That's the
+**access path**, and Postgres has four main ones.
+
+<Sub n="3.1" title="Four ways to read a table">
+
+| Access path | How it works | Best when |
+|---|---|---|
+| **Seq Scan** | Read every page in order, test each row | A large fraction of rows match, or the table is small |
+| **Index Scan** | Walk the B+tree for matching keys, fetch each row from the heap by TID | Few rows match, or rows are needed in index order |
+| **Index Only Scan** | Answer from the index alone; check the visibility map instead of the heap | All needed columns are in the index and the table is mostly vacuumed |
+| **Bitmap Heap Scan** | Collect matching TIDs from one or more indexes into a bitmap, sort by page, then read each heap page once | A moderate fraction matches, or several indexes are combined with AND/OR |
+
+<Why>Why would reading fewer rows ever be slower?</Why>
+
+Because an index scan pays per row, and a sequential scan pays per page. An
+index scan on an unordered column jumps to a different heap page for almost
+every row, so fetching 5% of the rows can mean touching most of the pages,
+one at a time and out of order. A sequential scan reads all of them, but in
+order and with no index work at all.
+
+</Sub>
+
+<Sub n="3.2" title="Measuring the crossover">
+
+The `orders` table has two useful columns for this. `r` is a random integer,
+so matching rows are scattered across the table. `id` matches the physical
+order, since rows were inserted in `id` order.
+
+<Predict
+  q="A query sums one column over rows where r < N, on a 5M-row table with r uniformly random. Everything is in memory. Forcing a plain Index Scan, at roughly what fraction of matching rows does it become slower than a Seq Scan?"
+  options={[
+    "Around 0.1%",
+    "Between 1% and 5%",
+    "Around 30%",
+    "Never: an index is always faster when it's in memory",
+  ]}
+  answer={1}
+>
+Measured: at 1% the index scan took **57 ms** against **164 ms** for the
+sequential scan, and at 5% it took **270 ms** against 169 ms. The crossover
+is between them, roughly 3%. At 20% the index scan took over a second. Each
+matching row costs a heap-page visit in random order, and the sequential scan
+pays a flat cost whatever the selectivity. On a cold disk the crossover comes
+much earlier.
+</Predict>
+
+The full measurement, each plan forced with the `enable_*` settings, median of
+five warm runs:
+
+| Rows matching | Seq Scan | Index Scan (`r`, random) | Bitmap (`r`) | Index Scan (`id`, ordered) | Planner's choice for `r` |
+|---|---|---|---|---|---|
+| 0.01% | 162 ms | 0.2 ms | 0.2 ms | 0.1 ms | Bitmap |
+| 0.1% | 160 ms | 1.1 ms | 1.8 ms | 0.4 ms | Bitmap |
+| 1% | 164 ms | 57 ms | 57 ms | 3.1 ms | Bitmap |
+| 5% | 169 ms | **270 ms** | 96 ms | 16 ms | Bitmap |
+| 20% | 183 ms | 1,224 ms | 157 ms | 71 ms | Bitmap |
+| 50% | 221 ms | 2,969 ms | 270 ms | 194 ms | Seq Scan |
+
+Three things stand out. A bitmap scan stays close to the better of the two
+across the whole range, which is why Postgres picks it so often in the middle.
+The planner's choice for `r` was the fastest option or within noise of it at
+every row. And on the ordered `id` column, the plain index scan beat the
+sequential scan even at 50%.
+
+</Sub>
+
+<Sub n="3.3" title="Correlation: why order on disk matters">
+
+That last result is **correlation**: how closely the physical row order
+follows the column's sort order. `ANALYZE` measures it for each column, and
+the planner uses it to price index scans:
+
+```text
+   attname   | correlation
+-------------+--------------
+ id          |            1
+ customer_id |  0.002412658
+ r           | -0.004186762
+```
+
+With correlation 1, consecutive index entries point at the same heap page, so
+an index scan over 50% of the rows reads about half the pages in order. With
+correlation near 0, every entry is a random page. Time-ordered columns (an
+`id` from a sequence, `created_at` on an append-only table) are naturally
+correlated; foreign keys and hashes aren't. `CLUSTER` rewrites a table in
+index order, once; it isn't maintained.
+
+</Sub>
+
+<Sub n="3.4" title="Choosing which indexes to build">
+
+<Why>What makes a good index for a query?</Why>
+
+One whose leading columns match the query's equality conditions, followed by
+at most one range condition, so the matching keys sit next to each other in
+the tree. After that it's about avoiding the heap entirely.
+
+| Rule | Example | Why |
+|---|---|---|
+| Equality columns first, then one range column | `(customer_id, created_at)` for `WHERE customer_id = $1 AND created_at > $2` | Matching entries are contiguous; with the range first, the equality can't narrow the scan |
+| Cover the query to get an index-only scan | `(customer_id) INCLUDE (amount)` | No heap visit per row, if the visibility map is current |
+| Index the rare value, not the column | `CREATE INDEX ON orders (created_at) WHERE status = 'pending'` | 0.1% of rows are pending; a partial index is 1,000 times smaller than a full one |
+| Match the sort you need | `(customer_id, created_at DESC)` for `ORDER BY created_at DESC LIMIT 20` per customer | The index delivers rows in order, so `LIMIT` stops after 20 |
+| Don't index what's always scanned anyway | A `status` column where 99.9% of rows are `done` | The planner won't use it for `done`, and every write still pays to maintain it |
+
+<Callout label="Common mistake" kind="warn">
+Adding an index per column and hoping the planner combines them. A bitmap AND
+of two single-column indexes works, but it reads both indexes in full for the
+matching ranges. One composite index in the right column order is usually
+cheaper to read, and every extra index costs every `INSERT` and `UPDATE`.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="04" id="joins">Join algorithms</SectionHeading>
+
+Every join in every relational engine is done with one of three algorithms,
+or a variant of one. They differ in what they need from their inputs and in
+how their cost grows.
+
+<Sub n="4.1" title="Nested loop">
+
+For each row of the outer input, scan the inner input for matches. With no
+index that's `O(N × M)`, and it's only sensible when one side is tiny. With an
+index on the inner join column, each probe is a B+tree lookup, and it's the
+best join there is for a small outer side: the **index nested loop**.
+
+It's also the only algorithm that works for any join condition, including
+inequalities like `a.ts BETWEEN b.start AND b.end`.
+
+</Sub>
+
+<Sub n="4.2" title="Hash join">
+
+For an equality join over larger inputs, build a hash table on the smaller
+side, then stream the larger side past it:
+
+<Steps
+  title="A hash join in Postgres (nodeHashjoin.c)"
+  lanes={[
+    { t: "Inner input", s: "smaller side", icon: "▤" },
+    { t: "Hash table", s: "work_mem × 2", icon: "#" },
+    { t: "Outer input", s: "larger side", icon: "▥" },
+    { t: "Probe", s: "hash, bucket, compare", icon: "⇄" },
+    { t: "Batch files", s: "if it doesn't fit", icon: "⛁" },
+  ]}
+  steps={[
+    [0, "`HJ_BUILD_HASHTABLE`: read the **inner** input to the end. The planner puts the side it expects to be smaller here."],
+    [1, "Hash each row's join key into the **hash table**. Its budget is `work_mem × hash_mem_multiplier` (4 MB × 2 by default in Postgres 16)."],
+    [4, "If it won't fit, split both inputs into **batches** by hash value and write all but the first to temporary files."],
+    [2, "`HJ_NEED_NEW_OUTER`: pull one row from the **outer** input and hash its key."],
+    [3, "`HJ_SCAN_BUCKET`: compare it against the rows in the matching bucket and emit each match. Then the next outer row."],
+    [4, "When the outer input ends, `HJ_NEED_NEW_BATCH` loads the next batch pair from disk and repeats the build and probe."],
+  ]}
+/>
+
+That's `O(N + M)`, with a first row only after the whole build side has been
+read. Squeezing the budget shows the batch cost. Joining all 5 million orders
+to 100,000 customers, one run each:
+
+| `work_mem` | Buckets | Batches | Hash memory | Execution time |
+|---|---|---|---|---|
+| 4 MB (default) | 131,072 | 1 | 4,540 kB | 1,001 ms |
+| 256 kB | 16,384 | 16 | 350 kB | 1,333 ms |
+
+</Sub>
+
+<Sub n="4.3" title="Merge join">
+
+If both inputs are sorted on the join key, walk them side by side like the
+merge step of merge sort, advancing whichever is behind. That's `O(N + M)`
+after sorting, with almost no memory. It wins when the sort is free, because
+both sides come from indexes on the join key, or because the query needs that
+order anyway for `ORDER BY` or `GROUP BY`.
+
+</Sub>
+
+<Sub n="4.4" title="All three, measured">
+
+The same join, `customers` to `orders` on `customer_id`, at three sizes, with
+the planner forced into each algorithm. Median of three and then five warm
+runs on a shared box; where the two sets differed, both are shown:
+
+| Query | Nested loop (index) | Hash join | Merge join | Planner picked |
+|---|---|---|---|---|
+| 10 customers (~500 orders) | **0.3 ms** | 200–284 ms | 0.2–0.3 ms | Nested loop |
+| 2% of customers (~100k orders) | **156–166 ms** | 264–490 ms | 6.1–8.2 s | Hash join |
+| All 5M orders | 6.8–12.1 s | **0.6–1.4 s** | 5.8–11.0 s | Hash join |
+
+| Algorithm | Needs | Cost | Memory | Wins when |
+|---|---|---|---|---|
+| **Nested loop** | Nothing (index on inner side to be fast) | `N × probe` | None | Outer side is small; non-equality joins |
+| **Hash join** | An equality condition | `N + M`, build first | Build side in memory, or batches | Both sides large and unsorted |
+| **Merge join** | Inputs sorted on the key | `N + M` plus any sorts | Very little | Inputs already sorted, or output order needed |
+
+<Why>Why did the planner pick hash for the 2% query, when nested loop was faster?</Why>
+
+Because of one cost setting. It priced each of the 2,000 index
+probes as if its heap pages might come from disk, at `random_page_cost = 4`:
+178,860 for the nested loop against 106,804 for the hash join. With
+`random_page_cost = 1.1`, it priced the nested loop at 53,526 and chose it.
+The [docs](https://www.postgresql.org/docs/16/runtime-config-query.html) say
+this directly: 4.0 assumes "the majority of random accesses to storage, such
+as indexed reads, are assumed to be in cache", and "if your data is likely to
+be completely in cache ... decreasing `random_page_cost` might be
+appropriate".
+
+<Callout label="Design implication">
+Cost constants describe your hardware. The default `random_page_cost` of 4
+assumes random reads are expensive but mostly cached. On SSDs, or when the working set fits in RAM, lowering
+`random_page_cost` towards `seq_page_cost` makes index plans look as cheap as
+they really are. Change it per tablespace or per database, and compare plans
+before and after.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="05" id="costing">How the planner prices a plan</SectionHeading>
+
+Plans are compared by a single number, the cost. It's worth seeing
+exactly where that number comes from, because it's simpler than it looks.
+
+<Sub n="5.1" title="The cost model">
+
+Cost is measured in units of one sequential page read. Five constants convert
+everything else into those units:
+
+| Setting | Default | Charged for |
+|---|---|---|
+| `seq_page_cost` | 1.0 | Each page read in order |
+| `random_page_cost` | 4.0 | Each page read out of order |
+| `cpu_tuple_cost` | 0.01 | Each row processed |
+| `cpu_index_tuple_cost` | 0.005 | Each index entry processed |
+| `cpu_operator_cost` | 0.0025 | Each operator or function evaluated |
+
+A sequential scan's cost is pages times `seq_page_cost` plus rows times the
+per-row CPU cost:
+
+<SourceRead
+  file="src/backend/optimizer/path/costsize.c"
+  repo="postgres/postgres"
+  tag="REL_16_4"
+  href="https://github.com/postgres/postgres/blob/REL_16_4/src/backend/optimizer/path/costsize.c#L284"
+>
+```c
+	/*
+	 * disk costs
+	 */
+	disk_run_cost = spc_seq_page_cost * baserel->pages;
+
+	/* CPU costs */
+	get_restriction_qual_cost(root, baserel, param_info, &qpqual_cost);
+
+	startup_cost += qpqual_cost.startup;
+	cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple;
+	cpu_run_cost = cpu_per_tuple * baserel->tuples;
+```
+</SourceRead>
+
+You can check it by hand:
+
+<TryIt what="Recompute a Seq Scan's cost from the formula" lang="sql" toolchain="PostgreSQL 16.15">
+```sql
+select relpages, reltuples from pg_class where relname = 'orders';
+explain select * from orders;
+explain select * from orders where amount > 500;
+```
+
+<Output>
+```text
+ relpages | reltuples
+----------+-----------
+    41667 |   5000040
+
+ Seq Scan on orders  (cost=0.00..91667.40 rows=5000040 width=35)
+
+ Seq Scan on orders  (cost=0.00..104167.50 rows=2500785 width=35)
+   Filter: (amount > '500'::numeric)
+```
+
+41,667 pages × 1.0 + 5,000,040 rows × 0.01 = **91,667.40**. Adding the filter
+charges one `cpu_operator_cost` per row, 5,000,040 × 0.0025 = 12,500.10, for
+**104,167.50**. The planner's `reltuples` estimate, 5,000,040, is 40 rows off
+the true count.
+</Output>
+</TryIt>
+
+Index scans, joins and sorts have longer formulas (index scans use the
+column's correlation to interpolate between random and sequential page
+costs), but they're all built from those five constants and row estimates.
+
+</Sub>
+
+<Sub n="5.2" title="Statistics">
+
+Row estimates come from `pg_statistic`, filled by `ANALYZE` from a sample
+of rows (300 × `default_statistics_target`, so 30,000 by default). For each
+column it stores:
+
+| Statistic | What it's for | For `orders` |
+|---|---|---|
+| `null_frac` | Fraction of NULLs | 0 everywhere |
+| `n_distinct` | Number of distinct values; negative means a fraction of rows | `status`: 2; `r`: −0.16 (about 16% of rows distinct) |
+| `most_common_vals` / `freqs` | Up to 100 most common values and their frequency | `status`: `{done, pending}` at `{0.999, 0.001}` |
+| `histogram_bounds` | Values splitting the rest into equal-population buckets | 101 bounds for `r`, `id`, `customer_id` |
+| `correlation` | Physical order vs sort order | `id`: 1; `r`: −0.004 |
+
+For `status = 'pending'` the planner reads 0.001 from the MCV list and
+estimates 5,000 rows, which was exactly right. For `r < 50000` it finds where
+50,000 falls in the histogram and interpolates.
+
+</Sub>
+
+<Sub n="5.3" title="Combining predicates: the independence assumption">
+
+For a `WHERE` with two conditions, the planner multiplies their
+selectivities, which is only right if the columns are independent. Real data
+rarely is. In `customers`, each city belongs to exactly one country:
+
+<TryIt what="Two correlated columns, before and after extended statistics" lang="sql" toolchain="PostgreSQL 16.15">
+```sql
+explain analyze select * from customers
+where city = 'city_7' and country = 'country_7';
+
+create statistics cust_city_country (dependencies) on city, country from customers;
+analyze customers;
+
+explain analyze select * from customers
+where city = 'city_7' and country = 'country_7';
+```
+
+<Output>
+```text
+ Seq Scan on customers  (cost=0.00..2236.00 rows=2 width=26) (actual rows=100 loops=1)
+
+ Seq Scan on customers  (cost=0.00..2236.00 rows=100 width=26) (actual rows=100 loops=1)
+```
+
+Without extended statistics: 100,000 × 1/1,000 × 1/50 = **2 rows**, against
+100 real ones. With a functional-dependency statistic (`pg_stats_ext` reported
+`{"2 => 3": 1.000000}`: city determines country), the estimate is exact.
+</Output>
+</TryIt>
+
+<Why>Why does a 50× error on one table matter so much?</Why>
+
+Because it multiplies up the plan. Joining those customers to a 2-million-row
+`visits` table, the planner estimated **1 joined row; there were 36**. Every
+node above it inherits the error. On a bigger query, an estimate of 1 is
+exactly what makes a nested loop without an index look free.
+
+Leis and colleagues measured how often this happens in
+[How Good Are Query Optimizers, Really?](https://www.vldb.org/pvldb/vol9/p204-leis.pdf)
+(VLDB 2015), with 113 multi-join queries over the IMDB data set. They found
+"all estimators routinely produce large errors", that estimates tend to be
+systematic underestimates, and that most of Postgres's very slow plans had one
+thing in common: a nested-loop join without an index, chosen "because of a
+very low cardinality estimate". Disabling those joins removed all their timeouts. They also found the
+cost model mattered much less than the cardinality estimates.
+
+<Callout label="Common mistake" kind="warn">
+Tuning cost constants or adding indexes when `EXPLAIN ANALYZE` shows
+`rows=1` estimated against `rows=40000` actual. Fix the estimate first:
+`ANALYZE` a table that changed a lot, raise the statistics target for a skewed
+column (`ALTER TABLE … ALTER COLUMN … SET STATISTICS 1000`), or add extended
+statistics for correlated columns.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="06" id="join-order">Join order</SectionHeading>
+
+With the access paths and join algorithms priced, the planner still has to
+decide the order. For n tables there are n! orders of a left-deep tree alone:
+120 for five tables, over 3.6 million for ten.
+
+<Sub n="6.1" title="Dynamic programming, from System R">
+
+Selinger and colleagues' [Access Path Selection](https://dl.acm.org/doi/10.1145/582095.582099)
+paper (SIGMOD 1979) for System R introduced the method nearly every planner
+still uses: build the best plan for each set of tables bottom up, reusing the
+best plan for each smaller set.
+
+<Steps
+  title="Planning A ⋈ B ⋈ C by dynamic programming"
+  lanes={[
+    { t: "Level 1", s: "one table", icon: "1" },
+    { t: "Level 2", s: "pairs", icon: "2" },
+    { t: "Level 3", s: "all three", icon: "3" },
+    { t: "Pruning", s: "keep the best", icon: "✂" },
+    { t: "Result", s: "cheapest plan", icon: "✓" },
+  ]}
+  steps={[
+    [0, "For each table, find the cheapest **access path**: seq scan, each usable index, bitmap. Keep the best, plus any that deliver a useful sort order."],
+    [1, "For each **pair** that has a join condition (A⋈B, B⋈C), try every join algorithm with each side as outer. Pairs with no condition between them are skipped where possible, avoiding cross products."],
+    [3, "For each pair, keep only the cheapest plan, plus cheaper-per-order variants. This is what makes it tractable: {A,B} is solved once, whatever comes next."],
+    [2, "For **{A,B,C}**, try joining each best pair plan with the remaining table: {A,B}⋈C, {B,C}⋈A, and so on."],
+    [4, "The cheapest plan for the full set is the result. The work grows with the number of subsets, 2ⁿ, not with n!."],
+  ]}
+/>
+
+<Why>Why keep a plan that isn't the cheapest?</Why>
+
+Selinger called them **interesting orders**. A merge join that's slightly more
+expensive than a hash join, but produces rows sorted by the key a later
+`ORDER BY` or merge join needs, can save a sort further up. So the planner
+keeps the cheapest plan for each useful output order, not just the cheapest
+overall.
+
+</Sub>
+
+<Sub n="6.2" title="When there are too many tables">
+
+2ⁿ still explodes. Postgres uses exhaustive search up to `geqo_threshold` (12)
+`FROM` items, and switches to a genetic algorithm beyond that, trading plan
+quality for planning time. Separately, it won't reorder explicit `JOIN`s that
+would produce more than `join_collapse_limit` (8) items.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `geqo_threshold` | 12 | At this many `FROM` items or more, use the genetic optimizer |
+| `from_collapse_limit` | 8 | Merge subqueries into the parent `FROM` list only up to this size |
+| `join_collapse_limit` | 8 | Reorder explicit `JOIN`s only up to this size; 1 means "join in the order written" |
+
+<Callout label="Common mistake" kind="warn">
+A 10-table query generated by an ORM with explicit `JOIN`s, planned in the
+order it was written because it's over `join_collapse_limit`. If a large query
+is slow and its join order looks arbitrary, count the tables. Raising the
+limit (per session is fine) or rewriting the query lets the planner search
+again.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="07" id="prepared">Plans that get reused</SectionHeading>
+
+Planning costs time, so a prepared statement can reuse its plan. The catch is
+that a reused plan was chosen without knowing the parameter values.
+
+<Sub n="7.1" title="Custom and generic plans">
+
+Postgres plans the first five executions of a prepared statement with the
+actual parameter values (**custom plans**). After that it also builds one
+**generic plan** for unknown values, and uses it whenever it's no more
+expensive than the average custom plan:
+
+<SourceRead
+  file="src/backend/utils/cache/plancache.c"
+  repo="postgres/postgres"
+  tag="REL_16_4"
+  href="https://github.com/postgres/postgres/blob/REL_16_4/src/backend/utils/cache/plancache.c#L1050"
+>
+```c
+	/* Generate custom plans until we have done at least 5 (arbitrary) */
+	if (plansource->num_custom_plans < 5)
+		return true;
+
+	avg_custom_cost = plansource->total_custom_cost / plansource->num_custom_plans;
+
+	/*
+	 * Prefer generic plan if it's less expensive than the average custom
+	 * plan.  (Because we include a charge for cost of planning in the
+	 * custom-plan costs, this means the generic plan only has to be less
+	 * expensive than the execution cost plus replan cost of the custom
+	 * plans.)
+	 */
+	if (plansource->generic_cost < avg_custom_cost)
+		return false;
+
+	return true;
+```
+</SourceRead>
+
+<Why>How does that go wrong?</Why>
+
+With skewed data. If the first five executions all use common values and the
+generic plan matches them, the generic plan wins and is used from then on,
+including for the rare value where a different plan would be a thousand
+times faster, or the reverse. The symptom is a query that's fast in `psql`
+and slow from the application, which uses prepared statements through its
+driver. `plan_cache_mode = force_custom_plan` for that statement or session
+is the direct fix.
+
+</Sub>
+
+<SectionHeading n="08" id="operating">Reading plans on a Monday</SectionHeading>
+
+<Sub n="8.1" title="What to run">
+
+```sql
+-- The plan that ran, with real row counts, time and buffers per node
+explain (analyze, buffers) select ...;
+
+-- For writes, wrap it so nothing changes
+begin; explain (analyze, buffers) update ...; rollback;
+
+-- Which queries cost the most in total
+create extension pg_stat_statements;
+select calls, round(total_exec_time) as ms, round(mean_exec_time, 2) as mean_ms, left(query, 60)
+from pg_stat_statements order by total_exec_time desc limit 10;
+
+-- Log plans of slow queries automatically, as the application ran them
+load 'auto_explain';
+set auto_explain.log_min_duration = '500ms';
+set auto_explain.log_analyze = on;
+```
+
+When you read an `EXPLAIN ANALYZE`, work through the same four questions:
+
+1. **Where's the time?** Find the node whose actual time jumps. Remember that
+   `actual time` and `rows` are per loop: multiply by `loops`.
+2. **Is any estimate off by 10× or more?** Compare `rows=` estimated with
+   actual, from the bottom up. The lowest bad estimate is the cause; the ones
+   above it inherit it.
+3. **What did it read?** `Buffers: shared hit` came from memory, `read` from
+   the OS, `temp` means a sort or hash spilled to disk.
+4. **Would another plan win?** Toggle `enable_nestloop`, `enable_hashjoin` or
+   `enable_seqscan` in a session and compare. That's a diagnosis tool, not a
+   production setting.
+
+</Sub>
+
+<Sub n="8.2" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Nested loop with `loops=` in the thousands and a huge actual row count | Outer side underestimated | Fix statistics (`ANALYZE`, higher target, extended stats); check correlated predicates |
+| Seq scan on a big table for a selective filter | No suitable index, a function on the column, or a type mismatch | Composite or expression index; compare like types |
+| Index scan slower than expected on a large range | Low correlation; rows scattered | Let it use a bitmap scan; `CLUSTER` for read-mostly tables; a covering index |
+| `Sort Method: external merge` or hash `Batches` above 1 | `work_mem` too small for this node | Raise `work_mem` for that session or query, not globally |
+| Fast in `psql`, slow from the app | Generic plan from a prepared statement | `plan_cache_mode = force_custom_plan` for it |
+| Plan changed overnight and got slow | Statistics changed after autovacuum's `ANALYZE`, or data crossed a threshold | Compare old and new plans with `auto_explain`; fix the estimate |
+| Planner prefers seq scans on an SSD box where indexes are faster | Default `random_page_cost = 4` | Lower it towards 1.1 for SSD or fully cached data |
+| Big ORM query with an odd join order | More tables than `join_collapse_limit` | Raise the limit, or simplify the query |
+
+</Sub>
+
+<SectionHeading n="09" id="summary">Summary</SectionHeading>
+
+1. **Every query is parsed, analysed, rewritten, planned and executed.** Only
+   the executor reads data; the planner decides everything before that.
+2. **Row stores run plans one row at a time.** The Volcano model composes
+   well, but per-row overhead dominates big scans: Postgres spent 29 ns a row
+   where DuckDB spent 1.6.
+3. **Index scans pay per row, sequential scans per page.** On a random column
+   the crossover was near 3% of rows; bitmap scans cover the middle ground.
+4. **Correlation decides how bad an index scan gets.** On a column matching
+   disk order, the index scan still won at 50%.
+5. **Nested loop wins with a small outer side and an index.** 0.3 ms against
+   200 ms for a hash join on ten customers.
+6. **Hash join wins when both sides are big.** 5M rows joined in about a
+   second, against 6 to 12 seconds for the others.
+7. **Cost is pages plus rows times five constants.** A Seq Scan on `orders`
+   costs exactly 41,667 + 5,000,040 × 0.01.
+8. **The defaults assume slow random I/O.** Lowering `random_page_cost` flipped
+   a join to the faster nested loop.
+9. **Row estimates are the usual culprit.** Multiplying correlated predicates
+   turned 100 rows into an estimate of 2; extended statistics fixed it.
+10. **Join order is dynamic programming over subsets** up to 12 tables, with a
+    genetic search above and no reordering of explicit joins past 8.
+
+<SectionHeading n="10" id="build">Build this</SectionHeading>
+
+**A query engine you can read in an afternoon.**
+
+- Implement Volcano operators over in-memory rows: `Scan`, `Filter`,
+  `Project`, `NestedLoopJoin`, `HashJoin`, `Sort`, `Limit`, each with
+  `next()`. Check that `Limit` stops the scan early.
+- Rewrite `Scan`, `Filter` and a `Sum` aggregate to pass batches of 1,024
+  values in columnar arrays. Time both on 10 million rows and compare with
+  the 29 vs 1.6 ns per row here.
+- Add a planner for three-table joins: estimate each filter's selectivity
+  from a histogram, enumerate join orders by dynamic programming, and pick
+  nested loop or hash join by a cost formula. Then feed it correlated columns
+  and watch it choose badly.
+
+<SectionHeading n="11" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What's the difference between EXPLAIN and EXPLAIN ANALYZE?">
+`EXPLAIN` shows the chosen plan with estimated costs and row counts, without
+running it. `EXPLAIN ANALYZE` runs the query and adds actual time, actual rows
+and loops per node, and with `BUFFERS`, the pages read. For a write, it really
+performs the write, so wrap it in a transaction and roll back.
+</QA>
+
+<QA level="beginner" q="When would a database choose a sequential scan even though an index exists?">
+When enough rows match that visiting them through the index costs more than
+reading every page in order. On a random column that happened near 3% of rows
+in memory, much earlier on disk. Also when the table is small, or the
+statistics say the value is very common.
+</QA>
+
+<QA level="intermediate" q="Describe hash join, nested loop and merge join, and when each wins.">
+Nested loop probes the inner side once per outer row; with an index on the
+inner key it's best for a small outer side, and it's the only one for
+non-equality joins. Hash join builds a hash table on the smaller side and
+probes it with the larger, `O(N + M)`, best for large unsorted equi-joins,
+spilling to batches if the build side exceeds memory. Merge join walks two
+sorted inputs in step; it wins when both are already sorted or the output
+order is needed.
+</QA>
+
+<QA level="intermediate" q="A query's EXPLAIN ANALYZE shows rows=1 estimated and rows=50000 actual at a scan. What do you do?">
+Treat it as the cause, since everything above inherits it. Check when the
+table was last analysed, and run `ANALYZE`. If the filter combines correlated
+columns, add extended statistics (`CREATE STATISTICS … (dependencies)`); if
+the column is skewed, raise its statistics target. Then check the plan
+changed, typically from a nested loop to a hash join.
+</QA>
+
+<QA level="intermediate" q="What's the difference between Volcano and vectorized execution?">
+Volcano operators return one row per `next()` call, with interpreted
+expressions, so per-row overhead (calls, interpretation, row-format access)
+dominates big scans. Vectorized operators pass batches of roughly a thousand
+values per column, paying that overhead once per batch and running tight
+loops the compiler can turn into SIMD. On the same 5M-row aggregate, Postgres
+took 145 ms on one core and DuckDB 8 ms on one thread, helped by columnar
+storage too.
+</QA>
+
+<QA level="deep" q="How does a planner choose a join order for eight tables without trying 40,320 orders?">
+Dynamic programming over subsets, from System R: find the best plan for each
+single table, then each pair, then each triple, always building from the best
+plans of smaller subsets, so each subset is solved once. That's about 2ⁿ
+subsets instead of n! orders. It keeps extra plans for interesting sort
+orders. Postgres does this up to `geqo_threshold` (12) tables, then switches
+to a genetic search, and doesn't reorder explicit joins beyond
+`join_collapse_limit` (8).
+</QA>
+
+<QA level="deep" q="Why is a query fast in psql but slow from the application?">
+Often a prepared statement. The driver prepares it, Postgres plans the first
+five executions with real parameter values, then switches to a generic plan
+if it's no costlier than their average. With skewed data the generic plan can
+be terrible for some values. Check with `EXPLAIN (ANALYZE) EXECUTE` after six
+executions, or `auto_explain`, and use `plan_cache_mode = force_custom_plan`.
+Other causes: different settings (`work_mem`, `search_path`) or a different
+parameter type causing a cast that disables an index.
+</QA>
+
+<SectionHeading n="12" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="A table has 1,000 pages and 100,000 rows. What does the planner charge for a Seq Scan with one filter?">
+    1,000 × 1.0 + 100,000 × (0.01 + 0.0025) = 2,250.
+  </Q>
+  <Q q="Why does a bitmap heap scan beat a plain index scan at 5% on a random column?">
+    It collects all matching TIDs first and sorts them by page, so each heap
+    page is read once and in order instead of once per matching row.
+  </Q>
+  <Q q="Two predicates each keep 10% of rows. What does Postgres estimate for both together?">
+    1%, by multiplying, unless extended statistics say the columns are
+    dependent.
+  </Q>
+  <Q q="What does a hash join do when the build side doesn't fit in work_mem × hash_mem_multiplier?">
+    Splits both inputs into batches by hash value, keeps one batch in memory,
+    writes the rest to temporary files and processes them one pair at a time.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Selinger et al., Access Path Selection in a Relational DBMS (SIGMOD 1979)">
+    The System R optimizer: cost formulas, selectivity estimates, dynamic
+    programming over join orders and interesting orders.
+  </WildCard>
+  <WildCard name="Graefe, Volcano: An Extensible and Parallel Query Evaluation System (1994)">
+    The iterator model almost every row store still uses, plus the exchange
+    operator for parallelism.
+  </WildCard>
+  <WildCard name="Boncz, Zukowski & Nes, MonetDB/X100 (CIDR 2005)">
+    Why tuple-at-a-time engines waste the CPU, and the vectorized design that
+    became Vectorwise and inspired DuckDB.
+  </WildCard>
+  <WildCard name="Neumann, Efficiently Compiling Efficient Query Plans (VLDB 2011)">
+    Data-centric code generation with LLVM, the design behind HyPer and
+    Umbra.
+  </WildCard>
+  <WildCard name="Leis et al., How Good Are Query Optimizers, Really? (VLDB 2015)">
+    The Join Order Benchmark, and measurements showing cardinality estimates,
+    not cost models, cause most bad plans.
+  </WildCard>
+  <WildCard name="Postgres docs: Using EXPLAIN, and How the Planner Uses Statistics">
+    Section 14.1 and chapter 76: every field in a plan, and worked examples of
+    the selectivity arithmetic with MCVs and histograms.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="13" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Storage Engine Internals">
+    The B+tree pages an index scan walks, the heap it visits, and the buffer
+    pool rings that keep a Seq Scan from flushing the cache.
+    [Chapter 18](/topics/18-storage-engines).
+  </WildCard>
+  <WildCard name="Transactions & Isolation Levels">
+    Why a Seq Scan takes a relation-level SIREAD lock under serializable, and
+    what the visibility checks on every row cost.
+    [Chapter 19](/topics/19-transactions-isolation).
+  </WildCard>
+  <WildCard name="CPU Architecture for Software Engineers">
+    Branch prediction, SIMD and instruction-level parallelism: the hardware
+    reasons vectorized execution is faster.
+    [Chapter 01](/topics/01-cpu-architecture).
+  </WildCard>
+  <WildCard name="Memory Hierarchy & Cache Coherence">
+    Why a columnar batch that fits in L1 beats a row scattered across a page.
+    [Chapter 02](/topics/02-memory-hierarchy).
+  </WildCard>
+</CardGrid>

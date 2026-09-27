@@ -1,0 +1,1238 @@
+---
+title: "Kafka & the Log as a Primitive"
+dek: "Kafka is a replicated, append-only file with an offset for every record. This chapter follows a record onto disk, through the in-sync replica set and out through sendfile, and shows what acks, the high watermark and exactly-once really promise."
+readingTime: "~30 min"
+level: "Intermediate"
+versions: "Apache Kafka 4.3.1 (KRaft) · source refs at tag 4.3.1 · measured on linuxkit 6.10.14 aarch64, OpenJDK 21"
+prereqs: "page cache and fsync, TCP basics, replication basics"
+updated: "2026-09-27"
+---
+
+Most engineers meet Kafka as "the queue" between two services. Orders go in
+one end and a consumer reads them out the other. Then the questions start. Why
+did a consumer group stop for a minute while it "rebalanced"? Why does a
+producer with `acks=all` sometimes fail when only one broker is down? Where did
+an acknowledged message go after a leader election?
+
+Kafka isn't a queue, and treating it as one is probably behind most of those
+surprises.
+It's a **log**: an append-only file of records, each with a number, copied to a
+few machines. Messages aren't removed when they're read. Readers just remember
+how far they've got.
+
+This chapter builds Kafka up from that one idea. It follows a record onto disk,
+through replication and back out to a consumer, then covers exactly-once,
+retention and the KRaft controller. Every shell block was run against a
+three-broker Kafka 4.3.1 cluster, and the output is pasted as it came out.
+
+<SectionHeading n="01" id="log">The log as a primitive</SectionHeading>
+
+A **log** is the simplest storage structure there is. Jay Kreps, who co-created
+Kafka at LinkedIn, put it as "an append-only, totally-ordered sequence of
+records ordered by time" in his essay
+[The Log](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying).
+
+<Sub n="1.1" title="Offsets, and readers that keep their own place">
+
+Each record gets the next integer, its **offset**. You can only add at the end.
+You read from any offset forward.
+
+That sounds too simple to be interesting. It has one property a queue doesn't:
+reading doesn't change the log.
+
+| | A queue (RabbitMQ, SQS) | A log (Kafka) |
+|---|---|---|
+| **What a read does** | Removes or hides the message | Nothing; the reader advances its own offset |
+| **Several readers** | Compete for messages | Each reads everything, at its own pace |
+| **Replay** | Gone once acknowledged | Rewind the offset and read again |
+| **Ordering** | Usually per queue, weakened by redelivery | Strict, per partition |
+| **Deletion** | Per message, on acknowledgement | Whole files, by age or size (section 8) |
+
+<Why>Why is "readers keep their own place" such a big deal?</Why>
+
+Because the broker stops tracking per-message state. It doesn't need to know
+who has read record 41,902. A consumer is a number, and adding a tenth consumer
+costs the broker almost nothing.
+
+That's also why a log is a good building block for other systems. Databases
+already use one: Postgres's write-ahead log (chapter 21) is a log that replicas
+replay. Kafka takes the same structure and makes it a service anyone can
+append to and replay.
+
+</Sub>
+
+<Sub n="1.2" title="Partitions: many logs, ordered one at a time">
+
+One log on one machine has a ceiling: one disk and one network card. So a Kafka
+**topic** is split into **partitions**, and each partition is an independent
+log with its own offsets.
+
+Producers pick the partition. With a key, the default is a murmur2 hash of
+the key modulo the partition count, so every record for `order-17` lands in the
+same partition, in order. Without a key, records are spread across partitions.
+
+<Why>Why only per-partition ordering?</Why>
+
+Because a total order across partitions would need every broker to agree on
+every append: a consensus round per record. Kafka gives you ordering
+where it's cheap, inside one partition, and lets you choose what shares a
+partition by choosing the key.
+
+<Callout label="Design implication">
+Pick the key as "the thing whose events must stay in order": an account, an
+order, a device. And pick the partition count early. Adding partitions changes
+`hash(key) % n`, so records for the same key start landing somewhere new and
+the old ordering guarantee no longer holds across the change.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="02" id="on-disk">What a partition looks like on disk</SectionHeading>
+
+A partition is a directory. Here's one from the test cluster, right after five
+keyed records were written to a three-partition topic `orders`:
+
+```text
+$ ls -la data1/orders-0/
+-rw-r--r-- 1 root root 10485760 Sep 27 04:05 00000000000000000000.index
+-rw-r--r-- 1 root root      123 Sep 27 04:05 00000000000000000000.log
+-rw-r--r-- 1 root root 10485756 Sep 27 04:05 00000000000000000000.timeindex
+-rw-r--r-- 1 root root        8 Sep 27 04:05 leader-epoch-checkpoint
+-rw-r--r-- 1 root root       43 Sep 27 04:05 partition.metadata
+```
+
+<Sub n="2.1" title="Segments and their two indexes">
+
+Records live in the `.log` file. When it passes `log.segment.bytes` (1 GiB by
+default) Kafka closes it and starts a new **segment**, named by the first offset
+it holds. A partition is a list of segments; only the newest, the **active
+segment**, is written to.
+
+Next to each segment sit two indexes:
+
+| File | Entry | What it maps |
+|---|---|---|
+| `.index` | 8 bytes: 4-byte offset relative to the segment's base, 4-byte file position | Offset → byte position in the `.log` |
+| `.timeindex` | 12 bytes: 8-byte timestamp, 4-byte relative offset | Timestamp → offset, for "seek to 09:00" |
+
+Both are preallocated to `log.index.size.max.bytes` (10 MiB) and memory-mapped,
+so a 123-byte log sits next to two 10 MB files. `du` reported 0 KB for
+both, because the files are sparse. At 10,485,756 bytes, the time index is the
+largest multiple of 12 that fits.
+
+<Why>Why is the index sparse?</Why>
+
+Because it doesn't need an entry per record. Kafka adds one roughly every
+`log.index.interval.bytes` (4,096) of log. A lookup binary-searches the index for
+the nearest entry at or below the target offset and scans forward from there, at
+most a few kilobytes. So the index stays small enough to live in memory.
+
+</Sub>
+
+<Sub n="2.2" title="The record batch">
+
+Kafka never stores a lone record. Its unit on disk, on the wire and in
+replication is a **record batch**, and its header is identical in all three
+places:
+
+<SourceRead
+  file="clients/src/main/java/org/apache/kafka/common/record/internal/DefaultRecordBatch.java"
+  repo="apache/kafka"
+  tag="4.3.1"
+  href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/common/record/internal/DefaultRecordBatch.java"
+>
+```java
+ * RecordBatch =>
+ *  BaseOffset => Int64
+ *  Length => Int32
+ *  PartitionLeaderEpoch => Int32
+ *  Magic => Int8
+ *  CRC => Uint32
+ *  Attributes => Int16
+ *  LastOffsetDelta => Int32 // also serves as LastSequenceDelta
+ *  BaseTimestamp => Int64
+ *  MaxTimestamp => Int64
+ *  ProducerId => Int64
+ *  ProducerEpoch => Int16
+ *  BaseSequence => Int32
+ *  RecordsCount => Int32
+ *  Records => [Record]
+```
+</SourceRead>
+
+That's 61 bytes of header, then the records, each storing its offset and
+timestamp as small varint deltas from the batch's base. Three fields matter for
+later sections: `PartitionLeaderEpoch` (section 4), and `ProducerId`,
+`ProducerEpoch` and `BaseSequence`, which make up idempotence (section 7).
+
+<TryIt what="Dump a real segment" lang="shell" toolchain="Kafka 4.3.1, linuxkit 6.10.14 aarch64">
+```shell
+kafka-dump-log.sh --files data1/orders-0/00000000000000000000.log --print-data-log
+```
+
+<Output>
+```text
+Dumping data1/orders-0/00000000000000000000.log
+Log starting offset: 0
+baseOffset: 0 lastOffset: 1 count: 2 baseSequence: 0 lastSequence: 1 producerId: 1000
+  producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false
+  position: 0 CreateTime: 1790481955153 size: 123 magic: 2 compresscodec: none crc: 2772778610
+| offset: 0 keySize: 7 valueSize: 17 sequence: 0 key: order-2 payload: {"id":2,"amt":20}
+| offset: 1 keySize: 7 valueSize: 17 sequence: 1 key: order-3 payload: {"id":3,"amt":30}
+```
+
+Two records, 48 bytes of key and value, 123 bytes on disk: the 61-byte header
+plus roughly 31 bytes per record. Nobody asked the console producer for
+idempotence, yet the batch carries `producerId: 1000` and sequence numbers.
+That's the default since Kafka 3.0.
+</Output>
+</TryIt>
+
+<Why>Why does the broker keep the producer's batches intact?</Why>
+
+So it doesn't have to touch them. It validates the CRC and assigns
+offsets, then writes the bytes as they arrived. On the way out it sends those
+same bytes to consumers. Section 5 shows why that matters so much.
+
+</Sub>
+
+<Sub n="2.3" title="Finding offset N">
+
+A consumer asks for "partition 2, from offset 5,000". Here's how the broker
+turns that into bytes:
+
+<Steps
+  title="Serving a fetch at offset 5,000"
+  lanes={[
+    { t: "Fetch request", s: "partition, offset", icon: "⇣" },
+    { t: "Segment list", s: "sorted by base offset", icon: "▤" },
+    { t: ".index", s: "mmap, binary search", icon: "⌗" },
+    { t: ".log", s: "short forward scan", icon: "≡" },
+    { t: "Socket", s: "sendfile()", icon: "⇡" },
+  ]}
+  steps={[
+    [0, "A fetch arrives for offset 5,000 with a byte limit (`max.partition.fetch.bytes`, 1 MiB by default)."],
+    [1, "The broker picks the segment with the **largest base offset ≤ 5,000**. Segments are kept in a sorted map, so this is a floor lookup."],
+    [2, "It binary-searches that segment's memory-mapped `.index` for the last entry at or below 5,000. It gets back a byte position, not an exact match."],
+    [3, "From that position it reads batch headers forward, skipping whole batches, until it reaches the batch containing offset 5,000. **At most about 4 KB of scanning.**"],
+    [4, "It hands the socket a file range (segment, start position, length) and the kernel copies it straight from the page cache. **The records never enter the JVM heap.**"],
+  ]}
+/>
+
+Fetches return whole batches, so a consumer asking for offset 5,000 may get
+a batch that starts at 4,960, and the client drops the records it didn't ask for.
+
+</Sub>
+
+<SectionHeading n="03" id="write-path">The write path: batching and acks</SectionHeading>
+
+A call to `producer.send()` doesn't send anything. It appends the record to an
+in-memory batch for its partition and returns a future.
+
+<Sub n="3.1" title="The accumulator, batch.size and linger.ms">
+
+The producer's **record accumulator** keeps one open batch per partition. A
+background sender thread ships a batch when it's full (`batch.size`, 16,384
+bytes) or when it has waited `linger.ms`.
+
+`linger.ms` defaulted to 0 until Kafka 4.0. It's now 5, and the
+[upgrade notes](https://kafka.apache.org/documentation/#upgrade) give the
+reason: "the efficiency gains from larger batches typically result in similar
+or lower producer latency despite the increased linger."
+
+<Why>Why would waiting make things faster?</Why>
+
+Because the broker's cost is mostly per request and per batch, not per byte:
+parsing, a CRC check, an append, a replication round. Put 150 records in a batch
+and you pay those costs once instead of 150 times.
+
+Here's how much it matters. One producer, 100-byte records, `acks=all`, a
+three-partition topic with replication factor 3, as fast as it will go:
+
+<Compare
+  cols={["Producer settings", "Records/s (median of 3)", "MB/s", "Records per batch"]}
+  rows={[
+    ["batch.size=100, linger.ms=0", "2,457", "0.23", "1"],
+    ["Defaults: batch.size=16384, linger.ms=5", "153,022", "14.6", "about 148"],
+    ["batch.size=262144, linger.ms=20", "233,645", "22.3", "up to about 2,400"],
+  ]}
+/>
+
+Batching is worth roughly **60×** here. That 148 comes from the dump of a default
+run: batches of 148 records, 16,277 bytes each, roughly 110 bytes per 100-byte
+record. On this shared box the runs varied a lot (the defaults ranged from
+92k to 168k records a second), so read the ratios, not the absolute numbers.
+
+</Sub>
+
+<Sub n="3.2" title="acks: when the producer hears back">
+
+`acks` decides when the leader answers the producer:
+
+| `acks` | Leader replies when | You can lose an acknowledged record when |
+|---|---|---|
+| `0` | Never. The producer doesn't wait | Anything goes wrong, including the request never arriving |
+| `1` | The leader has appended to its own log | The leader dies before a follower copies the record |
+| `all` (or `-1`) | Every replica in the ISR has it, and the ISR has at least `min.insync.replicas` members | Every in-sync replica is lost at once |
+
+`all` has been the default since Kafka 3.0. Latency at a steady 3,000 records a
+second on the same cluster, so queueing doesn't swamp the numbers:
+
+<Compare
+  cols={["acks", "p50", "p99", "What the wait covers"]}
+  rows={[
+    ["0", "1 ms", "20 ms", "Handing the batch to the socket"],
+    ["1", "1 ms", "39 ms", "One round trip and a leader append"],
+    ["all", "6 ms", "75 ms", "Plus followers fetching the batch and the leader seeing their progress"],
+  ]}
+/>
+
+<Why>Why does acks=all cost a few milliseconds even on one machine?</Why>
+
+Because followers **pull**. Nobody pushes the record to them. The leader
+waits until each follower's next fetch asks for an offset past the record, which
+proves the follower has it. Only then does it answer the producer. Section 4.1 follows that exchange in detail.
+
+</Sub>
+
+<SectionHeading n="04" id="replication">Replication: the ISR and the high watermark</SectionHeading>
+
+Each partition has one **leader** and some **followers**; replication factor 3
+means one of each plus one more. Producers and consumers talk to the leader.
+Followers are just consumers that write what they read into their own copy of
+the log.
+
+<Sub n="4.1" title="LEO, HW and committed records">
+
+Every replica tracks its **log end offset** (LEO): the offset the next record
+will get. Leaders also track the **high watermark** (HW): the offset below
+which every in-sync replica has the data. Records below the HW are
+**committed**; only those are shown to consumers.
+
+<StepSequence
+  title="One record, from produce to visible"
+  actors={["Producer", "Leader", "Follower A", "Follower B"]}
+  messages={[
+    { from: 0, to: 1, label: "Produce offset 100, acks=all", note: "The leader appends the batch to its log. Its **LEO becomes 101**. The HW is still 100, so no consumer can see the record yet." },
+    { from: 2, to: 1, label: "Fetch from 100", note: "Follower A's fetch was already parked on the leader, waiting for data (up to `replica.fetch.wait.max.ms`, 500 ms). It returns with the new batch." },
+    { from: 3, to: 1, label: "Fetch from 100", note: "Follower B gets the same batch. Each follower appends it to its own log." },
+    { from: 2, to: 1, label: "Fetch from 101", note: "Follower A's **next** fetch asks for 101. That's how the leader learns A has 100. There's no separate acknowledgement message." },
+    { from: 3, to: 1, label: "Fetch from 101", note: "Same for B. Now every ISR member's LEO is at least 101, so the leader **moves the HW to 101**." },
+    { from: 1, to: 0, label: "ack", note: "The leader answers the produce request. The record is committed, and consumers fetching from 100 can now receive it." },
+  ]}
+/>
+
+<Why>Why not let consumers read up to the leader's LEO?</Why>
+
+Because records above the HW might not survive. If the leader died now, a
+follower without record 100 could become leader, and 100 would never have
+existed. A consumer that had already processed it would have acted on a phantom.
+So consumers are held to records that will outlive the leader.
+
+</Sub>
+
+<Sub n="4.2" title="The in-sync replica set">
+
+The **ISR** is the set of replicas the leader waits for. The
+[design docs](https://kafka.apache.org/documentation/#replication) give two ways
+to leave it:
+
+- **The broker loses its session.** A broker that doesn't heartbeat the
+  controller within `broker.session.timeout.ms` (9 s) is fenced and removed
+  from every ISR it was in.
+- **The follower falls behind.** A replica that hasn't caught up to the
+  leader's end within `replica.lag.time.max.ms` (30 s) is dropped by the
+  leader.
+
+A replica rejoins when it catches up. In a test, a follower killed with `kill
+-9` was out of the ISR roughly 9.5 seconds later, measured by polling
+`kafka-topics.sh --describe` (which takes a second or two per call). That
+matches the 9-second session timeout.
+
+<Why>Why have an ISR instead of a fixed majority quorum?</Why>
+
+A majority quorum, as in Raft, needs 2f+1 copies to survive f failures. The ISR
+needs only f+1, because the leader waits for *all* in-sync replicas and a dead
+one is simply removed from the set. In exchange, the set can shrink, and
+you have to say how small you'll let it get. That's what
+`min.insync.replicas` is for.
+
+</Sub>
+
+<Sub n="4.3" title="min.insync.replicas and a record nobody can read">
+
+`min.insync.replicas` is the smallest ISR that may accept an `acks=all` write.
+With replication factor 3 and `min.insync.replicas=2`, you survive one broker
+loss with no pause and no loss of committed data.
+
+Here's the check, in the leader's append path:
+
+<SourceRead
+  file="core/src/main/scala/kafka/cluster/Partition.scala"
+  repo="apache/kafka"
+  tag="4.3.1"
+  href="https://github.com/apache/kafka/blob/4.3.1/core/src/main/scala/kafka/cluster/Partition.scala#L1219"
+>
+```scala
+        case Some(leaderLog) =>
+          val minIsr = effectiveMinIsr(leaderLog)
+          val inSyncSize = partitionState.isr.size
+
+          // Avoid writing to leader if there are not enough insync replicas to make it safe
+          if (inSyncSize < minIsr && requiredAcks == -1) {
+            throw new NotEnoughReplicasException(s"The size of the current ISR : $inSyncSize " +
+              s"is insufficient to satisfy the min.isr requirement of $minIsr for partition $topicPartition, " +
+              s"live replica(s) broker.id are : $inSyncReplicaIds")
+          }
+
+          val info = leaderLog.appendAsLeader(records, this.leaderEpoch, origin, requestLocal, verificationGuard, transactionVersion)
+
+          // we may need to increment high watermark since ISR could be down to 1
+          (info, maybeIncrementLeaderHW(leaderLog))
+```
+</SourceRead>
+
+The `requiredAcks == -1` means only `acks=all` is refused. An `acks=1` write
+goes through. So what happens to it?
+
+<Predict
+  q="A topic has two replicas and min.insync.replicas=2. One replica's broker is killed, so the ISR is just the leader. A producer with acks=1 writes a record and gets success. What does a consumer see?"
+  options={[
+    "The record, immediately",
+    "The record, once the ISR shrink is noticed",
+    "Nothing, until the dead replica comes back and catches up",
+    "An error from the broker",
+  ]}
+  answer={2}
+>
+Nothing. Since [KIP-966](https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas),
+the high watermark only moves while the ISR has at least `min.insync.replicas`
+members, whatever `acks` the producer used. So the record sits in the leader's log,
+above the HW, invisible. In the test below, the consumer saw it only after the
+second broker was restarted.
+</Predict>
+
+That guard is the first line of the HW function:
+
+<SourceRead
+  file="core/src/main/scala/kafka/cluster/Partition.scala"
+  repo="apache/kafka"
+  tag="4.3.1"
+  href="https://github.com/apache/kafka/blob/4.3.1/core/src/main/scala/kafka/cluster/Partition.scala#L1010"
+>
+```scala
+  private def maybeIncrementLeaderHW(leaderLog: UnifiedLog, currentTimeMs: Long = time.milliseconds): Boolean = {
+    if (isUnderMinIsr) {
+      trace(s"Not increasing HWM because partition is under min ISR(ISR=${partitionState.isr}")
+      return false
+    }
+    // ...
+    val leaderLogEndOffset = leaderLog.logEndOffsetMetadata
+    var newHighWatermark = leaderLogEndOffset
+    remoteReplicasMap.forEach { (_, replica) =>
+      // ... the HW is the lowest LEO among the (maximal) ISR ...
+    }
+```
+</SourceRead>
+
+<TryIt what="Two replicas, min.insync.replicas=2, one broker killed" lang="shell" toolchain="Kafka 4.3.1, three brokers, linuxkit 6.10.14 aarch64">
+```shell
+kafka-topics.sh --create --topic strict --replica-assignment 1:3 --config min.insync.replicas=2
+kill -9 <broker 3>          # wait for the ISR to shrink
+kafka-topics.sh --describe --topic strict
+
+echo hello | kafka-console-producer.sh --topic strict --command-property acks=all
+echo hello | kafka-console-producer.sh --topic strict --command-property acks=1
+kafka-get-offsets.sh --topic strict                     # reports the HW
+kafka-dump-log.sh --files data1/strict-0/00000000000000000000.log | tail -2
+kafka-console-consumer.sh --topic strict --from-beginning --timeout-ms 5000
+```
+
+<Output>
+```text
+Topic: strict  Partition: 0  Leader: 1  Replicas: 1,3  Isr: 1  Elr: 3
+WARN ... Got error produce response ... on topic-partition strict-0, retrying (2 attempts left). Error: NOT_ENOUGH_REPLICAS
+strict:0:0
+baseOffset: 0 lastOffset: 0 count: 1 ... producerId: -1 ... size: 73
+baseOffset: 1 lastOffset: 1 count: 1 ... producerId: -1 ... size: 74
+Processed a total of 0 messages
+```
+
+The `acks=all` write was refused. Two `acks=1` writes are on the leader's disk,
+but the high watermark is still 0 and the consumer got nothing. After broker 3
+restarted, the ISR went back to `1,3`, `kafka-get-offsets` reported 2 and the
+consumer read both. `Elr: 3` is KIP-966's **eligible leader replica**: broker 3
+is out of the ISR but known to hold everything up to the HW, so it may still be
+elected cleanly.
+</Output>
+</TryIt>
+
+<Callout label="Common mistake" kind="warn">
+Setting replication factor 3 and leaving `min.insync.replicas` at its broker
+default of **1**. Now the ISR can shrink to the leader alone, `acks=all` means
+"the leader has it", and one more failure loses acknowledged data. Use RF 3
+with `min.insync.replicas=2` for anything you can't lose.
+</Callout>
+
+</Sub>
+
+<Sub n="4.4" title="Leader epochs: truncating a log safely">
+
+When a leader dies, the controller picks a new one from the ISR, and every
+replica has to agree on where the log now ends. A follower may hold records the
+new leader never got. Those have to be cut off.
+
+Kafka originally truncated followers to their own high watermark. That lost
+data or left replicas diverged in some double-failure cases, described in
+[KIP-101](https://cwiki.apache.org/confluence/display/KAFKA/KIP-101+-+Alter+Replication+Protocol+to+use+Leader+Epoch+rather+than+High+Watermark+for+Truncation),
+because a follower's HW lags the leader's.
+
+KIP-101's fix was the **leader epoch**, a counter that goes up with each new leader
+and is stamped on every batch (the `PartitionLeaderEpoch` field above). Each
+replica keeps a small file, `leader-epoch-checkpoint`, recording the first
+offset of each epoch.
+
+<Why>How does an epoch tell a follower where to cut?</Why>
+
+A returning follower asks the new leader: "where did epoch 4 end for you?" The
+leader answers with the first offset of epoch 5 in its own log, and the follower
+truncates to that point. Both logs now match up to there, whatever either high
+watermark said. Raft solves the same problem with its term numbers.
+
+</Sub>
+
+<Sub n="4.5" title="Unclean leader election">
+
+If every ISR member is gone, you have a choice. Wait for one of them to come
+back, or elect a replica that was out of sync and accept the loss of whatever
+it didn't have.
+
+`unclean.leader.election.enable` makes that choice, and it defaults to `false`:
+the partition stays offline instead of silently losing committed data.
+
+This is where Kafka's replication story started. Kyle Kingsbury's
+[Jepsen test of Kafka](https://aphyr.com/posts/293-call-me-maybe-kafka)
+(2013), run against a pre-release Kafka 0.8, shrank the ISR to the leader alone, then partitioned it away. Of 987
+acknowledged writes, 520 were lost. One of his proposed fixes was a minimum ISR
+size, and `min.insync.replicas` is what Kafka later added.
+
+| Setting | Topic stays available when all ISR members die? | Acknowledged data can be lost? |
+|---|---|---|
+| `unclean.leader.election.enable=false` (default) | No: offline until an ISR member returns | No, while one ISR member's disk survives |
+| `unclean.leader.election.enable=true` | Yes: any live replica can lead | Yes, everything it hadn't copied |
+
+</Sub>
+
+<SectionHeading n="05" id="page-cache">The page-cache trick</SectionHeading>
+
+This is the part of the design that surprises people most. Kafka stores
+everything on disk, often keeps weeks of data, and is still fast. It gets there
+mostly by not doing things.
+
+<Sub n="5.1" title="No cache of its own, and no fsync per write">
+
+Kafka's design docs reject the usual plan, a big in-process cache flushed to
+disk "in a panic" when space runs out: "we invert that. All data is immediately
+written to a persistent log on the filesystem without necessarily flushing to
+disk. In effect this just means that it is transferred into the kernel's
+pagecache."
+
+So the broker's `write()` lands in the page cache (chapter 08) and returns, and the
+kernel writes it back to disk later. A JVM cache, the same docs note, would
+store objects at "often doubling the size of the data" and start cold after
+every restart. Page cache survives a broker restart.
+
+<Why>Then what makes an acknowledged record durable?</Why>
+
+Replication. `log.flush.interval.messages` defaults to `Long.MAX_VALUE`, so
+Kafka never fsyncs a segment because of a write. A committed record is in the
+page cache of every ISR member. You lose it only if all of them lose power
+before writeback. That's why ISR members should sit in different racks or
+availability zones. Kafka's docs argue that fsync on every write "can reduce
+performance by two to three orders of magnitude".
+
+<TryIt what="Which files does a broker fsync while taking writes?" lang="shell" toolchain="Kafka 4.3.1, single broker, strace 6.8, linuxkit 6.10.14 aarch64">
+```shell
+strace -f -qq -y -e trace=fsync,fdatasync -p "$BROKER_PID" -o sync.txt &
+kafka-producer-perf-test.sh --topic perf --num-records 200000 --record-size 100 \
+  --throughput 20000 --producer-props acks=all
+grep -oE 'sync\([0-9]+<[^>]*' sync.txt | sed 's#.*23-kafka-logs/##' | sort | uniq -c
+```
+
+<Output>
+```text
+     50 data1/__cluster_metadata-0/00000000000000000000.log
+      5 data1/replication-offset-checkpoint.tmp
+      5 data1
+```
+
+Ten seconds, 200,000 records, about 20 MB into `perf-0`, and **not one fsync
+on the topic's segment**. Every fsync went to the KRaft metadata log (section
+9), which does sync, and to the checkpoint file where the broker records high
+watermarks.
+</Output>
+</TryIt>
+
+</Sub>
+
+<Sub n="5.2" title="sendfile: from page cache to socket">
+
+Serving a read the ordinary way takes four copies, as the docs spell out: disk
+to page cache, page cache to a user buffer, user buffer to socket buffer, socket
+buffer to NIC. **`sendfile()`** skips the middle two: an application names a
+file range and a socket, and the kernel moves page-cache pages to the socket
+itself (chapter 10 follows that path through the stack).
+
+Kafka can do this because of section 2.2: the bytes on disk are already in the
+wire format. Here's the call site:
+
+<SourceRead
+  file="clients/src/main/java/org/apache/kafka/common/network/PlaintextTransportLayer.java"
+  repo="apache/kafka"
+  tag="4.3.1"
+  href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/common/network/PlaintextTransportLayer.java#L213"
+>
+```java
+    public long transferFrom(FileChannel fileChannel, long position, long count) throws IOException {
+        return fileChannel.transferTo(position, count, socketChannel);
+    }
+```
+</SourceRead>
+
+`FileChannel.transferTo` is Java's name for `sendfile` on Linux. Here's what it
+looks like from outside:
+
+<TryIt what="Trace the broker while a consumer reads 200,000 records" lang="shell" toolchain="Kafka 4.3.1, strace 6.8, linuxkit 6.10.14 aarch64">
+```shell
+strace -f -qq -e trace=sendfile -p "$BROKER_PID" -o sf.txt &
+kafka-console-consumer.sh --topic perf --partition 2 --offset 0 --max-messages 200000 > /dev/null
+grep sendfile sf.txt | grep -E '= [0-9]{5,}' | head -3
+```
+
+<Output>
+```text
+12246 sendfile(233, 185, [0] => [433428], 1048576) = 433428
+12246 sendfile(233, 185, [433428] => [739588], 615148) = 306160
+12246 sendfile(233, 185, [739588] => [1048576], 308988) = 308988
+```
+
+Socket 233, segment file 185, starting at **byte 0 of the segment**, asking for
+1,048,576 bytes: the consumer's `max.partition.fetch.bytes`. Linux sent as
+much as the socket buffer would take and the broker came back for the rest. In
+total, 23,075,872 bytes left through `sendfile` for the 200,000 records (roughly
+115 bytes each), and none of them were copied into the JVM.
+</Output>
+</TryIt>
+
+<Why>Why does a lagging consumer hurt everyone?</Why>
+
+A consumer reading the tail gets pages that were written seconds ago and are
+still cached. Kafka's docs put it as "on a Kafka cluster where the consumers are
+mostly caught up you will see no read activity on the disks whatsoever".
+
+A consumer replaying last week's data forces real disk reads, and those pages
+push the tail out of the cache. Now the caught-up consumers and the followers
+start missing cache too. One backfill job can raise latency for every client
+on the broker.
+
+<Callout label="Design implication">
+Size broker RAM for the page cache, not the heap. Keep the JVM heap modest and
+leave the rest for the kernel. Watch disk reads on brokers: in a healthy
+cluster they're near zero, and a rise usually means a consumer is reading far
+behind.
+</Callout>
+
+</Sub>
+
+<Sub n="5.3" title="Why TLS turns the trick off">
+
+`sendfile` works because the kernel never has to change the bytes. TLS has to
+encrypt them, and Kafka does that in Java with `SSLEngine`. From the docs: "`sendfile` is not used when SSL is enabled." The TLS transport layer
+reads the file into a buffer instead:
+
+<SourceRead
+  file="clients/src/main/java/org/apache/kafka/common/network/SslTransportLayer.java"
+  repo="apache/kafka"
+  tag="4.3.1"
+  href="https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/common/network/SslTransportLayer.java#L1003"
+>
+```java
+        if (fileChannelBuffer == null) {
+            // Pick a size that allows for reasonably efficient disk reads, keeps the memory overhead per connection
+            // manageable and can typically be drained in a single `write` call. The `netWriteBuffer` is typically 16k
+            // and the socket send buffer is 100k by default, so 32k is a good number given the mentioned trade-offs.
+            int transferSize = 32768;
+            // Allocate a direct buffer to avoid one heap to heap buffer copy. SSLEngine copies the source
+            // buffer (fileChannelBuffer) to the destination buffer (netWriteBuffer) and then encrypts in-place.
+            // ...
+            fileChannelBuffer = ByteBuffer.allocateDirect(transferSize);
+```
+</SourceRead>
+
+So with TLS every fetched byte is read into user space in 32 KB pieces,
+encrypted by the JVM and written back out. Kernel TLS could in principle keep
+the zero-copy path, but the docs note that in-kernel `SSL_sendfile` "is
+currently not supported by Kafka".
+
+<Callout label="Common mistake" kind="warn">
+Sizing a cluster from a plaintext benchmark and then turning on TLS. Every
+fetch now costs CPU for copying and encryption on the broker, and the gap is
+widest for fan-out topics with many consumers. Benchmark with the security
+settings you'll run in production.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="06" id="consumers">Consumers and consumer groups</SectionHeading>
+
+A consumer is a loop around `poll()`. It fetches batches from partition leaders
+and occasionally records how far it's got.
+
+<Sub n="6.1" title="Committed offsets">
+
+That position is stored in Kafka itself, in the internal compacted topic
+`__consumer_offsets`: one record per group, topic and partition. Committing
+means producing to that topic.
+
+Whether you process or commit first decides your delivery guarantee:
+
+| Order | Crash between the two means | Guarantee |
+|---|---|---|
+| Commit, then process | The records are skipped | At most once |
+| Process, then commit | The records are processed again | At least once, the default |
+| Commit inside the same transaction as the output | Neither | Exactly once, within Kafka (section 7) |
+
+`enable.auto.commit` is `true` by default and commits in the background
+during `poll()`. That's at-least-once as long as you finish processing a batch
+before calling `poll()` again.
+
+</Sub>
+
+<Sub n="6.2" title="Groups, and three generations of rebalancing">
+
+Consumers sharing a `group.id` split the partitions between them. Each partition
+goes to exactly one member, so the useful number of consumers is at most the
+number of partitions.
+
+When members join or leave, partitions move. That's a **rebalance**, and its
+design has changed twice:
+
+| Protocol | Where assignment happens | What stops during a rebalance |
+|---|---|---|
+| **Classic, eager** | A group leader among the clients | Every consumer revokes every partition, then waits for the new plan |
+| **Classic, cooperative** ([KIP-429](https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol), 2.4) | Still the client leader | Only partitions that actually move are revoked |
+| **Consumer protocol** ([KIP-848](https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol), GA in 4.0) | The broker's group coordinator | Nothing global. Each member reconciles on its own heartbeat |
+
+The KIP-848 [operations guide](https://kafka.apache.org/documentation/#consumer_rebalance_protocol)
+says it "no longer relies on a global synchronization barrier". Brokers
+enable it by default, but the Java client still defaults to
+`group.protocol=classic`, so you have to opt in per application.
+
+<Why>Why does a slow handler cause a rebalance?</Why>
+
+Because the classic protocol treats "hasn't called `poll()` for
+`max.poll.interval.ms`" (5 minutes) as dead. A handler stuck on a slow database
+call for five minutes gets kicked out, its partitions move, and another consumer
+reprocesses the same records. Then the first one comes back and triggers
+another rebalance.
+
+<Callout label="Common mistake" kind="warn">
+Raising `session.timeout.ms` to stop rebalance storms caused by slow
+processing. Heartbeats come from a background thread and keep flowing, so
+the session timeout (45 s) isn't what's firing. It's
+`max.poll.interval.ms`. Lower `max.poll.records` (500 by default) so each
+`poll()` loop finishes sooner, or move slow work off the poll thread.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="07" id="exactly-once">Idempotence and exactly-once</SectionHeading>
+
+At-least-once delivery produces duplicates in two places. A producer retries a
+batch whose acknowledgement was lost, and the broker writes it twice. Or a
+consumer reprocesses after a crash. Kafka closes the first with idempotence and
+the second, for Kafka-to-Kafka pipelines, with transactions. Both arrived in
+0.11 ([KIP-98](https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging)).
+
+<Sub n="7.1" title="The idempotent producer">
+
+Each producer gets a **producer ID** from the broker, and numbers its batches
+per partition: 0, 1, 2… The leader remembers the last sequence it accepted for
+each producer ID and rejects anything that doesn't follow:
+
+<SourceRead
+  file="storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerAppendInfo.java"
+  repo="apache/kafka"
+  tag="4.3.1"
+  href="https://github.com/apache/kafka/blob/4.3.1/storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerAppendInfo.java#L196"
+>
+```java
+    private boolean inSequence(int lastSeq, int nextSeq) {
+        return nextSeq == lastSeq + 1L || (nextSeq == 0 && lastSeq == Integer.MAX_VALUE);
+    }
+```
+</SourceRead>
+
+A retried batch that the broker already has is recognised as a duplicate and
+acknowledged without being written again. To do that, the broker keeps the
+metadata of the last five batches per producer (`NUM_BATCHES_TO_RETAIN = 5` in
+`ProducerStateEntry.java`). That's why idempotence requires
+`max.in.flight.requests.per.connection` of 5 or less.
+
+<Why>Can idempotence turn itself off?</Why>
+
+Yes, silently. From the producer docs: "If conflicting configurations are set and
+idempotence is not explicitly enabled, idempotence is disabled." Setting
+`acks=1` is such a conflict. Look back at the dump in section 4.3: those
+`acks=1` batches carry `producerId: -1`. It happened in the batching
+benchmark too, where `acks` was passed explicitly.
+
+<Callout label="Common mistake" kind="warn">
+Setting `acks=1` for speed and assuming you still have Kafka 3.0's
+duplicate-free default. You don't: idempotence went away with it. If you want
+it, set `enable.idempotence=true` explicitly and the producer will refuse a
+conflicting config instead of quietly dropping the guarantee.
+</Callout>
+
+</Sub>
+
+<Sub n="7.2" title="Transactions">
+
+A transaction lets a producer write to several partitions, and commit a
+consumer's offsets, atomically. It's run by a **transaction coordinator**, a
+broker that owns the producer's `transactional.id`, with state kept in another
+internal topic, `__transaction_state`.
+
+<StepSequence
+  title="Read, process, write: one transaction"
+  actors={["App (consumer + producer)", "Txn coordinator", "Output partitions", "__consumer_offsets"]}
+  messages={[
+    { from: 0, to: 1, label: "initTransactions()", note: "The coordinator bumps the **producer epoch** for this `transactional.id`. Any older instance with the same ID is now fenced: its writes will be rejected." },
+    { from: 0, to: 2, label: "send() × N", note: "Records go to the output partitions as usual, flagged transactional. They're in the log but a `read_committed` consumer can't see them yet." },
+    { from: 0, to: 1, label: "sendOffsetsToTransaction()", note: "The input offsets join the transaction, so \"I consumed up to here\" commits with the output." },
+    { from: 0, to: 1, label: "commitTransaction()", note: "The coordinator writes **PREPARE_COMMIT** to `__transaction_state`. From this point the commit will complete even if the app dies." },
+    { from: 1, to: 2, label: "COMMIT marker", note: "The coordinator writes a **control record** into every partition in the transaction, output partitions and offsets alike." },
+    { from: 1, to: 3, label: "COMMIT marker", note: "The offsets become visible too. Everything in the transaction is now visible to `read_committed` readers, or none of it is." },
+  ]}
+/>
+
+Markers are real records, and each takes an offset:
+
+<TryIt what="Three one-second transactions of about 1,000 records each" lang="shell" toolchain="Kafka 4.3.1, linuxkit 6.10.14 aarch64">
+```shell
+kafka-producer-perf-test.sh --topic txn --num-records 3000 --record-size 100 --throughput 1000 \
+  --transactional-id perf-tx --transaction-duration-ms 1000
+kafka-dump-log.sh --files data1/txn-0/00000000000000000000.log --print-data-log | grep endTxnMarker
+```
+
+<Output>
+```text
+| offset: 1001 ... endTxnMarker: COMMIT coordinatorEpoch: 0
+| offset: 2021 ... endTxnMarker: COMMIT coordinatorEpoch: 0
+| offset: 3002 ... endTxnMarker: COMMIT coordinatorEpoch: 0
+```
+
+3,000 records, and the partition ends at offset **3,003**. Batch headers
+also show `producerEpoch` going 1, 2, 3: with transaction version 2
+([KIP-890](https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense)),
+the epoch is bumped on every transaction.
+</Output>
+</TryIt>
+
+<Callout label="Common mistake" kind="warn">
+Computing "records remaining" or checking completeness with offset arithmetic,
+like `end offset - committed offset`. On a transactional topic, markers take up
+offsets, aborted records stay in the log, and compaction removes others. Offsets
+are increasing, not contiguous.
+</Callout>
+
+</Sub>
+
+<Sub n="7.3" title="read_committed and the last stable offset">
+
+A `read_committed` consumer reads up to the **last stable offset** (LSO): the
+first offset of the oldest transaction still open. Nothing past it is delivered,
+even records from producers that aren't transactional at all.
+
+<TryIt what="Hold a transaction open for 40 seconds, then abort" lang="shell" toolchain="Kafka 4.3.1, OpenJDK 21, linuxkit 6.10.14 aarch64">
+```shell
+java -cp "libs/*" Tx.java 40000 &      # begin, send 10 records, flush, sleep, abort
+kafka-console-consumer.sh --topic txn4 --from-beginning --command-property isolation.level=read_uncommitted | wc -l
+kafka-console-consumer.sh --topic txn4 --from-beginning --command-property isolation.level=read_committed | wc -l
+kafka-transactions.sh describe-producers --topic txn4 --partition 0
+```
+
+<Output>
+```text
+10
+0
+ProducerId  ProducerEpoch  LatestCoordinatorEpoch  LastSequence  LastTimestamp  CurrentTransactionStartOffset
+1003        0              -1                      9             1790482933080  0
+```
+
+A default `read_uncommitted` consumer sees all ten records of a transaction
+that's about to be aborted. The `read_committed` one sees nothing, and
+`CurrentTransactionStartOffset: 0` is what's holding the LSO there. After the
+abort, the partition's end offset was 11 (ten records and the ABORT marker), and
+`read_committed` still returned 0 records.
+</Output>
+</TryIt>
+
+<Why>Why is a hanging transaction an outage?</Why>
+
+Because the LSO can't pass it. Until the transaction commits, aborts or times
+out (`transaction.timeout.ms`, 60 s by default on the producer), every
+`read_committed` consumer on that partition is stuck. `kafka-transactions.sh
+find-hanging` and `abort` exist for exactly this case.
+
+</Sub>
+
+<Sub n="7.4" title="What exactly-once covers">
+
+Exactly-once in Kafka means a read-process-write loop where the input offsets
+and the output records commit together, all inside Kafka. It doesn't reach
+beyond that. In the design docs' words, "Exactly-once delivery for other destination
+systems generally requires cooperation with such systems".
+
+| Side effect | Covered by Kafka transactions? | What to do instead |
+|---|---|---|
+| Records written to Kafka topics | Yes | Transactions with `read_committed` downstream |
+| Consumer offsets | Yes | `sendOffsetsToTransaction` |
+| A row in Postgres | No | Store the offset in the same database transaction, or an idempotency key |
+| An email, a payment call | No | Idempotency keys at the receiver |
+
+<Callout label="Design implication">
+Treat "exactly-once" as "exactly-once *inside Kafka*". Anything that leaves the
+cluster is at-least-once, and the receiving side needs to deduplicate.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="08" id="retention">Retention and compaction</SectionHeading>
+
+A log that only grows fills its disks. Kafka removes data in two ways, and both
+work on whole segments, never single records.
+
+<Sub n="8.1" title="Deleting by time and size">
+
+With `cleanup.policy=delete` (the default), a closed segment is deleted once
+its newest record is older than `retention.ms` (7 days by default), or once the
+partition is over `retention.bytes` (unlimited by default). Active segments
+are never deleted.
+
+<Why>Why does retention sometimes keep data far longer than configured?</Why>
+
+Because the active segment doesn't close until it reaches `segment.bytes` or
+`segment.ms`. On a quiet partition with 1 GiB segments, a segment can take weeks
+to fill, and none of it is eligible for deletion until it rolls. Lower
+`segment.ms` for quiet topics; `segment.bytes` can't go below 1 MiB since
+Kafka 4.0.
+
+</Sub>
+
+<Sub n="8.2" title="Compaction: the latest value per key">
+
+With `cleanup.policy=compact`, Kafka keeps at least the last record for each
+key and throws older ones away. `__consumer_offsets` works this way: only the
+latest committed offset per partition matters.
+
+<TryIt what="Write 61 versions of three keys, then let the cleaner run" lang="shell" toolchain="Kafka 4.3.1, linuxkit 6.10.14 aarch64">
+```shell
+kafka-topics.sh --create --topic users2 --config cleanup.policy=compact \
+  --config segment.ms=3000 --config min.cleanable.dirty.ratio=0.01
+# alice, bob and carol, versions v1..v61, in three bursts: 183 records
+ls data1/users2-0/          # before, then again 45 s later
+kafka-console-consumer.sh --topic users2 --from-beginning --formatter-property print.offset=true ...
+```
+
+<Output>
+```text
+00000000000000000000.log  00000000000000000090.log  00000000000000000180.log     # before
+00000000000000000000.log  00000000000000000180.log  (and *.deleted files)        # after
+Offset:177  alice  v60
+Offset:178  bob    v60
+Offset:179  carol  v60
+Offset:180  alice  v61
+Offset:181  bob    v61
+Offset:182  carol  v61
+```
+
+183 records became 6. Kafka's cleaner merged the two closed segments into one that
+holds only offsets 177 to 179. Each surviving record **keeps its original
+offset**, so the log now has a gap from 0 to 176. Segment 180, still active,
+wasn't touched; compaction never cleans it.
+</Output>
+</TryIt>
+
+To delete a key, write a **tombstone**: the key with a null value. Tombstones are
+kept for `delete.retention.ms` so that consumers reading slowly
+still see the delete, then drops them.
+
+</Sub>
+
+<SectionHeading n="09" id="kraft">KRaft: the metadata is a log too</SectionHeading>
+
+Someone has to decide which broker leads each partition, who's in each ISR and
+which brokers are alive. For most of Kafka's life that was ZooKeeper.
+[KIP-500](https://cwiki.apache.org/confluence/display/KAFKA/KIP-500%3A+Replace+ZooKeeper+with+a+Self-Managed+Metadata+Quorum)
+replaced it with a Raft quorum of controllers, and Kafka 4.0 removed ZooKeeper
+mode entirely.
+
+<Sub n="9.1" title="A Raft log named __cluster_metadata">
+
+Controllers keep cluster state as a log: topic created, partition
+reassigned, ISR changed, broker fenced. That log is a Kafka partition,
+`__cluster_metadata-0`, with the same segment files as any other.
+
+One active controller appends to it, the other controllers replicate it with
+Raft, and brokers fetch it like followers to keep their own copy of the
+metadata up to date.
+
+<Why>Why does the metadata log fsync when topic data doesn't?</Why>
+
+Because Raft's safety depends on a voter not forgetting what it acknowledged.
+A Raft majority that loses unsynced writes in a power cut can elect a leader
+missing committed entries. That's why the strace in section 5.1 found 50 fsyncs
+on `__cluster_metadata-0` and none on the topic. Metadata is small and changes rarely, so
+the cost probably never shows up in your latency.
+
+A small test cluster shows the quorum:
+
+```text
+$ kafka-metadata-quorum.sh describe --status
+LeaderId:               1
+LeaderEpoch:            1
+HighWatermark:          66
+MaxFollowerLag:         0
+CurrentVoters:          [{"id": 1, ...}, {"id": 2, ...}, {"id": 3, ...}]
+```
+
+</Sub>
+
+<Sub n="9.2" title="What changed for operators">
+
+| | ZooKeeper era | KRaft |
+|---|---|---|
+| **Metadata store** | A separate ZooKeeper ensemble | A Raft log inside Kafka's controllers |
+| **Broker liveness** | ZooKeeper session | Heartbeats to the controller, `broker.session.timeout.ms` (9 s) |
+| **Controller failover** | New controller reloads all state from ZooKeeper | Standby controllers already have the log |
+| **Brokers learn metadata** | RPCs from the controller | Fetching the metadata log |
+| **Supported** | Up to 3.9 | Only option since 4.0 |
+
+</Sub>
+
+<SectionHeading n="10" id="operating">Running Kafka: what to watch and what to fix</SectionHeading>
+
+<Sub n="10.1" title="Settings that decide your guarantees">
+
+| Setting | Default | Set it to | Why |
+|---|---|---|---|
+| Replication factor | Per topic | 3 | Survive a broker loss with a spare |
+| `min.insync.replicas` | 1 | 2 with RF 3 | Otherwise `acks=all` can mean one copy |
+| `acks` | `all` | Leave it | `1` also silently disables idempotence |
+| `enable.idempotence` | `true` | `true`, explicitly | Fail loudly on a conflicting config |
+| `unclean.leader.election.enable` | `false` | Leave it, except for topics that prefer availability | Prevents silent loss |
+| `isolation.level` | `read_uncommitted` | `read_committed` downstream of transactional producers | Otherwise consumers see aborted data |
+| `group.protocol` | `classic` (client) | `consumer` on 4.x clusters | Incremental, broker-driven rebalances |
+
+</Sub>
+
+<Sub n="10.2" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `NOT_ENOUGH_REPLICAS` with one broker down | ISR below `min.insync.replicas` | Restore the broker; check RF and replica placement |
+| `acks=1` writes succeed but consumers see nothing | HW frozen while the ISR is under min ISR | Same; it's the KIP-966 guard working |
+| `UnderReplicatedPartitions` above 0 | A follower is slow or down | Check its disk, network and GC; look for a hot partition |
+| Consumer group keeps rebalancing | Processing exceeds `max.poll.interval.ms` | Lower `max.poll.records`, move slow work off the poll loop, or use the consumer protocol |
+| `read_committed` consumers stall on one partition | A hanging transaction pins the LSO | `kafka-transactions.sh find-hanging`, then `abort` |
+| Produce latency rises when a backfill job starts | Old segments evicting the tail from page cache | Throttle the backfill, add RAM, or serve history from tiered storage |
+| Broker CPU jumps after enabling TLS | No more `sendfile`; the JVM copies and encrypts | Budget for it, or terminate TLS elsewhere where policy allows |
+| Disk usage far above `retention.ms × write rate` | Active segments too big to roll on quiet partitions | Lower `segment.ms` or `segment.bytes` for those topics |
+| Duplicates after producer retries | Idempotence disabled by `acks=1` or `max.in.flight` above 5 | `acks=all`, `enable.idempotence=true` |
+
+<Callout label="Design implication">
+Of the broker metrics, the ISR ones matter most:
+`UnderReplicatedPartitions`, `UnderMinIsrPartitionCount` and
+`OfflinePartitionsCount`. Alert on the second, because that's when `acks=all`
+writes start failing, and the first is the warning before it.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="11" id="summary">Summary</SectionHeading>
+
+1. **Kafka is a log, not a queue.** Reads don't remove anything; each consumer
+   keeps its own offset, so extra readers are nearly free.
+2. **Ordering is per partition.** The key picks the partition, so choose it as
+   the thing whose events must stay in order.
+3. **A partition is a directory of segments.** Each has a sparse offset index
+   and time index; a lookup is a floor search, a binary search and a short scan.
+4. **The batch is the unit of everything.** Batching was worth about 60× in
+   throughput here, and `linger.ms` now defaults to 5 for that reason.
+5. **`acks=all` waits for the ISR, and the ISR can shrink.** Pair RF 3 with
+   `min.insync.replicas=2`, or `acks=all` can mean one copy.
+6. **Consumers only see records below the high watermark.** Since KIP-966 the
+   HW stops moving when the ISR is under min ISR, even for `acks=1` writes.
+7. **Durability comes from replication, not fsync.** The broker left 20 MB of
+   writes in the page cache; only the KRaft metadata log was synced.
+8. **`sendfile` sends fetches from page cache to socket.** TLS turns it off, and
+   a lagging consumer can evict everyone else's cache.
+9. **Idempotence and transactions give exactly-once inside Kafka only.**
+   `acks=1` silently turns idempotence off, and transaction markers use offsets.
+10. **Retention and compaction work on closed segments.** The active segment is
+    never deleted or compacted.
+
+<SectionHeading n="12" id="build">Build this</SectionHeading>
+
+**A one-partition log server in about 400 lines.** Pick any language with
+`sendfile` access (Go, Rust, C, or Java's `FileChannel.transferTo`).
+
+- An append endpoint that writes length-prefixed batches to a segment file and
+  returns the base offset. Roll to a new file at 64 MB, named by base offset.
+- A sparse index: one (relative offset, position) pair every 4 KB, in an
+  `mmap`ed file. Implement "fetch from offset N" as floor search, binary search,
+  forward scan.
+- Serve fetches with `sendfile`. Then serve them with read-into-buffer-and-write
+  and compare CPU per GB with `perf stat`.
+- Add one follower that pulls from the leader, a high watermark, and an
+  `acks=all` mode. Kill the follower and watch your own HW stop.
+
+<SectionHeading n="13" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What's the difference between a Kafka topic and a message queue?">
+A queue removes a message once it's consumed, and several consumers compete for
+messages. A Kafka topic is a set of append-only logs; reading doesn't change
+them, and each consumer group tracks its own offset. So several groups can each
+read everything, you can replay by resetting an offset, and data is removed only
+by retention or compaction, a whole segment at a time.
+</QA>
+
+<QA level="beginner" q="What do acks=0, acks=1 and acks=all mean?">
+When the leader answers the producer: never, after the leader's own append, or
+after every in-sync replica has the record and the ISR has at least
+`min.insync.replicas` members. `acks=1` loses acknowledged records if the
+leader dies before a follower copies them. `acks=all` is the default since 3.0.
+</QA>
+
+<QA level="intermediate" q="What is the high watermark, and why can't consumers read past it?">
+It's the offset below which every ISR member has the data. Records above it exist
+only on some replicas and could vanish if the leader fails, so showing them
+would let a consumer act on a record that later never existed. A leader learns
+followers' progress from the offsets in their next fetch requests, and since
+KIP-966 it only advances the HW while the ISR is at least `min.insync.replicas`.
+</QA>
+
+<QA level="intermediate" q="Your consumer group rebalances every few minutes. What do you check?">
+Whether processing a batch takes longer than `max.poll.interval.ms` (5 minutes
+by default). If it does, the consumer is treated as dead even though its
+heartbeats are fine. Lower `max.poll.records`, move slow work off the poll
+thread, or raise the interval. Also check for frequent deploys or autoscaling,
+and consider cooperative assignment or the KIP-848 consumer protocol so each
+rebalance only moves the partitions that need to move.
+</QA>
+
+<QA level="intermediate" q="Why is Kafka fast even though it stores everything on disk?">
+Appends are sequential and go to the page cache, not straight to disk; Kafka
+doesn't fsync per write and relies on replication for durability. Batches are
+stored in the wire format, so fetches go from page cache to socket with
+`sendfile` and never enter the JVM. Batching amortises per-request costs.
+Caught-up consumers are served from memory. TLS removes the `sendfile` part.
+</QA>
+
+<QA level="deep" q="How does Kafka prevent duplicates when a producer retries?">
+An idempotent producer gets a producer ID and numbers its batches per
+partition. Its leader keeps the last sequence and the metadata of the last five
+batches per producer ID. A retry that matches a stored batch is acknowledged
+without being written; a gap raises `OutOfOrderSequenceException`. That
+five-batch window is why `max.in.flight.requests.per.connection` must be at most
+5. Idempotence is disabled without warning if you set a conflicting config like
+`acks=1` without setting `enable.idempotence=true`.
+</QA>
+
+<QA level="deep" q="A read_committed consumer is stuck on one partition, and lag keeps rising. Other partitions are fine. What's going on?">
+Probably an open transaction. A `read_committed` consumer can't read past the
+last stable offset, the start of the oldest open transaction on that partition.
+A producer that began a transaction and died or hung pins it until the
+transaction times out, or indefinitely if markers were never written.
+`kafka-transactions.sh describe-producers` shows the `CurrentTransactionStartOffset`,
+`find-hanging` lists stuck ones, and `abort` clears them.
+</QA>
+
+<QA level="deep" q="Why does Kafka use leader epochs for truncation instead of the high watermark?">
+A follower's high watermark lags the leader's, because it only learns the HW in
+the next fetch response. Truncating to it after a leader change could throw away
+committed records or leave replicas with different data at the same offset,
+which KIP-101 documents. Leader epochs, stamped on every batch and checkpointed
+per replica, let a follower ask the new leader exactly where its previous
+epoch ended and truncate to that point.
+</QA>
+
+<SectionHeading n="14" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Three transactions of 1,000 records each commit on one partition. What's the end offset?">
+    3,003. Each commit writes a control record into the partition, and it takes
+    an offset like any other record.
+  </Q>
+  <Q q="Why is a new segment's .index file 10 MB when the log is 123 bytes?">
+    Index files are preallocated to `log.index.size.max.bytes` and memory-mapped.
+    They're sparse on disk, and trimmed when the segment rolls.
+  </Q>
+  <Q q="RF 3, min.insync.replicas=2, two brokers down. Can acks=1 producers still write? Can consumers read what they write?">
+    Yes, and no. Leaders accept `acks=1` writes, but the high watermark can't
+    move while the ISR is under min ISR, so the new records stay invisible.
+  </Q>
+  <Q q="What happens to sendfile when you enable TLS on the listener?">
+    It's not used. Kafka's TLS transport reads the file into a 32 KB direct buffer,
+    encrypts in the JVM and writes it out.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Jay Kreps: The Log (LinkedIn Engineering, 2013)">
+    The essay behind the idea: logs as the backbone of replication, data
+    integration and stream processing.
+  </WildCard>
+  <WildCard name="Kreps, Narkhede, Rao: Kafka (NetDB 2011)">
+    The original paper. The [PDF](https://www.microsoft.com/en-us/research/wp-content/uploads/2017/09/Kafka.pdf)
+    already has the page-cache and sendfile design, before replication existed.
+  </WildCard>
+  <WildCard name="Apache Kafka docs: Design">
+    Persistence, efficiency, replication and delivery semantics, from the
+    project. Most of the quotes in this chapter come from it.
+  </WildCard>
+  <WildCard name="Jepsen: Kafka (2013)">
+    Kyle Kingsbury's test that lost 520 of 987 acknowledged writes with a
+    shrinking ISR, and the start of `min.insync.replicas`.
+  </WildCard>
+  <WildCard name="core/src/main/scala/kafka/cluster/Partition.scala">
+    ISR shrink and expand, the high watermark and the min-ISR checks in one
+    file. Start at `maybeIncrementLeaderHW`.
+  </WildCard>
+  <WildCard name="KIP-98, KIP-848 and KIP-966">
+    Exactly-once and transactions; the broker-driven consumer protocol; eligible
+    leader replicas and the new HW rule. Read these for most of what changed.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="15" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Filesystems & the Page Cache">
+    Writeback, dirty pages and what fsync really guarantees: the ground
+    Kafka's durability model stands on. [Chapter 08](/topics/08-filesystems).
+  </WildCard>
+  <WildCard name="The Linux Networking Stack">
+    What `sendfile` does after Kafka calls it, and the socket buffers a fetch
+    fills. [Chapter 10](/topics/10-linux-networking).
+  </WildCard>
+  <WildCard name="PostgreSQL Deep Dive">
+    The write-ahead log, the other famous log, and how streaming replicas
+    replay it. [Chapter 21](/topics/21-postgres).
+  </WildCard>
+  <WildCard name="Redis Internals">
+    Another system whose replication acknowledges before copying, and what that
+    costs in a failover. [Chapter 22](/topics/22-redis).
+  </WildCard>
+</CardGrid>

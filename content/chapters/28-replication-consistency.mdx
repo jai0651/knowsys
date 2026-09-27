@@ -1,0 +1,995 @@
+---
+title: Replication & Consistency Models
+dek: "What you can read after a write depends on how the copies of your data are kept in step. This chapter defines linearizable, sequential, causal and eventual consistency precisely, shows how Postgres, Kafka, Dynamo-style stores and CRDTs actually implement them, and does the quorum arithmetic so you can tell which guarantee a configuration really buys."
+readingTime: "~32 min"
+level: "Intermediate"
+versions: "PostgreSQL 16.15 measured, source at REL_16_4 · Kafka source at 3.7.0 · measured in a shared 4-CPU container, linuxkit 6.10, and on an Apple M4"
+prereqs: "a database with replicas, basic networking, what a transaction is"
+updated: "2026-09-27"
+---
+
+You meet replication the first time a user updates their profile, reloads the
+page, and sees the old one. The write succeeded. The read went to a replica that
+hadn't caught up yet, and nothing in your stack considered that a bug.
+
+Every system that keeps more than one copy of its data has to decide what a
+reader is allowed to see while the copies disagree. That decision has a name,
+the **consistency model**, and it's usually made for you by a default you've
+never read: `synchronous_commit`, `acks`, a consistency level, a
+`ConsistentRead` flag.
+
+This chapter makes that decision visible. It defines the models precisely,
+from linearizable down to eventual, then follows each through a real system:
+Postgres streaming replication, Kafka's in-sync replicas, Dynamo-style quorums,
+and CRDTs. Along the way you'll measure what each guarantee costs, and learn to
+check what a configuration actually promises before production checks it for you.
+
+<SectionHeading n="01" id="why-replicate">Why keep more than one copy</SectionHeading>
+
+A single database server is simple to reason about. Every read sees every write
+that finished before it, because there's only one place to look. Replication
+breaks that on purpose, and it's worth being clear about what you get in return.
+
+<Sub n="1.1" title="Four reasons, four different requirements">
+
+| Reason | What it needs from the copies | Example |
+|---|---|---|
+| **Durability** | The write exists somewhere else before you say "done" | A synchronous standby in another zone |
+| **Availability** | Another copy can take over when one dies | Postgres failover with Patroni, Redis Sentinel |
+| **Read scaling** | Many copies can answer reads | Read replicas behind a pooler |
+| **Latency** | A copy close to the user | DynamoDB global tables, a CDN |
+
+The rows pull in different directions. Durability wants the copies updated
+*before* the write is acknowledged. Latency and availability want each copy to
+answer *without* waiting for the others. Every design in this chapter picks a
+point between those two.
+
+<Why>Why not just copy every write everywhere before replying?</Why>
+
+Because then every write waits for the slowest copy, and a write can't finish at
+all while any copy is unreachable. You'd have built a system that's less
+available than one server. The whole subject is about waiting for *some*
+copies, and being precise about what readers can see as a result.
+
+</Sub>
+
+<Sub n="1.2" title="Three ways to arrange the copies">
+
+| Topology | Who accepts writes | How conflicts arise | Real systems |
+|---|---|---|---|
+| **Single leader** | One node; others replay its log | They don't, until failover | Postgres, MySQL, Kafka partitions, Redis |
+| **Multi-leader** | Several nodes, each replicating to the others | Two leaders accept writes to the same key | CouchDB, Postgres with bidirectional logical replication, DynamoDB global tables (default mode) |
+| **Leaderless** | Any replica; the client or a coordinator writes to several | Concurrent writes land in different orders on different replicas | Dynamo, Cassandra, Riak |
+
+Single-leader is the default for a reason: one node orders all writes, so there
+are no conflicts to resolve. The other two exist because a single leader is one
+place, in one region, and it has to be up.
+
+</Sub>
+
+<SectionHeading n="02" id="models">Consistency models, from strongest to weakest</SectionHeading>
+
+A consistency model is a contract about which values a read may return. It's
+defined by what a client can *observe*, not by how the system is built. That's
+what makes it useful: you can test a system against it from outside.
+[Jepsen](https://jepsen.io/consistency) does exactly that.
+
+<Sub n="2.1" title="Linearizability: one copy, one moment">
+
+A system is **linearizable** if it behaves as though there's a single copy of
+the data, and every operation takes effect at one instant somewhere between its
+call and its return. Herlihy and Wing defined it in
+[1990](https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf).
+
+The consequence you care about is **recency**. Once any write has returned, or
+any read has seen its value, every read that *starts* later must see that value
+or a newer one. That holds across clients, with no sessions or sticky routing
+involved.
+
+<Why>Why does "starts later" matter so much?</Why>
+
+Because it ties the order of operations to real time. If Alice's write returns
+and she then phones Bob, who reads, Bob must see the write. Weaker models allow
+Bob's read to go to a replica that hasn't heard of it yet. Linearizability is the
+only model on this list where the phone call is safe.
+
+That's why the things that need a single truth are built on it: leader
+election, distributed locks, unique usernames, and "is this seat still free".
+
+</Sub>
+
+<Sub n="2.2" title="Sequential and causal consistency">
+
+**Sequential consistency** ([Lamport, 1979](https://www.microsoft.com/en-us/research/publication/make-multiprocessor-computer-correctly-executes-multiprocess-programs/))
+keeps the single order but drops the link to real time. All clients see the
+same order of operations, and each client's own operations appear in the order it
+issued them. But a read may return a value that's old, as long as everyone
+agrees on the history.
+
+**Causal consistency** drops the single order too. It only promises that if one
+operation could have influenced another (you read a post, then reply to it),
+everyone sees them in that order. Unrelated writes can appear in different orders
+to different readers.
+
+<Why>Why would anyone want causal instead of linearizable?</Why>
+
+Because causal consistency can stay available during a network partition, and
+linearizability can't. A replica cut off from the others can keep serving
+causally consistent reads and writes; it only has to respect the causality it
+knows about. Mahajan, Alvisi and Dahlin
+[proved](https://www.cs.cornell.edu/lorenzo/papers/cac-tr.pdf) that a slightly
+stronger variant is the strongest model that can.
+
+</Sub>
+
+<Sub n="2.3" title="Eventual consistency and session guarantees">
+
+**Eventual consistency** promises only this: if writes stop, all replicas will
+converge on the same value. It says nothing about what you read in the
+meantime. Werner Vogels'
+[Eventually Consistent](https://queue.acm.org/detail.cfm?id=1466448) is the
+classic description of the model as Amazon used it.
+
+Between eventual and causal sit four **session guarantees**, from Terry et al.'s
+[Session Guarantees for Weakly Consistent Replicated Data](https://www.cs.cornell.edu/courses/cs734/2000FA/cached%20papers/SessionGuaranteesPDIS_1.html)
+(1994), written for Xerox PARC's Bayou. They're promises to *one client*, which makes them cheap:
+
+| Guarantee | What one client is promised | What breaks without it |
+|---|---|---|
+| **Read your writes** | You see your own writes | The profile you just saved shows the old version |
+| **Monotonic reads** | You never see time go backwards | A comment appears, then disappears on reload |
+| **Monotonic writes** | Your writes apply in the order you made them | "Delete draft" is applied before "create draft" |
+| **Writes follow reads** | A write you make after reading X is ordered after X | A reply is stored before the post it replies to |
+
+Most "replica lag" bugs you'll meet are probably violations of the first two. You can often fix them
+for the one user who noticed without paying for linearizability for everyone.
+
+</Sub>
+
+<Sub n="2.4" title="The models side by side">
+
+| Model | Real-time order | One global order | Available in a partition | Typical mechanism |
+|---|---|---|---|---|
+| **Linearizable** | Yes | Yes | No | Single leader with quorum reads, Raft, Paxos |
+| **Sequential** | No | Yes | No | Total-order broadcast, then local reads |
+| **Causal** | No | No, only causal pairs | Yes | Version vectors, dependency tracking |
+| **Session guarantees** | No | No | Yes, if the client sticks to reachable replicas | Session tokens, sticky routing, LSN waits |
+| **Eventual** | No | No | Yes | Async replication, anti-entropy |
+
+<Predict
+  q="A Postgres primary with one async read replica. A user saves a setting (on the primary), then the next page load reads it from the replica and sees the old value. Which guarantee was violated?"
+  options={[
+    "Monotonic reads",
+    "Read your writes",
+    "Monotonic writes",
+    "None; eventual consistency allows this and it's still a bug",
+  ]}
+  answer={1}
+>
+Read your writes: the client failed to see its own write. It's also allowed by
+the system's actual model (eventual), so nothing logged an error. The
+bug is a mismatch between what the app assumed and what the replica promises.
+Section 3.4 shows the fixes, most of which cost far less than making every read
+go to the primary.
+</Predict>
+
+</Sub>
+
+<Sub n="2.5" title="What CAP actually says">
+
+Gilbert and Lynch's [proof](https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf)
+of the CAP theorem is narrower than its reputation. It says a system can't be
+both **linearizable** and **available** (every request to a live node gets a
+non-error answer) while the network is **partitioned**.
+
+That's all. It doesn't cover latency, it doesn't cover the weaker models, and
+it says nothing about the system when there's no partition. Abadi's
+[PACELC](https://www.cs.umd.edu/~abadi/papers/abadi-pacelc.pdf) fills that gap:
+if there's a Partition, choose Availability or Consistency; Else, choose
+Latency or Consistency.
+
+<Callout label="Design implication">
+The trade-off you'll pay every day is the "else" half: latency against
+consistency, with the network healthy. Every synchronous copy adds a round trip
+to every write. Partitions are probably rare in your network; round trips happen on every request. Size
+your consistency choice by the latency it adds, not by the partition you might
+see once a year.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="03" id="single-leader">Single-leader replication, measured on Postgres</SectionHeading>
+
+In single-leader replication the primary writes each change to its log, the
+write-ahead log (WAL), and streams the log to standbys, which replay it. The
+interesting question is when the primary tells the client "committed".
+
+<Sub n="3.1" title="Five answers to 'when is it committed?'">
+
+Postgres makes the choice per transaction with
+[`synchronous_commit`](https://www.postgresql.org/docs/16/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT),
+once `synchronous_standby_names` lists at least one standby:
+
+| `synchronous_commit` | The commit returns after | Survives primary loss? | Standby reads see it? |
+|---|---|---|---|
+| `off` | Nothing; WAL is flushed later, within 3 × `wal_writer_delay` | No, even locally | No |
+| `local` | Local WAL flush | Only if the primary's disk survives | No |
+| `remote_write` | Standby has written WAL to its OS (not fsynced) | Unless the standby's OS crashes too | No |
+| `on` (default) | Standby has flushed WAL to disk | Yes | **No** |
+| `remote_apply` | Standby has replayed it | Yes | **Yes** |
+
+The last column is probably the one people miss. The default, `on`, makes the write
+*durable* on the standby. It doesn't make it *visible* there, because replay is a
+separate step that runs after the flush.
+
+Step through one commit with a synchronous standby:
+
+<StepSequence
+  title="One COMMIT with synchronous_commit = on"
+  actors={["Client", "Primary", "Standby"]}
+  messages={[
+    { from: 0, to: 1, label: "COMMIT", note: "The client commits. The primary writes a commit record to its WAL and flushes it locally, as it would with no standby at all." },
+    { from: 1, to: 2, label: "WAL up to LSN X", note: "The **walsender** process streams the WAL to the standby's **walreceiver**. The backend now waits in `SyncRepWaitForLSN()`, and `pg_stat_activity` shows `wait_event = SyncRep`." },
+    { from: 2, to: 2, label: "write + fsync", note: "The standby writes the WAL and fsyncs it. The record is now durable in two places." },
+    { from: 2, to: 1, label: "flush = X", note: "The standby reports its write, flush and apply positions. The walsender sees **flush ≥ X** and wakes the waiting backend." },
+    { from: 1, to: 0, label: "COMMIT OK", note: "The client hears success. **The standby may not have replayed the record yet**, so a query there can still return the old row." },
+    { from: 2, to: 2, label: "replay", dashed: true, note: "The startup process replays the record some time later. Only now can standby queries see it; `remote_apply` would have waited for this step." },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="3.2" title="What each level costs">
+
+<Callout label="The machines" kind="note">
+**Linux:** PostgreSQL 16.15 on kernel 6.10.14-linuxkit, aarch64, in a shared
+4-CPU container on an Apple M4. Primary and standby on the same box, talking
+over loopback. The load average during these runs reached 52 from other
+tenants, so treat every number as noisy and look at the ordering, not the
+values.
+</Callout>
+
+One client, `pgbench` running a single-row `UPDATE` in autocommit, 4 seconds per
+run, seven rounds interleaved across the five modes:
+
+<Compare
+  cols={["synchronous_commit", "Median latency", "Range over 7 runs", "What it waited for"]}
+  rows={[
+    ["off", "0.33 ms", "0.08–0.61 ms", "Nothing"],
+    ["local", "1.74 ms", "0.66–5.09 ms", "Local fsync"],
+    ["remote_write", "2.92 ms", "0.97–6.36 ms", "Local fsync + standby write()"],
+    ["on", "3.17 ms", "1.60–7.37 ms", "Local fsync + standby fsync"],
+    ["remote_apply", "3.74 ms", "1.86–9.47 ms", "… + standby replay"],
+  ]}
+/>
+
+On one box the round trip costs roughly nothing, so what you're seeing is mostly the
+second fsync and the replay. Across availability zones, add the network round
+trip to every row from `remote_write` down. AWS
+[documents](https://docs.aws.amazon.com/whitepapers/latest/aws-fault-isolation-boundaries/availability-zones.html)
+inter-AZ latency as single-digit milliseconds, and that goes on top of every
+commit.
+
+<Why>Why is `off` safe to use at all?</Why>
+
+Because it can lose recent commits, but it can't corrupt anything. The docs say
+a crash leaves the database "just the same as if those transactions had been
+aborted cleanly". For a click-counter or a log of page views, losing the last
+few hundred milliseconds in a crash is often a fine trade for a roughly 5× faster commit.
+You can set it per transaction, so the important writes can keep `on`.
+
+</Sub>
+
+<Sub n="3.3" title="The escape hatch in synchronous replication">
+
+Synchronous replication has a failure mode that surprises people. Stop the
+standby, and every commit on the primary waits forever. In the test above, a
+`CREATE TABLE` issued with the standby down was still in `wait_event = SyncRep`
+**80 seconds** later.
+
+Then there's the way out. Cancel a waiting commit, and here's what the source
+does:
+
+<SourceRead
+  file="src/backend/replication/syncrep.c"
+  repo="postgres/postgres"
+  tag="REL_16_4"
+  href="https://github.com/postgres/postgres/blob/REL_16_4/src/backend/replication/syncrep.c#L269"
+>
+```c
+		/*
+		 * It's unclear what to do if a query cancel interrupt arrives.  We
+		 * can't actually abort at this point, but ignoring the interrupt
+		 * altogether is not helpful, so we just terminate the wait with a
+		 * suitable warning.
+		 */
+		if (QueryCancelPending)
+		{
+			QueryCancelPending = false;
+			ereport(WARNING,
+					(errmsg("canceling wait for synchronous replication due to user request"),
+					 errdetail("The transaction has already committed locally, but might not have been replicated to the standby.")));
+			SyncRepCancelWait();
+			break;
+		}
+```
+</SourceRead>
+
+The commit record is already in the primary's WAL by the time the backend
+waits. It can't be rolled back, so a cancel just stops waiting. Here it is
+happening, with the standby stopped:
+
+<TryIt what="Cancel a commit that's waiting for a stopped synchronous standby" lang="shell" toolchain="PostgreSQL 16.15, linuxkit 6.10.14 aarch64">
+```shell
+psql -c "insert into orders values (42)" &      # session A
+sleep 3
+psql -Atc "select wait_event from pg_stat_activity where query like 'insert%'"
+psql -Atc "select pg_cancel_backend(pid) from pg_stat_activity where wait_event='SyncRep'"
+wait
+psql -Atc "select count(*) from orders where id=42"
+```
+
+<Output>
+```text
+waiting: SyncRep for 3s
+[session A] WARNING:  canceling wait for synchronous replication due to user request
+[session A] DETAIL:  The transaction has already committed locally, but might not have been replicated to the standby.
+[session A] INSERT 0 1
+row visible on primary: 1
+```
+
+The client got `INSERT 0 1`, a success, with a warning most drivers never
+surface. The row is committed on the primary and exists nowhere else.
+</Output>
+</TryIt>
+
+<Callout label="Common mistake" kind="warn">
+Assuming a synchronous standby means no acknowledged write can be lost. A
+statement cancel, a connection-pooler timeout that cancels, or an operator
+running `pg_cancel_backend` on "stuck" sessions all turn a waiting commit into an
+unreplicated one. If you rely on synchronous replication for durability, alert
+on sessions in `SyncRep`, and don't kill them.
+</Callout>
+
+<Why>Why not keep one standby and accept that writes block?</Why>
+
+Because then any standby restart is a write outage. The usual answer is a
+quorum of standbys:
+`synchronous_standby_names = 'ANY 1 (s1, s2)'` commits once either of two
+standbys confirms, so losing one blocks nothing. `FIRST 1 (s1, s2)` instead
+prefers `s1` and falls back to `s2` in order.
+
+</Sub>
+
+<Sub n="3.4" title="Reading your own writes from a replica">
+
+Now the profile bug from the introduction, measured. A client updates one row on
+the primary, then immediately reads it from the standby, 2,000 times in a row.
+A read is **stale** if it returns anything other than the value just written.
+
+<Compare
+  cols={["Primary's synchronous_commit", "Stale reads (3 runs of 2,000)", "Median"]}
+  rows={[
+    ["local (standby is async)", "1,924 · 1,975 · 1,931", "96.6%"],
+    ["on (standby flushed)", "97 · 63 · 38", "3.2%"],
+    ["remote_apply (standby replayed)", "0 · 0 · 0", "0%"],
+  ]}
+/>
+
+<Why>Why does `on` still give stale reads?</Why>
+
+Because, as the table in 3.1 said, a flushed record isn't a replayed record.
+The window between the standby's fsync and its replay is short on an idle box,
+and it caught roughly 3% of reads here. Under a heavy write load, or while replay
+waits on a conflicting query, that window grows.
+
+There are three standard fixes, from cheapest to most expensive:
+
+| Fix | How it works | Cost |
+|---|---|---|
+| **Pin the session to the primary for a while** | After a write, send that user's reads to the primary for N seconds | Primary load; N is a guess at lag |
+| **Wait for an LSN** | Return `pg_current_wal_insert_lsn()` with the write; before reading, the replica waits until `pg_last_wal_replay_lsn()` passes it | A token to carry and a short wait on the replica |
+| **`remote_apply`** | Every commit waits for replay on the synchronous standbys | Every write pays replay latency; only helps reads on those standbys |
+
+The LSN approach is causal consistency for one session, built from two
+functions. It also degrades well: if the replica is far behind, the reader can
+give up waiting and go to the primary.
+
+</Sub>
+
+<Sub n="3.5" title="Kafka's version: in-sync replicas">
+
+Kafka partitions are single-leader too, but Kafka doesn't count a fixed set of
+standbys. It keeps a dynamic **in-sync replica set** (ISR): followers that have
+recently caught up with the leader. With `acks=all`, a produce waits for every
+member of the current ISR, and `min.insync.replicas` sets how small the ISR may
+shrink before writes are refused.
+
+<SourceRead
+  file="core/src/main/scala/kafka/cluster/Partition.scala"
+  repo="apache/kafka"
+  tag="3.7.0"
+  href="https://github.com/apache/kafka/blob/3.7.0/core/src/main/scala/kafka/cluster/Partition.scala#L1354"
+>
+```scala
+          val minIsr = effectiveMinIsr(leaderLog)
+          val inSyncSize = partitionState.isr.size
+
+          // Avoid writing to leader if there are not enough insync replicas to make it safe
+          if (inSyncSize < minIsr && requiredAcks == -1) {
+            throw new NotEnoughReplicasException(s"The size of the current ISR ${partitionState.isr} " +
+              s"is insufficient to satisfy the min.isr requirement of $minIsr for partition $topicPartition")
+          }
+```
+</SourceRead>
+
+Note the `requiredAcks == -1` condition: the check applies only to `acks=all`.
+A producer with `acks=1` writes happily to a leader whose ISR is just itself.
+The [Kafka chapter](/topics/23-kafka-logs) follows the high watermark and
+leader epochs through a failover.
+
+<Callout label="Design implication">
+Postgres counts named standbys; Kafka counts whoever is currently keeping up.
+Kafka's scheme tolerates a slow follower by dropping it from the ISR, at the
+price that "all replicas" can quietly mean one, which is probably not what the
+person who wrote `acks=all` had in mind. With replication factor 3, the
+common safe setting is `min.insync.replicas=2` and `acks=all`: any single broker
+can fail without losing an acknowledged write or blocking producers.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="04" id="quorums">Leaderless replication and quorum arithmetic</SectionHeading>
+
+Amazon's [Dynamo paper](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf)
+(2007) removed the leader. Any replica accepts a write; the client, or a
+coordinator acting for it, sends each operation to several replicas and waits for
+some of them. Cassandra, Riak and ScyllaDB work this way.
+
+<Sub n="4.1" title="N, W and R">
+
+Three numbers describe a leaderless configuration:
+
+- **N**: how many replicas hold each key.
+- **W**: how many must acknowledge a write before it succeeds.
+- **R**: how many must answer a read before it returns.
+
+If `W + R > N`, every read set overlaps every write set in at least one
+replica. So a read always reaches at least one replica that has the latest
+*completed* write, and can return it by picking the value with the highest
+version. Dynamo's paper gives (3, 2, 2) as the common configuration.
+
+<Estimate
+  rows={[
+    { label: "N = 3, W = 2, R = 2 (Cassandra QUORUM both ways)", math: "2 + 2 > 3", value: "overlap ≥ 1" },
+    { label: "Replicas that can be down for writes", math: "N − W", value: "1" },
+    { label: "Replicas that can be down for reads", math: "N − R", value: "1" },
+    { label: "N = 3, W = 1, R = 1 (Cassandra ONE)", math: "1 + 1 ≤ 3", value: "no overlap" },
+    { label: "N = 5, W = 3, R = 3", math: "3 + 3 > 5", value: "survives 2 down" },
+  ]}
+  result={{ label: "Quorum rule of thumb for N replicas", value: "W = R = ⌊N/2⌋ + 1" }}
+/>
+
+Cassandra's `QUORUM` is exactly that ⌊RF/2⌋ + 1, and `LOCAL_QUORUM` counts only
+replicas in the coordinator's datacenter, so it doesn't pay a cross-region round
+trip.
+
+<Why>Why do quorums tolerate slow nodes so well?</Why>
+
+Because the client waits for the fastest W or R replies and ignores the rest.
+One replica in a GC pause adds no latency at all to a `W = 2` write with
+`N = 3`. A single leader can't do that: if the leader is slow, every write is
+slow.
+
+</Sub>
+
+<Sub n="4.2" title="A quorum read, with read repair">
+
+Step through a read at `R = 2` when one replica missed the latest write:
+
+<StepSequence
+  title="Quorum read, N = 3, R = 2, one stale replica"
+  actors={["Client", "Coordinator", "Replica A", "Replica B"]}
+  messages={[
+    { from: 0, to: 1, label: "GET cart", note: "The client asks any node. That node becomes the **coordinator** for this request." },
+    { from: 1, to: 2, label: "read", note: "It asks the replicas that own the key. Cassandra sends a full data request to one and **digest** requests (a hash of the value) to the others." },
+    { from: 1, to: 3, label: "digest", note: "Replica B answers too. Two replies meet R = 2, so the third replica is not waited for." },
+    { from: 3, to: 1, label: "v1 (ts 100)", note: "The replies disagree. Replica B has an older version; the coordinator picks the value with the **highest timestamp**, v2 from A." },
+    { from: 1, to: 3, label: "repair: v2", note: "Before answering, it writes v2 back to B. This is **blocking read repair**, the default in Cassandra 4.0 (`read_repair = 'BLOCKING'`)." },
+    { from: 1, to: 0, label: "v2", note: "The client gets v2. Any later quorum read must now overlap a replica holding v2, so reads can't go backwards." },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="4.3" title="Why W + R > N isn't linearizable">
+
+The overlap rule promises that a read sees the latest *completed* write. It says
+nothing about a write that's still in flight, and that gap is enough to break
+linearizability.
+
+<StepSequence
+  title="Two quorum reads during one slow write (no read repair)"
+  actors={["Writer", "Replica A", "Replica B", "Replica C", "Readers"]}
+  messages={[
+    { from: 0, to: 1, label: "x = 2", note: "A writer starts setting x from 1 to 2 with W = 2. The write reaches **A** first; the messages to B and C are delayed." },
+    { from: 4, to: 1, label: "read A, B", note: "Reader 1 reads from A and B. A says 2, B says 1. The newest wins: **reader 1 sees 2**." },
+    { from: 4, to: 2, label: "read B, C", note: "Reader 2 starts *after* reader 1 finished. It reads B and C, both still 1: **reader 2 sees 1**." },
+    { from: 0, to: 2, label: "x = 2", note: "The write reaches B and completes. Every replica ends up agreeing." },
+    { from: 4, to: 4, label: "history", dashed: true, note: "But a later read returned an older value than an earlier one. **No single-copy order explains that**, so the history isn't linearizable, even though W + R > N." },
+  ]}
+/>
+
+<Why>Why does read repair fix it?</Why>
+
+Because it makes a reader finish the write it saw. If reader 1 writes 2 back to a
+quorum before returning, reader 2's quorum must overlap one replica with 2.
+That's the [ABD algorithm](https://dl.acm.org/doi/10.1145/200836.200869)
+(Attiya, Bar-Noy and Dolev, 1995), and it's what the
+[Cassandra docs](https://cassandra.apache.org/doc/latest/cassandra/managing/operating/read_repair.html)
+call **monotonic quorum reads**. Setting `read_repair = 'NONE'` gives it up.
+
+Even ABD only gives a linearizable *register*. It can't do compare-and-set,
+because two writers can each pass a quorum with different values. For that,
+Cassandra has lightweight transactions, which run Paxos. The
+[consensus chapter](/topics/27-consensus) covers why that step needs consensus
+and not just overlap.
+
+</Sub>
+
+<Sub n="4.4" title="Sloppy quorums, hinted handoff and anti-entropy">
+
+Dynamo had one more trick. If some of a key's N home replicas are down, a write
+goes to the next healthy nodes on the ring instead, which keep a **hint** and
+hand the data back when the home replica returns. That's a **sloppy quorum**.
+
+<Why>Why does a sloppy quorum break the overlap?</Why>
+
+Because W acknowledgements from *stand-in* nodes don't overlap R replies from
+the *home* nodes. A write can succeed and a following quorum read can miss it
+entirely until the hints are delivered. Sloppy quorums buy write availability
+and give up the `W + R > N` argument to get it.
+
+Replicas that missed writes and never got hints are fixed by **anti-entropy**:
+a background comparison of Merkle trees, so two replicas can find their
+differences by exchanging hashes instead of data (`nodetool repair` in
+Cassandra).
+
+<Callout label="Common mistake" kind="warn">
+Not running repair on a Cassandra cluster that deletes data. Deletes are stored
+as tombstones, and tombstones are purged after `gc_grace_seconds` (ten days by
+default). A replica that missed the delete and isn't repaired in that window
+still holds the old value, and hands it back to everyone: the deleted row comes
+back.
+</Callout>
+
+</Sub>
+
+<Sub n="4.5" title="Quorums in a storage engine: Aurora">
+
+Quorum arithmetic isn't only for key-value stores. Amazon Aurora
+([SIGMOD 2017](https://www.amazon.science/publications/amazon-aurora-design-considerations-for-high-throughput-cloud-native-relational-databases))
+stores six copies of each segment across three availability zones, with a write
+quorum of 4 and a read quorum of 3.
+
+| Failure | Copies lost | Writes? | Reads? |
+|---|---|---|---|
+| One node | 1 | Yes (5 ≥ 4) | Yes |
+| One whole AZ | 2 | Yes (4 ≥ 4) | Yes |
+| One AZ plus one more node | 3 | No (3 below 4) | Yes (3 ≥ 3), so it can rebuild |
+
+`4 + 3 > 6`, so reads overlap writes. And `4 + 4 > 6`, so two writes overlap
+too, which stops two writers from both succeeding on disjoint copies. The
+paper's argument for six copies is exactly the last row: "AZ+1" failures must
+not lose data.
+
+</Sub>
+
+<SectionHeading n="05" id="conflicts">Conflicts, version vectors and CRDTs</SectionHeading>
+
+With multiple leaders or no leader, two replicas can accept different writes to
+the same key at the same time. Something has to decide what the value is
+afterwards.
+
+<Sub n="5.1" title="Last writer wins, and what it throws away">
+
+The simplest rule: every write carries a timestamp, and the highest timestamp
+wins. Cassandra does this per column.
+
+It converges, but it **silently discards** every concurrent write except one.
+And "last" is decided by wall clocks on different machines, so a node whose clock
+runs a few seconds fast wins every conflict for as long as it's fast, even
+against writes made later in real time.
+
+<Why>Why not just use better clocks?</Why>
+
+Because two writes that happen at "the same time" on different replicas aren't
+ordered, whatever the clocks say. Neither saw the other. Picking one by timestamp
+is a policy, not a fact. What you need first is a way to *detect* that two
+writes were concurrent.
+
+</Sub>
+
+<Sub n="5.2" title="Detecting concurrency with version vectors">
+
+A **version vector** keeps one counter per replica. Each replica increments its
+own entry when it accepts a write, and a write carries the vector it was based
+on. Compare two vectors entry by entry:
+
+| Comparison | Meaning | What to do |
+|---|---|---|
+| Every entry of A ≤ B | A happened before B | Keep B |
+| Every entry of B ≤ A | B happened before A | Keep A |
+| Neither | **Concurrent** | Keep both as siblings, or merge |
+
+Dynamo kept both and returned the siblings to the application, which merged
+them. For the shopping cart, the merge was a union. The paper is candid about
+the consequence: "deleted items can resurface", because a union can't tell a
+removed item from one the other replica never had.
+
+</Sub>
+
+<Sub n="5.3" title="CRDTs: data types that merge themselves">
+
+A **conflict-free replicated data type** is a data structure whose merge
+function needs no application help, and always converges. Shapiro, Preguiça,
+Baquero and Zawirski
+[formalised them in 2011](https://www.lip6.fr/Marc.Shapiro/papers/2011/CRDTs_SSS-2011.pdf).
+
+The trick is to make merge **commutative, associative and idempotent**. Then it
+doesn't matter in which order replicas exchange state, how often, or whether
+messages are duplicated. They all reach the same value. (Mathematically, the
+states form a join-semilattice and merge is the join.)
+
+The simplest example is a grow-only counter:
+
+<Steps
+  title="A G-counter across a partition"
+  lanes={[
+    { t: "Replica A", s: "vector [a, b]", icon: "A" },
+    { t: "Replica B", s: "vector [a, b]", icon: "B" },
+    { t: "Exchange", s: "send whole state", icon: "⇄" },
+    { t: "Merge", s: "per-entry max", icon: "∨" },
+    { t: "Value", s: "sum of entries", icon: "Σ" },
+  ]}
+  steps={[
+    [0, "Both replicas start at `[0, 0]`. Each one only ever increments **its own entry**: A owns the first slot, B the second."],
+    [0, "The network partitions. A takes three increments and holds `[3, 0]`, with a local value of 3."],
+    [1, "B takes two increments meanwhile and holds `[0, 2]`. Neither can see the other, and neither blocks."],
+    [2, "The partition heals and they swap states. There's no log to replay and no ordering to agree on."],
+    [3, "Each takes the **max of each entry**: `max([3,0], [0,2]) = [3, 2]`. Merging again, or in the other order, gives the same answer."],
+    [4, "Both report **5**. A plain integer with last-writer-wins would have reported 3 or 2 and lost the other side's increments."],
+  ]}
+/>
+
+Per-entry max is idempotent (merging twice changes nothing) and commutative
+(the order doesn't matter), and those two properties are the whole trick. Subtraction breaks them, so a
+counter that goes down is two G-counters, one for increments and one for
+decrements (a **PN-counter**).
+
+</Sub>
+
+<Sub n="5.4" title="An OR-set keeps the cart honest">
+
+Dynamo's cart problem has a CRDT answer: the **observed-remove set**. Each add
+gets a unique tag, and a remove deletes only the tags it has *seen*. An add that
+happens concurrently with a remove carries a tag the remove never saw, so it
+survives. Add wins over concurrent remove, and a remove that wasn't concurrent
+with anything sticks.
+
+<TryIt what="G-counter and OR-set merges, against last-writer-wins" lang="python" toolchain="Python 3.14.6, Apple M4">
+```python
+class GCounter:
+    def __init__(self, me): self.me, self.p = me, {}
+    def inc(self, n=1): self.p[self.me] = self.p.get(self.me, 0) + n
+    def value(self): return sum(self.p.values())
+    def merge(self, o):
+        for r, n in o.p.items(): self.p[r] = max(self.p.get(r, 0), n)
+
+class ORSet:
+    def __init__(self): self.adds, self.removes = set(), set()   # (element, tag)
+    def add(self, e): self.adds.add((e, uuid.uuid4().hex[:6]))
+    def remove(self, e): self.removes |= {t for t in self.adds if t[0] == e}
+    def value(self): return {e for e, t in self.adds - self.removes}
+    def merge(self, o): self.adds |= o.adds; self.removes |= o.removes
+
+a, b = GCounter("a"), GCounter("b")
+a.inc(3); b.inc(2)
+a.merge(b); b.merge(a); a.merge(b)          # repeated merges change nothing
+
+x, y = ORSet(), ORSet()
+x.add("book"); y.merge(x)                   # both carts hold the book
+x.remove("book")                            # replica x: user removes it
+y.add("book")                               # replica y, concurrently: adds it again
+x.merge(y); y.merge(x)
+
+lww = max([(1001, "remove"), (1000, "add again")])
+```
+
+<Output>
+```text
+counter a = 5  counter b = 5
+cart x = {'book'}  cart y = {'book'}
+last-writer-wins keeps only: remove
+```
+</Output>
+</TryIt>
+
+The removed tombstones never go away in this naive version. Production CRDTs
+probably spend most of their complexity on garbage-collecting that metadata safely.
+
+<Callout label="Design implication">
+CRDTs converge, but they can't enforce an invariant that needs coordination.
+"The balance never goes below zero" or "only one user gets this username" can't
+be checked by a replica that might be partitioned from another one approving the
+same thing. Use CRDTs for counters, sets, presence and collaborative text; use a
+single leader or consensus for anything with a uniqueness or bound to protect.
+</Callout>
+
+Where you'll meet them: Riak's data types, Redis Enterprise's Active-Active
+databases, and the collaborative-editing libraries Automerge and Yjs.
+
+</Sub>
+
+<SectionHeading n="06" id="choosing">Choosing and running a consistency level</SectionHeading>
+
+<Sub n="6.1" title="Match the requirement to the mechanism">
+
+| You need | Weakest model that does it | Mechanism to reach for |
+|---|---|---|
+| Users see their own edits | Read your writes | Pin to primary after writes, or LSN tokens |
+| A feed that never jumps backwards | Monotonic reads | Sticky replica per session |
+| Replies after the posts they answer | Causal | Version vectors, or one leader per conversation |
+| A uniqueness check, a lock, a leader | Linearizable | Primary-only reads, Raft/etcd, Paxos LWTs |
+| No acknowledged write lost if a node dies | (Durability) | Sync standby, `acks=all` + `min.insync.replicas`, W ≥ 2 |
+| A like-counter across regions | Eventual, merged | CRDT counter |
+
+<Why>Why not just make everything linearizable to be safe?</Why>
+
+Because you pay for it on every request. Linearizable reads have to reach the
+leader, or a quorum, or wait out a lease; in a multi-region deployment that's a
+cross-region round trip per read. And the price in DynamoDB is literal:
+eventually consistent reads are
+[half the cost](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html)
+of strongly consistent ones, and reads from global secondary indexes can only be
+eventually consistent.
+
+</Sub>
+
+<Sub n="6.2" title="Watching replication in production">
+
+```sql
+-- Postgres, on the primary: one row per standby
+select application_name, state, sync_state,
+       write_lag, flush_lag, replay_lag,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) as replay_bytes_behind
+from pg_stat_replication;
+
+-- Postgres, on a standby
+select now() - pg_last_xact_replay_timestamp() as apparent_lag;
+
+-- Commits waiting on a synchronous standby right now
+select pid, now() - query_start as waiting, query
+from pg_stat_activity where wait_event = 'SyncRep';
+```
+
+`pg_last_xact_replay_timestamp()` is the time of the last replayed commit, so
+on an idle primary the "lag" grows even though the standby is fully caught up.
+Measure lag in bytes, or write a heartbeat row every second and measure its age.
+
+For Kafka, the two to alert on are `UnderReplicatedPartitions` (followers
+falling out of the ISR) and `UnderMinIsrPartitionCount` (partitions now refusing
+`acks=all` writes). For Cassandra, watch hint backlog and when each table was
+last repaired.
+
+</Sub>
+
+<Sub n="6.3" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| A user's edit "disappears" on reload | Read went to a lagging replica | Pin to primary after write, or LSN wait |
+| Items flicker between two states | Reads alternate between replicas at different positions | Sticky routing per session |
+| All writes hang; primary is healthy | Synchronous standby down | `ANY 1 (s1, s2)` quorum; alert on `SyncRep` waits |
+| Acknowledged writes missing after failover | Async replication, or a cancelled sync wait | Sync standby, `acks=all` with `min.insync.replicas=2`, don't kill `SyncRep` sessions |
+| Deleted rows come back (Cassandra) | Repair not run within `gc_grace_seconds` | Schedule repair well inside the window |
+| A concurrent update silently lost | Last-writer-wins on a multi-leader or leaderless store | Version vectors with merge, CRDTs, or conditional writes |
+| `NotEnoughReplicasException` from producers | ISR shrank below `min.insync.replicas` | Find the slow broker: disk, network, GC |
+
+</Sub>
+
+<SectionHeading n="07" id="summary">Summary</SectionHeading>
+
+1. **Replication trades freshness for latency and availability.** Every design
+   waits for some copies and not others; the consistency model says what readers
+   see as a result.
+2. **Linearizability means one copy and real-time order.** It's the only model
+   where "I wrote it, then told you, and you read it" is safe, and it can't stay
+   available in a partition.
+3. **Session guarantees fix most replica-lag bugs cheaply.** Read your writes and
+   monotonic reads are promises to one client, not to the world.
+4. **Postgres's default synchronous commit is durable, not visible.** In the test
+   here, about 3% of immediate standby reads were stale with `on`, and none with
+   `remote_apply`.
+5. **A cancelled synchronous commit is still committed.** Postgres returns
+   success with a warning, and the row exists only on the primary.
+6. **Kafka counts in-sync replicas, not named ones.** `acks=all` means "the
+   current ISR", so `min.insync.replicas` is what makes it mean anything.
+7. **`W + R > N` guarantees overlap with completed writes, not linearizability.**
+   An in-flight write can let a later read see an older value, unless readers
+   write back (ABD, blocking read repair).
+8. **Sloppy quorums give up the overlap.** They keep writes available and let
+   reads miss them until hints are delivered.
+9. **Last-writer-wins converges by throwing writes away.** Version vectors detect
+   concurrency; CRDTs resolve it without the application.
+10. **CRDTs can't protect invariants.** Anything with a uniqueness or a bound
+    needs a leader or consensus.
+
+<SectionHeading n="08" id="build">Build this</SectionHeading>
+
+**A consistency checker for your own database.**
+
+- Start a Postgres primary and one standby (`pg_basebackup -R` does most of the
+  work) and reproduce the stale-read table in section 3.4. Then add
+  `pg_current_wal_insert_lsn()` to every write, make the reader wait for
+  `pg_last_wal_replay_lsn()` to pass it, and show the stale count go to zero
+  with `synchronous_commit = local`.
+- Write a three-replica in-memory key-value store in one process, with
+  configurable N, W, R and a per-message random delay. Record every operation's
+  start time, end time and result, then check the history for a read that
+  returned an older value than a read that finished before it started. Find
+  the anomaly from section 4.3, then add read repair and show it disappear.
+- Implement a PN-counter and an OR-set, and write a randomized test that merges
+  replicas in random orders with duplicated messages. Assert they all converge.
+
+<SectionHeading n="09" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What's the difference between synchronous and asynchronous replication?">
+With asynchronous replication the primary acknowledges a commit once it's
+durable locally, then streams it to replicas; a primary crash can lose recent
+acknowledged writes. With synchronous replication the commit waits for at least
+one replica to confirm. Postgres lets you choose what "confirm" means: written,
+flushed or replayed (`remote_write`, `on`, `remote_apply`).
+</QA>
+
+<QA level="beginner" q="A user updates their profile and the next page shows the old one. What happened and how do you fix it?">
+A read-your-writes violation: the read went to a replica that hadn't replayed
+the write. Fixes, cheapest first: route that user's reads to the primary for a
+short window after a write; carry the write's LSN and have the replica wait
+until it has replayed past it; or use `remote_apply` so commits wait for replay
+on the synchronous standbys.
+</QA>
+
+<QA level="intermediate" q="Explain linearizability versus sequential consistency.">
+Both require a single total order of operations consistent with each client's
+program order. Linearizability also requires that order to respect real time:
+if operation A finished before B started, A comes first. Sequential consistency
+allows a read to return an older value, provided all clients agree on the
+history. The practical difference is whether an out-of-band message ("I just
+wrote it") guarantees the other party will see the write.
+</QA>
+
+<QA level="intermediate" q="N = 3, W = 2, R = 2. Is this system linearizable?">
+Not by itself. Every read overlaps every *completed* write, but a write in
+progress can be seen by one read and missed by a later one on a different
+quorum. Readers that write the value back to a quorum before returning (ABD,
+Cassandra's blocking read repair) fix that for reads and writes of a single
+register. Compare-and-set still needs consensus, such as Cassandra's Paxos
+lightweight transactions.
+</QA>
+
+<QA level="intermediate" q="What does min.insync.replicas do in Kafka, and when does it apply?">
+It sets the smallest ISR a partition may have and still accept `acks=all`
+writes; below it the leader throws `NotEnoughReplicasException`. It doesn't
+affect `acks=0` or `acks=1` producers at all. With replication factor 3, `acks=all`
+plus `min.insync.replicas=2` means any one broker can fail without losing an
+acknowledged write or stopping producers.
+</QA>
+
+<QA level="deep" q="Your Postgres uses synchronous replication, yet after a failover an acknowledged order is missing. How?">
+The commit was written locally first, and the backend then waited for the
+standby. If that wait was cancelled (statement cancel, pooler timeout,
+`pg_cancel_backend`, even a terminated connection), Postgres returns success with a
+WARNING that the transaction "has already committed locally, but might not have
+been replicated". A failover to that standby loses it. Other paths: a standby
+removed from `synchronous_standby_names`, or `synchronous_commit` set to `local`
+or `off` for that session.
+</QA>
+
+<QA level="deep" q="Why can't a CRDT enforce 'account balance never goes negative'?">
+CRDT replicas accept updates without coordinating, and merge afterwards. Two
+partitioned replicas can each approve a withdrawal that's fine locally and
+overdraws the account together; no merge can undo that without losing a
+withdrawal. Invariants over the global state need coordination at write time:
+a single leader, consensus, or escrow (splitting the balance into per-replica
+allowances in advance).
+</QA>
+
+<QA level="deep" q="What does a sloppy quorum give up, and why would Dynamo accept that?">
+The overlap argument. When home replicas are down, writes go to stand-in nodes
+that hold hints, so a later quorum read of the home replicas can miss an
+acknowledged write until handoff completes. Dynamo's priority was that a
+shopping-cart write should never be refused; a stale read, reconciled later by
+merging, was the acceptable cost.
+</QA>
+
+<SectionHeading n="10" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="synchronous_commit = on, and the commit returns. Where is the row visible?">
+    On the primary. On the synchronous standby it's durable but may not be
+    replayed yet, so standby queries can miss it. Only remote_apply waits for
+    replay.
+  </Q>
+  <Q q="N = 5. What's the smallest W with R = 2 that still guarantees overlap?">
+    W = 4, since W + R must exceed 5. That write tolerates only one replica
+    down. W = R = 3 tolerates two, so it's the usual choice.
+  </Q>
+  <Q q="Why is per-entry max a valid merge for a G-counter but plain max of totals isn't?">
+    Max of totals loses increments made on different replicas: 3 and 2 merge to
+    3, not 5. Per-entry max keeps each replica's own count, so the sum is
+    exact, and it's still idempotent and commutative.
+  </Q>
+  <Q q="Which is cheaper in DynamoDB, and by how much: an eventually consistent or a strongly consistent read?">
+    Eventually consistent reads cost half as much. GSI reads can only be
+    eventually consistent.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Jepsen: Consistency Models">
+    A clickable map of every model in this chapter and the ones between them,
+    with precise definitions and which are available in a partition.
+    [jepsen.io/consistency](https://jepsen.io/consistency)
+  </WildCard>
+  <WildCard name="DeCandia et al., Dynamo (SOSP 2007)">
+    Consistent hashing, sloppy quorums, hinted handoff, vector clocks and the
+    shopping cart, in one paper.
+    [PDF](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf)
+  </WildCard>
+  <WildCard name="Shapiro et al., Conflict-free Replicated Data Types">
+    The formal treatment: state-based and operation-based CRDTs, and a
+    catalogue of counters, registers, sets and graphs.
+    [Comprehensive study](https://inria.hal.science/inria-00555588/document)
+  </WildCard>
+  <WildCard name="src/backend/replication/syncrep.c">
+    Postgres synchronous replication in about a thousand lines, including the
+    comments on why a cancelled wait can't abort.
+    [REL_16_4](https://github.com/postgres/postgres/blob/REL_16_4/src/backend/replication/syncrep.c)
+  </WildCard>
+  <WildCard name="Bailis et al., Probabilistically Bounded Staleness (VLDB 2012)">
+    How stale a partial quorum is in practice, modelled from production latency
+    distributions.
+    [PDF](https://vldb.org/pvldb/vol5/p776_peterbailis_vldb2012.pdf)
+  </WildCard>
+  <WildCard name="Verbitski et al., Amazon Aurora (SIGMOD 2017)">
+    Six copies, a 4/6 write quorum and a 3/6 read quorum, and the AZ+1
+    argument behind them.
+    [Paper](https://www.amazon.science/publications/amazon-aurora-design-considerations-for-high-throughput-cloud-native-relational-databases)
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="11" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Consensus: Raft, Paxos & Leases">
+    How a replicated log gets linearizable writes and reads, and what a quorum
+    read costs. [Chapter 27](/topics/27-consensus).
+  </WildCard>
+  <WildCard name="Failure Detection & Membership">
+    When a replica counts as down, and why failovers lose writes when that
+    guess is wrong. [Chapter 30](/topics/30-failure-detection).
+  </WildCard>
+  <WildCard name="PostgreSQL Deep Dive">
+    WAL, the standby's replay loop and replication slots in more depth.
+    [Chapter 21](/topics/21-postgres).
+  </WildCard>
+  <WildCard name="Kafka & the Log as a Primitive">
+    The ISR, the high watermark and leader epochs through a broker failure.
+    [Chapter 23](/topics/23-kafka-logs).
+  </WildCard>
+  <WildCard name="Redis Internals">
+    Asynchronous replication and the acknowledged write that vanishes in a
+    failover. [Chapter 22](/topics/22-redis).
+  </WildCard>
+</CardGrid>

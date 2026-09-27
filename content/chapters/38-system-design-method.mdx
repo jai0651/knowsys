@@ -1,0 +1,751 @@
+---
+title: The System Design Method
+dek: "A repeatable way to design a system: pin the requirements to numbers, estimate capacity before drawing anything, and add a component only when a number forces it. With measured reference numbers for memory, disks, Redis and Postgres, a worked estimate, and the read-path and write-path choices that decide most designs."
+readingTime: "~28 min"
+level: "Intermediate"
+versions: "PostgreSQL 16.15 · Redis 7.0.15 · measured on linuxkit 6.10.14 aarch64 (shared 4-CPU container) and Apple M4 · macOS 26.5.1"
+prereqs: "HTTP services, databases, caching basics"
+updated: "2026-09-27"
+---
+
+Sooner or later you'll be handed a blank page and a sentence: "we need a
+service that stores chat history", or "design a notifications system". It
+happens in design reviews, in planning for a new product, and in every
+system design interview.
+
+The most common failure is probably drawing boxes first. A load balancer, some app servers,
+a cache, a queue, a sharded database: it looks like architecture, and none of
+it was chosen for a reason. The design that comes out is either far more
+complicated than the load needs, or it breaks on the one number nobody
+worked out.
+
+This chapter is a method for avoiding both. It turns requirements into
+numbers, gives you reference numbers to compare them against (measured, with
+the machine named), works a full estimate, and then shows how each component
+you might draw is the answer to a specific number crossing a specific line.
+
+<SectionHeading n="01" id="method">The method in one picture</SectionHeading>
+
+System design isn't a search for the right architecture. It's a series of
+questions, each answered with a number, and each answer narrowing what the
+next step can be.
+
+<Sub n="1.1" title="Six steps, in order">
+
+<Steps
+  title="Designing a system, one question at a time"
+  lanes={[
+    { t: "Requirements", s: "what, for whom", icon: "?" },
+    { t: "Estimate", s: "QPS, bytes, peak", icon: "∑" },
+    { t: "API + data", s: "calls, entities", icon: "{}" },
+    { t: "Boxes", s: "only what's forced", icon: "▣" },
+    { t: "Deep dive", s: "the bottleneck", icon: "⌕" },
+    { t: "Failure", s: "what breaks, then what", icon: "⚠" },
+  ]}
+  steps={[
+    [0, "Pin down **what the system must do** and the non-functional targets: how many users, how fast, how durable, how consistent. Every later step depends on these numbers."],
+    [1, "**Estimate** requests per second at peak, bytes stored per year, bytes moved per second, and working-set size. Ten minutes of arithmetic here decides more than an hour of diagrams."],
+    [2, "Write the **API** (the handful of calls clients make) and the **data model** (entities, keys, and which queries each call runs). Access patterns decide the storage choice."],
+    [3, "Start from the simplest design that could work: one service, one database. **Add a component only when an estimate says the simple version can't meet a requirement.**"],
+    [4, "Find the one part that's closest to its limit, usually storage or the hottest read path, and design it properly: partitioning, caching, indexes, consistency."],
+    [5, "Walk each component's **failure**: what happens when it's slow, when it's down, when it's overloaded. Most real designs are finished here, not in step 4."],
+  ]}
+/>
+
+<Why>Why estimate before drawing anything?</Why>
+
+Because the numbers decide which boxes exist. A service doing 50 writes a
+second and one doing 50,000 aren't the same design with different server
+counts. One fits on a single Postgres instance with room to spare; the other
+may need partitioning, batching and a queue. Draw first and you'll design for
+whichever one you happened to imagine.
+
+<Callout label="Design implication">
+Every component in a design should have a sentence of the form "this is here
+because *number* exceeds *limit*". If you can't write that sentence for a box,
+it's decoration, and decoration costs you an on-call rotation.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="02" id="requirements">Requirements you can put a number on</SectionHeading>
+
+Requirements come in two kinds. **Functional** ones say what the system does:
+send a message, load a conversation, search history. **Non-functional** ones
+say how well: how many, how fast, how durable. The second kind decides the
+architecture.
+
+<Sub n="2.1" title="The questions that change the design">
+
+| Question | Example answer | What it changes |
+|---|---|---|
+| How many users, and how active? | 20M daily active users | Every other estimate |
+| Read-to-write ratio? | 3 reads per write | Whether caching or write throughput dominates |
+| How much data per item, and for how long? | 300 B per message, kept forever | Storage growth, whether one node can hold it |
+| Latency target, and at which percentile? | p99 under 200 ms to load a conversation | What can sit on the read path |
+| Durability? | An acknowledged message is never lost | Synchronous replication, fsync on commit |
+| Consistency? | A sender sees their own message at once | Where reads can be served from |
+| Availability target? | 99.9% of requests succeed | Redundancy, and what degrades first |
+| Peak shape? | Evening peak about 3× the daily average | Capacity you provision |
+
+<Why>Why ask about percentiles and not just "fast"?</Why>
+
+Because the average hides the requests that make users leave. A p99 target
+says what the slowest 1% may take, and that's what decides whether a
+synchronous call to a slow dependency is allowed on the path.
+[Chapter 16](/topics/16-contention-tail-latency) shows how quickly the tail
+grows with load and fan-out.
+
+</Sub>
+
+<Sub n="2.2" title="Write the assumptions down">
+
+You'll rarely be given every number. Make an assumption, say it out loud, and
+write it next to the estimate. "Assuming a 3× evening peak" is a design input
+someone can correct. A silent assumption is a bug.
+
+<Callout label="Common mistake" kind="warn">
+Designing for the average. Capacity has to cover the peak, and the peak of a
+consumer product can be several times its daily average. Estimate from the
+average, then multiply by a stated peak factor before comparing with any
+limit.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="03" id="numbers">Numbers to reason with</SectionHeading>
+
+An estimate is only useful if you have something to compare it with. You need
+a feel for what one machine, one disk, one database node and one network hop
+can do.
+
+<Sub n="3.1" title="Time and size conversions">
+
+A few conversions carry most estimates:
+
+| Quantity | Exact | Round to |
+|---|---|---|
+| Seconds in a day | 86,400 | 10⁵ |
+| Seconds in a 30-day month | 2,592,000 | 2.5 × 10⁶ |
+| Seconds in a year | 31,557,600 | 3 × 10⁷ |
+| 1 million requests a day | 11.6 per second | 10/s |
+| 1 billion requests a day | 11,574 per second | 10⁴/s |
+| 2¹⁰, 2²⁰, 2³⁰, 2⁴⁰ bytes | KiB, MiB, GiB, TiB | 10³, 10⁶, 10⁹, 10¹² |
+
+<Predict
+  q="A product has 10 million daily active users, each making 50 API requests a day. About how many requests per second does the API serve on average?"
+  options={[
+    "About 580",
+    "About 5,800",
+    "About 58,000",
+    "About 500,000",
+  ]}
+  answer={1}
+>
+10M × 50 = 500M requests a day. Divide by 86,400, or by 10⁵ to estimate:
+about **5,800 a second** on average. With a 3× peak you'd provision for about
+17,000. Round early and you'll still land within a factor of two, which is all
+an estimate needs.
+</Predict>
+
+</Sub>
+
+<Sub n="3.2" title="Latency, measured">
+
+The classic reference is the table of approximate timings in Peter Norvig's
+[Teach Yourself Programming in Ten Years](https://norvig.com/21-days.html),
+widely circulated as "latency numbers every programmer should know". Its
+figures are old, so here are the same kinds of operations measured on the
+machines used for this book, next to Norvig's:
+
+<Compare
+  cols={["Operation", "Measured", "Machine", "Norvig's table"]}
+  rows={[
+    ["Random memory access, 256 MB working set", "124 ns", "Linux VM", "100 ns"],
+    ["Read 1 MB sequentially from RAM", "35 µs", "Linux VM", "250 µs"],
+    ["Loopback TCP round trip, 1 byte", "31 µs (p99 47 µs)", "Linux VM", "—"],
+    ["4 KB write + fdatasync", "65 µs (p99 up to 600 µs)", "Linux VM", "—"],
+    ["4 KB write + F_FULLFSYNC (a real flush)", "3.9 ms", "M4 internal SSD", "—"],
+    ["Postgres: fetch one conversation's messages by index", "0.083 ms", "Linux VM, 1 client", "—"],
+    ["Redis GET, 50 clients", "0.11 ms p50", "Linux VM", "—"],
+    ["Disk seek (spinning disk)", "not measured", "—", "8 ms"],
+  ]}
+/>
+
+Linux VM: linuxkit 6.10.14 aarch64 in a shared 4-CPU container on an Apple
+M4, gcc 13.3 `-O2`, median of 3 runs. M4: macOS 26.5.1, median of 3.
+
+<Why>Why is the VM's fsync 60 times faster than the Mac's?</Why>
+
+Because they're not doing the same thing. On macOS, plain `fsync` (20 µs in
+the same test) doesn't force the drive to flush its cache; `F_FULLFSYNC` does,
+and that's the 3.9 ms. The VM's `fdatasync` lands in a virtual disk on the
+host, so it's a floor, not a promise of durability. Real server SSDs with
+power-loss protection sit in between. Measure the disk you'll actually run on
+before you size anything that commits per request.
+
+</Sub>
+
+<Sub n="3.3" title="Throughput, measured">
+
+The other half is how much one node can do. These are one small node's
+numbers, and they're meant as orders of magnitude, not as benchmarks:
+
+<Compare
+  cols={["Workload", "Throughput", "Setup"]}
+  rows={[
+    ["Redis GET, no pipelining", "238,000 ops/s", "redis-benchmark, 50 clients"],
+    ["Redis GET, pipelined 16 deep", "2,380,000 ops/s", "redis-benchmark, 50 clients"],
+    ["Postgres primary-key SELECT (pgbench -S)", "16,000 tps / 44,000 tps", "1 client / 8 clients"],
+    ["Postgres: last 50 messages of a conversation", "12,000 / 37,800 queries/s", "1 client / 8; 1M rows, in RAM"],
+    ["Postgres single-row INSERT, commit per row", "35,800 rows/s", "8 clients"],
+    ["Same, synchronous_commit = off", "69,900 rows/s", "8 clients"],
+    ["Postgres INSERT in batches of 100 rows", "278,800 rows/s", "8 clients"],
+    ["Postgres pgbench TPC-B-like (scale 10)", "4,600 tps", "8 clients; contended rows"],
+  ]}
+/>
+
+PostgreSQL 16.15 and Redis 7.0.15 on the Linux VM above, `shared_buffers =
+128MB`, median of 3 runs of 10–15 s. The VM's cheap fsync flatters every
+commit-per-row number; on a disk with millisecond flushes, group commit has to
+do much more of the work.
+
+<Why>Why is the TPC-B-like number so much lower than plain inserts?</Why>
+
+Because every pgbench TPC-B transaction updates one of only ten `branches`
+rows at scale 10, so eight clients spend their time waiting on each other's
+row locks. That's the difference between a workload's raw cost and its
+contention, and designs fail on the second one. (The mechanics are in
+[chapter 13](/topics/13-locks).)
+
+<Callout label="Design implication">
+Batching is the biggest lever on write throughput. The same node took 7.8×
+more rows a second in batches of 100 than one row per commit. Whenever a
+requirement allows writes to be grouped (a queue consumer, a buffer flushed
+every 50 ms), the write path gets an order of magnitude cheaper.
+</Callout>
+
+</Sub>
+
+<Sub n="3.4" title="Distance">
+
+Some latency no engineering removes. Light in optical fibre travels at about
+two-thirds of its speed in a vacuum, roughly 200,000 km a second, which is
+about **1 ms of round trip per 100 km**.
+
+| Hop | Distance | Round trip, physics alone |
+|---|---|---|
+| Same machine, loopback | — | 31 µs measured above (software, not distance) |
+| Between AWS Availability Zones | "within 100 km (60 miles) of each other" ([AWS](https://aws.amazon.com/about-aws/global-infrastructure/regions_az/)) | up to about 1 ms |
+| New York to London | about 5,600 km | at least 56 ms |
+| Los Angeles to Tokyo | about 8,800 km | at least 88 ms |
+
+Real paths aren't great circles, so real round trips are longer. The point is
+the floor: a design that makes three sequential cross-ocean calls on a request
+has spent about a third of a second before any code runs.
+
+</Sub>
+
+<SectionHeading n="04" id="estimate">Capacity first: a worked estimate</SectionHeading>
+
+Here's the method applied to one system: storing and serving chat message
+history. The numbers are assumptions, stated, so you can change any of them.
+
+<Sub n="4.1" title="The requirements">
+
+- 20 million daily active users.
+- Each sends 40 messages a day, averaging 300 bytes with metadata.
+- Each opens 100 conversations a day; opening one loads its last 50 messages.
+- Messages are kept forever. An acknowledged message must never be lost.
+- p99 under 200 ms to open a conversation. Evening peak is 3× the average.
+
+</Sub>
+
+<Sub n="4.2" title="Requests, storage, bandwidth, memory">
+
+<Estimate
+  rows={[
+    { label: "Messages written per day", math: "20M × 40", value: "800M" },
+    { label: "Average write rate", math: "800M / 86,400", value: "9,300/s" },
+    { label: "Peak write rate", math: "9,300 × 3", value: "28,000/s" },
+    { label: "Conversation loads per day", math: "20M × 100", value: "2B" },
+    { label: "Peak read rate", math: "2B / 86,400 × 3", value: "69,000/s" },
+    { label: "Stored per day, Postgres row + index", math: "800M × ≈340 B (measured, 1M-row table)", value: "272 GB" },
+    { label: "Stored per year, one copy", math: "272 GB × 365", value: "99 TB" },
+    { label: "Stored per year, three replicas", math: "99 TB × 3", value: "≈300 TB" },
+    { label: "Peak read bandwidth", math: "69,000/s × 50 × 300 B", value: "1.0 GB/s" },
+  ]}
+  result={{ label: "the number that decides the design", value: "≈100 TB a year" }}
+/>
+
+<Predict
+  q="Compare these estimates with the measured single-node numbers in section 3.3. Which requirement is the first to rule out a single Postgres instance?"
+  options={[
+    "Peak writes: 28,000 a second",
+    "Peak reads: 69,000 a second",
+    "Storage: about 100 TB a year",
+    "None; one node can do all of it",
+  ]}
+  answer={2}
+>
+Writes at 28,000 a second are uncomfortably close to the 35,800 measured on a
+small node, but batching (278,800 rows a second) gives them plenty of room.
+Reads at 69,000 a second exceed one node's 37,800, but a cache or two read
+replicas cover that. Storage has no such trick: 99 TB in the first year, and
+growing every year, doesn't fit on one machine. **Storage forces
+partitioning**, and once the data is partitioned, reads and writes are spread
+across the partitions too.
+</Predict>
+
+<Why>Why did bandwidth show up as a big number?</Why>
+
+Because every conversation load returns 50 messages, so 69,000 loads a
+second is 1 GB/s of payload leaving the storage tier, before protocol
+overhead. That's a reason to cache recent messages close to the app servers,
+return fewer messages per page, and compress responses. The request count
+alone would never have told you.
+
+</Sub>
+
+<Sub n="4.3" title="Working set and connections">
+
+Two more estimates decide the cache and the connection pools.
+
+**Working set.** Most conversation loads are of recent, active conversations.
+If the cache holds the last 50 messages of each conversation active today,
+say 20 million conversations, that's 20M × 50 × 300 B = 300 GB. If a tenth of
+them take most of the reads, 30 GB of Redis covers the hot set.
+
+**Connections.** Little's Law ([chapter 16](/topics/16-contention-tail-latency))
+says requests in flight = arrival rate × time in system. At 69,000 reads a
+second and 0.2 ms per query, that's about 14 queries in flight at once. At
+20 ms, because the database is struggling, it's 1,400, which is more
+connections than a Postgres node should hold. Size pools and set timeouts for
+the slow case, not the fast one.
+
+<Callout label="Common mistake" kind="warn">
+Stopping at requests per second. QPS is the number everyone computes and the
+one that rarely decides a design. Storage growth, bytes per second, working-set
+size and in-flight requests are where designs usually break, and each takes one
+more line of arithmetic.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="05" id="boxes">Which box to draw</SectionHeading>
+
+With the numbers in hand, the boxes follow. Start from the simplest thing:
+one stateless service in front of one database. Then add components only when
+an estimate crosses a line.
+
+<Sub n="5.1" title="Each component answers a number">
+
+| Component | Add it when | What it costs you |
+|---|---|---|
+| **More app servers** behind a load balancer | CPU or memory on one server is the limit, or you need to survive losing one | Almost nothing if the servers are stateless |
+| **Read replicas** | Reads exceed one node, and slightly stale reads are acceptable | Replication lag; read-your-writes needs routing |
+| **Cache** (Redis, memcached) | A hot working set is read far more than written, or a read is expensive | Invalidation, stampedes, a second source of truth |
+| **Queue** (Kafka, SQS) | Work can happen later, bursts exceed steady capacity, or several consumers need the same events | Asynchrony: you need idempotent consumers and a way to see lag |
+| **Partitioning** | Data or write rate exceeds one node | Cross-partition queries, rebalancing, hot keys |
+| **Object storage** (S3) | Large blobs, or cold data read rarely | Higher latency per request, no in-place updates |
+| **CDN** | The same bytes are read by many users far from the servers | Cache invalidation at the edge |
+| **Search index** | Queries need full text or many filter combinations | A second copy to keep in sync |
+
+<Why>Why not add them all up front, to be safe?</Why>
+
+Because each one is a new way to fail. A cache can serve stale data or fall
+over and send its entire load to the database at once. A queue can back up
+for hours without anyone noticing. Partitioning makes every query that
+crosses partitions slower and every migration harder. Complexity is a cost you
+pay on every deploy and every incident, so you pay it only for a number.
+
+</Sub>
+
+<Sub n="5.2" title="How far one box goes">
+
+Simple designs probably go further than you'd expect. Nick Craver's
+[Stack Overflow: The Architecture – 2016 Edition](https://nickcraver.com/blog/2016/02/17/stack-overflow-the-architecture-2016-edition/)
+reported, for one day in February 2016, 209,420,973 HTTP requests to the load
+balancers and 504,816,843 SQL queries, served by 11 web servers, 4 SQL
+Servers in two clusters and 2 Redis servers. That's about 2,400 requests and
+5,800 queries a second on average. Craver adds that they're "down to needing
+only 1 web server", with the caveat "I'm not saying it's a good idea."
+
+<Callout label="Design implication">
+Before partitioning anything, check whether one well-indexed database on a
+large machine, plus a replica for failover, meets the numbers. For most
+internal systems and many products it does, and the design you don't build is
+the one that never pages you.
+</Callout>
+
+</Sub>
+
+<Sub n="5.3" title="How the chat design grows">
+
+Here's the chat-history design built up one forced component at a time,
+starting from the simplest version:
+
+<Steps
+  title="Growing the chat-history design, one number at a time"
+  lanes={[
+    { t: "One service", s: "+ one Postgres", icon: "◉" },
+    { t: "Batching", s: "writes grouped", icon: "≡" },
+    { t: "Cache", s: "recent messages", icon: "⚡" },
+    { t: "Partitions", s: "by conversation", icon: "▦" },
+    { t: "Cold tier", s: "object storage", icon: "☁" },
+  ]}
+  steps={[
+    [0, "Start with **stateless app servers and one Postgres primary** with a synchronous standby. At launch traffic this meets every requirement, and it's the design to beat."],
+    [1, "Peak writes of **28,000 a second** come close to one node's single-row commit rate. Group inserts per connection (a short buffer, flushed every few milliseconds), which measured at **7.8×** the throughput."],
+    [2, "Peak reads of **69,000 a second** and **1 GB/s** exceed one node. Cache each active conversation's last 50 messages: a hot set of about **30 GB**. Most loads never reach the database."],
+    [3, "Storage of about **100 TB a year** is beyond any single node. Partition messages by `conversation_id`, so one conversation's messages, and every query about it, stay on one partition."],
+    [4, "Most messages are probably never read again after a few weeks (check that against your read logs). Move old partitions' data to **object storage** in large compressed files, and keep only recent months in the database."],
+  ]}
+/>
+
+Each step has a number next to it, and each number came from section 4. A
+design review can challenge any step by challenging its number.
+
+<Why>Why partition by conversation and not by user?</Why>
+
+Because the dominant query is "the last 50 messages in this conversation".
+Partitioning by conversation makes it a single-partition index scan. By user,
+a group conversation's messages would be scattered across every member's
+partition, and every load would be a fan-out query. The partition key should
+be whatever the hottest query filters on.
+
+</Sub>
+
+<SectionHeading n="06" id="access-patterns">Access patterns decide storage</SectionHeading>
+
+After the numbers, the second thing that decides a design is the shape of the
+reads and writes: which queries run, how often, and what they touch.
+
+<Sub n="6.1" title="Write the queries next to the API">
+
+For each call in the API, write the query it runs. For the chat system:
+
+| API call | Query | Rate at peak | Needs |
+|---|---|---|---|
+| `POST /conversations/:id/messages` | Insert one row | 28,000/s | Durable commit, monotonically ordered IDs per conversation |
+| `GET /conversations/:id/messages?before=…` | Last 50 by `(conversation_id, id)` | 69,000/s | Composite index, cache |
+| `GET /users/:id/conversations` | Conversations by last activity | Lower | A separate, per-user index |
+| `GET /search?q=…` | Full-text over a user's messages | Low | A search index, updated asynchronously |
+
+<Why>Why does the third row need a separate index?</Why>
+
+Because it's keyed by user, and the messages are partitioned by conversation.
+Any query that doesn't filter on the partition key has to ask every
+partition, or be served from a second structure keyed the way it reads. That's
+the general pattern: one copy of the data per access pattern that matters,
+kept in sync by the write path or by a stream of changes.
+
+</Sub>
+
+<Sub n="6.2" title="Fan-out on write, or on read">
+
+The biggest access-pattern decision in feed-like systems is *when* to do the
+work of assembling what a user sees. Twitter's home timeline is the
+well-documented example. From Raffi Krikorian's
+[Timelines at Scale](https://www.infoq.com/presentations/Twitter-Timeline-Scalability/)
+talk (2013), as summarised by
+[High Scalability](https://highscalability.com/the-architecture-twitter-uses-to-deal-with-150m-active-users/):
+"300K QPS are spent reading timelines and only 6000 requests per second are
+spent on writes." With reads 50 times more frequent than writes, Twitter did
+the work at write time:
+
+<StepSequence
+  title="Fan-out on write: one tweet delivered to followers' timelines"
+  actors={["Author", "Write API", "Fan-out", "Timeline cache", "Follower"]}
+  messages={[
+    { from: 0, to: 1, label: "POST tweet", note: "The author posts. The tweet is stored once, durably, by ID." },
+    { from: 1, to: 2, label: "enqueue fan-out", note: "The write API hands the tweet ID to a fan-out service and returns. The author doesn't wait for delivery." },
+    { from: 2, to: 3, label: "insert ID × followers", note: "Fan-out looks up the author's followers and inserts the tweet ID into **each follower's timeline** in a Redis cluster. For an account with many followers, one tweet is many thousands of inserts." },
+    { from: 4, to: 3, label: "GET home timeline", note: "A follower opens the app. Their timeline is **already assembled**: one read of a list of IDs, then a batch fetch of the tweets." },
+    { from: 2, to: 2, label: "skip huge accounts", note: "For accounts with tens of millions of followers the fan-out is too slow. Their tweets are **merged in at read time** instead, a hybrid of the two strategies." },
+  ]}
+/>
+
+The summary gives the details: each home timeline is capped at 800 entries in
+Redis, fan-out aims to finish "under 5 seconds, but it doesn't always work,
+especially when celebrities tweet," and for accounts like Lady Gaga's, with 31
+million followers at the time, the answer was to "merge in her timeline at
+read time".
+
+| Strategy | Work happens | Read cost | Write cost | Breaks when |
+|---|---|---|---|---|
+| **Fan-out on write** | When content is created | One lookup | One insert per follower | An author has millions of followers |
+| **Fan-out on read** | When a feed is loaded | One query per followed source, then merge | One insert | A reader follows thousands of sources, or reads dominate |
+| **Hybrid** | Write for most authors, read for the largest | Lookup plus a small merge | Bounded | You need to maintain both paths |
+
+<Callout label="Design implication">
+Put the expensive work on the side of the ratio that happens less often. If
+reads outnumber writes 50 to 1, precompute at write time. If a single write
+would touch millions of rows, don't. Most real systems end up hybrid, and
+the threshold between the two paths is itself a number to estimate.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="07" id="deep-dive">The deep dive: latency budgets and failure</SectionHeading>
+
+Once the boxes are drawn, two passes finish the design: one to check the
+latency target is reachable, and one to check what happens when each box
+misbehaves.
+
+<Sub n="7.1" title="Spend the latency budget">
+
+A p99 target is a budget, and every hop on the request path spends some of
+it. Walk the path of one conversation load:
+
+<Steps
+  title="Where 200 ms goes on one conversation load"
+  lanes={[
+    { t: "Client", s: "user's network", icon: "◉" },
+    { t: "Edge + LB", s: "TLS, routing", icon: "⇆" },
+    { t: "App server", s: "auth, logic", icon: "⚙" },
+    { t: "Cache", s: "Redis", icon: "⚡" },
+    { t: "Database", s: "partition", icon: "▦" },
+  ]}
+  steps={[
+    [0, "A user 1,000 km from the region pays about **10 ms of round trip** to physics alone, more on a mobile network. A new connection adds TLS round trips on top."],
+    [1, "The load balancer terminates TLS and forwards within the region: well under a millisecond per hop when it's healthy."],
+    [2, "The app server authenticates the request and decides what to fetch. Keep it to one round of calls: **each sequential dependency adds its own p99** to yours."],
+    [3, "The cache answers most loads. A Redis GET measured **0.11 ms** at p50 on one node; over a real network add the round trip within a zone."],
+    [4, "A cache miss goes to the conversation's partition: **0.083 ms** for the query itself in the test above, plus the network. At p99 with a loaded database, budget milliseconds, not microseconds."],
+    [0, "The budget works out: most of 200 ms is left for the user's own network and for the tail. The design has room, **as long as nothing on the path is a synchronous call to a slow or remote dependency**."],
+  ]}
+/>
+
+<Why>Why count sequential calls and not total calls?</Why>
+
+Because parallel calls cost you the slowest one, while sequential calls cost
+you the sum. Three sequential calls of 20 ms p99 each can take 60 ms at the
+tail. Three parallel ones cost about the slowest of three, which is
+still a tail, but only one of them. [Chapter 16](/topics/16-contention-tail-latency)
+covers what fan-out does to the tail.
+
+</Sub>
+
+<Sub n="7.2" title="Walk each box's failure">
+
+For each component, ask three questions: what if it's slow, what if it's
+down, and what if it's overloaded? For the chat design:
+
+| Component | If it's down | The design's answer |
+|---|---|---|
+| App server | Its requests fail | Stateless; the load balancer routes around it |
+| Cache | Every read goes to the database: a stampede | Database sized for a partial cold cache; request coalescing; cache replicas |
+| Database primary for one partition | Writes to those conversations fail | Synchronous standby, automatic failover; other partitions unaffected |
+| Fan-out or search indexer | New messages aren't searchable yet | Asynchronous by design; alert on lag, not on errors |
+| Whole region | Everything fails | A decision: accept it within the SLO, or pay for a second region |
+
+<Why>Why does the cache row matter so much?</Why>
+
+Because a cache that absorbs most reads means the database behind it was
+sized for the few that get through. When the cache empties, after a restart
+or a failover, the database suddenly gets the full read rate. A cache is a
+load reducer until it fails, and then it's a load multiplier. Timeouts, retry
+budgets and load shedding for moments like that are covered in
+[chapter 40](/topics/40-reliability).
+
+</Sub>
+
+<SectionHeading n="08" id="write-it-down">Writing it down</SectionHeading>
+
+<Sub n="8.1" title="The design document">
+
+A design that lives only in a whiteboard photo can't be reviewed. The
+document doesn't need to be long; it needs to show its reasoning:
+
+1. **Requirements**, with every number and every assumption.
+2. **Estimates**: peak QPS, storage per year, bandwidth, working set.
+3. **API and data model**, with the query each call runs.
+4. **The design**, with the "this is here because" sentence for each component.
+5. **Alternatives considered**, and the number that ruled each one out.
+6. **Failure modes** from section 7.2.
+7. **What you'll measure** to know it's working: the SLIs, and the capacity
+   metrics that tell you when the next step in section 5.3 is due.
+
+</Sub>
+
+<Sub n="8.2" title="Symptom, cause, fix in design reviews">
+
+| Symptom in the design | Likely cause | Fix |
+|---|---|---|
+| Five services and a queue for a system with 50 requests a second | Boxes drawn before numbers | Estimate; start from one service and one database |
+| "We'll shard later" with 100 TB a year in the estimate | Storage never estimated | Choose the partition key now, from the hottest query |
+| p99 target unreachable on paper | Sequential calls on the request path | Parallelise, precompute, or move the call off the path |
+| Cache hit rate assumed at 99% with no working-set estimate | Working set never computed | Estimate the hot set; size the database for a cold cache |
+| Queue added "for scale" | No burst or asynchrony requirement | Remove it, or state the burst it absorbs |
+| Estimates quoted as averages | No peak factor | Multiply by a stated peak before comparing with limits |
+| Benchmarks borrowed from a blog | Nobody measured on the target hardware | Measure one node for the hottest query and the write path |
+
+<Callout label="Common mistake" kind="warn">
+Using someone else's throughput numbers. Every figure in section 3 came from
+one small shared VM, and the fsync number alone differs 60× between the two
+machines measured here. Run pgbench or redis-benchmark with your own query
+shape on the instance type you'll deploy, before the design depends on it.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="09" id="summary">Summary</SectionHeading>
+
+1. **Numbers decide the boxes.** Estimate before drawing, and give every
+   component a reason of the form "this number exceeds that limit".
+2. **Non-functional requirements shape the architecture.** Users, ratio,
+   size, latency percentile, durability and peak factor are the inputs.
+3. **State every assumption.** A written assumption can be corrected; a silent
+   one is a bug.
+4. **86,400 seconds a day, about 10⁵.** One million requests a day is about
+   12 a second; one billion is about 12,000.
+5. **Know one node's limits, measured.** On the test VM: Redis 238k GETs a
+   second, Postgres 36k single-row commits, 279k rows a second in batches.
+6. **Batching is the biggest write lever.** It was 7.8× on the same node.
+7. **QPS rarely decides the design.** In the worked example storage did, at
+   about 100 TB a year; bandwidth and working set came next.
+8. **Access patterns choose the partition key.** Partition by what the hottest
+   query filters on, and keep a second copy per other important pattern.
+9. **Put expensive work on the rarer side of the ratio.** Fan-out on write
+   when reads dominate, on read for the accounts where writes explode.
+10. **Finish with the latency budget and the failure walk.** Sequential calls
+    add their tails, and a cache that fails multiplies load.
+
+<SectionHeading n="10" id="build">Build this</SectionHeading>
+
+**An estimate you can check.**
+
+- Pick a system you run. Write its requirements as in section 2.1 and estimate
+  peak QPS, storage per year, bandwidth and working set.
+- Measure one node: run `pgbench` with a custom script containing your hottest
+  read and your write, and `redis-benchmark` with your value size. Compare with
+  the estimate.
+- Find the first number that crosses a single-node limit. Is it the one your
+  current architecture was built around?
+- Write the one-page design document from section 8.1 for the next 10× of
+  growth, with a number next to every component you'd add.
+
+<SectionHeading n="11" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="How do you turn daily active users into requests per second?">
+Multiply users by requests per user per day, then divide by 86,400 (or 10⁵
+for a quick estimate). 10 million users making 50 requests each is 500 million
+a day, about 5,800 a second on average. Then multiply by a stated peak factor,
+say 3×, before comparing with any capacity limit.
+</QA>
+
+<QA level="beginner" q="When would you add a cache?">
+When a hot working set is read much more often than it's written, or when a
+read is expensive to compute, and the estimate shows the database can't serve
+the read rate or the latency target alone. Estimate the working set to size
+the cache, and size the database for the moment the cache is cold.
+</QA>
+
+<QA level="intermediate" q="What usually forces a system off a single database?">
+Often storage, not queries. Reads can be scaled with replicas and caches, and
+writes with batching, but data that grows by tens of terabytes a year doesn't
+fit on one node. In the chat example, 800 million messages a day at about 340
+bytes each is roughly 100 TB a year, which forces partitioning, while the read
+and write rates alone didn't.
+</QA>
+
+<QA level="intermediate" q="How do you choose a partition key?">
+From the hottest query. If the dominant read is "the last 50 messages of a
+conversation", partition by conversation ID so it's a single-partition index
+scan. Then check the key spreads load evenly (no giant conversation owns a
+partition) and list the queries that don't filter on it, since each needs a
+second structure or a fan-out.
+</QA>
+
+<QA level="intermediate" q="Fan-out on write or fan-out on read for a news feed?">
+Fan-out on write when reads greatly outnumber writes and most authors have
+modest audiences: precompute each reader's feed so a read is one lookup.
+Fan-out on read for authors whose audience is so large that writing to every
+follower is too slow. Twitter reported 300K QPS of timeline reads against 6,000
+writes a second, fanned out on write, and merged the largest accounts in at
+read time.
+</QA>
+
+<QA level="deep" q="Your design meets its average latency but not its p99. Where do you look?">
+At sequential dependencies on the request path, because each adds its own tail
+to yours; at fan-out, where the slowest of N calls decides the response; and at
+shared resources near saturation, where queueing grows the tail first. Fixes
+are parallelising calls, precomputing, hedging slow calls, moving work off the
+synchronous path, and adding headroom to the hottest resource.
+</QA>
+
+<QA level="deep" q="Why is a cache a risk as well as an optimisation?">
+Because the database behind it is sized for the misses. If the cache serves
+95% of reads, the database sees 5%. When the cache is emptied by a restart,
+failover or eviction storm, the database suddenly sees all of it, twenty times
+its usual load, and can fall over, which keeps the cache from refilling. The
+design has to size for a partially cold cache, coalesce concurrent misses for
+the same key, and shed load while it warms.
+</QA>
+
+<SectionHeading n="12" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="One billion requests a day: about how many per second on average?">
+    About 11,600. Divide by 86,400, or estimate with 10⁹ / 10⁵ = 10⁴.
+  </Q>
+  <Q q="800 million 340-byte records a day: how much storage per year for one copy?">
+    About 99 TB: 272 GB a day × 365.
+  </Q>
+  <Q q="Why did batching 100 rows per insert raise throughput 7.8×?">
+    The per-commit costs (round trip, transaction bookkeeping, WAL flush) are
+    paid once per batch instead of once per row.
+  </Q>
+  <Q q="What does 1 ms of round trip buy you in fibre?">
+    About 100 km of distance, since light in fibre covers roughly 200,000 km a
+    second, there and back.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Nick Craver, Stack Overflow: The Architecture – 2016 Edition" verdict="The best evidence for starting simple.">
+    Real request and query counts, real server counts, and a long argument for
+    vertical scaling. [nickcraver.com](https://nickcraver.com/blog/2016/02/17/stack-overflow-the-architecture-2016-edition/)
+  </WildCard>
+  <WildCard name="Raffi Krikorian, Timelines at Scale (QCon 2013)">
+    Twitter's fan-out-on-write design, the numbers behind it and the celebrity
+    exception. [InfoQ](https://www.infoq.com/presentations/Twitter-Timeline-Scalability/),
+    [summary](https://highscalability.com/the-architecture-twitter-uses-to-deal-with-150m-active-users/)
+  </WildCard>
+  <WildCard name="Peter Norvig, Teach Yourself Programming in Ten Years">
+    The origin of the latency table everyone copies; compare it with your own
+    measurements. [norvig.com](https://norvig.com/21-days.html)
+  </WildCard>
+  <WildCard name="Martin Kleppmann, Designing Data-Intensive Applications">
+    The book-length treatment of replication, partitioning, and derived data
+    kept in sync: the components section 5 adds.
+  </WildCard>
+  <WildCard name="pgbench and redis-benchmark">
+    The two tools used for section 3.3. Custom pgbench scripts (`-f`) let you
+    measure your own query shape.
+    [pgbench docs](https://www.postgresql.org/docs/16/pgbench.html),
+    [redis-benchmark](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/)
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="13" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Contention, Queueing & Tail Latency">
+    The utilisation curve, Little's Law and fan-out: the arithmetic behind
+    headroom and latency budgets. [Chapter 16](/topics/16-contention-tail-latency).
+  </WildCard>
+  <WildCard name="Reliability Engineering">
+    SLOs, error budgets and what each box should do when a dependency fails.
+    [Chapter 40](/topics/40-reliability).
+  </WildCard>
+  <WildCard name="Observability">
+    How to measure the SLIs and capacity signals a design document promises.
+    [Chapter 39](/topics/39-observability).
+  </WildCard>
+  <WildCard name="Redis Internals">
+    What the cache box in section 5 is doing inside, and where it runs out.
+    [Chapter 22](/topics/22-redis).
+  </WildCard>
+</CardGrid>

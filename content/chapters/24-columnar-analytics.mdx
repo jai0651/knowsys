@@ -1,0 +1,1293 @@
+---
+title: Columnar & Analytical Engines
+dek: "Why an analytical query over ten million rows can take a few milliseconds: data stored by column, encoded down to a few bits a value, skipped by statistics before it's read, and processed two thousand values at a time. This chapter takes a Parquet file, a vectorized engine and a ClickHouse table apart, and measures each trick."
+readingTime: "~30 min"
+level: "Intermediate"
+versions: "Measured on Apple M4, macOS 26.5.1 · DuckDB 1.5.5 · pyarrow 25.0.1 · SQLite 3.53.3 · ClickHouse 26.10 · source refs at DuckDB v1.5.5, parquet-format 2.11.0, ClickHouse v25.8.9.20-lts"
+prereqs: "CPU caches, SIMD basics, B-trees, SQL GROUP BY"
+updated: "2026-09-27"
+---
+
+Most engineers meet analytical engines through a dashboard that got slow. A
+`GROUP BY` over last quarter's events takes forty seconds on the Postgres
+replica, someone exports the table to Parquet, points DuckDB or ClickHouse at
+it, and the same query comes back in under a tenth of a second.
+
+That gap isn't a better planner or a faster disk. It comes from a handful of
+design decisions that all push the same way: store each column on its own,
+encode it until it's tiny, skip the parts that can't match, and process values
+in batches sized for the CPU cache.
+
+This chapter builds those decisions up one at a time on a single ten-million-row
+table. It opens a real Parquet file and reads its footer, measures what each
+encoding buys, runs a Volcano engine against a vectorized one, and then shows
+how ClickHouse and DuckDB put the pieces together. Every number was measured on
+an Apple M4 and is labelled with what produced it.
+
+<SectionHeading n="01" id="why-columns">Rows, columns and the analytical query</SectionHeading>
+
+A database stores a table as bytes on disk, and its first decision is the order
+of those bytes: all of row one, then all of row two, or all of column one, then all
+of column two.
+
+<Sub n="1.1" title="Two workloads, two layouts">
+
+Transactional queries and analytical queries want opposite things.
+
+| | Transactional (OLTP) | Analytical (OLAP) |
+|---|---|---|
+| **Typical query** | Fetch or update one order by id | Sum revenue by country for a quarter |
+| **Rows touched** | A handful | Millions to billions |
+| **Columns touched** | Most of them | Two or three out of dozens |
+| **Writes** | Constant, small, in place | Bulk appends, rarely updates |
+| **Layout that fits** | Row store: Postgres heap, InnoDB, SQLite | Column store: Parquet, ClickHouse, DuckDB |
+
+A row store keeps each row's fields next to each other, so fetching order 42
+is one page read. A column store keeps each column's values next to each other,
+so summing one column reads only that column.
+
+<Why>Why does the layout matter so much for a sum?</Why>
+
+Because storage is read in blocks, and so is memory. A row store can't read the
+`amount` field of a row without pulling the whole row, and its neighbours, into
+cache. So a query that touches one field pays for all of them.
+
+</Sub>
+
+<Sub n="1.2" title="The table this chapter uses">
+
+Every measurement here runs against one synthetic table of **10 million
+events**, generated inside DuckDB:
+
+| Column | Type | Shape |
+|---|---|---|
+| `ts` | timestamp | Increasing, one event every 3 seconds through 2026 |
+| `user_id` | int32 | Pseudo-random, about 1 million distinct values |
+| `country` | string | 10 distinct values |
+| `event_type` | string | 4 distinct values |
+| `amount` | double | Pseudo-random, 0 to 999.99 |
+| `url` | string | `https://shop.example/p/` plus one of 5 million ids |
+
+As CSV that's **725 MB**, roughly 72 bytes a row. Loaded into SQLite it's an
+**804 MB** file. Written to Parquet with pyarrow's defaults it's **224 MB**.
+
+Here's what that means for `SELECT sum(amount)`:
+
+<Estimate
+  rows={[
+    { label: "Bytes a row store must read", math: "the whole SQLite file", value: "804 MB" },
+    { label: "Bytes the amount column occupies in Parquet", math: "sum of its column chunks, snappy", value: "26 MB" },
+    { label: "Ratio", math: "804 / 26", value: "≈ 31×" },
+  ]}
+  result={{ label: "Less I/O for the columnar layout, before any cleverness", value: "≈ 31×" }}
+/>
+
+</Sub>
+
+<Sub n="1.3" title="What the layout alone buys">
+
+Same data loaded into SQLite and into DuckDB's own file format, same machine,
+warm page cache, median of three to five runs:
+
+<Compare
+  cols={["Query", "SQLite 3.53.3", "DuckDB table, 1 thread", "DuckDB table, 4 threads"]}
+  rows={[
+    ["SELECT sum(amount)", "421 ms", "11.7 ms", "4.2 ms"],
+    ["SELECT country, sum(amount) GROUP BY country", "3,209 ms", "31.0 ms", "10.5 ms"],
+    ["File size on disk", "804 MB", "135 MB", "135 MB"],
+  ]}
+/>
+
+On one thread, DuckDB is 36× faster on the sum and about 100× on the group-by.
+The group-by gap is wider because SQLite's plan for it is `USE TEMP B-TREE FOR
+GROUP BY`: it builds a B-tree keyed on country and inserts every row into it,
+where DuckDB keeps ten running totals in a hash table.
+
+<Callout label="Common mistake" kind="warn">
+Reading this table as "SQLite is slow". It's a row store answering a question
+row stores aren't built for, and on `WHERE id = ?` it would beat every engine in
+this chapter. What you're seeing is the cost of a layout mismatch, not a bad
+database.
+</Callout>
+
+</Sub>
+
+<Sub n="1.4" title="What columns cost you">
+
+Columns aren't free. Each strength is a weakness for another workload:
+
+| Operation | Row store | Column store |
+|---|---|---|
+| Read a few columns of many rows | Reads every column | Reads only those columns |
+| Fetch one whole row by key | One page | One seek per column, then stitch the row back together |
+| Insert one row | Append to one page | Touch every column file; engines buffer and batch instead |
+| Update one field in place | Cheap | Usually a rewrite of a block, or a delete marker plus an insert |
+| Compress | Mixed types side by side, so poorly | One type at a time, often 5–1000× (section 3) |
+
+That's why the systems in this chapter all want data in **big batches**:
+Parquet writers buffer a million rows before writing a row group, and ClickHouse
+turns every `INSERT` into a new immutable file (section 7).
+
+</Sub>
+
+<SectionHeading n="02" id="parquet-layout">Inside a Parquet file</SectionHeading>
+
+Parquet is the columnar file format most analytical tools read and write:
+Spark, Trino, DuckDB, ClickHouse, pandas, Polars, Snowflake's external tables.
+Its layout comes from Google's
+[Dremel paper](https://research.google/pubs/dremel-interactive-analysis-of-web-scale-datasets-2/)
+(VLDB 2010), and the format itself is defined in one Thrift file.
+
+<Sub n="2.1" title="Four levels: file, row group, column chunk, page">
+
+A Parquet file is a hierarchy:
+
+| Level | What it holds | pyarrow default |
+|---|---|---|
+| **File** | Magic bytes `PAR1`, the row groups, then the footer | |
+| **Row group** | A horizontal slice of rows, stored column by column | up to 1,048,576 rows |
+| **Column chunk** | One column's values for one row group, contiguous on disk | |
+| **Page** | The unit of encoding and compression inside a chunk | about 1 MB, or 20,000 rows |
+| **Footer** | Schema, and for every chunk its offsets, sizes, encodings and min/max | at the end of the file |
+
+<Why>Why split rows into groups at all, instead of one chunk per column?</Why>
+
+Two reasons. A writer has to buffer a whole row group in memory before it can
+write the columns one after another, so the group size caps writer memory. And
+a row group is the natural unit of parallelism and skipping: one thread per
+group, and one set of min/max statistics per group per column.
+
+<Why>Why is the footer at the end?</Why>
+
+Because the writer only knows the offsets and statistics once it has written
+the data. Putting metadata last lets it stream row groups out and write the
+index once. Readers pay for it: they must seek to the end first. The
+last 8 bytes are the footer's length and `PAR1` again, so a reader fetches the
+tail, then the footer, then only the chunks it needs.
+
+<Steps
+  title="Reading one column of one row group from a Parquet file"
+  lanes={[
+    { t: "File tail", s: "last 8 bytes", icon: "⇥" },
+    { t: "Footer", s: "FileMetaData (Thrift)", icon: "≡" },
+    { t: "Row-group stats", s: "min · max · nulls", icon: "⌗" },
+    { t: "Column chunk", s: "one byte range", icon: "▦" },
+    { t: "Pages", s: "dictionary · data", icon: "▤" },
+    { t: "Vector", s: "decoded values", icon: "◉" },
+  ]}
+  steps={[
+    [0, "The reader fetches the **last 8 bytes**: a 4-byte footer length and the magic `PAR1`. On S3 that's one ranged GET."],
+    [1, "It reads the **footer**, 7,940 bytes for the 10-million-row file here, and decodes the schema and every row group's metadata."],
+    [2, "For each row group it checks the column's **min and max** against the query's filter. Groups that can't match are never read."],
+    [3, "For the groups that survive, it reads only the **column chunks** the query names, using the offsets and sizes in the footer."],
+    [4, "Inside a chunk, a **dictionary page** comes first if there is one, then data pages. Each page is decompressed (snappy, zstd) and then decoded."],
+    [5, "Decoded values land in an in-memory **vector** for the engine. Only here does the data look like numbers and strings again."],
+  ]}
+/>
+
+</Sub>
+
+<Sub n="2.2" title="The footer, from the spec">
+
+Here's the metadata each row group carries, from the format's Thrift
+definition:
+
+<SourceRead
+  file="src/main/thrift/parquet.thrift"
+  repo="apache/parquet-format"
+  tag="apache-parquet-format-2.11.0"
+  href="https://github.com/apache/parquet-format/blob/apache-parquet-format-2.11.0/src/main/thrift/parquet.thrift#L1001"
+>
+```thrift
+struct RowGroup {
+  /** Metadata for each column chunk in this row group.
+   * This list must have the same order as the SchemaElement list in FileMetaData.
+   **/
+  1: required list<ColumnChunk> columns
+
+  /** Total byte size of all the uncompressed column data in this row group **/
+  2: required i64 total_byte_size
+
+  /** Number of rows in this row group **/
+  3: required i64 num_rows
+
+  /** If set, specifies a sort ordering of the rows in this RowGroup.
+   * The sorting columns can be a subset of all the columns.
+   */
+  4: optional list<SortingColumn> sorting_columns
+  /* ... file_offset, total_compressed_size, ordinal ... */
+}
+```
+</SourceRead>
+
+And for each column chunk:
+
+<SourceRead
+  file="src/main/thrift/parquet.thrift"
+  repo="apache/parquet-format"
+  tag="apache-parquet-format-2.11.0"
+  href="https://github.com/apache/parquet-format/blob/apache-parquet-format-2.11.0/src/main/thrift/parquet.thrift#L875"
+>
+```thrift
+struct ColumnMetaData {
+  1: required Type type
+  2: required list<Encoding> encodings
+  3: required list<string> path_in_schema
+  4: required CompressionCodec codec
+  5: required i64 num_values
+  6: required i64 total_uncompressed_size
+  7: required i64 total_compressed_size
+  /* ... */
+  /** Byte offset from beginning of file to first data page **/
+  9: required i64 data_page_offset
+  /* ... */
+  /** Byte offset from the beginning of file to first (only) dictionary page **/
+  11: optional i64 dictionary_page_offset
+
+  /** optional statistics for this column chunk */
+  12: optional Statistics statistics;
+  /* ... encoding_stats, bloom_filter_offset, bloom_filter_length, ... */
+}
+```
+</SourceRead>
+
+Field 12 is where skipping comes from. `Statistics` holds `min_value`,
+`max_value` and `null_count`, and the spec now asks readers to tell a missing
+`null_count` apart from zero.
+
+</Sub>
+
+<Sub n="2.3" title="A real footer">
+
+Reading the footer of the pyarrow-written file takes a few lines:
+
+<TryIt what="Print a Parquet file's row groups, chunk sizes and statistics" lang="python" toolchain="pyarrow 25.0.1, Apple M4, macOS 26.5.1">
+```python
+import pyarrow.parquet as pq
+m = pq.ParquetFile("events_snappy.parquet").metadata
+print(m.num_rows, m.num_row_groups, m.serialized_size)
+
+rg = m.row_group(0)
+for c in range(rg.num_columns):
+    cc = rg.column(c)
+    s = cc.statistics
+    print(cc.path_in_schema, cc.total_compressed_size, s.min, s.max)
+
+for r in range(m.num_row_groups):          # the ts range of every row group
+    s = m.row_group(r).column(0).statistics
+    print(r, m.row_group(r).num_rows, s.min, s.max)
+```
+
+<Output>
+```text
+10000000 10 7940
+ts 6755729 2026-01-01 00:00:00 2026-02-06 09:48:45
+user_id 4688240 0 999997
+country 529155 BR US
+event_type 267050 buy view
+amount 2702020 -0.0 999.99
+url 8432088 https://shop.example/p/0 https://shop.example/p/999996
+0 1048576 2026-01-01 00:00:00 2026-02-06 09:48:45
+1 1048576 2026-02-06 09:48:48 2026-03-14 19:37:33
+2 1048576 2026-03-14 19:37:36 2026-04-20 05:26:21
+3 1048576 2026-04-20 05:26:24 2026-05-26 15:15:09
+4 1048576 2026-05-26 15:15:12 2026-07-02 01:03:57
+5 1048576 2026-07-02 01:04:00 2026-08-07 10:52:45
+6 1048576 2026-08-07 10:52:48 2026-09-12 20:41:33
+7 1048576 2026-09-12 20:41:36 2026-10-19 06:30:21
+8 1048576 2026-10-19 06:30:24 2026-11-24 16:19:09
+9 562816 2026-11-24 16:19:12 2026-12-14 05:19:57
+```
+
+Ten row groups, nine of exactly 2²⁰ rows, and a 7,940-byte footer describing
+224 MB. Because `ts` was written in order, each group covers a clean five-week
+window. Hold on to that: it's what makes section 4 work.
+</Output>
+</TryIt>
+
+<Why>Why is the max url "p/999996" when there are five million ids?</Why>
+
+Because string statistics compare bytes, not numbers. `"p/999996"` sorts after
+`"p/4999999"`. That's harmless here, but it means a range filter on a string
+column that holds numbers can't prune the way you'd expect.
+
+</Sub>
+
+<SectionHeading n="03" id="encodings">Encodings: making each column small</SectionHeading>
+
+Storing a column's values side by side means they share a type and often a
+shape: few distinct values, long runs, steady increments. Parquet has an
+encoding for each shape, and it applies them *before* the general-purpose
+compressor.
+
+<Sub n="3.1" title="Dictionary, RLE and bit-packing">
+
+Most columns default to **dictionary** encoding. A writer collects the
+distinct values into a dictionary page, then stores each value as a small
+integer index. Those indexes go through Parquet's hybrid **RLE/bit-packing**
+encoding: runs of the same index become one (count, value) pair, and everything
+else is packed into the fewest bits that can hold the largest index.
+
+Look at `country` in row group 0: 1,048,576 values in **529,155 bytes**.
+
+<Estimate
+  rows={[
+    { label: "Distinct countries", math: "10 values", value: "10" },
+    { label: "Bits per index", math: "ceil(log2 10)", value: "4 bits" },
+    { label: "Index bytes for one row group", math: "1,048,576 × 4 / 8", value: "524,288 B" },
+    { label: "Measured column chunk", math: "from the footer", value: "529,155 B" },
+  ]}
+  result={{ label: "Overhead beyond pure 4-bit packing: dictionary, headers", value: "≈ 0.9%" }}
+/>
+
+`event_type`, with four values, packs to 2 bits: 267,050 bytes for the same
+row count. The strings `"view"` and `"click"` are stored once per row group.
+
+</Sub>
+
+<Sub n="3.2" title="When the dictionary gives up">
+
+A dictionary only helps when values repeat. pyarrow caps the dictionary at
+**1 MB per column chunk** (`dictionary_pagesize_limit`). When a chunk's
+dictionary outgrows it, the writer stops adding entries and writes the
+rest of that chunk's pages as `PLAIN`.
+
+To see which columns hit the cap, write the file again with dictionaries
+turned off and compare:
+
+| Column | Distinct values | Dictionary on | Dictionary off | What happened |
+|---|---|---|---|---|
+| `country` | 10 | 5.05 MB | 19.0 MB | Dictionary wins, 3.8× |
+| `event_type` | 4 | 2.55 MB | 19.8 MB | Dictionary wins, 7.8× |
+| `amount` | 100,000 | 26.0 MB | 48.3 MB | Dictionary wins, 1.9× |
+| `url` | ~5,000,000 | 80.5 MB | 79.9 MB | Dictionary full, fell back to plain |
+| `ts` | 10,000,000 | 64.6 MB | 61.8 MB | Every value distinct, fell back to plain |
+
+<Why>Why is ts slightly bigger with a dictionary than without?</Why>
+
+Because the writer started a dictionary for each chunk, wrote an 811 KB
+dictionary page (the gap between `dictionary_page_offset` and
+`data_page_offset` in row group 0), then gave up. That wasted dictionary page is still in the file. For a column
+where every value is distinct, a dictionary is pure cost.
+
+</Sub>
+
+<Sub n="3.3" title="Delta encoding for sorted numbers">
+
+`ts` goes up by exactly 3 seconds every row. Storing each timestamp as a full
+8-byte integer ignores that. **`DELTA_BINARY_PACKED`** stores the first value,
+then the differences, bit-packed in blocks; a constant difference packs to
+almost nothing.
+
+```python
+pq.write_table(t, "events_delta.parquet",
+               use_dictionary=["country", "event_type", "user_id", "amount", "url"],
+               column_encoding={"ts": "DELTA_BINARY_PACKED"})
+```
+
+The `ts` column went from **64.55 MB to 0.07 MB**, about 900× smaller, and
+the whole file from 224 MB to 159 MB. One line of writer configuration.
+
+<Callout label="Design implication">
+The writer's defaults are tuned for "reasonable on anything", and your columns
+aren't anything. Timestamps, auto-increment ids and sequence numbers are sorted
+integers; tell the writer. Check `total_compressed_size` per column in the
+footer before and after, and let the file tell you what worked.
+</Callout>
+
+</Sub>
+
+<Sub n="3.4" title="Sort order is a compression setting">
+
+Run-length encoding needs runs. In the original file, rows arrive in time order
+and countries are shuffled, so the longest run of one country is short.
+
+<Predict
+  q="You rewrite the same 10 million rows sorted by (country, event_type). The country column was 5.05 MB. What is it now?"
+  options={[
+    "About the same: it has 10 values either way",
+    "About half: 2.5 MB",
+    "About a tenth: 0.5 MB",
+    "Under 1% of the original: tens of kilobytes",
+  ]}
+  answer={3}
+>
+**0.02 MB.** Sorted, each row group holds one or two long runs of the same
+country, and RLE writes each run as a single count-and-value pair. `event_type`,
+sorted second, went from 2.55 MB to 0.03 MB. You pay elsewhere: `ts`
+is no longer in order, and grew from 64.6 MB to 69.9 MB. Sorting is a choice of
+which columns get to compress.
+</Predict>
+
+This is the same idea as ClickHouse's `ORDER BY` in section 7. Picking a sort
+key picks both what compresses and what can be skipped.
+
+</Sub>
+
+<Sub n="3.5" title="Then the general-purpose compressor">
+
+After encoding, each page goes through a block compressor. pyarrow defaults to
+snappy:
+
+| Column | snappy | zstd | Note |
+|---|---|---|---|
+| `ts` (dictionary fallback) | 64.6 MB | 34.1 MB | zstd finds the pattern that plain encoding hid |
+| `user_id` | 44.9 MB | 36.5 MB | Random ints: snappy saved nothing (compressed = uncompressed) |
+| `url` | 80.5 MB | 42.4 MB | Shared `https://shop.example/p/` prefix |
+| **Whole file** | **224 MB** | **144 MB** | |
+
+<Why>So why isn't zstd the default?</Why>
+
+It costs more CPU to decompress, and snappy was designed for speed over ratio.
+For files read many times from local disk, snappy's speed can win; for files
+read from S3, where you pay per byte and wait on the network, zstd probably does.
+Measure your own read path before switching fleet-wide.
+
+</Sub>
+
+<SectionHeading n="04" id="skipping">Skipping data before reading it</SectionHeading>
+
+You can't beat bytes you never read. Columnar engines skip in three
+ways: by column, by statistics, and, in the extreme, by answering from metadata
+alone.
+
+<Sub n="4.1" title="Projection: reading only the named columns">
+
+<Compare
+  cols={["Query on the Parquet file", "DuckDB, 1 thread", "What it reads"]}
+  rows={[
+    ["SELECT count(*)", "0.3 ms", "The footer only: num_rows per row group"],
+    ["SELECT sum(amount)", "53.9 ms", "The amount chunks, 26 MB"],
+    ["SELECT country, sum(amount) … GROUP BY", "67.0 ms", "country and amount, 31 MB"],
+    ["SELECT sum(length(url))", "221 ms", "The url chunks, 80 MB, plus string decoding"],
+  ]}
+/>
+
+`count(*)` never touches a data page, because each row group's count is in
+the footer.
+
+<Callout label="Common mistake" kind="warn">
+`SELECT *` against a columnar store. On a row store it costs a little extra
+network. On a column store it reads, decompresses and decodes every column,
+and reassembles rows at the end. The widest, least compressible columns (URLs,
+JSON blobs, user agents) are usually the ones nobody needed.
+</Callout>
+
+</Sub>
+
+<Sub n="4.2" title="Zone maps: min/max per block">
+
+The per-row-group `min` and `max` in the footer are what the literature calls a
+**zone map**: a summary per block, used to prove a block can't contain a match.
+Two queries with almost the same selectivity:
+
+<Compare
+  cols={["Filter", "Rows matched", "DuckDB, 1 thread", "Row groups that can match"]}
+  rows={[
+    ["ts in one day (June 1)", "28,800", "9.5 ms", "1 of 10"],
+    ["user_id between 0 and 2879", "28,905", "44.6 ms", "10 of 10"],
+  ]}
+/>
+
+Only row group 4 can hold June 1, whose `ts` range is May 26 to July 2;
+the other nine are ruled out by the footer alone. `user_id` is pseudo-random,
+so every row group's range is roughly 0 to 999,999, and every group has to be
+read and filtered. DuckDB does the same with its own tables, which carry
+[zonemaps](https://duckdb.org/docs/current/guides/performance/indexing.html) per
+row group.
+
+<Why>Why does the day filter get slower with four threads (11.7 ms)?</Why>
+
+Because after pruning there's one row group left, and a row group is the unit of
+parallel work: DuckDB's
+[file-format guide](https://duckdb.org/docs/current/guides/performance/file_formats.html)
+says it "can only parallelize over row groups". Three threads have nothing to do, and spinning them up costs
+more than it saves. The `user_id` query, with ten groups to share, dropped from
+44.6 ms to 18.0 ms.
+
+</Sub>
+
+<Sub n="4.3" title="Statistics only prune clustered columns">
+
+Min/max statistics are only as good as the physical order of the data. The
+rule is simple:
+
+| Column shape | Min/max per block | Pruning |
+|---|---|---|
+| Sorted, or arrives in order (time, auto-increment id) | Narrow, non-overlapping ranges | Excellent |
+| Correlated with the sort order (e.g. order date vs ship date) | Somewhat narrow | Partial |
+| Random or high-cardinality with no order (user id, UUID) | Each block spans the whole domain | None |
+
+For the unordered case there are two further tools. A **page index**
+(`ColumnIndex` and `OffsetIndex`) stores min/max per page, not per row group,
+in one place near the footer; pyarrow writes it only if you pass
+`write_page_index=True`. A **Bloom filter** per column chunk answers "is this
+exact value possibly here?", which helps equality on a UUID where min/max can't.
+
+<Callout label="Design implication">
+Decide the sort order of your files from your filters. If most queries say
+`WHERE tenant_id = ? AND ts > ?`, sort by `(tenant_id, ts)` when you write. It
+costs one sort at write time and pays on every read.
+</Callout>
+
+</Sub>
+
+<Sub n="4.4" title="Too many small files">
+
+Each file costs a footer read, a schema check, and on object storage at least
+one extra request. The same 10 million rows split into 1,000 files of 10,000
+rows:
+
+| Layout | Files | Total size | `sum(amount)`, DuckDB, 4 threads |
+|---|---|---|---|
+| One file, 10 row groups | 1 | 224 MB | 22–28 ms |
+| 1,000 files, 10,000 rows each | 1,000 | 240 MB | 153–159 ms |
+
+Roughly six times slower on a local SSD with a warm cache, and 7% bigger, because
+every file repeats its footer and every small chunk compresses a little worse.
+On S3, per-request latency probably makes it far worse. Streaming pipelines that
+flush a file every few seconds produce exactly this; compact them.
+
+</Sub>
+
+<SectionHeading n="05" id="vectorized">Execution: from Volcano to vectors</SectionHeading>
+
+Reading less data only helps if the engine can process what's left quickly. Here
+the question stops being about bytes and becomes about CPU instructions per
+value.
+
+<Sub n="5.1" title="The Volcano model">
+
+Almost every row-store engine executes a plan as a tree of operators, each
+with a `next()` method that returns one row. This is the **iterator** or
+**Volcano** model, from Goetz Graefe's
+[1994 paper](https://doi.org/10.1109/69.273032). A root operator calls `next()` on its
+child, which calls its child, down to the scan.
+
+<StepSequence
+  title="One row through a Volcano plan: SELECT sum(price*qty) WHERE qty < 25"
+  actors={["Aggregate", "Filter", "Scan"]}
+  messages={[
+    { from: 0, to: 1, label: "next()", note: "The aggregate wants one more row. It makes a **virtual call** to its child." },
+    { from: 1, to: 2, label: "next()", note: "The filter needs a candidate, so it makes another virtual call down to the scan." },
+    { from: 2, to: 1, label: "row", note: "The scan copies one row's fields into a row struct and returns it." },
+    { from: 1, to: 1, label: "eval(qty < 25)", note: "The filter evaluates its predicate by walking an **expression tree**: a virtual call for `qty`, one for `25`, one for `<`." },
+    { from: 1, to: 0, label: "row", note: "The row passes. The filter returns it up." },
+    { from: 0, to: 0, label: "eval(price*qty)", note: "The aggregate walks its own expression tree, three more virtual calls, and adds one number. **Then it does all of it again for the next row.**" },
+  ]}
+/>
+
+It's a clean design: any operator composes with any other. Now look at what
+the CPU sees.
+
+<Why>What does the CPU see?</Why>
+
+Roughly ten indirect calls and a pointer chase for every row, around one
+multiply and one add. Each call target has to be guessed by the branch predictor, the
+compiler can't unroll or vectorize across rows because each call handles one,
+and the useful arithmetic is a small fraction of the instructions.
+
+</Sub>
+
+<Sub n="5.2" title="The interpretation tax, measured in 2005">
+
+Peter Boncz, Marcin Zukowski and Niels Nes measured this in the
+[MonetDB/X100 paper](https://www.cidrdb.org/cidr2005/papers/P19.pdf) (CIDR 2005).
+Profiling MySQL on TPC-H Query 1, they found that the five operations doing the
+query's real work "correspond to only 10% of total execution time". 28% went to
+the aggregation hash table, and the remaining 62% to functions that navigate
+MySQL's record format.
+
+A single addition cost 38 instructions at an IPC of 0.8, about **49 cycles**, on
+a CPU that could do one multiply every 3 cycles. Their fix was to keep the
+Volcano structure but make `next()` return a **vector** of values, about a
+thousand at a time, and implement every operation as a tight loop over arrays.
+
+</Sub>
+
+<Sub n="5.3" title="Vectors in DuckDB">
+
+DuckDB is built on that idea. Its vector size is a compile-time constant:
+
+<SourceRead
+  file="src/include/duckdb/common/vector_size.hpp"
+  repo="duckdb/duckdb"
+  tag="v1.5.5"
+  href="https://github.com/duckdb/duckdb/blob/v1.5.5/src/include/duckdb/common/vector_size.hpp"
+>
+```cpp
+namespace duckdb {
+
+//! The default standard vector size
+#define DEFAULT_STANDARD_VECTOR_SIZE 2048U
+
+//! The vector size used in the execution engine
+#ifndef STANDARD_VECTOR_SIZE
+#define STANDARD_VECTOR_SIZE DEFAULT_STANDARD_VECTOR_SIZE
+#endif
+
+#if (STANDARD_VECTOR_SIZE & (STANDARD_VECTOR_SIZE - 1) != 0)
+#error The vector size must be a power of two
+#endif
+
+} // namespace duckdb
+```
+</SourceRead>
+
+Every operator in DuckDB passes a `DataChunk` of up to 2,048 rows, one vector
+per column. A filter doesn't copy the rows that pass; it produces a **selection
+vector**, a list of the indexes that passed, and the next operator reads through
+it.
+
+One aside on that `#if`: in C, `!=` binds tighter than `&`, so it computes
+`N & ((N - 1) != 0)`, which is `N & 1`. It rejects odd sizes, not every
+non-power of two.
+
+</Sub>
+
+<Sub n="5.4" title="Volcano against vectors, same machine">
+
+To see the gap directly, here's the query from the diagram over 20 million rows
+of two in-memory columns, written both ways in C++. The Volcano version uses
+virtual `next()` and a virtual expression tree; its vectorized twin runs two
+primitives per batch: a branch-free selection, and a multiply-and-sum through
+the selection vector.
+
+<TryIt what="Tuple-at-a-time versus vector-at-a-time, SELECT sum(price*qty) WHERE qty < 25" lang="cpp" toolchain="Apple clang 21 -O2, Apple M4, macOS 26.5.1">
+```cpp
+// Vectorized primitives: tight loops the compiler can pipeline.
+size_t sel_lt(const int32_t* col, int32_t k, size_t n, uint32_t* sel) {
+  size_t j = 0;
+  for (size_t i = 0; i < n; i++) { sel[j] = i; j += col[i] < k; }   // no branch
+  return j;
+}
+double sum_mul_sel(const double* a, const int32_t* b, const uint32_t* sel, size_t n) {
+  double s = 0;
+  for (size_t i = 0; i < n; i++) { uint32_t x = sel[i]; s += a[x] * b[x]; }
+  return s;
+}
+
+for (size_t off = 0; off < N; off += vs) {                 // vs = vector size
+  size_t n = std::min(vs, N - off);
+  size_t k = sel_lt(&qty[off], 25, n, sel.data());
+  total += sum_mul_sel(&price[off], &qty[off], sel.data(), k);
+}
+```
+
+<Output>
+```text
+volcano               233.9 ms   11.69 ns/row  sum=6000042453
+vector size        1     86.6 ms    4.33 ns/row  sum=6000042453
+vector size       16     18.9 ms    0.94 ns/row  sum=6000042453
+vector size       64     16.2 ms    0.81 ns/row  sum=6000042453
+vector size     2048     18.6 ms    0.93 ns/row  sum=6000042453
+```
+
+Each line is the median of five runs, and every line gets the same sum. The
+Volcano version spends about 12 ns a row; batches of 2,048 spend under 1 ns,
+**roughly 12× less**. Five later runs, on a busier machine, put the ratio at
+11.7×. Even a "vector" of one row beats Volcano 2.7×, because it drops the
+expression-tree calls.
+</Output>
+</TryIt>
+
+</Sub>
+
+<Sub n="5.5" title="Why about a thousand, and not a million">
+
+If batching is good, why not process the whole column in one step? MonetDB, the
+predecessor of X100, did exactly that, and the X100 paper explains why it
+wasn't ideal: every intermediate result becomes a full column in RAM, and the
+engine runs at memory bandwidth instead of cache bandwidth.
+
+A second test makes the intermediates explicit: `sum(price * (1 - disc) * (1 +
+tax))`, where each primitive writes its result to a vector, four intermediate
+double vectors in all. Median of three runs:
+
+<Compare
+  cols={["Vector size", "Intermediates in flight", "Time, 20M rows", "ns per row"]}
+  rows={[
+    ["1", "32 B", "72.9 ms", "3.6"],
+    ["128", "4 KB", "14.8 ms", "0.74"],
+    ["1,024", "32 KB", "13.4 ms", "0.67"],
+    ["2,048", "64 KB", "13.1 ms", "0.66"],
+    ["65,536", "2 MB", "21.2 ms", "1.06"],
+    ["4,194,304", "128 MB", "38.3 ms", "1.92"],
+    ["20,000,000 (whole column)", "625 MB", "36.2 ms", "1.81"],
+  ]}
+/>
+
+Fastest was 128 to 2,048 values, where all four intermediates fit in the
+M4's 64 KB L1 data cache (`hw.l1dcachesize`). Past that, each primitive writes
+its output to a deeper cache level or DRAM and the next one reads it back.
+Whole-column processing is 2.8× slower than the sweet spot. The X100 paper found
+the same shape on 2005 hardware: "all values between 128 and 8K actually work
+well", with performance falling once "intermediate results do not fit in the
+cache anymore".
+
+<Why>Where does SIMD come in?</Why>
+
+Tight loops over arrays are what compilers auto-vectorize. Recompiling the same
+test with `-fno-vectorize -fno-slp-vectorize` took the 2,048 case from 13.1 ms
+to **35.2 ms**, and the binary went from 28 NEON `fmul.2d`/`fadd.2d`/`fsub.2d`
+instructions to none. Volcano gets no such help: no function loops over rows.
+
+</Sub>
+
+<Sub n="5.6" title="The other answer: compile the query">
+
+Vectorization isn't the only fix. **Data-centric code generation**, from Thomas
+Neumann's HyPer, compiles the whole pipeline into one tight loop per query, so
+a row stays in registers from scan to aggregate. Kersten et al. built both
+approaches inside one engine to compare them
+([VLDB 2018](https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf)) and found "both
+are efficient, but have different strengths": vectorization "is better at hiding
+cache miss latency", while compilation "requires fewer CPU instructions, which
+benefits cache-resident workloads".
+
+| Engine | Execution model |
+|---|---|
+| DuckDB, ClickHouse, Velox, DataFusion, Snowflake | Vectorized |
+| HyPer, Umbra, Spark's whole-stage codegen | Compiled |
+| Postgres, MySQL, SQLite | Tuple-at-a-time (Postgres adds JIT for expressions) |
+
+</Sub>
+
+<SectionHeading n="06" id="late-materialization">Late materialization</SectionHeading>
+
+A column store has to hand back rows eventually, so it must decide when to glue
+the columns back together, and that choice has a name: early versus late
+**materialization**.
+
+<Sub n="6.1" title="Early and late, step by step">
+
+Take `SELECT url FROM events WHERE user_id = 12345`. Ten rows match out of ten
+million.
+
+- **Early materialization** reads `user_id` and `url` together, builds (user_id,
+  url) tuples, then filters. It decodes ten million URLs to return ten.
+- **Late materialization** works on positions for as long as possible:
+
+<Steps
+  title="Late materialization: SELECT url WHERE user_id = 12345"
+  lanes={[
+    { t: "Scan user_id", s: "one column", icon: "▦" },
+    { t: "Filter", s: "compare in place", icon: "⌗" },
+    { t: "Positions", s: "selection vector", icon: "≡" },
+    { t: "Fetch url", s: "only at positions", icon: "⇣" },
+    { t: "Output", s: "rows", icon: "◉" },
+  ]}
+  steps={[
+    [0, "The engine reads and decodes only the **`user_id`** column, a vector at a time."],
+    [1, "It compares each value to 12345. Nothing else about the row exists yet."],
+    [2, "The result is a list of **positions** that matched. For most vectors that list is empty, and the vector is done."],
+    [3, "Only for vectors with matches does it read `url`, and it decodes only the entries at those positions."],
+    [4, "The ten (url) values become output rows. Ten million URLs were never turned into strings."],
+  ]}
+/>
+
+</Sub>
+
+<Sub n="6.2" title="Measured on the Parquet file">
+
+<Compare
+  cols={["Query, DuckDB 4 threads", "Median"]}
+  rows={[
+    ["SELECT user_id WHERE user_id = 12345", "6 ms"],
+    ["SELECT url WHERE user_id = 12345", "29–33 ms"],
+    ["SELECT sum(length(url)), every url decoded", "115 ms"],
+  ]}
+/>
+
+Fetching `url` for ten rows costs far less than decoding the column, but it
+isn't free: 25 ms over the filter alone. Parquet pages are compressed as a
+unit, so to reach the one entry you need, the reader still has to decompress
+the page that holds it.
+
+<Why>So is late materialization always better?</Why>
+
+No. Abadi, Myers, DeWitt and Madden studied exactly this in C-Store
+([ICDE 2007](https://www.cs.umd.edu/~abadi/papers/abadiicde2007.pdf)). Their
+heuristic: late materialization wins "if output data is aggregated, or if the
+query has low selectivity (highly selective predicates), or if input data is
+compressed using a light-weight compression technique". Otherwise, "for high
+selectivity, non-aggregated, non-compressed data, early materialization should
+be used", because going back for each column re-reads blocks.
+
+<Callout label="Design implication">
+Late materialization is why a narrow filter on a cheap column followed by a
+fetch of an expensive one is fast. Put the selective predicate on a small,
+well-encoded column when you can. ClickHouse makes this explicit with
+`PREWHERE`, which it applies on its own: in the plans in section 7 it moved the
+`WHERE` into a "Prewhere filter" without being asked.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="07" id="clickhouse">ClickHouse: MergeTree, parts and granules</SectionHeading>
+
+Parquet is a file format; ClickHouse is a server that owns its storage. Its main
+table engine, **MergeTree**, borrows ideas from LSM trees (immutable files merged
+in the background) and puts a sparse index on top. The engine's design is
+described in the [VLDB 2024 paper](https://www.vldb.org/pvldb/vol17/p3731-schulze.pdf).
+
+The same 10 million rows, loaded with `clickhouse local`:
+
+```sql
+CREATE TABLE events (
+  ts DateTime, user_id UInt32,
+  country LowCardinality(String), event_type LowCardinality(String),
+  amount Float64, url String
+) ENGINE = MergeTree ORDER BY (country, event_type, ts);
+
+INSERT INTO events
+  SELECT ts, user_id, country, event_type, amount, url FROM file('events_snappy.parquet');
+```
+
+<Sub n="7.1" title="Every INSERT is a part">
+
+A MergeTree table is a set of **parts**. Each insert block is sorted by the
+table's `ORDER BY` and written as a new, immutable part: a directory with one
+data file and one mark file per column, plus a primary index. Background
+threads merge small parts into bigger ones.
+
+<StepSequence
+  title="Three inserts, one merge"
+  actors={["INSERT", "Parts on disk", "Background merge", "SELECT"]}
+  messages={[
+    { from: 0, to: 1, label: "10 rows", note: "The first insert is sorted and written as part `all_1_1_0`: partition `all`, blocks 1 to 1, merge level 0." },
+    { from: 0, to: 1, label: "10 rows", note: "The second becomes `all_2_2_0`. Nothing is modified in place; parts are immutable." },
+    { from: 0, to: 1, label: "10 rows", note: "The third becomes `all_3_3_0`. A query now has to read three parts and merge their sorted streams." },
+    { from: 2, to: 1, label: "merge", note: "A merge reads the three sorted parts, merge-sorts them, and writes `all_1_3_1`: blocks 1 to 3, level 1, 30 rows." },
+    { from: 2, to: 1, label: "drop old", note: "The three source parts become inactive and are deleted after `old_parts_lifetime`." },
+    { from: 3, to: 1, label: "read", note: "A query started before the merge keeps reading the old parts. **One that starts after reads one part.**" },
+  ]}
+/>
+
+Those are the real part names from `system.parts`, with merges stopped and
+then started. The 10-million-row load arrived as 10 insert blocks, one per
+Parquet row group, and merged through `all_1_6_1` to `all_1_10_2`.
+
+<Why>Why write new files instead of updating in place?</Why>
+
+Because every column is sorted and compressed in blocks. Changing one row in
+place would mean decompressing, editing and recompressing a block in every
+column file. Writing a new part is a sequential append, and merging later
+amortises the sort, the same trade an LSM tree makes.
+
+</Sub>
+
+<Sub n="7.2" title="Granules and the sparse primary index">
+
+Inside a part, rows are grouped into **granules** of 8,192 rows. The primary
+index stores the `ORDER BY` key of the *first row of each granule*, not of
+every row:
+
+<SourceRead
+  file="src/Storages/MergeTree/MergeTreeSettings.cpp"
+  repo="ClickHouse/ClickHouse"
+  tag="v25.8.9.20-lts"
+  href="https://github.com/ClickHouse/ClickHouse/blob/v25.8.9.20-lts/src/Storages/MergeTree/MergeTreeSettings.cpp#L64"
+>
+```cpp
+    DECLARE(UInt64, index_granularity, 8192, R"(
+    Maximum number of data rows between the marks of an index. I.e how many rows
+    correspond to one primary key value.
+    )", 0) \
+    /* ... */
+    DECLARE(UInt64, index_granularity_bytes, 10 * 1024 * 1024, R"(
+    Maximum size of data granules in bytes.
+
+    To restrict the granule size only by number of rows, set to `0` (not recommended).
+    )", 0) \
+```
+</SourceRead>
+
+For the merged part:
+
+```text
+name        rows      marks  primary_key_bytes_in_memory  compressed  uncompressed
+all_1_10_2  10000000  1222   7.32 KiB                     140.70 MiB  532.01 MiB
+```
+
+Ten million rows, 1,221 granules (10,000,000 / 8,192, rounded up) plus a final
+mark, and an index of **7.32 KiB** that lives in memory. A B-tree over the same
+rows would have ten million entries.
+
+<Why>How does a sparse index find a row?</Why>
+
+It doesn't find rows; it finds granules. A binary search over the 1,221 first
+keys gives the range of granules that could hold the key, and ClickHouse reads
+those granules in full. The **mark files** map each granule number to an offset
+in each column's compressed data file, so it can seek straight to granule 400
+of `amount` without reading granules 0 to 399.
+
+<Callout label="Common mistake" kind="warn">
+Using ClickHouse for point lookups by a key that isn't the leading `ORDER BY`
+column. A sparse index can't narrow that down, so the query reads every
+granule. Even a perfect hit reads 8,192 rows to return one. For "fetch order by
+id", keep a row store.
+</Callout>
+
+</Sub>
+
+<Sub n="7.3" title="What ORDER BY buys: counting granules">
+
+`EXPLAIN indexes = 1` reports how many granules survive the index:
+
+```text
+EXPLAIN indexes=1 SELECT sum(amount) FROM events WHERE country='JP' AND event_type='buy';
+      PrimaryKey
+          Keys: country, event_type
+          Granules: 32/1221
+          Search Algorithm: binary search
+
+EXPLAIN indexes=1 SELECT sum(amount) FROM events WHERE ts >= '2026-06-01' AND ts < '2026-06-02';
+      PrimaryKey
+          Keys: ts
+          Granules: 81/1221
+          Search Algorithm: generic exclusion search
+        Ranges: 79
+```
+
+A filter on the first two key columns reads 32 granules, 262,144 rows, to find
+249,926 matches: 2.6% of the table. A filter on `ts`, third in the key, still
+prunes to 81 granules, because within each of the 40 (country, event_type)
+groups `ts` is sorted; but it has to test granule ranges instead of a single
+binary search, and it reads 79 separate ranges.
+
+| Filter on | Position in ORDER BY | Granules read | Why |
+|---|---|---|---|
+| `country`, `event_type` | 1st and 2nd | 32 / 1,221 | One contiguous range, binary search |
+| `ts` | 3rd | 81 / 1,221 | Sorted only within each prefix group |
+| `user_id` | not in key | 1,221 / 1,221 | No order to exploit |
+
+Sorting by `(country, event_type, ts)` also compressed the two low-cardinality
+columns to **11 KiB and 12 KiB** for 10 million rows, the ClickHouse version
+of section 3.4.
+
+</Sub>
+
+<Sub n="7.4" title="Too many parts">
+
+Parts are cheap to create and expensive to query in large numbers. ClickHouse
+protects itself with two thresholds per partition:
+
+<SourceRead
+  file="src/Storages/MergeTree/MergeTreeSettings.cpp"
+  repo="ClickHouse/ClickHouse"
+  tag="v25.8.9.20-lts"
+  href="https://github.com/ClickHouse/ClickHouse/blob/v25.8.9.20-lts/src/Storages/MergeTree/MergeTreeSettings.cpp#L650"
+>
+```cpp
+    DECLARE(UInt64, parts_to_delay_insert, 1000, R"(
+    If the number of active parts in a single partition exceeds the
+    `parts_to_delay_insert` value, an `INSERT` is artificially slowed down.
+    /* ... */
+    DECLARE(UInt64, parts_to_throw_insert, 3000, R"(
+    If the number of active parts in a single partition exceeds the
+    `parts_to_throw_insert` value, `INSERT` is interrupted with the `Too many
+    parts (N). Merges are processing significantly slower than inserts`
+    exception.
+    /* ... */
+    Prior to version 23.6 this setting was set to 300.
+```
+</SourceRead>
+
+Usually it's an application inserting one row per request. Each insert
+is a part; a thousand requests a second outruns any merge scheduler.
+
+<Why>What's the fix, if the application really produces rows one at a time?</Why>
+
+Batch before ClickHouse. Buffer in the client and insert every second or every
+10,000 rows, put Kafka in front and consume in batches, or turn on
+`async_insert`, which makes the server buffer small inserts into one part. The
+guidance in the
+[MergeTree docs](https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree)
+is the same: fewer, larger inserts.
+
+</Sub>
+
+<SectionHeading n="08" id="duckdb">DuckDB: an analytical engine in your process</SectionHeading>
+
+DuckDB takes the opposite deployment choice from ClickHouse. It's a library,
+like SQLite: no server, no network, linked into your Python, R, Node or Java
+process ([SIGMOD 2019 demo](https://mytherin.github.io/papers/2019-duckdbdemo.pdf)).
+
+<Sub n="8.1" title="What's inside">
+
+Internally it's the machinery from sections 3 to 6:
+
+| Piece | In DuckDB |
+|---|---|
+| Storage | Its own single-file format, in row groups of 122,880 rows (`DEFAULT_ROW_GROUP_SIZE` in [`storage_info.hpp`](https://github.com/duckdb/duckdb/blob/v1.5.5/src/include/duckdb/storage/storage_info.hpp)), which is 60 vectors of 2,048 |
+| Skipping | Min/max zonemaps per row group, and the Parquet footer statistics when reading Parquet |
+| Execution | Vectorized, 2,048-row `DataChunk`s, selection vectors |
+| Parallelism | Morsel-driven ([Why DuckDB](https://duckdb.org/why_duckdb)), after [Leis et al. (SIGMOD 2014)](https://db.in.tum.de/~leis/papers/morsels.pdf): threads take the next chunk of rows from a shared scan |
+| Files | Queries Parquet, CSV and JSON directly, locally or over HTTP and S3 |
+
+<Why>Why embed an analytical engine instead of running a server?</Why>
+
+Because moving data is often the slowest part of analysis. A DataFrame or a
+local Parquet file can be scanned in place, with no serialisation over a
+socket. That's the DuckDB paper's argument for data-science work.
+
+You pay what SQLite users pay: one process writes at a time, and it isn't
+built for many concurrent users.
+
+</Sub>
+
+<Sub n="8.2" title="Choosing an engine">
+
+| Need | Reach for | Why |
+|---|---|---|
+| Analytics on files on your laptop or in a job | DuckDB | No server, reads Parquet in place |
+| Real-time analytics, many concurrent queries, continuous ingest | ClickHouse | Server, MergeTree, replication, distributed tables |
+| Petabytes on S3 with many engines reading the same data | Parquet (or a table format over it) plus Trino, Spark or DuckDB | The file format is the shared contract |
+| Transactions, point lookups, joins on keys | Postgres | Row store; see [chapter 21](/topics/21-postgres) |
+| Analytics that must be in the same database as the transactions | Postgres replica with a columnar extension, or change data capture into ClickHouse | Keeps OLTP load off the analytics path |
+
+</Sub>
+
+<SectionHeading n="09" id="operating">Running analytical engines in production</SectionHeading>
+
+<Sub n="9.1" title="Where to look">
+
+```shell
+# Parquet: per-column sizes, encodings, row-group stats
+python3 -c "import pyarrow.parquet as pq; print(pq.ParquetFile('f.parquet').metadata.row_group(0))"
+duckdb -c "SELECT path_in_schema, encodings, total_compressed_size, stats_min, stats_max
+           FROM parquet_metadata('f.parquet') WHERE row_group_id = 0"
+
+# DuckDB: the plan, with rows and time per operator
+duckdb -c "EXPLAIN ANALYZE SELECT ..."
+
+# ClickHouse: granules read, and parts per table
+clickhouse client -q "EXPLAIN indexes = 1 SELECT ..."
+clickhouse client -q "SELECT table, count() FROM system.parts WHERE active GROUP BY table"
+clickhouse client -q "SELECT query_duration_ms, read_rows, read_bytes, query
+                      FROM system.query_log ORDER BY event_time DESC LIMIT 10"
+```
+
+`read_rows` against the rows the query actually needed is the single best
+measure of whether your sort key is working.
+
+</Sub>
+
+<Sub n="9.2" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Query reads almost every row group or granule despite a narrow filter | Filter column isn't clustered; min/max ranges overlap | Sort files or `ORDER BY` on the filter columns; add a page index or Bloom filter for equality |
+| Many small files, slow listing and scans | Streaming writer flushing every few seconds | Compact into files of hundreds of MB |
+| `Too many parts` on insert | Row-at-a-time inserts | Batch client-side, `async_insert`, or a queue in front |
+| A column is far bigger than expected | Dictionary fell back to plain; wrong encoding for sorted data | Check per-chunk sizes; delta-encode sorted ints; zstd |
+| Queries fast on one thread, not faster on more | Too few row groups after pruning, or one giant row group | Smaller row groups, more files, balanced partitions |
+| `SELECT *` dashboards slow and expensive | Every column read and decoded | Name the columns |
+| Point lookups slow on ClickHouse | Key isn't the leading `ORDER BY` column; granule reads 8,192 rows | Keep lookups in a row store, or add a projection with a different order |
+
+<Callout label="Common mistake" kind="warn">
+Partitioning a table by a high-cardinality column like `user_id`. Every
+partition gets its own files or parts, so you trade one big scan for millions of
+tiny ones, and ClickHouse's part limits count per partition. Partition by time
+or tenant; sort by the rest.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="10" id="summary">Summary</SectionHeading>
+
+1. **Columns win when queries touch few columns of many rows.** `sum(amount)`
+   read 26 MB of Parquet instead of an 804 MB SQLite file.
+2. **Parquet is file, row group, column chunk, page, with metadata last.** The
+   footer holds offsets and min/max for every chunk, 7,940 bytes for 10M rows.
+3. **Encoding comes before compression.** Ten countries packed to 4 bits a
+   value; a sorted timestamp delta-encoded from 64.55 MB to 0.07 MB.
+4. **Dictionaries fail on high-cardinality columns.** Past pyarrow's 1 MB cap
+   the writer falls back to plain, and the dictionary page is wasted.
+5. **Sort order decides compression and skipping.** Sorting by country took it
+   from 5.05 MB to 0.02 MB, and made a day filter read one row group of ten.
+6. **Min/max statistics only prune clustered columns.** A random `user_id`
+   range read every row group.
+7. **Volcano spends most of its time interpreting.** Vectors of about a thousand
+   values cut the per-row cost roughly 12× in the test here.
+8. **Vectors should fit in cache.** 128 to 2,048 values was fastest; processing
+   whole columns was 2.8× slower.
+9. **Late materialization fetches wide columns only where rows matched.**
+   Ten URLs cost 30 ms against 115 ms to decode all of them.
+10. **ClickHouse indexes granules, not rows.** 8,192 rows per index entry, 7.32
+    KiB of index for 10 million rows, and one immutable part per insert.
+
+<SectionHeading n="11" id="build">Build this</SectionHeading>
+
+**A tiny columnar scanner.** One table, three columns, about 400 lines of C++
+or Rust.
+
+- Write a file format: a header, then for each block of 65,536 rows one
+  contiguous array per column, and a footer with each block's offset and the
+  min/max of each column. Dictionary-encode one string column to `uint8`.
+- Write a scanner that reads the footer, skips blocks whose min/max can't match
+  a filter, and processes survivors in vectors with a selection vector.
+- Measure three things: bytes read with and without the skip, time per row at
+  vector sizes 1, 256, 2,048 and 65,536, and the size of the string column with
+  and without the dictionary. Then sort the data by the filter column and run
+  it again.
+
+If your numbers have the shape of sections 3 to 5, you've built the core of
+every engine here.
+
+<SectionHeading n="12" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Why are column stores faster for analytics?">
+Analytical queries read a few columns of many rows. A column store reads only
+those columns, so it moves far fewer bytes; each column holds one type, so it
+compresses well; and the engine can process a column as an array in tight
+loops. In the test here, `sum(amount)` read 26 MB of Parquet where a row store
+had to read an 804 MB file, and ran 36× faster on one thread.
+</QA>
+
+<QA level="beginner" q="What's in a Parquet footer, and why is it at the end?">
+The schema, and for every row group and column chunk: byte offsets, compressed
+and uncompressed sizes, encodings, value counts and min/max/null statistics.
+It's at the end because the writer only knows those values after writing the
+data, so it can stream row groups and write the index once. Readers fetch the
+last 8 bytes for the footer length, then the footer, then only the chunks they
+need.
+</QA>
+
+<QA level="intermediate" q="A Parquet column is much bigger than you expected. What do you check?">
+Per-chunk `total_compressed_size` and encodings in the footer. Common causes: a
+high-cardinality string column whose dictionary hit the size cap and fell back
+to plain; a sorted integer or timestamp stored plain instead of delta-encoded;
+snappy where zstd would do much better; and rows written in an order that
+breaks up runs. Rewriting sorted by low-cardinality columns can shrink them by
+orders of magnitude.
+</QA>
+
+<QA level="intermediate" q="Why doesn't a filter on user_id skip any row groups when a filter on ts skips nine of ten?">
+Skipping uses per-row-group min/max. `ts` was written in order, so each group
+covers a narrow, non-overlapping time range, and a one-day filter matches one
+group. `user_id` values are scattered, so every group's range spans nearly the
+whole domain and nothing can be ruled out. Fix it by sorting on the filter
+column when writing, or add a page index or Bloom filter for equality lookups.
+</QA>
+
+<QA level="intermediate" q="What causes ClickHouse's 'Too many parts' error?">
+Each `INSERT` creates an immutable part, and background merges combine them.
+If inserts arrive faster than merges can keep up, usually from one-row inserts
+per request, the active part count in a partition passes
+`parts_to_delay_insert` (1,000), where inserts get slowed, and then
+`parts_to_throw_insert` (3,000), where they're rejected. Batch inserts
+client-side, use `async_insert`, or put a queue in front.
+</QA>
+
+<QA level="deep" q="Explain vectorized execution. Why around a thousand values per vector and not the whole column?">
+Volcano returns one row per virtual `next()` call and interprets expressions per
+row, so most instructions are overhead: the X100 paper found MySQL spending
+about 10% of TPC-H Q1 on real work. Vectorized engines return batches and run
+each operation as a loop over arrays, which amortises the call overhead and
+lets the compiler pipeline and SIMD-vectorize. But each primitive materialises
+its output, so vectors must be small enough that all intermediates stay in
+cache. Too large and each step round-trips through memory; that's the
+column-at-a-time problem MonetDB had. In the test here, 128 to 2,048 was fastest,
+and whole-column processing was 2.8× slower.
+</QA>
+
+<QA level="deep" q="When is late materialization worse than early?">
+When many rows pass the filter and the output isn't aggregated. Late
+materialization keeps positions and goes back to fetch other columns, which
+means re-reading and re-decompressing blocks. Abadi et al.'s heuristic from
+C-Store: use late materialization when output is aggregated, predicates are
+highly selective, or data uses lightweight compression; otherwise early
+materialization can win.
+</QA>
+
+<QA level="deep" q="How does ClickHouse's sparse primary index differ from a B-tree, and what does it cost?">
+A B-tree has one entry per row and finds a row exactly. ClickHouse stores the
+key of the first row of each 8,192-row granule, 1,221 entries for 10 million
+rows in the test here, 7.32 KiB, always in memory. It binary-searches to a range of
+granules and reads them whole, with mark files mapping granule numbers to
+offsets in each column file. The costs: point lookups read at least 8,192 rows,
+and filters on columns that aren't a prefix of `ORDER BY` prune poorly or not at
+all.
+</QA>
+
+<SectionHeading n="13" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="SELECT count(*) on a 10-million-row Parquet file took 0.3 ms. Why?">
+    The row count of every row group is in the footer, so the engine answers from
+    metadata and never reads a data page.
+  </Q>
+  <Q q="A column with 10 distinct values in a 1,048,576-row group took 529,155 bytes. Where does that come from?">
+    Dictionary encoding with RLE/bit-packed indexes: 10 values need 4 bits, and
+    1,048,576 × 4 bits is 524,288 bytes. The rest is the dictionary and page
+    headers.
+  </Q>
+  <Q q="Why did a one-day filter get slower going from 1 thread to 4?">
+    Pruning left one row group, and a row group is the unit of parallel work.
+    The extra threads had nothing to do but still cost setup.
+  </Q>
+  <Q q="Your ClickHouse table is ORDER BY (tenant, ts). A query filters only on ts. Does the index help?">
+    Somewhat. `ts` is sorted inside each tenant's range, so generic exclusion
+    search can skip granules, but it reads many separate ranges instead of one.
+    In the test here, a third-position `ts` filter read 81 of 1,221 granules.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Boncz, Zukowski, Nes: MonetDB/X100 (CIDR 2005)">
+    The paper behind vectorized execution. The MySQL profile in section 3 and
+    the vector-size experiment in section 5.1.1 repay a full read.
+  </WildCard>
+  <WildCard name="Abadi, Myers, DeWitt, Madden: Materialization Strategies in a Column-Oriented DBMS (ICDE 2007)">
+    Early versus late materialization, with an analytical model and the
+    heuristic quoted in section 6.
+  </WildCard>
+  <WildCard name="Stonebraker et al.: C-Store (VLDB 2005)">
+    The column-store design that Vertica came from: sorted projections,
+    compression-aware operators, a write store in front of a read store.
+  </WildCard>
+  <WildCard name="apache/parquet-format: parquet.thrift and Encodings.md">
+    The spec itself. Read `ColumnMetaData`, `Statistics` and `PageHeader`, then
+    the encodings document for the RLE/bit-packing hybrid.
+  </WildCard>
+  <WildCard name="Schulze et al.: ClickHouse, Lightning Fast Analytics for Everyone (VLDB 2024)">
+    MergeTree, parts, granules, the vectorized engine and the integration
+    layer, from the people who built them.
+  </WildCard>
+  <WildCard name="ClickHouse docs: A practical introduction to primary indexes">
+    A long, concrete walk through granules, marks and index selection with
+    `EXPLAIN` output, including why the order of key columns matters.
+  </WildCard>
+  <WildCard name="Kersten et al.: Compiled and Vectorized Queries (VLDB 2018)">
+    Both execution models inside one engine, compared fairly, with SIMD and
+    multi-core results.
+  </WildCard>
+  <WildCard name="Melnik et al.: Dremel (VLDB 2010)">
+    Where Parquet's nested encoding with repetition and definition levels comes
+    from.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="14" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Memory Hierarchy & Cache Coherence">
+    Cache lines and cache sizes, the reason vectors of about a thousand values
+    beat whole columns. [Chapter 02](/topics/02-memory-hierarchy).
+  </WildCard>
+  <WildCard name="CPU Architecture for Software Engineers">
+    Pipelines, branch prediction and SIMD, the machinery vectorized primitives
+    are written for. [Chapter 01](/topics/01-cpu-architecture).
+  </WildCard>
+  <WildCard name="PostgreSQL Deep Dive">
+    The row store on the other side of the comparison: the heap, tuples and
+    pages. [Chapter 21](/topics/21-postgres).
+  </WildCard>
+  <WildCard name="Kafka & the Log as a Primitive">
+    How events usually reach an analytical store in batches big enough to
+    avoid small files and too many parts.
+    [Chapter 23](/topics/23-kafka-logs).
+  </WildCard>
+</CardGrid>

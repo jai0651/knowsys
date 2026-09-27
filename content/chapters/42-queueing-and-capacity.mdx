@@ -1,0 +1,896 @@
+---
+title: Queueing, Capacity & Scaling
+dek: "How to turn queueing theory into a fleet size: measuring what one instance can really take, how much headroom to keep and why, how autoscalers decide, why they oscillate, and how to load test for capacity instead of for a screenshot."
+readingTime: "~30 min"
+level: "Intermediate"
+versions: "Kubernetes v1.31 HPA source · AWS EC2 Auto Scaling docs · PostgreSQL 16 pgbench · measured on linuxkit 6.10.14 aarch64 (shared 4-CPU container) · simulations in Python 3 on Apple M4"
+prereqs: "Little's Law and the utilisation curve (chapter 16), basic Kubernetes"
+updated: "2026-09-27"
+---
+
+Every service eventually needs an answer to "how many machines?" Someone is
+planning a launch, or the bill is too high, or last Tuesday's traffic peak took
+the site down. The answer probably comes from a guess, a rule of thumb, or the
+number that worked last year.
+
+The theory for doing better is short, and [chapter 16](/topics/16-contention-tail-latency)
+covers it: latency grows as `1/(1 − ρ)`, Little's Law links concurrency to
+throughput and latency, and the Universal Scalability Law says where adding
+workers stops helping. What that chapter doesn't do is turn those results into
+a fleet size, a headroom policy and an autoscaler configuration.
+
+This chapter does. It starts from what one instance can take, builds up to a
+fleet that survives a zone failure, explains what headroom is for, and then
+takes apart the autoscaler: how Kubernetes and AWS decide, why a feedback loop
+with delay oscillates, and how to load test so the numbers going into all of it
+are real.
+
+<SectionHeading n="01" id="theory-to-fleet">From queueing theory to a fleet</SectionHeading>
+
+Capacity planning uses three results from chapter 16. None of them is
+re-derived here; this is what each is *for* when you're sizing something.
+
+<Sub n="1.1" title="Three results, three jobs">
+
+| Result | What it says | Its job in capacity planning |
+|---|---|---|
+| **Utilisation curve**, `W/S = 1/(1 − ρ)` | Time in system explodes as a resource nears full | Sets the **target utilisation** you plan to: the knee, not 100% |
+| **Little's Law**, `L = λW` | Concurrency equals throughput times latency | Sizes **pools and concurrency limits**: threads, connections, in-flight requests |
+| **Universal Scalability Law** | Contention and crosstalk cap how far adding workers helps | Tells you whether **scaling out** will work at all, and where it stops |
+
+Detail behind each, including why the M/M/1 curve is an optimistic bound,
+is in [chapter 16, sections 2 to 4](/topics/16-contention-tail-latency).
+
+<Why>If the theory is settled, why is capacity planning hard?</Why>
+
+Because every input is uncertain. You don't know next month's peak, you don't
+know exactly what one instance can take, and the thing that adds capacity (an
+autoscaler, a procurement process) is slow and imprecise. Most of capacity
+planning is deciding how much margin to keep for each of those uncertainties.
+
+</Sub>
+
+<Sub n="1.2" title="The questions a capacity plan answers">
+
+1. What can **one instance** serve while meeting the latency target?
+2. What's the **peak demand** over the planning horizon?
+3. How many instances does that take, **including the failures** you've
+   decided to survive?
+4. How fast can capacity be **added**, and how much headroom covers the gap?
+5. Which **dependencies** don't scale with the fleet, and what are their limits?
+
+The Google SRE book puts the same thing as three mandatory steps: "an accurate
+organic demand forecast, which extends beyond the lead time required for
+acquiring capacity", inorganic demand from launches and campaigns, and "regular
+load testing of the system to correlate raw capacity (servers, disks, and so on)
+to service capacity" ([Introduction](https://sre.google/sre-book/introduction/)).
+
+</Sub>
+
+<SectionHeading n="02" id="sizing">Sizing a fleet</SectionHeading>
+
+<Sub n="2.1" title="Per-instance capacity is the knee, not the maximum">
+
+What matters for one instance isn't the most requests per second it
+can complete. It's the rate at which it still meets your latency target, and
+that's always lower.
+
+<Why>Why not plan against the maximum?</Why>
+
+Because at the maximum, utilisation is near 1, and the utilisation curve says
+the queue, and therefore latency, is unbounded there. An instance "doing 600
+rps" at saturation may be doing it with a p99 of seconds. Planning to that
+number means planning to be slow at every peak.
+
+So measure a curve, not a point: offered rate on one axis, p99 latency on the
+other, and read off the highest rate where p99 is still inside the target.
+Section 6 does this against Postgres and shows why you should repeat it.
+
+| Number | Where it comes from | Use it for |
+|---|---|---|
+| **Maximum throughput** | Unthrottled load test; the plateau | Nothing, except finding the knee |
+| **Knee** | Rate where p99 starts rising steeply | The upper bound for planning |
+| **Planning capacity** | Knee, minus margin for measurement noise and variance between instances | Fleet arithmetic |
+
+</Sub>
+
+<Sub n="2.2" title="Demand is the peak, over the horizon you can't react inside">
+
+Size for the **peak** you'll see before you can add capacity, not for the
+average. Most user-facing traffic has a daily cycle, and a fleet sized for the
+daily mean falls over at the daily peak.
+
+Lead time sets the horizon. If adding servers takes two minutes (an
+autoscaler with warm images), you plan minutes ahead. If it takes a quarter
+(buying hardware, raising a cloud quota, provisioning a database), your
+forecast has to reach past that quarter, which is the SRE book's point above.
+
+</Sub>
+
+<Sub n="2.3" title="The arithmetic, with failures included">
+
+Here's a fleet sized for a service with a peak of 12,000 requests per second,
+running in three availability zones, where a load test found each instance
+comfortable up to 400 rps at the latency target:
+
+<Estimate
+  rows={[
+    { label: "Instances for peak, no failures", math: "12,000 / 400", value: "30" },
+    { label: "Survive losing one of three zones", math: "30 × 3 / 2 (two zones must carry the peak)", value: "45" },
+    { label: "Rolling deploy takes 10% out at a time", math: "45 / 0.9", value: "50" },
+    { label: "Organic growth before the next review, +15%", math: "50 × 1.15", value: "58" },
+  ]}
+  result={{ label: "Instances to run, against a naive answer of 30", value: "58" }}
+/>
+
+At peak, with everything healthy, those 58 instances are each serving about 207
+rps, a bit over half of their 400 rps planning capacity. A correctly sized fleet
+probably looks under-used on a good day, because it's sized for a bad one.
+
+<Why>Why does zone loss cost so much?</Why>
+
+Because with three zones, losing one removes a third of capacity, and the other
+two have to absorb it. Each surviving zone's load rises by half. So the
+steady-state utilisation you can afford is two-thirds of your per-instance
+limit. With two zones, it's half. That's the price of zonal redundancy, and it's
+why many services run in three zones instead of two.
+
+Google's SRE book names a stricter version: **N + 2**, provisioning "to handle a
+simultaneous planned and unplanned outage", so peak traffic can be served "while
+the largest 2 instances are unavailable" ([Production Services Best Practices](https://sre.google/sre-book/service-best-practices/)).
+"Instance" there can mean a whole cluster.
+
+Here's what the zone-failure line in that estimate is buying, step by step:
+
+<StepSequence
+  title="One zone fails at peak"
+  actors={["Load balancer", "Zone A", "Zone B", "Zone C"]}
+  messages={[
+    { from: 0, to: 1, label: "4,000 rps", note: "At peak, the balancer spreads 12,000 rps evenly: **4,000 per zone**, about 267 rps on each of 15 instances." },
+    { from: 2, to: 2, label: "zone B lost", note: "Zone B fails: a power event, a bad network change. Its 15 instances stop answering health checks." },
+    { from: 0, to: 0, label: "health checks fail", note: "After a few failed checks the balancer marks zone B's targets unhealthy. Requests sent there in the meantime fail or time out." },
+    { from: 0, to: 1, label: "6,000 rps", note: "Zone B's share moves to the survivors. Each now takes **6,000 rps: 400 per instance**, exactly the planning capacity." },
+    { from: 0, to: 3, label: "6,000 rps", note: "Sized with the ×3/2 factor, both survivors are at their knee but not past it. **Sized at 30 instances, they'd be at 600 rps each, far past the knee**." },
+  ]}
+/>
+
+<Callout label="Design implication">
+Decide which failures you're sizing for, write them down, and put them in the
+arithmetic. "Survive one zone at peak during a deploy" is a capacity
+requirement with a number. "Highly available" isn't one.
+</Callout>
+
+</Sub>
+
+<Sub n="2.4" title="Bigger pools run hotter">
+
+Chapter 16's curve is for one server. With `c` servers sharing one queue (an
+M/M/c queue), the picture improves a lot, and capacity planning depends on how
+much. The standard result is the **Erlang C** formula for the probability that
+an arriving request has to wait.
+
+This table computes it for several pool sizes. Each cell is the probability of
+waiting, then the mean wait in units of one service time:
+
+<Compare
+  cols={["Servers", "ρ = 0.5", "ρ = 0.7", "ρ = 0.8", "ρ = 0.9"]}
+  rows={[
+    ["1", "50% · 1.00", "70% · 2.33", "80% · 4.00", "90% · 9.00"],
+    ["4", "17% · 0.09", "43% · 0.36", "60% · 0.75", "79% · 1.97"],
+    ["16", "1% · 0.00", "13% · 0.03", "30% · 0.10", "59% · 0.37"],
+    ["64", "0% · 0.00", "0% · 0.00", "6% · 0.00", "31% · 0.05"],
+  ]}
+/>
+
+<Predict
+  q="A pool of 4 servers keeps mean queueing delay under a tenth of a service time up to about 52% utilisation. Merge sixteen such pools into one shared pool of 64 servers. How hot can it run for the same delay?"
+  options={[
+    "About 52%, the same: utilisation is utilisation",
+    "About 65%",
+    "About 93%",
+    "100%: with 64 servers nothing waits",
+  ]}
+  answer={2}
+>
+About 93%. Solving Erlang C for the highest utilisation that keeps mean wait
+at or below 0.1 service times gives 9% for one server, 52% for four, 80% for
+sixteen, 93% for sixty-four and 96% for 128. A big shared pool absorbs one
+server's burst with another's idle moment, so it can run far hotter for the
+same latency.
+</Predict>
+
+<Why>Where does this show up in real systems?</Why>
+
+Anywhere a pool gets split. Per-tenant thread pools, per-shard worker queues and
+per-pod connection pools all trade the efficiency of one large pool for
+isolation. Sometimes that's the right trade, since isolation stops one noisy
+tenant from starving the others. But it's a trade with a capacity cost you can
+compute, and it's paid in machines.
+
+These numbers come from a thirty-line Python implementation of Erlang C
+(it assumes Poisson arrivals and exponential service, so treat them as the
+same optimistic bound as the M/M/1 curve).
+
+</Sub>
+
+<Sub n="2.5" title="Little's Law for the connection pool">
+
+A common capacity failure has nothing to do with CPU. Every pod has its own
+database connection pool, and the fleet autoscales.
+
+<Estimate
+  rows={[
+    { label: "Pods at peak", math: "", value: "40" },
+    { label: "Connection pool per pod (a common default)", math: "", value: "10" },
+    { label: "Connections the fleet can open", math: "40 × 10", value: "400" },
+    { label: "Postgres max_connections default", math: "", value: "100" },
+    { label: "Concurrent queries actually needed", math: "L = λW = 2,000 queries/s × 5 ms", value: "10" },
+  ]}
+  result={{ label: "Connections the fleet can demand, against what the work needs", value: "400 vs 10" }}
+/>
+
+Little's Law says the database only ever has about ten queries in flight. The
+fleet is still able to open 400 connections, four times Postgres's
+[default `max_connections`](https://www.postgresql.org/docs/16/runtime-config-connection.html)
+of 100. Scale-out that works for the app servers breaks the database at the
+moment traffic peaks.
+
+<Callout label="Common mistake" kind="warn">
+Sizing per-pod pools without multiplying by the maximum replica count. Put a
+shared pooler (pgbouncer, RDS Proxy) in front of the database, size its server
+side with `L = λW` plus margin, and set the autoscaler's `maxReplicas` with
+the database's limit in mind.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="03" id="headroom">Headroom: what the spare capacity is for</SectionHeading>
+
+Headroom is the gap between what you run at and what you could run at. It's the
+line item finance asks about, so it needs a justification for each part.
+
+<Sub n="3.1" title="Five things headroom pays for">
+
+| Headroom covers | Why it's needed | How to size it |
+|---|---|---|
+| **Bursts** | Traffic is burstier than a one-minute average shows | Peak-to-mean at a short interval (per second, not per minute) |
+| **Failure domains** | A zone or a node can vanish | The `×3/2` or N+2 factor from 2.3 |
+| **Deploys** | Rolling deploys take instances out | Divide by the fraction left in service |
+| **Forecast and measurement error** | Next month's peak and per-instance capacity are both estimates | The spread you've seen in both, historically |
+| **Scaling lag** | New capacity arrives minutes after it's needed | Growth rate × time to add capacity (3.2) |
+
+<Why>Why not just run hot and let the autoscaler catch up?</Why>
+
+Because the autoscaler is slow compared to the utilisation curve. Near the
+knee, a few percent more load doubles latency (chapter 16's Predict: 90% to 95%
+takes you from ten service times to twenty). The autoscaler needs minutes to
+react. For those minutes, headroom is the only capacity you have.
+
+</Sub>
+
+<Sub n="3.2" title="Headroom for scaling lag">
+
+Here's rough arithmetic for a morning ramp, where traffic grows steadily:
+
+<Estimate
+  rows={[
+    { label: "Traffic growth during the ramp", math: "", value: "2% per minute" },
+    { label: "Metric window and scrape lag", math: "60 s average + 15 s", value: "75 s" },
+    { label: "HPA sync period", math: "", value: "up to 15 s" },
+    { label: "Pod scheduling, image pull, start, readiness", math: "", value: "90 s" },
+    { label: "Time from need to new capacity", math: "75 + 15 + 90", value: "3 min" },
+    { label: "Traffic growth in that time", math: "2% × 3", value: "6%" },
+  ]}
+  result={{ label: "Headroom above the target just to absorb lag", value: "≥ 6%" }}
+/>
+
+If the cluster also has to add a node first, add the node's provisioning time,
+probably a few minutes more. That's the case where lag headroom gets large.
+
+<Callout label="Design implication">
+Every second you remove from the scaling path is headroom you don't have to
+buy. Fast-starting images, pre-pulled layers, warm node pools and readiness
+probes that pass as soon as the service is truly ready all reduce it.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="04" id="autoscalers">How autoscalers decide</SectionHeading>
+
+An autoscaler is a feedback controller: it measures a metric, compares it with a
+target, and changes the replica count. How each step works decides whether
+it's stable.
+
+<Sub n="4.1" title="The Kubernetes HPA loop">
+
+<StepSequence
+  title="One Horizontal Pod Autoscaler decision, end to end"
+  actors={["kubelet", "metrics-server", "HPA controller", "Deployment", "New pod"]}
+  messages={[
+    { from: 0, to: 1, label: "CPU per pod", note: "The kubelet computes each container's CPU rate from the kernel's cumulative counters. metrics-server collects them; its shipped manifests set **15 s** resolution." },
+    { from: 2, to: 1, label: "query (every 15 s)", note: "The HPA runs as a loop in `kube-controller-manager`, **every 15 seconds** by default (`--horizontal-pod-autoscaler-sync-period`)." },
+    { from: 2, to: 2, label: "ratio = current / target", note: "It averages utilisation over the ready pods and computes `desired = ceil(current × ratio)`. Within **10%** of the target, it does nothing." },
+    { from: 2, to: 3, label: "set replicas", note: "Scale-up applies at once, up to 100% or 4 pods per 15 s. Scale-down takes the **highest** recommendation of the last **300 s**." },
+    { from: 3, to: 4, label: "create pod", note: "The scheduler places the pod, the node pulls the image, the process starts. **None of this capacity exists yet.**" },
+    { from: 4, to: 2, label: "ready: counted", note: "Only once the pod is Ready, and its CPU sample was taken while Ready, does its load count toward the average. Until then it's set aside." },
+  ]}
+/>
+
+You'll find the formula in the [HPA documentation](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/):
+if the current metric is 200m and the target 100m, replicas double; at 50m they
+halve.
+
+</Sub>
+
+<Sub n="4.2" title="The code that makes the decision">
+
+Here's the core of the resource-metric path in the replica calculator:
+
+<SourceRead
+  file="pkg/controller/podautoscaler/replica_calculator.go"
+  repo="kubernetes/kubernetes"
+  tag="v1.31.0"
+  href="https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/controller/podautoscaler/replica_calculator.go#L65"
+>
+```go
+readyPodCount, unreadyPods, missingPods, ignoredPods := groupPods(podList, metrics, resource, c.cpuInitializationPeriod, c.delayOfInitialReadinessStatus)
+removeMetricsForPods(metrics, ignoredPods)
+removeMetricsForPods(metrics, unreadyPods)
+// ...
+usageRatio, utilization, rawUtilization, err := metricsclient.GetResourceUtilizationRatio(metrics, requests, targetUtilization)
+// ...
+scaleUpWithUnready := len(unreadyPods) > 0 && usageRatio > 1.0
+if !scaleUpWithUnready && len(missingPods) == 0 {
+	if math.Abs(1.0-usageRatio) <= c.tolerance {
+		// return the current replicas if the change would be too small
+		return currentReplicas, utilization, rawUtilization, timestamp, nil
+	}
+
+	// if we don't have any unready or missing pods, we can calculate the new replica count now
+	return int32(math.Ceil(usageRatio * float64(readyPodCount))), utilization, rawUtilization, timestamp, nil
+}
+// ...
+if scaleUpWithUnready {
+	// on a scale-up, treat unready pods as using 0% of the resource request
+	for podName := range unreadyPods {
+		metrics[podName] = metricsclient.PodMetric{Value: 0}
+	}
+}
+```
+</SourceRead>
+
+Two details carry the stability. The **tolerance** check skips small
+corrections. And on a scale-up, pods that aren't ready yet are counted as using
+**0%**, so a scale-up already in flight dampens the next one instead of being
+ignored. Section 5 simulates what happens without that.
+
+<Why>Why ignore the CPU of pods that are starting?</Why>
+
+Because starting pods often burn CPU that has nothing to do with load: JIT
+compilation, cache warming, class loading. According to the docs, the
+`--horizontal-pod-autoscaler-cpu-initialization-period` (default **5 minutes**)
+exists to "exclude misleading high CPU usage from initializing Pods (for
+example: Java apps warming up)". Counting it would make each new pod look
+overloaded and trigger more scale-up.
+
+</Sub>
+
+<Sub n="4.3" title="The defaults, and what each is for">
+
+| Setting | Default | What it prevents |
+|---|---|---|
+| Sync period | 15 s | Deciding more often than metrics change |
+| Tolerance | 0.1 (10%) | Chasing noise around the target |
+| Scale-up policy | +100% or +4 pods per 15 s, whichever is more | Unbounded jumps from one bad sample |
+| Scale-up stabilisation | 0 s | Nothing: scale-up is meant to be fast |
+| Scale-down stabilisation | 300 s (highest recommendation in the window) | Removing pods only to recreate them moments later |
+| CPU initialisation period | 5 min | Warm-up CPU triggering scale-up |
+| Initial readiness delay | 30 s | Pods flapping Ready/Unready at start |
+
+The docs call the failure these defaults guard against "thrashing, or flapping",
+and compare it to "hysteresis in cybernetics". That asymmetry is deliberate:
+scaling up late costs latency; scaling down early costs latency *and* a second
+scale-up.
+
+</Sub>
+
+<Sub n="4.4" title="AWS target tracking and the cluster autoscaler">
+
+EC2 Auto Scaling's [target tracking](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html)
+works the same way and makes the same asymmetric choice. It "prioritizes
+availability during periods of fluctuating traffic levels by scaling in more
+gradually", scales out if any policy asks, and scales in only if all agree.
+New instances don't count toward the group's metrics until their **warmup** time
+has passed, the equivalent of the HPA's readiness handling.
+
+It also says which metrics can't be tracked. The metric "must increase or
+decrease proportionally to the number of instances". Total `RequestCount` at the
+load balancer doesn't change when you add instances; request `Latency` "doesn't
+necessarily change proportionally"; a raw queue length has to be divided by the
+instance count first.
+
+Below the HPA, the Kubernetes [cluster autoscaler](https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/FAQ.md)
+adds nodes when pods can't be scheduled, checking every 10 seconds, and removes
+a node after it has been unneeded for 10 minutes. When a scale-up needs a new
+node, the node's boot time is added to the pod's.
+
+</Sub>
+
+<SectionHeading n="05" id="oscillation">Why autoscalers oscillate</SectionHeading>
+
+An autoscaler that swings between too few and too many replicas, over and over,
+is probably one of the most common capacity problems in Kubernetes. It follows from a
+basic property of feedback loops.
+
+<Sub n="5.1" title="Feedback with delay">
+
+A controller that acts on old information will probably overshoot. It sees load that was
+high a minute ago, adds capacity that arrives a minute and a half from now, and
+keeps adding in the meantime, since the metric hasn't changed yet. When the
+capacity lands, it's too much; the controller sees low utilisation and removes
+it, and the cycle runs again in the other direction.
+
+An HPA loop's delay has several parts, and they add:
+
+| Source of delay | Typical size | Where it's set |
+|---|---|---|
+| Metric window | 15–60 s | metrics-server resolution, or your Prometheus rate window |
+| Scrape and propagation | 15–30 s | Metrics pipeline |
+| Controller period | up to 15 s | `--horizontal-pod-autoscaler-sync-period` |
+| Pod start to Ready | seconds to minutes | Image size, JVM start, readiness probe |
+| New node, if needed | minutes | Cluster autoscaler plus cloud provisioning |
+
+<Steps
+  title="One oscillation cycle"
+  lanes={[
+    { t: "Load", s: "real demand", icon: "↑" },
+    { t: "Metric", s: "averaged, lagged", icon: "▤" },
+    { t: "Controller", s: "every 15 s", icon: "⚙" },
+    { t: "Capacity", s: "pods Ready", icon: "▦" },
+  ]}
+  steps={[
+    [0, "Load rises. Existing pods get busier, and **latency rises now**."],
+    [1, "The metric is a 60 s average, reported 15 s late. It shows only part of the rise."],
+    [2, "The controller scales up to match what it sees. Then, 15 s later, it sees a **higher** number, because the window has caught up, and scales up again."],
+    [3, "Pods take 90 s to become Ready. Every decision in that time was made against capacity that **was already on its way**."],
+    [1, "The pods land together. Utilisation drops well below the target."],
+    [2, "Without a scale-down window, the controller removes pods at once, and the cycle starts again from too few."],
+  ]}
+/>
+
+</Sub>
+
+<Sub n="5.2" title="A simulation you can run">
+
+To see the effect of each safeguard separately, here's a small simulation. Load
+sits at 600 rps, steps to 1,500 rps at t = 300 s, and carries a 15% sine wave
+with a four-minute period plus 5% noise. Each pod serves 100 rps; the target is
+60% CPU; the metric is a 60-second average reported 15 s late; pods take 90 s to
+become ready; the controller runs every 15 s with the HPA's 10% tolerance.
+
+<TryIt what="Simulate three autoscaler policies against the same load" lang="python" toolchain="Python 3, Apple M4, 11 seeds per policy, medians reported">
+```python
+for t in range(1800):
+    load = base(t) * (1 + 0.15*sin(2*pi*t/240)) * (1 + gauss(0, 0.05))
+    while pending and pending[0] <= t: pending.pop(0); ready += 1
+    cpu.append(min(1.0, load / (ready*100)))        # saturates at 100%
+    if t % 15 == 0 and t > 75:
+        m = mean(cpu[t-75:t-15])                     # 60 s window, 15 s late
+        ratio = m / 0.6
+        cur = ready + len(pending)
+        desired = ready if abs(1-ratio) <= 0.1 else ceil(ratio * ready)
+        if down_window and desired < cur:            # HPA-style scale-down window
+            desired = max(d for (tt, d) in recs if tt > t - down_window)
+        have = ready if ignore_pending else cur      # the bug in policy A
+        if desired > have: pending += [t+90] * (desired - have)
+        elif desired < cur: remove(cur - desired)
+```
+
+<Output>
+```text
+A: ignores pending pods, no window   scale-ups 75  scale-downs 30  peak 131  overloaded 1020 s
+B: counts pending pods, no window    scale-ups 44  scale-downs 32  peak  39  overloaded  760 s
+C: counts pending, 300 s down window scale-ups  7  scale-downs  2  peak  35  overloaded  222 s
+```
+
+"Overloaded" counts seconds, out of 1,800, when load exceeded 90% of ready
+capacity. The load needs 21 to 29 pods at the 60% target after the step.
+</Output>
+</TryIt>
+
+<Figure caption="Replicas over time for one seed. Policy B chases the four-minute wave and lands out of phase with it; policy C holds near the peak requirement after its first overshoot. The needed line is load (without noise) divided by 60 rps per pod.">
+<Plot
+  xLabel="seconds"
+  yLabel="replicas"
+  xTicks={[0, 300, 600, 900, 1200, 1500, 1800]}
+  series={[
+    { name: "needed at 60%", points: [[0,10],[60,11.5],[120,10],[180,8.5],[240,10],[270,11.1],[300,28.7],[360,25],[420,21.2],[480,25],[540,28.7],[600,25],[660,21.2],[720,25],[780,28.7],[840,25],[900,21.2],[960,25],[1020,28.7],[1080,25],[1140,21.2],[1200,25],[1260,28.7],[1320,25],[1380,21.2],[1440,25],[1500,28.7],[1560,25],[1620,21.2],[1680,25],[1740,28.7],[1770,27.7]] },
+    { name: "B: no window", points: [[0,6],[90,10],[180,16],[240,12],[300,12],[360,18],[420,25],[450,29],[510,33],[540,34],[570,31],[630,31],[660,23],[690,14],[720,15],[780,22],[840,34],[900,30],[960,23],[990,17],[1050,27],[1110,34],[1140,36],[1170,33],[1200,21],[1230,18],[1290,28],[1350,35],[1410,34],[1440,22],[1470,18],[1530,28],[1590,34],[1650,35],[1680,20],[1710,17],[1770,28]] },
+    { name: "C: 300 s window", points: [[0,6],[90,10],[180,16],[330,16],[360,23],[390,27],[450,32],[480,35],[870,35],[900,29],[1770,29]] },
+  ]}
+/>
+</Figure>
+
+</Sub>
+
+<Sub n="5.3" title="Reading the three policies">
+
+**Policy A** repeats a bug that's easy to write in a home-grown scaler: it compares the desired
+count with *ready* pods only, so every 15 s during the 90 s start-up it orders
+the same pods again. Across eleven seeds its median peak was 131 replicas for a load that needs
+29; in the run plotted it then crashed to 11, and spent most of the run overloaded anyway. The HPA avoids this
+by counting unready and missing pods in its calculation (section 4.2).
+
+**Policy B** counts pending pods but scales down immediately. It never ran away,
+but it chased the four-minute wave with about 75 seconds of metric lag and 90
+seconds of start-up, and so it kept arriving at the wrong phase: adding pods as
+the wave fell and removing them as it rose. It was overloaded for 760 of 1,800
+seconds.
+
+**Policy C** is B plus the HPA's default 300-second scale-down window. It
+overshot once, to 35, held there, and settled at 29, which covers the peaks of
+the wave. It scaled 9 times in thirty minutes instead of 76.
+
+<Why>Why was even policy C overloaded for 222 seconds?</Why>
+
+Because of the step at t = 300. Utilisation is capped at 100%, so an overloaded
+fleet reports at most 100 / 60 = 1.67 times the target, and each decision can
+only grow the fleet by roughly that factor. From 16 pods, it took about 150 seconds and
+three rounds of start-up to reach the 29 the new load needed. That's scaling
+lag, and only headroom covers it.
+
+<Callout label="Design implication">
+If load has a cycle with a period comparable to your loop's total delay, a
+fast-reacting autoscaler will chase it out of phase. Either make the loop
+much faster than the cycle, or make it much slower (a long scale-down window)
+and provision for the cycle's peak.
+</Callout>
+
+</Sub>
+
+<Sub n="5.4" title="Other ways to build an oscillator">
+
+| Cause | What happens | Fix |
+|---|---|---|
+| Scaling on **latency** | Latency isn't proportional to replicas; near the knee it jumps, far below it barely moves | Scale on a utilisation or per-instance throughput metric |
+| Scaling on a **raw queue length** | Adding consumers doesn't change the backlog proportionally | Divide by consumer count (backlog per pod) and target that |
+| **Warm-up CPU** counted | New pods look overloaded, triggering more scale-up | CPU initialisation period; readiness only when warm |
+| **HPA and VPA** on the same metric | Two controllers correct the same error in different ways | The VPA [docs](https://github.com/kubernetes/autoscaler/blob/master/vertical-pod-autoscaler/docs/known-limitations.md) say it "should not be used with" the HPA "on the same resource metric (CPU or memory)" |
+| **Scale-down drains caches** | Removed pods take their warm caches; misses raise load on the rest | Longer scale-down windows; shared caches |
+| **Retries from overload** | Overloaded pods time out; clients retry; load rises faster than capacity | Retry budgets and backoff ([chapter 40](/topics/40-reliability)) |
+
+<Callout label="Common mistake" kind="warn">
+Scaling on p99 latency because "that's what users feel". Latency is flat far
+below the knee and near-vertical at it, so a latency target gives the
+controller almost no signal until it's too late, then an enormous one. Alert on
+latency; scale on utilisation or throughput per instance.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="06" id="load-testing">Load testing for capacity</SectionHeading>
+
+Every number in section 2 depends on one measurement: what an instance can take
+at the latency target. Getting it wrong in either direction costs money or
+outages.
+
+<Sub n="6.1" title="Open-loop, at fixed rates, stepping up">
+
+A capacity test offers a **fixed rate** of requests on a schedule that doesn't
+wait for responses (an open loop), measures latency from each request's
+**scheduled** send time, and steps the rate up until p99 crosses the target.
+[Chapter 16](/topics/16-contention-tail-latency) explains why a closed loop that
+waits for each response under-reports exactly the latency you're testing for.
+
+pgbench does this properly with `--rate`. Its docs say the latency it reports
+"is calculated from the scheduled start times, so it includes the time each
+transaction had to wait for the previous transaction to finish", and that start
+times follow "a Poisson-distributed schedule"
+([pgbench](https://www.postgresql.org/docs/16/pgbench.html)).
+
+</Sub>
+
+<Sub n="6.2" title="A capacity curve for Postgres, measured on a noisy box">
+
+Here's a real one. A Postgres 16 server pinned to one CPU of the shared
+container, serving a range query that sums 10,000 rows, with 16 pgbench clients
+on other CPUs. Each repetition first measured the maximum throughput for 10
+seconds, then ran 30 seconds at each fraction of that maximum.
+
+<Compare
+  cols={["Offered load, % of the capacity just measured", "Run 1 p99", "Run 2 p99", "Run 3 p99"]}
+  rows={[
+    ["Measured capacity (10 s, unthrottled)", "833 tps", "750 tps", "1,035 tps"],
+    ["30%", "21 ms", "24 ms", "8.6 ms"],
+    ["50%", "56 ms", "133 ms", "190 ms"],
+    ["70%", "411 ms", "80 ms", "8.5 ms"],
+    ["80%", "4.3 s", "2.8 s", "16 ms"],
+    ["90%", "7.3 s", "674 ms", "3.5 s"],
+    ["95%", "703 ms", "59 ms", "11.1 s"],
+    ["105%", "3.6 s", "30 ms", "11.1 s"],
+  ]}
+/>
+
+Run 3 is the textbook curve: p99 under 20 ms up to 80% of capacity, then
+seconds at 90%, where the backlog grew for the whole 30 seconds. Runs 1 and 2
+aren't. In run 2, 105% of "capacity" had a p99 of 30 ms, and in run 1, 80% had a
+p99 of 4.3 seconds.
+
+<Why>Why did the same fraction behave so differently between runs?</Why>
+
+Because the capacity itself moved. Ten back-to-back 10-second measurements of
+the same server, taken straight after these runs, gave **478, 609, 574, 796, 777,
+579, 609, 596, 543 and 951** transactions a second. Earlier the same afternoon,
+three measurements gave 1,240 to 1,476. Other tenants on the shared VM were
+taking CPU time, so one core of "Postgres capacity" was a different amount of
+CPU from minute to minute.
+
+A cloud instance is a milder version of the same thing: noisy neighbours,
+throttling, different hardware generations behind the same instance type. So
+per-instance capacity is a **distribution**, not a number. Measure it several
+times, on several instances, and plan to the low end of what you saw. The gap
+between the median and the low end is the "measurement error" line in the
+headroom table in section 3.1.
+
+<Callout label="The machine" kind="note">
+PostgreSQL 16, `fsync=off`, `shared_buffers=64MB`, pinned with `taskset` to one
+CPU; pgbench 16 on four other CPUs, `-c 16 -j 4 -R rate --log`. Docker Desktop
+VM on an Apple M4, linuxkit 6.10.14 aarch64, inside a 4-CPU container shared
+with other workloads. Percentiles computed from pgbench's per-transaction logs.
+</Callout>
+
+</Sub>
+
+<Sub n="6.3" title="What a capacity test has to include">
+
+| Test | What it finds | What people skip |
+|---|---|---|
+| **Step load** | The knee: highest rate inside the latency target | Repeating it, and on more than one instance |
+| **Soak** (hours at planning load) | Leaks, GC growth, compaction, log rotation, cache churn | Running long enough for the slow problems to appear |
+| **Production-shaped traffic** | Real mix of endpoints, payload sizes, cache hit ratios | Replaying or shadowing real traffic instead of one endpoint |
+| **Dependency limits** | The database, cache or third-party API that saturates first | Testing with real dependencies, not mocks |
+| **Autoscaler ramp** | Whether scaling keeps up with a realistic ramp | Ramping at the real rate, from the real minimum |
+| **Failure at load** | What happens when an instance or zone is removed at peak | Killing things during the test, not before it |
+
+<Callout label="Common mistake" kind="warn">
+Load testing one endpoint against mocked dependencies and calling the result
+"capacity". The first thing to saturate in production is usually shared: a
+database, a connection limit, a cache's network bandwidth. A test that doesn't
+include them measures a system you don't run.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="07" id="dependencies">The parts that don't autoscale</SectionHeading>
+
+An autoscaler adds copies of the stateless tier. Everything the tier depends on
+has fixed capacity until someone changes it, and scaling out moves load onto
+those things faster.
+
+<Sub n="7.1" title="What to check before trusting an autoscaler">
+
+| Dependency | Its limit | What scale-out does to it |
+|---|---|---|
+| **Database** | Connections, CPU, IOPS on one primary | More pods, more connections and queries (2.5) |
+| **Caches** | Memory, network bandwidth per node | New pods start cold; misses go to the database |
+| **Cloud quotas** | Instances, IPs, load balancer targets per account | Scale-up fails at the quota, often at peak |
+| **Downstream APIs** | Their rate limits | More callers, more `429`s, more retries |
+| **Cluster capacity** | Free nodes, IPs in the subnet | Pending pods wait for the cluster autoscaler |
+
+<Why>Why do the dependencies fail at the worst moment?</Why>
+
+Because the autoscaler does its most scaling exactly at peak. A fleet that
+normally runs 10 pods and scales to 40 has never had 40 pods' worth of
+connections open until the busiest minute of the year. Set `maxReplicas` from
+the dependencies' limits, not from what the stateless tier could use.
+
+</Sub>
+
+<SectionHeading n="08" id="monday">A capacity review for Monday</SectionHeading>
+
+<Sub n="8.1" title="Checklist">
+
+1. **Per-instance capacity**: when was the knee last measured, with what
+   traffic mix, and how many repetitions?
+2. **Peak demand**: what's the forecast peak over the lead time for adding
+   capacity? Include launches.
+3. **Failures sized for**: which zone, instance or deploy failures does the
+   fleet survive at peak? Show the arithmetic.
+4. **Autoscaler**: what's the metric, is it proportional to replicas, and
+   what's the total delay from need to Ready?
+5. **Headroom**: which of the five items in 3.1 does it cover, and how much of
+   each?
+6. **Dependencies**: at `maxReplicas`, how many connections, requests and IPs
+   does the fleet demand from each dependency?
+
+</Sub>
+
+<Sub n="8.2" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Replica count swings up and down every few minutes | Loop delay comparable to a load cycle; no scale-down window | Longer scale-down stabilisation; faster start-up; provision for the cycle's peak |
+| Scale-up overshoots massively | Controller ignores pods already starting | Count pending pods (HPA does); fix home-grown scalers |
+| Latency spikes every morning, then recovers | Scaling lag on the ramp | Headroom for lag (3.2), scheduled pre-scaling |
+| New pods trigger more scale-up | Warm-up CPU counted | CPU initialisation period; readiness after warm-up |
+| Database falls over during scale-out | Per-pod pools multiplied by replicas | Shared pooler; `maxReplicas` from the database's limit |
+| Fleet fine until a zone fails, then collapses | Sized without the failure factor | Size for `×3/2` (three zones) or N+2 |
+| Load test said 600 rps, production struggles at 350 | Test mix, mocked dependencies, or a single noisy run | Production-shaped traffic, real dependencies, repeated runs |
+| Autoscaler never scales on a queue metric | Metric not proportional to consumers | Target backlog per consumer |
+
+</Sub>
+
+<SectionHeading n="09" id="summary">Summary</SectionHeading>
+
+1. **Plan to the knee, not the maximum.** The rate at which p99 is still inside
+   the target is the per-instance capacity.
+2. **Put failures in the arithmetic.** Surviving one zone of three means
+   running at two-thirds of the limit: 30 instances becomes 45.
+3. **A well-sized fleet looks idle on a good day**, because it's sized for a
+   bad one.
+4. **Bigger pools run hotter.** For the same queueing delay, 4 servers can run
+   at 52% and 64 at 93%; every split of a pool costs capacity.
+5. **Little's Law sizes the pool that matters.** 40 pods with 10 connections
+   each can demand 400 from a database whose work needs 10.
+6. **Headroom pays for bursts, failures, deploys, error and lag**, and each part
+   can be sized.
+7. **The HPA is a delayed feedback loop**: 15 s decisions, 10% tolerance, a
+   300 s scale-down window, and unready pods counted as idle on scale-up.
+8. **Delay makes loops oscillate.** In the simulation, ignoring pending pods
+   peaked at 131 replicas for a need of 29; a scale-down window cut 76 scaling
+   actions to 9.
+9. **Scale on metrics proportional to replicas.** Utilisation or throughput per
+   instance, not latency or a raw queue length.
+10. **Measure capacity open-loop, repeatedly, with real dependencies.** On a
+    shared machine the knee moved between runs minutes apart.
+
+<SectionHeading n="10" id="build">Build this</SectionHeading>
+
+**A capacity model for one service.**
+
+- Run a step-load test against one instance with an open-loop tool (`wrk2 -R`,
+  `oha`, `k6` with an arrival-rate executor, or pgbench `-R` for a database).
+  Repeat it three times and plot p99 against rate with all three runs visible.
+- Write the section 2.3 arithmetic as a spreadsheet or script with your real
+  peak, zones, deploy strategy and growth, and compare its answer to what you
+  run today.
+- Reproduce the simulation in section 5.2, then add a node-provisioning delay
+  and a cache that goes cold on scale-down, and find the scale-down window that
+  keeps replicas stable.
+- For each dependency, compute what the fleet demands at `maxReplicas`, and
+  lower `maxReplicas` or add a pooler where it exceeds the limit.
+
+<SectionHeading n="11" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="How do you decide how many instances a service needs?">
+Measure what one instance can serve at the latency target (the knee of its
+p99-against-rate curve, not its maximum), take the forecast peak over the lead
+time for adding capacity, divide, then multiply for the failures you intend to
+survive, deploys and growth. With three zones, surviving one at peak alone
+multiplies the count by 1.5.
+</QA>
+
+<QA level="beginner" q="Why does a correctly sized fleet look under-utilised?">
+Because it's sized for its worst hour: peak traffic with a zone down during a
+deploy. In the example in this chapter, a fleet sized that way serves about
+half its planning capacity per instance on a normal peak. Running it hotter
+means the bad hour arrives with no room left.
+</QA>
+
+<QA level="intermediate" q="Walk me through how the Kubernetes HPA decides to scale.">
+Every 15 seconds it reads the metric, averages it over ready pods, and computes
+`desired = ceil(current × currentMetric / targetMetric)`. It does nothing if
+the ratio is within 10% of 1. Scale-up happens at once, up to doubling or four
+pods per 15 s; scale-down uses the highest recommendation of the last five
+minutes. Pods that aren't ready are counted as using 0% on a scale-up, which
+stops it re-ordering pods already starting.
+</QA>
+
+<QA level="intermediate" q="Your autoscaler oscillates between 10 and 40 pods. What do you look at?">
+Total loop delay first (metric window, scrape lag, sync period, pod start-up,
+node provisioning) compared with the period of the oscillation and of the load
+itself. Then whether the metric is proportional to replicas, whether warm-up CPU
+is being counted, whether a home-grown scaler ignores pending pods, and whether
+another controller (VPA on the same metric) is fighting it. A longer scale-down
+window is the usual first fix.
+</QA>
+
+<QA level="intermediate" q="Why is scaling on latency a bad idea?">
+Latency isn't proportional to replica count. Well below the knee it barely
+moves as load changes, so the controller gets no signal; near the knee it
+climbs steeply, so the controller gets a huge one, late. AWS's target-tracking
+docs list load balancer latency as a metric that doesn't work for the same
+reason. Scale on utilisation or throughput per instance, and alert on latency.
+</QA>
+
+<QA level="deep" q="Why can a large shared pool run at higher utilisation than several small ones?">
+Pooling. With `c` servers sharing one queue, a burst on one is absorbed by idle
+time on another. Erlang C gives the numbers: for mean queueing delay at or below
+0.1 service times, one server can run at 9%, four at 52%, sixteen at 80% and
+sixty-four at 93%. Splitting a pool per tenant or per shard buys isolation and
+pays for it in capacity, and that cost can be computed before you pay it.
+</QA>
+
+<QA level="deep" q="The app tier autoscales fine but the database falls over at peak. Why, and what do you change?">
+Each pod has its own connection pool, so connections scale with replicas even
+though the database's useful concurrency doesn't. Little's Law gives the real
+need: queries per second times query time, often tens of connections, while 40
+pods with pools of 10 can open 400 against a default `max_connections` of 100.
+Put a shared pooler in front, size it with `L = λW` plus margin, and cap
+`maxReplicas` from the database's limits.
+</QA>
+
+<SectionHeading n="12" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Three zones, 30 instances needed at peak. How many to survive one zone failing at peak?">
+    45. Two zones must carry the whole peak, so each needs half again as much:
+    30 × 3 / 2.
+  </Q>
+  <Q q="Which metric can't AWS target tracking use: CPU utilisation, ALB RequestCountPerTarget, or ALB RequestCount?">
+    `RequestCount`, the total at the load balancer. It doesn't change when you
+    add instances. Per-target request count does.
+  </Q>
+  <Q q="What does the HPA assume about pods that aren't ready yet during a scale-up?">
+    That they're using 0% of the resource request. It dampens the next
+    scale-up and stops the controller ordering the same pods twice.
+  </Q>
+  <Q q="Why does pgbench -R report latency from the scheduled start time?">
+    So a transaction that had to wait behind a slow one is charged for the wait.
+    Measuring from the actual start would hide queueing, the thing a capacity
+    test is looking for.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Kubernetes — Horizontal Pod Autoscaling" verdict="Read the algorithm section once; most HPA surprises are in it.">
+    The formula, readiness handling, tolerance, stabilisation windows and
+    default policies. [kubernetes.io](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/).
+  </WildCard>
+  <WildCard name="replica_calculator.go (Kubernetes v1.31.0)">
+    The code quoted in 4.2: grouping pods, tolerance, and zero-usage handling for
+    unready pods. [Source](https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/controller/podautoscaler/replica_calculator.go#L65).
+  </WildCard>
+  <WildCard name="AWS — Target tracking scaling policies">
+    Warmup, conservative scale-in, and which metrics can't be tracked.
+    [AWS docs](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html).
+  </WildCard>
+  <WildCard name="Cluster Autoscaler FAQ">
+    Scan interval, scale-down timing, and what blocks node removal.
+    [GitHub](https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/FAQ.md).
+  </WildCard>
+  <WildCard name="Google SRE book — Introduction and Production Services Best Practices">
+    The three mandatory steps of capacity planning, and N + 2.
+    [Introduction](https://sre.google/sre-book/introduction/) ·
+    [Best practices](https://sre.google/sre-book/service-best-practices/).
+  </WildCard>
+  <WildCard name="PostgreSQL — pgbench">
+    Rate-limited runs, schedule lag, and latency measured from the intended
+    start. [Docs](https://www.postgresql.org/docs/16/pgbench.html).
+  </WildCard>
+  <WildCard name="Neil Gunther — Guerrilla Capacity Planning">
+    The Universal Scalability Law applied to real capacity questions, with
+    fitting methods.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="13" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Contention, Queueing & Tail Latency">
+    The theory this chapter applies: the utilisation curve, Little's Law, the
+    USL and coordinated omission. [Chapter 16](/topics/16-contention-tail-latency).
+  </WildCard>
+  <WildCard name="Performance Engineering">
+    USE and RED for finding the saturated resource, and CPU throttling in
+    containers. [Chapter 41](/topics/41-performance-engineering).
+  </WildCard>
+  <WildCard name="Reliability Engineering">
+    Load shedding, retry budgets and the overload behaviour that capacity
+    headroom buys time for. [Chapter 40](/topics/40-reliability).
+  </WildCard>
+  <WildCard name="Containers from Scratch">
+    cgroups, the mechanism behind pod CPU requests and limits.
+    [Chapter 11](/topics/11-containers).
+  </WildCard>
+</CardGrid>

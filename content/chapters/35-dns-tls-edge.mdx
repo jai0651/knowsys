@@ -1,0 +1,1185 @@
+---
+title: "DNS, TLS & the Edge"
+dek: "Before your server sees a request, the client has resolved a name, agreed keys with someone it has verified, and been routed to one of many machines sharing an address. You'll learn the resolution path, the TLS 1.3 handshake, how certificate chains are checked, how anycast works, and why CDN cache keys decide your hit rate."
+readingTime: "~30 min"
+level: "Intermediate"
+versions: "RFC 1034/2308/8446/9111 · glibc 2.39 · OpenSSL 3.0.13 · nginx 1.24 · Unbound 1.19.2 · measured on linuxkit 6.10.14 and Apple M4"
+prereqs: "TCP basics, public-key crypto at the level of 'sign and verify'"
+updated: "2026-09-27"
+---
+
+Every HTTPS request starts with work your service never sees. The client turns
+a name into an address, opens a TCP connection, runs a TLS handshake, checks a
+chain of certificates, and gets routed to one of hundreds of machines that all
+answer to the same IP. Only then does your first byte of HTTP arrive.
+
+That front half is where a lot of latency and a lot of outages live. A slow
+first request after a deploy, a pod that takes 20 ms to look up a hostname, a
+certificate that works in Chrome and fails in a Java client, a CDN with a 30%
+hit rate on static files: each has a cause in one of these layers, and each is
+fixable once you know which.
+
+This chapter walks the path in the order a client does. DNS first, then the
+TLS handshake, then certificate chains, then anycast, and last the CDN cache
+that decides whether your origin sees the request at all.
+
+<SectionHeading n="01" id="before-first-byte">What happens before the first byte</SectionHeading>
+
+Type a URL into a browser, or call `requests.get()` in a script, and three
+questions have to be answered before any HTTP is exchanged.
+
+<Sub n="1.1" title="Three questions, three protocols">
+
+| Question | Answered by | Typical cost, cold |
+|---|---|---|
+| Which IP address serves this name? | DNS | 0 to several hundred ms, depending on caches |
+| Is the machine at that address really the name I asked for, and what keys do we share? | TLS handshake and certificate verification | 1 round trip (TLS 1.3) or 2 (TLS 1.2), plus CPU |
+| Which of the many machines behind that address gets my packets? | Anycast routing and the CDN edge | Decided by BGP, invisible to the client |
+
+Those costs stack. A client that's never talked to you before pays for DNS, then
+the TCP handshake, then TLS, and only then sends its request.
+
+<Why>Why count round trips instead of milliseconds?</Why>
+
+Because round trips are the part you can't buy your way out of. A handshake that needs two round trips
+costs 20 ms to a client 5 ms away and 300 ms to one on a bad mobile link.
+
+Here's what that looks like from a laptop to `www.cloudflare.com`, eleven
+connections per protocol version:
+
+<Compare
+  cols={["Handshake", "TCP connect (median)", "TLS handshake (median)", "TLS ÷ TCP"]}
+  rows={[
+    ["TLS 1.2", "60.5–67.9 ms", "139.1–141.3 ms", "2.05–2.34"],
+    ["TLS 1.3", "64.3–105.2 ms", "74.3–78.8 ms", "0.71–1.22"],
+  ]}
+/>
+
+That's two runs on an Apple M4, Python 3.14.6 with OpenSSL 3.6.4, over a home
+connection. TCP connect is one round trip, so it's a decent RTT estimate. TLS
+1.2 took roughly two of them and TLS 1.3 roughly one, as the protocols
+promise. Section 3 shows why.
+
+</Sub>
+
+<SectionHeading n="02" id="dns">DNS: from a name to an address</SectionHeading>
+
+DNS is a distributed, cached, hierarchical database. No single server knows
+every name. Each one knows a slice and points you at whoever knows the next
+slice down. The design is in [RFC 1034](https://www.rfc-editor.org/rfc/rfc1034)
+and it hasn't changed shape since 1987.
+
+<Sub n="2.1" title="Four roles">
+
+A lookup involves up to four kinds of server, and it's worth keeping them
+apart, because each caches differently and fails differently.
+
+| Role | Examples | What it does |
+|---|---|---|
+| **Stub resolver** | glibc's resolver in your process, `systemd-resolved` | Sends one recursive query and waits. Applies the search list and `ndots`. |
+| **Recursive resolver** | Unbound, CoreDNS forwarding upstream, 1.1.1.1, 8.8.8.8, the VPC resolver | Does the walking: asks root, then TLD, then authoritative. Caches everything it learns. |
+| **Root and TLD servers** | `a.root-servers.net` to `m`, the `.com` and `.org` servers | Answer only with referrals: "I don't know, ask these servers." |
+| **Authoritative server** | Route 53, Cloudflare DNS, your own BIND | Holds the actual records for a zone and answers with them. |
+
+<Why>Why does your app never talk to the root servers?</Why>
+
+Because the stub resolver in your process is deliberately dumb. It sends one
+question, with "recursion desired" set, to whatever `/etc/resolv.conf` names.
+That puts the cache in one shared place, where every client benefits from
+every lookup.
+
+</Sub>
+
+<Sub n="2.2" title="One cold lookup, step by step">
+
+When nothing is cached, the recursive resolver walks the tree from the top.
+Step through a lookup of `www.wikipedia.org`:
+
+<StepSequence
+  title="A cold recursive lookup of www.wikipedia.org"
+  actors={["Your app (stub)", "Recursive resolver", "Root server", ".org server", "Wikimedia NS"]}
+  messages={[
+    { from: 0, to: 1, label: "A? www.wikipedia.org", note: "The stub sends one query with **recursion desired** set, and waits. Everything after this is the recursive resolver's job." },
+    { from: 1, to: 2, label: "A? www.wikipedia.org", note: "With an empty cache, the resolver starts at a **root server**, whose addresses it ships with as built-in hints." },
+    { from: 2, to: 1, label: "referral: org. NS", note: "The root doesn't know the answer. It returns a **referral**: the `.org` name servers, with a TTL of 172,800 seconds (two days), plus their addresses as glue." },
+    { from: 1, to: 3, label: "A? www.wikipedia.org", note: "The resolver asks a `.org` server. With **QNAME minimisation** (RFC 9156) it would ask only about `wikipedia.org` here, leaking less to each level." },
+    { from: 3, to: 1, label: "referral: wikipedia.org NS", note: "Another referral: `ns0`, `ns1` and `ns2.wikimedia.org`, with a one-hour TTL." },
+    { from: 1, to: 4, label: "A? www.wikipedia.org", note: "Finally the **authoritative** server for the zone. It answers with a CNAME to `dyna.wikimedia.org`, which the resolver then has to resolve too." },
+    { from: 1, to: 0, label: "A record", note: "The resolver returns the final answer and **caches every record it saw**, each with its own TTL. The next client asking for anything under `.org` skips the first two steps." },
+  ]}
+/>
+
+`dig +trace` does that walk itself, from the machine you run it on, so you can
+see each referral and how long each server took:
+
+<TryIt what="Walk the DNS tree by hand" lang="shell" toolchain="dig 9.18.39, shared 4-CPU container, linuxkit 6.10">
+```shell
+dig +trace +nodnssec www.wikipedia.org
+```
+
+<Output>
+```text
+.                  4502   IN NS  a.root-servers.net.
+...
+org.             172800   IN NS  c0.org.afilias-nst.info.
+...
+wikipedia.org.     3600   IN NS  ns0.wikimedia.org.
+...
+www.wikipedia.org. 86400  IN CNAME dyna.wikimedia.org.
+;; Received 420 bytes from 192.168.65.7#53(192.168.65.7) in 3 ms
+;; Received 783 bytes from 199.7.91.13#53(d.root-servers.net) in 193 ms
+;; Received 743 bytes from 199.19.53.1#53(c0.org.afilias-nst.info) in 70 ms
+;; Received 95 bytes from 208.80.153.231#53(ns1.wikimedia.org) in 312 ms
+```
+
+One run. The first line is the local resolver handing back the root server
+list from its own cache. The next three are real round trips to three different
+organisations, and they add up to more than half a second.
+</Output>
+</TryIt>
+
+Look at the TTLs down the left: two days for the `.org` delegation, an hour for
+the Wikimedia name servers, a day for the CNAME. The expensive top of the tree
+almost never needs asking.
+
+</Sub>
+
+<Sub n="2.3" title="Caching, TTLs, and what a miss costs">
+
+To see what the cache is worth, I ran a private Unbound resolver in the lab
+container, restarted it to empty its cache, and asked it for eight names twice
+each. That's three rounds, each starting cold:
+
+<Compare
+  cols={["Name", "Cold (median of 3)", "Warm", "Why the cold one is slow"]}
+  rows={[
+    ["news.ycombinator.com", "247 ms", "1–2 ms", "`.com` already cached from an earlier name"],
+    ["www.cloudflare.com", "280 ms", "0–2 ms", "short chain"],
+    ["github.com", "289 ms", "1 ms", "short chain"],
+    ["www.rust-lang.org", "626 ms", "0–6 ms", "CNAME into a CDN's zone"],
+    ["www.netflix.com", "804 ms", "0–1 ms", "CNAME into a second zone"],
+    ["www.kernel.org", "812 ms", "0–1 ms", "CNAME into a second zone"],
+    ["www.wikipedia.org", "1,207 ms", "0–1 ms", "first query of each round: primes root and `.org` too"],
+    ["www.apple.com", "1,790 ms", "1–5 ms", "three CNAMEs across three zones"],
+  ]}
+/>
+
+Measured in the shared 4-CPU container (linuxkit 6.10), through Docker Desktop's
+network. The warm column is the resolver answering from memory.
+
+<Why>Why was www.apple.com seven times slower than github.com?</Why>
+
+Because of its CNAME chain. The answer came back as
+`www.apple.com` → `www-apple-com.v.aaplimg.com` → `www.apple.com.edgekey.net` →
+`e6858.dsce9.akamaiedge.net` → an A record. Each hop lands in a different zone,
+and each zone the resolver hasn't seen yet costs its own walk from the TLD
+down. CDNs lean on CNAMEs like this to steer clients, and the price is paid on
+every cold cache.
+
+Also notice the TTL on the last record in that chain: 11 seconds when I looked.
+CDNs seem to keep their final A records short so they can move traffic quickly. That
+keeps the tail of the chain permanently near-cold.
+
+<Why>How long is "not found" cached?</Why>
+
+Negative answers are cached too. [RFC 2308](https://www.rfc-editor.org/rfc/rfc2308)
+says a resolver caches an NXDOMAIN for "the minimum of the MINIMUM field of the
+SOA record and the TTL of the SOA itself". So if you query a name *before* you
+create it, resolvers remember that it doesn't exist, for up to that long.
+
+<Callout label="Common mistake" kind="warn">
+Health-checking or pre-warming a hostname before its record exists, then
+creating the record and wondering why clients still get NXDOMAIN. Check the
+zone's SOA minimum (`dig SOA example.com`) and assume every resolver that saw
+the miss will keep it that long.
+</Callout>
+
+TTLs cut the other way during a migration. If an A record has a one-day TTL,
+changing it takes up to a day to reach every client. The usual move is to
+drop the TTL to a minute or so a full old-TTL before the change, make the
+change, then raise it again afterwards.
+
+</Sub>
+
+<Sub n="2.4" title="The stub resolver's search list, and ndots:5">
+
+Your stub resolver has one feature that surprises nearly everyone who runs
+Kubernetes: it may rewrite your name before sending it. Every pod gets a
+`/etc/resolv.conf` like this, [written by the kubelet](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/):
+
+```text
+nameserver 10.32.0.10
+search <namespace>.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5
+```
+
+`ndots:5` means "if the name has fewer than five dots, try it with each search
+domain appended *first*". Here's the logic in glibc:
+
+<SourceRead
+  file="resolv/res_query.c"
+  repo="bminor/glibc"
+  tag="glibc-2.39"
+  href="https://github.com/bminor/glibc/blob/glibc-2.39/resolv/res_query.c#L363"
+>
+```c
+	dots = 0;
+	for (cp = name; *cp != '\0'; cp++)
+		dots += (*cp == '.');
+	trailing_dot = 0;
+	if (cp > name && *--cp == '.')
+		trailing_dot++;
+	/* ... */
+	/*
+	 * If there are enough dots in the name, let's just give it a
+	 * try 'as is'. The threshold can be set with the "ndots" option.
+	 * Also, query 'as is', if there is a trailing dot in the name.
+	 */
+	saved_herrno = -1;
+	if (dots >= statp->ndots || trailing_dot) {
+		ret = __res_context_querydomain (ctx, name, NULL, class, type, /* ... */);
+		/* ... */
+	}
+	/* ... otherwise, or if that failed: */
+		for (size_t domain_index = 0; !done; ++domain_index) {
+			const char *dname = __resolv_context_search_list
+			  (ctx, domain_index);
+			/* ... query name + "." + dname ... */
+			switch (statp->res_h_errno) {
+			case NO_DATA:
+				got_nodata++;
+				/* FALLTHROUGH */
+			case HOST_NOT_FOUND:
+				/* keep trying */
+				break;
+			/* ... SERVFAIL also moves on; anything else stops ... */
+```
+</SourceRead>
+
+<Predict
+  q="A pod with the default Kubernetes resolv.conf looks up api.github.com (two dots). How many DNS queries does glibc send for the A record?"
+  options={[
+    "1: the name has dots, so it goes out as is",
+    "2: one search domain, then the name as is",
+    "4: three search domains, then the name as is",
+    "3: the search domains only",
+  ]}
+  answer={2}
+>
+Four. Two dots is fewer than `ndots:5`, so glibc tries
+`api.github.com.<namespace>.svc.cluster.local`, then `.svc.cluster.local`, then
+`.cluster.local`, and each gets NXDOMAIN before the real name goes out. On a
+dual-stack pod, every one of those is doubled with an AAAA query.
+</Predict>
+
+You can check that without a cluster. I pointed a private mount namespace's
+`/etc/resolv.conf` at a local Unbound that answers `cluster.local` itself, as
+CoreDNS would, and logged what arrived:
+
+<TryIt what="Count the queries glibc sends under ndots:5, then ndots:1" lang="shell" toolchain="glibc 2.39, Unbound with log-queries, shared 4-CPU container, linuxkit 6.10">
+```shell
+unshare -m bash -c '
+  mount --bind resolv.k8s /etc/resolv.conf     # the kubelet-style file above
+  getent ahosts api.github.com > /dev/null'
+grep -oE 'info: [^ ]+ [^ ]+ A' logs/unbound.log
+```
+
+<Output>
+```text
+# ndots:5
+A api.github.com.default.svc.cluster.local.
+A api.github.com.svc.cluster.local.
+A api.github.com.cluster.local.
+A api.github.com.
+# ndots:1
+A api.github.com.
+# ndots:5, but the app asked for "api.github.com." with a trailing dot
+A api.github.com.
+```
+
+Only A queries appear because this container has no IPv6 address. With every
+answer already in the resolver's cache, the median `getaddrinfo()` took
+**6.8 ms under `ndots:5` against 1.5 ms under `ndots:1`** (median of five runs
+of fifty calls each, on a busy shared box).
+</Output>
+</TryIt>
+
+<Why>Why does Kubernetes default to something so expensive?</Why>
+
+So that short names work. With `ndots:5`, a pod can call `http://payments` or
+`payments.billing` and the search list turns it into the right service name.
+Its cost lands on every *external* name, and on the cluster DNS servers, which
+now answer three NXDOMAINs for every real lookup.
+
+<Callout label="Design implication">
+For pods that call external services a lot, set `dnsConfig.options` to
+`ndots: "1"` or `"2"`, or use fully qualified names with a trailing dot
+(`api.github.com.`). Either one takes the search list out of the path for
+names that are already complete.
+</Callout>
+
+</Sub>
+
+<Sub n="2.5" title="UDP, truncation, and spoofing">
+
+Most DNS runs over UDP: one packet out, one back, no handshake. That's why a
+warm lookup costs about a millisecond. It also creates two problems.
+
+First, size. A UDP answer that's bigger than the path can carry gets
+fragmented, and fragments get dropped by firewalls. [DNS Flag Day 2020](https://www.dnsflagday.net/2020/)
+settled on a default EDNS buffer of **1,232 bytes**, which "will avoid
+fragmentation on nearly all current networks" (an IPv6 minimum MTU of 1,280
+minus 48 bytes of headers). Bigger answers come back with the TC (truncated)
+bit set, and the resolver "MUST" retry over TCP.
+
+<Callout label="Common mistake" kind="warn">
+Firewall rules or security groups that allow port 53 over UDP only. Everything
+works until an answer grows past 1,232 bytes, usually from DNSSEC signatures or
+a long list of records, and then those lookups fail while small ones succeed.
+</Callout>
+
+Second, spoofing. A UDP answer is accepted if it matches the question and
+a 16-bit query ID. [RFC 5452](https://www.rfc-editor.org/rfc/rfc5452), written
+after Dan Kaminsky's 2008 cache-poisoning attack, points out that 16 bits
+"will require on average 32768 attempts to guess". Its fix is to randomise the
+*source port* too, which multiplies the space an attacker has to guess. Every
+modern resolver does this.
+
+DNSSEC goes further and signs the records, so a resolver can check them. It
+also adds new ways to fail. Slack's
+[2021 DNSSEC rollout](https://slack.engineering/what-happened-during-slacks-dnssec-rollout/)
+broke resolution for some users for about a day: a DS record cached by
+resolvers "for 24h by default" outlived the rollback, and a Route 53 bug in
+NSEC answers for wildcard records made validating resolvers conclude that A
+records didn't exist.
+
+</Sub>
+
+<SectionHeading n="03" id="tls">The TLS 1.3 handshake</SectionHeading>
+
+You have an address and a TCP connection. Now the client needs two things
+before it sends anything private: keys that only it and the server know, and
+proof that the server really is the name it asked for.
+
+<Sub n="3.1" title="What the handshake has to establish">
+
+| Goal | How TLS 1.3 gets it |
+|---|---|
+| Agree on algorithms | Client offers cipher suites, groups and signature schemes; server picks |
+| Shared secret keys | Ephemeral Diffie-Hellman (X25519 or P-256): each side sends a public share |
+| Server identity | Server sends its certificate chain and **signs the handshake transcript** with the certificate's private key |
+| Tamper detection | Both sides send a `Finished` MAC over everything so far |
+
+<Why>Why sign the transcript instead of encrypting with the certificate's key?</Why>
+
+Because TLS 1.3 ([RFC 8446](https://www.rfc-editor.org/rfc/rfc8446)) dropped
+static RSA key exchange entirely. In TLS 1.2 with RSA key exchange, the client
+encrypted the session secret to the server's long-term key, so anyone who later
+stole that key could decrypt every recorded session. With ephemeral
+Diffie-Hellman, the long-term key only *signs*. Steal it later and past traffic
+stays sealed. That property is **forward secrecy**, and in TLS 1.3 you get it
+by default.
+
+</Sub>
+
+<Sub n="3.2" title="One handshake, step by step">
+
+<StepSequence
+  title="A full TLS 1.3 handshake, then the first request"
+  actors={["Client", "Server"]}
+  messages={[
+    { from: 0, to: 1, label: "ClientHello + key_share", note: "The client sends its supported versions and ciphers, the **SNI** (the hostname it wants, in plaintext), ALPN (`h2`, `http/1.1`), and a Diffie-Hellman **key share**, guessing the group the server will pick." },
+    { from: 1, to: 0, label: "ServerHello + key_share", note: "The server picks a cipher and group and sends its own share. **Both sides can now compute the handshake keys.** Everything after this is encrypted." },
+    { from: 1, to: 0, label: "EncryptedExtensions, Certificate", note: "Still in the same flight: negotiated extensions (like the ALPN choice), then the **certificate chain**: leaf, then intermediates." },
+    { from: 1, to: 0, label: "CertificateVerify, Finished", note: "The server **signs a hash of the transcript** with the leaf certificate's private key, then sends a MAC over the whole handshake." },
+    { from: 0, to: 0, label: "verify chain + signature", note: "The client checks the chain up to a trusted root, the hostname against the SAN list, the validity dates, and the signature. If any check fails, it aborts here." },
+    { from: 0, to: 1, label: "Finished + GET /", note: "The client sends its own Finished **and its HTTP request in the same flight**. That's one round trip from ClientHello to request." },
+    { from: 1, to: 0, label: "NewSessionTicket, response", note: "After the handshake, the server may send **session tickets** the client can use to resume later, then the response." },
+  ]}
+/>
+
+<Why>Why is this one round trip when TLS 1.2 took two?</Why>
+
+Because the client guesses. In TLS 1.2 the client first learned which key
+exchange the server picked, and only then sent its share, so there was a whole
+round trip spent on negotiation. TLS 1.3 has the client send a key share in its
+very first message. If the guess is wrong the server asks again
+(`HelloRetryRequest`) and you're back to two round trips, but clients guess
+X25519 and probably win nearly every time. Every handshake in this chapter's tests
+negotiated X25519.
+
+That's the ratio in section 1: about 2.1× the TCP round trip for TLS 1.2, about
+1× for TLS 1.3.
+
+</Sub>
+
+<Sub n="3.3" title="Resumption and 0-RTT">
+
+A client that has talked to you before holds a session ticket. Presenting it
+lets the server skip the certificate and the signature: both sides derive keys
+from the stored secret (plus, normally, a fresh Diffie-Hellman exchange for
+forward secrecy).
+
+TLS 1.3 also lets that client send data in its very first flight, **0-RTT** or
+"early data", before the server has answered at all. It's tempting, and RFC
+8446 is blunt about what it costs:
+
+- "This data is not forward secret, as it is encrypted solely under keys
+  derived using the offered PSK."
+- "There are no guarantees of non-replay between connections."
+
+<Why>What does replay mean for your API?</Why>
+
+An attacker who records a 0-RTT request can send the same bytes to the server
+again, and the server can't tell them apart from the original. For a `GET` of a
+public page that's harmless. For `POST /transfer` it's a second transfer.
+
+[RFC 8470](https://www.rfc-editor.org/rfc/rfc8470) gives you the tools. A CDN
+or proxy that accepted a request in early data forwards it with
+`Early-Data: 1`, and your origin can answer `425 (Too Early)`, which tells the
+client to retry after the handshake completes.
+
+<Callout label="Design implication">
+If you enable 0-RTT at the edge, treat any request carrying `Early-Data: 1` as
+replayable. Allow it for idempotent reads, answer 425 for anything with side
+effects, and make sure your idempotency keys (not TLS) are what protect writes.
+</Callout>
+
+</Sub>
+
+<Sub n="3.4" title="A resumed handshake that took 43 ms on loopback">
+
+Resumption should be the fastest handshake there is. In the lab, a resumed
+TLS 1.2 connection plus one tiny request was *forty times slower* than a full
+one, on loopback, where the round trip is microseconds.
+
+<TryIt what="Resumed TLS 1.2 handshake plus one small request, with and without TCP_NODELAY" lang="python" toolchain="Python 3.12.3, OpenSSL 3.0.13, nginx 1.24 on loopback, shared 4-CPU container, linuxkit 6.10">
+```python
+for nodelay in (0, 1):
+    for i in range(60):
+        s = socket.create_connection(("127.0.0.1", 58443))
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, nodelay)
+        t = time.perf_counter()
+        ss = ctx.wrap_socket(s, server_hostname="lab.test", session=sess)
+        ss.sendall(b"GET / HTTP/1.0\r\n\r\n"); ss.recv(100)
+        ts.append(time.perf_counter() - t); sess = ss.session; ss.close()
+```
+
+<Output>
+```text
+TCP_NODELAY=0  resumed TLS1.2 + one request: median 43.0 ms
+TCP_NODELAY=1  resumed TLS1.2 + one request: median 1.6 ms
+TCP_NODELAY=0  resumed TLS1.2 + one request: median 43.7 ms
+TCP_NODELAY=1  resumed TLS1.2 + one request: median 1.2 ms
+TCP_NODELAY=0  resumed TLS1.2 + one request: median 43.2 ms
+TCP_NODELAY=1  resumed TLS1.2 + one request: median 1.3 ms
+```
+
+Full TLS 1.2 handshakes and TLS 1.3 handshakes, full or resumed, didn't show
+the stall.
+</Output>
+</TryIt>
+
+That 40-odd milliseconds is probably a signature: Linux's minimum delayed-ACK timer,
+`TCP_DELACK_MIN`, is `HZ/25`
+([`include/net/tcp.h`](https://github.com/torvalds/linux/blob/v6.10/include/net/tcp.h#L259)),
+which is 40 ms. Here's the sequence that fits every row:
+
+1. In a resumed TLS 1.2 handshake, the **client speaks last**: its
+   `ChangeCipherSpec` and `Finished` go out, and the server has nothing to say
+   back.
+2. The server's kernel delays its ACK, hoping to piggyback it on data.
+3. The client immediately writes a small request. **Nagle's algorithm** holds
+   small segments while earlier data is unacknowledged.
+4. Both sides wait until the server's delayed-ACK timer fires, 40 ms later.
+
+In a full TLS 1.2 handshake the server speaks last, so its `Finished`
+acknowledges the client and there's nothing outstanding. In TLS 1.3 the server
+sends session tickets right after the client's `Finished`, which carries the
+ACK immediately. That seems to be why 1.3 didn't stall here, though I didn't capture packets to prove it.
+
+<Callout label="Common mistake" kind="warn">
+Benchmarking a TLS client, or writing one, without `TCP_NODELAY`. Most HTTP
+clients set it; custom protocol clients, test harnesses and older libraries
+often don't. The symptom is a latency floor of roughly 40 ms that vanishes on
+some handshakes and not others.
+</Callout>
+
+</Sub>
+
+<Sub n="3.5" title="What a handshake costs the CPU">
+
+Round trips dominate over a real network. On the server, though, handshakes
+are the expensive part of TLS: bulk encryption with AES-GCM is cheap, and the
+public-key operations are not.
+
+<Compare
+  cols={["Operation (OpenSSL 3.0.13)", "Per second, one core", "Per operation", "Who pays in a handshake"]}
+  rows={[
+    ["RSA-2048 sign", "1,892", "529 µs", "Server, once per full handshake"],
+    ["RSA-2048 verify", "79,206", "12.6 µs", "Client, per RSA signature in the chain"],
+    ["ECDSA P-256 sign", "60,532", "16.5 µs", "Server, once per full handshake"],
+    ["ECDSA P-256 verify", "19,561", "51 µs", "Client, per ECDSA signature in the chain"],
+    ["X25519 key exchange", "34,653", "28.9 µs", "Both sides, every handshake"],
+  ]}
+/>
+
+`openssl speed -seconds 2`, median of three runs, in the shared 4-CPU container
+(linuxkit 6.10, aarch64).
+
+<Why>Why do almost all big sites use ECDSA certificates now?</Why>
+
+Because the server signs, and an RSA-2048 signature costs about 32 times what
+an ECDSA P-256 signature does on this box. A server doing nothing but full
+RSA handshakes could manage under 2,000 per core per second; with ECDSA the
+signature stops being the bottleneck. All three public sites in section 4.3
+served ECDSA P-256 leaves. RSA's cheap *verify* is why some sites also keep an
+RSA certificate for old clients that can't verify ECDSA.
+
+Resumption skips the signature altogether. If you run several edge servers, they need to share ticket keys, or a client
+resuming against a different server falls back to a full handshake.
+
+</Sub>
+
+<SectionHeading n="04" id="certificates">Certificate chains</SectionHeading>
+
+The handshake proves the server holds a private key. The certificate is what
+ties that key to a name, and the chain is what makes the client believe the
+certificate.
+
+<Sub n="4.1" title="What a certificate says">
+
+An X.509 certificate is a signed statement: "this public key belongs to these
+names, from this date to that date, and may be used for these purposes". The
+fields that matter in practice:
+
+| Field | What the client checks |
+|---|---|
+| **Subject Alternative Name (SAN)** | The hostname you connected to must match one entry. The old Common Name field is ignored for this by modern browsers. |
+| **Validity** (`notBefore`, `notAfter`) | The current time must be inside it. A skewed client clock breaks this. |
+| **Basic Constraints** | Only certificates marked `CA:TRUE` may sign other certificates. |
+| **Key Usage / Extended Key Usage** | A leaf must be allowed for `serverAuth`. |
+| **Issuer and signature** | Must be signed by the next certificate up the chain. |
+
+A wildcard SAN like `*.wikipedia.org` matches exactly one label, so it covers
+`en.wikipedia.org` but not `wikipedia.org` or `a.b.wikipedia.org`. That's why
+Wikipedia's certificate lists both `*.wikipedia.org` and `wikipedia.org`, among
+41 names.
+
+</Sub>
+
+<Sub n="4.2" title="Building and checking a chain">
+
+Browsers and operating systems ship a **trust store** of a few hundred root
+certificates. Roots almost never sign server certificates directly. They sign
+**intermediates**, kept online, which sign leaves. The server has to send the
+leaf and the intermediates; the client supplies the root from its store.
+
+<Steps
+  title="How a client verifies the chain for lab.test"
+  lanes={[
+    { t: "Leaf", s: "CN=lab.test", icon: "◉" },
+    { t: "Intermediate", s: "sent by server", icon: "▦" },
+    { t: "Root", s: "in trust store", icon: "⌂" },
+    { t: "Checks", s: "name · dates · usage", icon: "✓" },
+  ]}
+  steps={[
+    [0, "The server sends the **leaf** first. Its issuer field names `Lab Intermediate`, and its SAN lists `lab.test` and `www.lab.test`."],
+    [1, "The client finds a certificate whose subject matches that issuer **among the ones the server sent**, and checks the leaf's signature with the intermediate's public key."],
+    [1, "The intermediate must carry `CA:TRUE`. Its own issuer is `Lab Root`, which the server didn't send, and shouldn't."],
+    [2, "The client looks up `Lab Root` in its **trust store**. A root is trusted because it's there, not because of anything it says about itself."],
+    [3, "With a path to a trusted root, the client checks the **hostname** against the leaf's SAN, the **validity dates** on every certificate, and the leaf's **serverAuth** usage."],
+    [3, "Only after all of that does it check the `CertificateVerify` signature from the handshake, proving the server holds the leaf's private key."],
+  ]}
+/>
+
+In production, step 2 is the one that fails most often: the server sends the
+leaf but forgets the intermediate. I built a three-level chain in the lab and
+served it both ways from nginx:
+
+<TryIt what="Serve a leaf with and without its intermediate" lang="shell" toolchain="OpenSSL 3.0.13, nginx 1.24, shared 4-CPU container, linuxkit 6.10">
+```shell
+# ssl_certificate chain-ec.pem  (leaf + intermediate)  on :58443
+# ssl_certificate leaf-ec.pem   (leaf only)            on :58445
+openssl s_client -connect 127.0.0.1:58443 -servername lab.test -CAfile root.pem
+openssl s_client -connect 127.0.0.1:58445 -servername lab.test -CAfile root.pem
+```
+
+<Output>
+```text
+# :58443, full chain
+depth=2 CN = Lab Root
+depth=1 CN = Lab Intermediate
+depth=0 CN = lab.test
+Server Temp Key: X25519, 253 bits
+New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+Verify return code: 0 (ok)
+
+# :58445, leaf only
+depth=0 CN = lab.test
+verify error:num=20:unable to get local issuer certificate
+verify error:num=21:unable to verify the first certificate
+Verify return code: 21 (unable to verify the first certificate)
+```
+</Output>
+</TryIt>
+
+<Why>Why does a missing intermediate work in one browser and fail in curl?</Why>
+
+Because some clients paper over it. A browser may already have the
+intermediate cached from another site, ship a preloaded list of intermediates,
+or fetch the missing one from the URL in the certificate's Authority
+Information Access field. `curl`, OpenSSL, Go, Java and
+most server-side clients don't, so they fail with exactly the error above.
+That's why "works in my browser" is no test of a certificate deploy.
+
+<Callout label="Common mistake" kind="warn">
+Configuring the leaf certificate alone in nginx, HAProxy or a load balancer.
+The `ssl_certificate` file must contain the leaf followed by its
+intermediates. Test with `openssl s_client -connect host:443 -servername host`
+from a machine that isn't your laptop's browser.
+</Callout>
+
+</Sub>
+
+<Sub n="4.3" title="Real chains, and why they're longer than they need to be">
+
+Here's what three public sites sent in September 2026:
+
+| Site | Chain as served (leaf first) | DER sizes | Leaf lifetime |
+|---|---|---|---|
+| www.cloudflare.com | leaf → WE1 → GTS Root R4 (cross-signed by GlobalSign Root CA) | 923, 675, 894 B | 90 days |
+| www.wikipedia.org | leaf → YE2 → ISRG Root YE (cross-signed by X2) → ISRG Root X2 (cross-signed by X1) | 1,636, 656, 682, 1,140 B | 90 days |
+| github.com | leaf → Sectigo DV E36 → Sectigo Root E46 (cross-signed by USERTrust ECC) | 1,009, 867, 842 B | 90 days |
+
+Every leaf was ECDSA P-256. And every chain includes a certificate for a root,
+signed by an *older* root: a **cross-sign**.
+
+<Why>Why send a root the client might already have?</Why>
+
+Because not every client has it. A new root takes years to reach every trust
+store, especially on devices that never update. Wikipedia's chain uses Let's
+Encrypt's [Generation Y hierarchy](https://letsencrypt.org/2025/11/24/gen-y-hierarchy),
+whose new roots are cross-signed so that clients trusting only ISRG Root X1 or
+X2 can still build a path. A modern client stops at whichever root it trusts;
+an old one follows the cross-signs up to a root it knows.
+
+Cross-signs expire, and that's caused real outages. When DST Root CA X3 expired
+on [September 30, 2021](https://letsencrypt.org/docs/dst-root-ca-x3-expiration-september-2021/),
+devices that didn't trust ISRG Root X1 started failing. Worse, "in OpenSSL
+1.0.x, a quirk in certificate verification means that even clients that trust
+ISRG Root X1 will fail" when handed the longer chain: the old verifier followed
+the path to the expired root and gave up instead of trying the shorter one.
+
+Chain length also has a cost you can see. Wikipedia's four certificates add up
+to about 4.1 KB, sent on every full handshake to every new client. Resumed
+handshakes skip the certificates entirely, which is one more reason to make
+resumption work.
+
+</Sub>
+
+<Sub n="4.4" title="Revocation, transparency, and short lifetimes">
+
+If a private key leaks, the certificate should stop working before it expires.
+Both classic mechanisms, certificate revocation lists (CRLs) and OCSP, both
+had the same flaw: when the check failed or timed out, most clients carried on
+anyway. So the industry's answer has been to make certificates expire sooner
+instead.
+
+| Change | Date | Source |
+|---|---|---|
+| Chrome requires Certificate Transparency for certificates issued after April 30, 2018 | July 2018 (Chrome 68) | [Chrome CT policy](https://googlechrome.github.io/CertificateTransparency/) |
+| Let's Encrypt turns off its OCSP responders | August 6, 2025 | [Let's Encrypt](https://letsencrypt.org/2025/08/06/ocsp-service-has-reached-end-of-life) |
+| Maximum public certificate lifetime drops to 200 days | March 15, 2026 | [CA/B Forum SC-081v3](https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/) |
+| ...to 100 days | March 15, 2027 | same |
+| ...to 47 days | March 15, 2029 | same |
+
+**Certificate Transparency** means every publicly trusted certificate is
+logged in public, append-only logs, and the certificate carries signed
+timestamps proving it. You can watch the logs for certificates issued for your
+domains that you didn't ask for.
+
+<Callout label="Design implication">
+With 47-day certificates coming, any certificate renewed by hand will
+eventually expire in production. Automate issuance with ACME, alert on
+`notAfter` for every endpoint you serve (including internal ones and
+load-balancer listeners), and test renewal the way you test backups.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="05" id="anycast">Anycast: one address, many places</SectionHeading>
+
+You've resolved `www.cloudflare.com` to `104.16.124.96`. There isn't one
+machine with that address. There are hundreds of data centres, all announcing
+it.
+
+<Sub n="5.1" title="How it works">
+
+BGP, the internet's routing protocol, lets networks announce "I can reach this
+block of addresses". Normally one network announces a block. With **anycast**,
+many sites announce the *same* block, and every router picks whichever
+announcement looks closest by its own policy, usually the shortest path.
+
+So each client's packets flow to a nearby site, with no
+lookup, no redirect and no client-side logic. The DNS root is the biggest
+example: 13 names, `a` to `m`, served by 12 organisations, and on the morning
+this chapter was written, [root-servers.org](https://root-servers.org/) counted
+**2,045 instances** behind them.
+
+<Why>How can you tell which instance answered?</Why>
+
+Many anycast DNS services answer a special query in the CHAOS class that
+returns an identifier for the instance:
+
+```shell
+dig +short CH TXT id.server @1.1.1.1      # Cloudflare returns a site code
+dig +short CH TXT id.server @k.root-servers.net  # e.g. "ns1.in-maa.k.ripe.net"
+```
+
+From the lab, 1.1.1.1 answered with an airport code for a nearby city plus an
+instance number, and K-root named a RIPE instance by its city code too. The same query from another country gets a different
+answer from the same IP address.
+
+</Sub>
+
+<Sub n="5.2" title="A site fails, and traffic moves">
+
+Anycast's other gift is failover without anyone deciding anything. Step through
+what happens when one site goes away:
+
+<Steps
+  title="An anycast site withdraws its route"
+  lanes={[
+    { t: "Client", s: "sends to 104.16.x.x", icon: "◉" },
+    { t: "ISP routers", s: "BGP tables", icon: "⇅" },
+    { t: "Site A", s: "nearest", icon: "▦" },
+    { t: "Site B", s: "next nearest", icon: "▦" },
+  ]}
+  steps={[
+    [1, "Sites A and B both announce the same prefix. The client's ISP has both routes and prefers **Site A**, the shorter path."],
+    [2, "Site A serves the client's packets. Nobody outside the ISP's routing table knows or cares which site that was."],
+    [2, "Site A's health checks fail, and its routers **withdraw the announcement**. This is automatic: the site takes itself out."],
+    [1, "The withdrawal propagates through BGP. Within seconds to minutes, the ISP's routers fall back to the next-best route."],
+    [3, "New packets to the same IP now arrive at **Site B**. UDP clients, like DNS, don't notice anything but a slower answer."],
+    [3, "A TCP connection that was open to Site A lands on Site B mid-stream. Site B has no state for it and sends a **reset**. The client reconnects."],
+  ]}
+/>
+
+<Why>Why doesn't anycast break every TCP connection?</Why>
+
+Because routes are stable most of the time. [RFC 4786](https://www.rfc-editor.org/rfc/rfc4786),
+the operational guide to anycast, discusses exactly this: a route change
+mid-connection sends packets to a node with no state for them. In practice
+paths change rarely enough that short HTTP connections probably finish where
+they started. Long-lived connections are the ones that notice.
+
+</Sub>
+
+<Sub n="5.3" title="When the automatic withdrawal is the outage">
+
+That same self-withdrawal that makes anycast resilient took Facebook off the
+internet on October 4, 2021. Meta's
+[postmortem](https://engineering.fb.com/2021/10/05/networking-traffic/outage-details/)
+describes a maintenance command that "unintentionally took down all the
+connections in our backbone network". Then this:
+
+> "our DNS servers disable those BGP advertisements if they themselves can not
+> speak to our data centers, since this is an indication of an unhealthy
+> network connection"
+
+Every DNS site saw the backbone disappear, decided it was the unhealthy one,
+and withdrew. All at once. With no DNS, nobody could resolve any Facebook name,
+including the tools engineers needed to fix it.
+
+<Callout label="Design implication">
+A health check that withdraws a site is correct when one site is sick and
+catastrophic when all of them see the same fault. Guard automatic withdrawal
+with a floor ("never withdraw if it would leave fewer than N sites
+announcing"), and keep an out-of-band path to your DNS and routers that
+doesn't depend on either.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="06" id="cdn-cache-keys">CDN cache keys</SectionHeading>
+
+Your request has reached an edge server near the client. Whether your origin
+sees it now depends on one thing: whether the edge finds a stored response
+whose **cache key** matches.
+
+<Sub n="6.1" title="A request at the edge">
+
+<Steps
+  title="One GET, through an edge cache to the origin"
+  lanes={[
+    { t: "Client", s: "browser", icon: "◉" },
+    { t: "Edge", s: "nearest PoP", icon: "⌁" },
+    { t: "Cache", s: "key → object", icon: "▦" },
+    { t: "Origin", s: "your servers", icon: "⌂" },
+  ]}
+  steps={[
+    [0, "The client sends `GET /img/logo.png?v=3` with its usual headers: `Accept-Encoding`, `User-Agent`, cookies."],
+    [1, "The edge terminates TLS and **builds the cache key** from parts of the request: by default scheme, host, path and query string."],
+    [2, "It looks the key up. If the stored response has a `Vary` header, it also compares the named request headers against the ones stored with the object."],
+    [2, "**Hit, and fresh** (within `max-age`): the edge answers from memory. The origin never hears about it."],
+    [3, "**Miss**, or stale: the edge forwards to the origin (often through a regional shield cache), and stores the response under the key if it's cacheable."],
+    [1, "The edge replies, usually with a header saying what happened, like `X-Cache` or `CF-Cache-Status`."],
+  ]}
+/>
+
+Defaults differ, so check yours. nginx's default is
+`proxy_cache_key $scheme$proxy_host$request_uri`
+([docs](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache_key)).
+Cloudflare's [default key](https://developers.cloudflare.com/cache/how-to/cache-keys/)
+is scheme, host and "URI with query string", plus a few headers such as
+`Origin` for CORS.
+
+</Sub>
+
+<Sub n="6.2" title="Same content, different keys">
+
+A cache key is a string. Two requests that mean the same thing but spell it
+differently are two different objects, and each one has to come from the
+origin.
+
+<TryIt what="Five requests for the same content through an nginx cache" lang="shell" toolchain="nginx 1.24 proxy_cache, default key, shared 4-CPU container, linuxkit 6.10">
+```shell
+for u in "/p?a=1&b=2" "/p?a=1&b=2" "/p?b=2&a=1" "/P?a=1&b=2" "/p?a=1&b=2&utm_source=x"; do
+  curl -s -D- -o /dev/null "http://127.0.0.1:58080$u" | grep -i x-cache
+done
+```
+
+<Output>
+```text
+/p?a=1&b=2                   X-Cache: MISS
+/p?a=1&b=2                   X-Cache: HIT
+/p?b=2&a=1                   X-Cache: MISS
+/P?a=1&b=2                   X-Cache: MISS
+/p?a=1&b=2&utm_source=x      X-Cache: MISS
+```
+
+Four objects on disk for what the origin treats as one response. Reordered
+parameters, a different case in the path, and a marketing tag each made a new
+key.
+</Output>
+</TryIt>
+
+Normalise the key at the edge instead: sort query parameters, drop the
+ones the origin ignores (`utm_*`, `fbclid`, `gclid`), and lowercase the path if
+your origin is case-insensitive. Every CDN has a setting or a rule language for
+this, and nginx lets you build `proxy_cache_key` from whatever variables you
+like.
+
+<Why>Why not just drop the whole query string from the key?</Why>
+
+Because some parameters change the response. `?v=3` cache-busting, `?page=2`,
+`?w=400` for image resizing. Drop those from the key and every user gets
+whichever variant was cached first. Choose an allow-list of parameters that
+matter, not a deny-list of ones that don't.
+
+</Sub>
+
+<Sub n="6.3" title="Vary: the second half of the key">
+
+The origin can widen the key itself with the `Vary` response header. `Vary:
+Accept-Encoding` tells caches "store a separate copy per value of the request's
+`Accept-Encoding`". [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111#section-4.1)
+defines the match: the headers must be equal after only whitespace and
+known-equivalent normalisation. And "a stored response with a Vary header field
+value containing a member '*' always fails to match."
+
+Here's what happens with a header that has thousands of values:
+
+<TryIt what="An origin that sends Vary: User-Agent" lang="shell" toolchain="nginx 1.24 proxy_cache, shared 4-CPU container, linuxkit 6.10">
+```shell
+curl -A "Mozilla/5.0 (Macintosh) Chrome/140.0.0.0" .../v/logo.png   # first
+curl -A "Mozilla/5.0 (Macintosh) Chrome/140.0.0.0" .../v/logo.png   # same UA
+curl -A "Mozilla/5.0 (Macintosh) Chrome/140.0.0.1" .../v/logo.png   # patch version
+curl -A "Mozilla/5.0 (Windows) Chrome/140.0.0.0"   .../v/logo.png   # another OS
+```
+
+<Output>
+```text
+X-Cache: MISS
+X-Cache: HIT
+X-Cache: MISS
+X-Cache: MISS
+```
+
+One browser patch release is enough to miss.
+</Output>
+</TryIt>
+
+<Callout label="Common mistake" kind="warn">
+Sending `Vary: User-Agent` or `Vary: Cookie` on responses you want cached. Real
+traffic has thousands of distinct user agents and effectively unique cookies,
+so the hit rate falls toward zero. If you need per-device variants, derive a
+small header at the edge (`X-Device: mobile|desktop`), vary on that, and key on
+it.
+</Callout>
+
+A `Set-Cookie` header also makes nginx skip caching ("such a response will not
+be cached"), so a framework that sets a session cookie on every response
+quietly turns off your cache.
+
+</Sub>
+
+<Sub n="6.4" title="Unkeyed inputs and cache poisoning">
+
+Getting it the other way round is worse. If a request header *changes the response* but
+*isn't in the key*, whatever response the first requester triggered is stored
+and served to everyone.
+
+James Kettle's [Practical Web Cache Poisoning](https://portswigger.net/research/practical-web-cache-poisoning)
+(2018) calls these **unkeyed inputs**: "Any difference in the response
+triggered by an unkeyed input may be stored and served to other users." His
+example was a site that built an absolute URL from `X-Forwarded-Host`, which the
+cache didn't key on. Send one request with a malicious host, and the cached
+page pointed every later visitor at the attacker's script.
+
+| Mistake | What goes wrong | Fix |
+|---|---|---|
+| Key too wide (UA, cookies, tracking params) | Hit rate collapses; origin takes the load | Normalise the key; vary on a small derived header |
+| Key too narrow (response depends on an unkeyed header) | One user's variant served to everyone, or poisoning | Key on every input that changes output, or stop reading the header |
+| Personal data in a cacheable response | One user's page served to another | `Cache-Control: private` or `no-store` on anything personal |
+
+<Callout label="Design implication">
+The origin decides what's cacheable with `Cache-Control`, but the edge decides
+what counts as the same request. Write down both halves together for each route
+(what the key is, and which inputs change the output) and check they agree.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="07" id="operating">Operating the front half</SectionHeading>
+
+<Sub n="7.1" title="Tools">
+
+```shell
+# DNS: what does the resolver say, and what does the authority say?
+dig www.example.com                        # via /etc/resolv.conf
+dig @1.1.1.1 www.example.com +noall +answer +ttlid
+dig +trace www.example.com                 # walk it yourself
+dig SOA example.com                        # negative-cache TTL is in here
+getent ahosts payments                     # what glibc does, search list included
+
+# TLS: what chain does the server send, and does it verify?
+openssl s_client -connect host:443 -servername host -showcerts </dev/null
+echo | openssl s_client -connect host:443 -servername host 2>/dev/null \
+  | openssl x509 -noout -dates -ext subjectAltName
+
+# Where does the time go?
+curl -so /dev/null -w 'dns %{time_namelookup} tcp %{time_connect} tls %{time_appconnect} ttfb %{time_starttransfer}\n' https://host/
+
+# Edge: hit or miss, and why?
+curl -sI https://host/path | grep -iE 'cache|age|vary|cache-control'
+```
+
+`curl -w`'s timers are cumulative from the start, so subtract to get each
+phase.
+
+</Sub>
+
+<Sub n="7.2" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Pods spend milliseconds on every external lookup; CoreDNS load is high | `ndots:5` search-list expansion, 3 NXDOMAINs per name | `dnsConfig` with a lower `ndots`, or trailing-dot FQDNs |
+| New record exists, some clients still get NXDOMAIN | Negative answer cached from before the record existed | Wait out the SOA minimum; don't query names before creating them |
+| DNS migration still sending traffic to the old IP after hours | Old TTL was long, and clients cached it | Lower the TTL one old-TTL ahead of the change |
+| Large DNS answers fail, small ones work | UDP only allowed on port 53, or fragments dropped | Allow TCP 53; keep answers under 1,232 bytes |
+| `curl` or Java says "unable to get local issuer certificate", browsers are fine | Server sends leaf without intermediate | Put the full chain in the certificate file |
+| Old devices fail after a CA change | Chain relies on a cross-sign or root they don't have, or that expired | Check the served chain against the oldest clients you support |
+| About 40 ms added to some TLS requests from one client | Nagle plus delayed ACK after the client speaks last | Set `TCP_NODELAY` on the client socket |
+| TLS terminators pegged on CPU at modest request rates | Full handshakes with RSA keys; no resumption | ECDSA certificates, session tickets shared across servers, keep-alive |
+| Static files have a low hit rate | Tracking params, unsorted queries or `Vary: User-Agent` in the key | Normalise the key; vary on a derived header |
+| One user saw another user's page | Personal response cached under a shared key | `Cache-Control: private`; key on the session if you must cache |
+
+</Sub>
+
+<Sub n="7.3" title="When the edge itself fails">
+
+An edge network is shared infrastructure, so its failures are everyone's. On June 8,
+2021, a bug deployed on May 12 was triggered by what Fastly called a
+[valid customer configuration change](https://www.fastly.com/blog/summary-of-june-8-outage),
+and 85% of its network returned errors. It was detected within a minute and
+95% of the network was back within 49 minutes. Sites that depended on one CDN,
+with no way to route around it, were down for all of that.
+
+Keep DNS TTLs on CDN-facing records short enough that switching providers is
+possible mid-outage, and keep the origin able to serve something directly, even
+if it's only a status page.
+
+</Sub>
+
+<SectionHeading n="08" id="summary">Summary</SectionHeading>
+
+1. **Three protocols run before your first byte.** DNS for the address, TLS for
+   keys and identity, BGP anycast for which machine gets the packets.
+2. **DNS is fast because it caches at every level.** A cold walk measured
+   250 ms to 1.8 s in the lab; a warm answer took about 1 ms.
+3. **CNAME chains multiply cold-lookup cost.** Each new zone in the chain is
+   another walk, and CDNs keep the last TTL short.
+4. **`ndots:5` turns one external lookup into four.** Lower it or use trailing
+   dots for pods that call outside the cluster.
+5. **TLS 1.3 needs one round trip; TLS 1.2 needs two.** The client sends its key
+   share first and nearly always guesses the group right.
+6. **0-RTT data can be replayed.** Allow it only for idempotent requests and
+   answer 425 to the rest.
+7. **The server signs, so the leaf's key type sets handshake CPU.** RSA-2048
+   signing cost about 32× ECDSA P-256 on the lab box.
+8. **The server must send its intermediates.** Browsers hide the mistake;
+   `curl`, Java and Go don't.
+9. **Anycast gives locality and failover for free, and can fail everywhere at
+   once.** Guard automatic route withdrawal with a floor.
+10. **Your cache key decides your hit rate.** Normalise it, keep `Vary` small,
+    and key on every input that changes the response.
+
+<SectionHeading n="09" id="build">Build this</SectionHeading>
+
+**A front-half latency and correctness probe.**
+
+- Write a script that, for a list of URLs, reports DNS time (cold, against a
+  freshly started local Unbound, and warm), TCP connect, TLS handshake, TLS
+  version, key-exchange group, leaf key type, chain length in certificates and
+  bytes, days until `notAfter`, and whether the chain verifies with only the
+  certificates the server sent.
+- Add a Kubernetes mode: run it in a pod with the default `resolv.conf`, then
+  with `ndots:1`, and print the query counts and lookup times side by side.
+- Point it at an nginx cache you control and have it report hit ratios for the
+  same object requested with shuffled query parameters, tracking tags, and a
+  handful of user agents. Then fix the cache key and run it again.
+
+<SectionHeading n="10" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Walk me through what happens when you type a URL and press Enter, up to the first HTTP byte.">
+The stub resolver asks a recursive resolver for the name; if nothing is cached,
+the resolver walks root, TLD and authoritative servers and caches each answer by
+TTL. The client opens TCP to the address, which anycast routing may deliver to
+the nearest of many sites. Then the TLS handshake: ClientHello with SNI and a key
+share, ServerHello, certificate chain and a signature over the transcript,
+Finished. The client verifies the chain and hostname, sends its Finished and the
+HTTP request in the same flight.
+</QA>
+
+<QA level="beginner" q="What's the difference between a recursive and an authoritative DNS server?">
+An authoritative server holds the records for a zone and answers only for that
+zone. A recursive resolver holds nothing of its own; it walks the hierarchy on a
+client's behalf and caches what it learns. Your application only ever talks to a
+recursive resolver, through the stub resolver in its own process.
+</QA>
+
+<QA level="intermediate" q="Why is TLS 1.3 one round trip faster than TLS 1.2?">
+In TLS 1.2 the client learned the server's chosen key exchange before sending
+its own share, costing a round trip. In 1.3 the client sends a Diffie-Hellman
+share in the ClientHello, guessing the group. If the guess is right, which it
+almost always is with X25519, both sides have keys after one exchange. A wrong
+guess triggers HelloRetryRequest and costs the round trip back.
+</QA>
+
+<QA level="intermediate" q="A service in Kubernetes is slow to call an external API, and CoreDNS is busy. What do you check?">
+The pod's `resolv.conf`. With the default `ndots:5`, a name like
+`api.vendor.com` is first tried with each of three search domains, so every
+lookup costs three NXDOMAINs before the real query, doubled with AAAA on
+dual-stack. Fix with `dnsConfig.options` ndots of 1 or 2, a trailing dot on the
+FQDN, or connection reuse so lookups happen less often.
+</QA>
+
+<QA level="intermediate" q="Your new certificate works in Chrome but curl fails with 'unable to get local issuer certificate'. Why?">
+The server is sending only the leaf, not the intermediate. Browsers often have
+the intermediate cached or fetch it via the AIA extension; curl and most
+server-side TLS stacks don't. Put the leaf followed by the intermediates in the
+file the server loads, and test with `openssl s_client -showcerts`.
+</QA>
+
+<QA level="deep" q="When is TLS 0-RTT safe to enable?">
+When every request that can arrive in early data is safe to replay. 0-RTT data
+is encrypted under the resumption PSK only, so it's not forward secret, and the
+server can't distinguish a replay from the original. Enable it at the edge,
+have the edge forward `Early-Data: 1`, and have the origin return 425 Too Early
+for anything non-idempotent, so the client retries after the full handshake.
+</QA>
+
+<QA level="deep" q="How can anycast take down a whole service when it's supposed to add redundancy?">
+Each site withdraws its route when its health check fails. If a shared
+dependency fails (in Facebook's 2021 outage, the backbone to the data centres),
+every site fails the same check and withdraws together, and the prefix vanishes
+from the internet. Protect against correlated withdrawal with a minimum number
+of announcing sites, and keep out-of-band access that doesn't depend on the
+service's own DNS.
+</QA>
+
+<QA level="deep" q="What's web cache poisoning, and how do you prevent it?">
+A response is influenced by a request input that isn't part of the cache key,
+such as `X-Forwarded-Host`. The first request's variant is stored and served to
+everyone who shares the key. Prevent it by keying on every input that changes
+the response, or by not letting unkeyed headers affect output at all, and by
+marking personal responses `private`.
+</QA>
+
+<SectionHeading n="11" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="A resolver got NXDOMAIN for a name whose SOA has TTL 3600 and MINIMUM 900. How long can it cache the miss?">
+    900 seconds. RFC 2308 uses the minimum of the SOA's MINIMUM field and the
+    SOA record's own TTL.
+  </Q>
+  <Q q="What is the maximum lifetime of a new public TLS certificate after March 15, 2027?">
+    100 days, under CA/B Forum ballot SC-081v3, falling to 47 days in March 2029.
+  </Q>
+  <Q q="Why does DNS need TCP at all?">
+    Answers larger than the EDNS buffer (1,232 bytes by the 2020 flag-day
+    default) are truncated with TC=1, and the resolver must retry over TCP.
+  </Q>
+  <Q q="What does a trailing dot on a hostname do in glibc?">
+    It marks the name fully qualified: glibc queries it as-is and skips the
+    search list, whatever ndots says.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="RFC 8446: The Transport Layer Security Protocol Version 1.3">
+    The handshake, key schedule and 0-RTT caveats from the source. Section 2 is
+    a readable overview; section 8 is the replay discussion.
+  </WildCard>
+  <WildCard name="RFC 1034 and RFC 2308">
+    DNS concepts and negative caching. Short, old, and still how every resolver
+    behaves.
+  </WildCard>
+  <WildCard name="glibc resolv/res_query.c (glibc-2.39)">
+    The search-list and ndots logic every Linux process uses, in about 150
+    lines.
+  </WildCard>
+  <WildCard name="Meta: More details about the October 4 outage">
+    Anycast DNS withdrawing itself everywhere at once, and why recovery needed
+    people on site.
+  </WildCard>
+  <WildCard name="James Kettle: Practical Web Cache Poisoning (2018)">
+    Unkeyed inputs, how to find them, and real cases against large sites.
+  </WildCard>
+  <WildCard name="Slack: What happened during Slack's DNSSEC rollout">
+    DS-record caching and a wildcard NSEC bug, in a detailed public postmortem.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="12" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="The Linux Networking Stack">
+    What happens to the SYN and the handshake packets once they reach your
+    machine, and the delayed-ACK timer behind section 3.4. [Chapter 10](/topics/10-linux-networking).
+  </WildCard>
+  <WildCard name="VPC & Cloud Networking">
+    The network your origin sits in, including the VPC resolver that answers
+    your instances' DNS. [Chapter 33](/topics/33-vpc-networking).
+  </WildCard>
+  <WildCard name="Load Balancing & Traffic Management">
+    What sits behind the edge: L4 and L7 balancers, health checks and
+    connection draining. [Chapter 34](/topics/34-load-balancing).
+  </WildCard>
+  <WildCard name="IAM & the Security Boundary">
+    The other half of "who is allowed to talk to this": identity for services
+    instead of hostnames. [Chapter 37](/topics/37-iam-security-boundary).
+  </WildCard>
+</CardGrid>

@@ -1,0 +1,1087 @@
+---
+title: Performance Engineering
+dek: "How to find out where the time actually goes: the USE and RED checklists, how a sampling profiler builds a stack, how to read a flame graph, and how to write a benchmark that measures what you think it measures."
+readingTime: "~30 min"
+level: "Intermediate"
+versions: "Linux v6.10 source · perf 6.8 · measured on linuxkit 6.10.14 aarch64 (shared 4-CPU container) and Apple M4 · macOS 26.5.1"
+prereqs: "processes and threads, basic C, reading a latency percentile"
+updated: "2026-09-27"
+---
+
+Sooner or later someone asks you to make something faster. An endpoint's p99
+doubled after a release. A batch job that took an hour now takes three. The
+cloud bill grew faster than traffic did.
+
+A common mistake is to start changing code. Most of the time the slow part
+probably isn't where anyone guessed, and a change made on a guess either does nothing or
+moves the cost somewhere harder to see. Performance engineering is mostly the
+discipline of finding out before you change anything.
+
+This chapter teaches that discipline in the order you'd use it. It starts with
+two checklists that tell you which resource or service to look at, then shows
+how a sampling profiler turns a running program into stacks, how to read the
+flame graph those stacks make, what hardware counters add, and how to build a
+benchmark whose number you can trust.
+
+<SectionHeading n="01" id="method">Start with a question, not a tool</SectionHeading>
+
+"Make it faster" isn't a question you can measure. Before opening a profiler,
+turn it into one.
+
+<Sub n="1.1" title="Three different goals">
+
+Performance means one of three things, and they pull in different directions:
+
+| Goal | The question | Typical unit | What usually improves it |
+|---|---|---|---|
+| **Latency** | How long does one request take? | ms at p50, p99 | Less work per request, less waiting |
+| **Throughput** | How many requests per second at an acceptable latency? | req/s at a latency target | More parallelism, less contention |
+| **Efficiency** | How much hardware does each request cost? | CPU-seconds or dollars per million requests | Less work per request |
+
+Batching is probably the classic example of the pull. It raises throughput and
+efficiency, since fixed costs are paid once per batch, and it raises latency,
+since a request waits for its batch to fill.
+
+<Why>Why write the goal down?</Why>
+
+Because it decides what "better" means when you measure. A change that halves
+CPU per request but adds a millisecond of queueing is a win for the cloud bill
+and a loss for the p99. If you haven't decided which one you're after, you'll
+report whichever number moved the right way.
+
+</Sub>
+
+<Sub n="1.2" title="On-CPU and off-CPU time">
+
+A request's wall-clock time splits into two kinds, and they need different tools:
+
+- **On-CPU time**: a thread is running instructions. A CPU profiler sees it.
+- **Off-CPU time**: a thread is blocked: waiting on a lock, a disk read, a
+  network reply, a free slot in a pool, or the scheduler. A CPU profiler sees
+  **nothing**, because a blocked thread executes no instructions to sample.
+
+<Why>How do you tell which kind you have?</Why>
+
+Compare CPU time to wall time for the slow requests. If a request takes 200 ms
+and its thread was on-CPU for 180 ms, profile the CPU. If it was on-CPU for 5
+ms, the other 195 ms were spent waiting, and a CPU flame graph will show you a
+tidy picture of the 5 ms that don't matter.
+
+[Chapter 16](/topics/16-contention-tail-latency) shows the extreme case: a lock
+convoy where p99 got eleven times worse while the CPU profile stayed flat.
+
+</Sub>
+
+<Sub n="1.3" title="Amdahl's law for optimisers">
+
+Once you know where time goes, one piece of arithmetic stops you wasting a
+week. If a part of the work takes a fraction `p` of the total and you make it
+`s` times faster, the whole thing gets faster by:
+
+```
+speedup = 1 / ((1 − p) + p / s)
+```
+
+<Predict
+  q="A function takes 10% of a request's time. You rewrite it to be twice as fast. How much faster is the request?"
+  options={[
+    "About 2× faster",
+    "About 10% faster",
+    "About 5% faster",
+    "It depends on the CPU",
+  ]}
+  answer={2}
+>
+`1 / (0.9 + 0.1 / 2)` is `1 / 0.95`, about 1.053: a 5% speedup. Even making
+that function infinitely fast would only save 10%. The size of the slice sets
+the ceiling on what optimising it can buy. So measure the slices first.
+</Predict>
+
+<Callout label="Design implication">
+Measure before you change anything, and rank candidates by the share of time
+they own, not by how inefficient they look. A beautifully wasteful function that
+runs 1% of the time is worth less than a boring one that runs 40%.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="02" id="use-red">Two checklists: USE for resources, RED for services</SectionHeading>
+
+When a system is slow and you don't yet know why, a checklist beats intuition.
+It makes you look at the things you'd otherwise skip, and it's fast.
+
+<Sub n="2.1" title="The USE method">
+
+Brendan Gregg's [USE method](https://www.brendangregg.com/usemethod.html) is one
+sentence: "For every resource, check utilization, saturation, and errors."
+
+| Metric | Gregg's definition | What it looks like |
+|---|---|---|
+| **Utilisation** | "the average time that the resource was busy servicing work" | CPU 70%, disk 90% busy |
+| **Saturation** | "the degree to which the resource has extra work which it can't service, often queued" | Run-queue length, I/O queue depth, threads waiting on a pool |
+| **Errors** | "the count of error events" | NIC drops, ECC errors, `EMFILE` on `accept()` |
+
+A **resource** is anything with a finite capacity: CPUs, memory, disks, network
+interfaces, and software resources such as a mutex, a thread pool or a
+connection pool.
+
+<Why>Why is saturation the one to watch?</Why>
+
+Because utilisation is an average, and averages hide bursts. A disk that's 60%
+busy over a minute may have been 100% busy for twenty seconds with a queue
+behind it. Saturation measures that queue directly, and queueing is where
+latency comes from (the arithmetic is in [chapter 16](/topics/16-contention-tail-latency)).
+
+Gregg keeps a [Linux checklist](https://www.brendangregg.com/USEmethod/use-linux.html)
+that maps each cell to a command. The rows you'll use most:
+
+| Resource | Utilisation | Saturation | Errors |
+|---|---|---|---|
+| **CPU** | `vmstat 1`: `us` + `sy` + `st` | `vmstat 1`: `r` above the CPU count; `/proc/pressure/cpu` | Rarely visible without vendor counters |
+| **Memory** | `free -m` | `vmstat` `si`/`so` (swapping); OOM kills in `dmesg` | `dmesg` for hardware errors |
+| **Network** | `sar -n DEV 1` against link speed | Drops, overruns, retransmits (`nstat`) | `ip -s link` errors |
+| **Disk** | `iostat -xz 1` `%util` | `iostat` queue size above 1, high `await` | `smartctl`, `dmesg` |
+| **File descriptors** | `ls /proc/PID/fd \| wc -l` against the limit | n/a | `EMFILE` from `open()` and `accept()` |
+
+`/proc/pressure/*` is **PSI** (pressure stall information, Linux 4.20). It
+reports the share of time some task was stalled waiting on CPU, memory or I/O,
+That's saturation, measured directly.
+
+</Sub>
+
+<Sub n="2.2" title="A USE pass, step by step">
+
+Here's the order in which to run the pass on one host. Each step either finds a
+saturated resource or rules one out in under a minute.
+
+<Steps
+  title="A USE pass on a slow Linux host"
+  lanes={[
+    { t: "Errors", s: "cheapest to check", icon: "!" },
+    { t: "CPU", s: "vmstat · PSI", icon: "◉" },
+    { t: "Memory", s: "free · si/so", icon: "▦" },
+    { t: "Disk", s: "iostat -xz", icon: "▤" },
+    { t: "Network", s: "nstat · sar", icon: "⇅" },
+    { t: "Software", s: "pools · locks", icon: "≡" },
+  ]}
+  steps={[
+    [0, "Start with **errors**: `dmesg -T | tail`, NIC drops, OOM kills. An error is usually unambiguous, and checking takes seconds."],
+    [1, "`vmstat 1`: if `r` stays above the number of CPUs, runnable threads are queueing for a core. Check `/proc/pressure/cpu` and, in a container, the cgroup's **throttling counters**."],
+    [2, "`free -m` and `vmstat` `si`/`so`. Any sustained swapping is saturation, and page-cache shrinkage shows up later as disk reads."],
+    [3, "`iostat -xz 1`: `%util` near 100 with a growing queue and rising `await` means requests are waiting for the device, not being served by it."],
+    [4, "`nstat` for retransmits and listen overflows, `sar -n DEV` for bandwidth. [Chapter 10](/topics/10-linux-networking) has the full list of drop counters."],
+    [5, "Then the **software resources** the kernel can't see: thread pools, connection pools, locks. Here saturation means work waiting for a slot, and only your own metrics show it."],
+  ]}
+/>
+
+Gregg reckons the method "solves about 80% of server issues with 5% of the
+effort". The rest probably need a profiler, the subject of section 3.
+
+</Sub>
+
+<Sub n="2.3" title="The saturation nobody graphs: CPU throttling in containers">
+
+On Kubernetes, the CPU resource you're actually limited by is often the
+cgroup's CPU **quota**, not the machine's cores. A container with a limit of 4
+CPUs gets 400 ms of CPU time per 100 ms period, however many cores the host has.
+When it spends that budget early, every thread in it waits for the next period.
+
+The container used for this chapter's measurements has exactly that limit. Its
+cgroup file shows the quota and how often it hit it:
+
+<TryIt what="Read a container's CPU quota and throttling counters" lang="shell" toolchain="linuxkit 6.10.14 aarch64, cgroup v2, shared 4-CPU container">
+```shell
+cat /sys/fs/cgroup/cpu.max
+cat /sys/fs/cgroup/cpu.stat
+cat /sys/fs/cgroup/cpu.pressure
+```
+
+<Output>
+```text
+400000 100000
+usage_usec 2975847350
+user_usec 2014181826
+system_usec 961665523
+nr_periods 11985
+nr_throttled 4964
+throttled_usec 950837608
+some avg10=20.26 avg60=16.05 avg300=17.44 total=243046491
+full avg10=9.07 avg60=6.32 avg300=7.49 total=129115661
+```
+
+In **4,964 of 11,985 periods** (41%) the container used its whole quota and
+was paused until the next period: about 951 seconds of throttling in total.
+The host has ten cores, so `top` inside the container never showed the CPUs
+as full.
+</Output>
+</TryIt>
+
+<Why>Why doesn't CPU utilisation show it?</Why>
+
+Because the usual dashboards compare usage to the node's cores, or average it
+over a minute. A service can average 50% of its limit and still be throttled in
+most periods, if its work arrives in bursts that use the whole quota in the
+first part of each 100 ms period. Each throttle adds up to the rest of that
+period to every request caught in it.
+
+Linux 5.4 fixed one kernel cause of excess throttling
+([de53fd7aedb1](https://github.com/torvalds/linux/commit/de53fd7aedb100f03e5d2231cfce0e4993282425)):
+per-CPU slices of quota were expiring unused, so "highly-threaded, non-cpu-bound
+applications" were throttled "while simultaneously not consuming the allocated
+amount of quota". The fix helps; bursty work under a tight limit still throttles.
+
+<Callout label="Common mistake" kind="warn">
+Diagnosing latency in a container from CPU utilisation alone. Check
+`nr_throttled` against `nr_periods` in `cpu.stat` (or
+`container_cpu_cfs_throttled_periods_total` in cAdvisor) first. A throttled
+service looks idle on the node and slow to its callers.
+</Callout>
+
+</Sub>
+
+<Sub n="2.4" title="The RED method, for services">
+
+USE is about machines. For a service, Tom Wilkie's
+[RED method](https://grafana.com/blog/2018/08/02/the-red-method-how-to-instrument-your-services/)
+asks three things of every endpoint: **Rate** ("the number of requests per
+second"), **Errors** ("the number of those requests that are failing") and
+**Duration** ("the amount of time those requests take").
+
+Wilkie's summary of the pair: "The RED Method is about caring about your users
+and how happy they are, and the USE Method is about caring about your machines
+and how happy they are."
+
+| Checklist | Unit of analysis | Answers | Misses |
+|---|---|---|---|
+| **USE** | A resource: CPU, disk, pool, lock | Which resource is the bottleneck? | Whether users are hurting |
+| **RED** | A service or endpoint | Which endpoint is slow or failing, and since when? | Why it's slow |
+| **Four golden signals** ([Google SRE](https://sre.google/sre-book/monitoring-distributed-systems/)) | A service | Latency, traffic, errors, and saturation | Same as RED, plus a saturation signal |
+
+Use RED to find **which** service and endpoint regressed, and when. Use USE on
+the hosts and pools behind it to find **which resource** it's waiting on. Use a
+profiler to find **which code** is burning the resource.
+
+</Sub>
+
+<SectionHeading n="03" id="profilers">How a sampling profiler works</SectionHeading>
+
+When the checklist points at CPU, you need to know which code is using it. The
+standard tool on Linux is `perf`, and knowing how it collects a sample explains
+most of the ways its output misleads you.
+
+<Sub n="3.1" title="Sampling, not tracing">
+
+A **tracing** profiler records every function entry and exit. It's exact, and
+it slows the program so much that the timing it reports is no longer the
+program's.
+
+A **sampling** profiler interrupts the program at a fixed rate and records
+where it was. At 99 samples a second on one core, it wakes 99 times a second,
+records a stack each time, and otherwise leaves the program alone. Functions
+that run often appear in many samples; functions that run rarely appear in few.
+The counts converge on the share of CPU time each function owns.
+
+<Why>Why 99 Hz and not 100?</Why>
+
+Gregg's [perf examples](https://www.brendangregg.com/perf.html) explain it: "to
+avoid accidentally sampling in lockstep with some periodic activity, which would
+produce skewed results." Plenty of software runs on 10 ms timers, maybe including yours. Sampling at
+exactly 100 Hz could land on the same phase of that timer every time.
+
+</Sub>
+
+<Sub n="3.2" title="One sample, from interrupt to flame graph">
+
+<Steps
+  title="What perf record -F 99 -g does for one sample"
+  lanes={[
+    { t: "Timer / PMU", s: "fires 99×/s per CPU", icon: "⏱" },
+    { t: "Kernel", s: "perf_event handler", icon: "⚙" },
+    { t: "Stack walk", s: "frame pointers", icon: "↥" },
+    { t: "Ring buffer", s: "mmap'd, per CPU", icon: "▦" },
+    { t: "perf.data", s: "perf record", icon: "▤" },
+    { t: "Flame graph", s: "folded stacks", icon: "▲" },
+  ]}
+  steps={[
+    [0, "A timer (or a hardware counter overflowing) **interrupts** whatever the CPU is running. The program doesn't cooperate; it's simply stopped mid-instruction."],
+    [1, "The kernel's perf handler reads the saved registers: the **program counter** says which instruction was running."],
+    [2, "It then **walks the stack** to find the callers. With frame pointers this is a short loop of pointer reads; section 3.3 shows the loop."],
+    [3, "The sample (PC, callchain, PID, CPU, timestamp) is written into a **ring buffer** shared with the `perf` process, without a syscall."],
+    [4, "`perf record` drains the ring into `perf.data`. Nothing is symbolised yet; addresses become function names later, in `perf script`."],
+    [5, "`perf script` prints each stack. A collapse script **folds** identical stacks into one line with a count, and `flamegraph.pl` draws them."],
+  ]}
+/>
+
+What's expensive isn't the interrupt. It's the stack walk, and whether it
+works at all depends on how your program was compiled.
+
+</Sub>
+
+<Sub n="3.3" title="Frame pointers: a linked list on the stack">
+
+With frame pointers, every function's prologue saves its caller's frame pointer
+and return address next to each other on the stack, and points a register at
+them. On arm64 that register is `x29`; on x86-64 it's `rbp`. The saved pairs
+form a linked list, and walking the stack is following it.
+
+Here's the whole user-space walker the kernel uses on arm64:
+
+<SourceRead
+  file="arch/arm64/kernel/stacktrace.c"
+  repo="torvalds/linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/arch/arm64/kernel/stacktrace.c#L331"
+>
+```c
+struct frame_tail {
+	struct frame_tail	__user *fp;
+	unsigned long		lr;
+} __attribute__((packed));
+
+static struct frame_tail __user *
+unwind_user_frame(struct frame_tail __user *tail, void *cookie,
+	       stack_trace_consume_fn consume_entry)
+{
+	struct frame_tail buftail;
+	/* ... */
+	pagefault_disable();
+	err = __copy_from_user_inatomic(&buftail, tail, sizeof(buftail));
+	pagefault_enable();
+	/* ... */
+	lr = ptrauth_strip_user_insn_pac(buftail.lr);
+
+	if (!consume_entry(cookie, lr))
+		return NULL;
+
+	/*
+	 * Frame pointers should strictly progress back up the stack
+	 * (towards higher addresses).
+	 */
+	if (tail >= buftail.fp)
+		return NULL;
+
+	return buftail.fp;
+}
+
+void arch_stack_walk_user(stack_trace_consume_fn consume_entry, void *cookie,
+					const struct pt_regs *regs)
+{
+	/* ... */
+		tail = (struct frame_tail __user *)regs->regs[29];
+		while (tail && !((unsigned long)tail & 0x7))
+			tail = unwind_user_frame(tail, cookie, consume_entry);
+	/* ... */
+}
+```
+</SourceRead>
+
+Start at `x29`, copy two words (the next frame pointer and the return
+address), record the return address, and repeat until the chain stops going
+up the stack. It runs with page faults disabled, because it runs in interrupt
+context and can't sleep.
+
+<Why>What happens when a function doesn't keep a frame pointer?</Why>
+
+Then `x29` holds whatever that function used it for, and the chain breaks or
+skips. GCC and Clang omit frame pointers at `-O2` on many targets, since it frees
+a register. Gregg's [history](https://www.brendangregg.com/blog/2024-03-17/the-return-of-the-frame-pointers.html)
+traces the default to a 2004 GCC change made for 32-bit x86, where the
+register mattered.
+
+</Sub>
+
+<Sub n="3.4" title="What a broken stack does to a profile">
+
+Here's a toy request handler with three phases, `parse`, `lookup` and
+`format`, each a `noinline` function called from `handle_request`, built twice
+with GCC 13.3 `-O2`: once with `-fno-omit-frame-pointer` and once with
+`-fomit-frame-pointer`. Both were profiled with `perf record -F 999 -g`.
+
+<TryIt what="Profile the same program with and without frame pointers" lang="shell" toolchain="gcc 13.3 -O2, perf 6.8, linuxkit 6.10.14 aarch64, shared 4-CPU container">
+```shell
+gcc -O2 -g -fno-omit-frame-pointer -o svc_fp   svc.c
+gcc -O2 -g -fomit-frame-pointer    -o svc_nofp svc.c
+perf record -F 999 -g -o fp.data   -- ./svc_fp 400000
+perf record -F 999 -g -o nofp.data -- ./svc_nofp 400000
+perf script -i fp.data | ./collapse.py | head -3
+perf script -i nofp.data | ./collapse.py | head -3
+```
+
+<Output>
+```text
+_start;[unknown];[unknown];main;handle_request;lookup 1281
+_start;[unknown];[unknown];main;handle_request;parse 830
+_start;[unknown];[unknown];main;handle_request;format;[unknown];... 169
+
+_start;[unknown];handle_request;lookup 1439
+_start;[unknown];handle_request;parse 828
+_start;[unknown];format;[unknown];[unknown];[unknown];[unknown] 181
+```
+
+With frame pointers, **all 2,458 samples** had `main` and `handle_request` in
+their stack. Without them, **2 of 2,649** had `main`, and 382 samples (14%)
+showed `format` with no `handle_request` above it. The `[unknown]` frames are
+libc code without symbols installed: a different problem.
+</Output>
+</TryIt>
+
+Even the broken profile has the right leaf functions. What it gets wrong is
+the **ancestry**: `format` looks as if something other than `handle_request`
+called it. In a real service with fifty callers of a JSON encoder, that's the
+difference between "the encoder is slow" and "the encoder is slow when the
+audit endpoint calls it".
+
+</Sub>
+
+<Sub n="3.5" title="The other ways to walk a stack">
+
+| Method | How it works | Cost | Where it breaks |
+|---|---|---|---|
+| **Frame pointers** | Follow saved `fp`/`lr` pairs | A few loads per frame; one register given up | Any code built without them, including some JIT and hand-written assembly |
+| **DWARF** (`--call-graph dwarf`) | Copy a chunk of raw stack per sample; unwind later with debug info | Large `perf.data`, slow post-processing | Stacks deeper than the copied chunk; JIT code has no DWARF |
+| **LBR** (`--call-graph lbr`, Intel) | Hardware records recent branches | Nearly free | Limited depth (tens of entries); Intel-only; often not exposed in VMs |
+| **ORC** | Kernel-only unwind tables generated at build time | Cheap | Kernel only |
+| **SFrame** | A compact user-space format modelled on ORC | Cheap | Needs toolchain and kernel support, still arriving |
+
+DWARF mode on the same frame-pointer-less binary recovered `main` in **2,144
+of 2,475 samples** (87%). It paid for it in file size: `perf.data` was **21.2 MB**
+against **0.32 MB** for the frame-pointer run of the same length, roughly 66×
+larger, because each sample carries a copy of the raw stack.
+
+<Why>So why did distros turn frame pointers back on?</Why>
+
+Because the cost turned out small and the benefit large. Fedora 38 added
+`-fno-omit-frame-pointer` to its default build flags
+([change page](https://fedoraproject.org/wiki/Changes/fno-omit-frame-pointer)),
+and Ubuntu 24.04 did the same for 64-bit platforms, measuring a penalty
+"between 1-2% in most cases"
+([Canonical](https://ubuntu.com/blog/ubuntu-performance-engineering-with-frame-pointers-by-default)).
+Gregg reports overhead at Netflix "usually less than one percent", with
+microbenchmarks as the exception.
+
+<Callout label="Design implication">
+Build your own services with `-fno-omit-frame-pointer` (and, for the JVM,
+`-XX:+PreserveFramePointer`). One or two percent of CPU buys you a profile you
+can read in production, at any time, without redeploying.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="04" id="flame-graphs">Reading a flame graph</SectionHeading>
+
+A profile of a real service has tens of thousands of distinct stacks. Gregg
+invented the flame graph in 2011, while debugging MySQL, because profiler text
+output was a wall nobody could read
+([flamegraphs.html](https://www.brendangregg.com/flamegraphs.html)).
+
+<Sub n="4.1" title="What the axes mean">
+
+| Element | Meaning | Not |
+|---|---|---|
+| **Box** | One function in one stack | A single call |
+| **Width** | How many samples had this frame: its share of CPU | Duration of one call |
+| **y-axis** | Stack depth; each box's parent is its caller | Time |
+| **x-axis** | Stacks "sorted alphabetically (it is not the passage of time)" | Time order |
+| **Top edge** | What was actually on-CPU | |
+| **Colour** | Usually random warm hues, or by type (kernel, JIT, user) | Heat or cost |
+
+<Why>Why alphabetical?</Why>
+
+So that identical stacks merge. If samples were placed in time order, the same
+call path would appear in hundreds of thin slivers. Sorting by name puts every
+sample of `main;handle_request;lookup` next to each other, and they merge into
+one wide box.
+
+</Sub>
+
+<Sub n="4.2" title="Folded stacks: the format underneath">
+
+The input to a flame graph is a text file with one line per distinct stack:
+frames joined by semicolons, root first, then a count. The profile in section
+3.4 folds to three main lines:
+
+```text
+main;handle_request;lookup   1281
+main;handle_request;parse     830
+main;handle_request;format    347
+```
+
+So `handle_request` is 100% wide, and it splits into `lookup` (52%), `parse`
+(34%) and `format` (14%). That's the whole flame graph for this program.
+
+<Why>Why care about the format?</Why>
+
+Because it's a universal interchange. `perf`, `bpftrace`, async-profiler for the
+JVM, `py-spy` and Go's `pprof` can all produce folded stacks, and once you have
+them you can `grep`, `diff` and sum them with shell tools. Two profiles folded
+the same way can be subtracted, and that's all a differential flame graph
+is.
+
+</Sub>
+
+<Sub n="4.3" title="How to read one in five minutes">
+
+1. **Find the widest towers near the top.** A wide box whose children are
+   narrow is a function doing work itself. That's your target.
+2. **Read plateaus, not peaks.** Tall thin spikes are deep call chains that run
+   rarely. They catch the eye and probably don't matter.
+3. **Search.** The interactive SVG has a search box; searching `malloc`, `lock`
+   or `memcpy` highlights and totals every match across all stacks.
+4. **Check the ancestry of a hot leaf.** The same leaf under two different
+   parents is two different problems.
+5. **Look for what shouldn't be there.** Logging, regex compilation, exception
+   construction, JSON re-parsing and TLS handshakes are common surprises.
+
+<Callout label="Common mistake" kind="warn">
+Reading the x-axis as time. Two boxes side by side didn't run one after the
+other; they're just next to each other in the alphabet. For a time-ordered view,
+use a flame chart (Chrome DevTools, Perfetto) instead. It's a different picture.
+</Callout>
+
+</Sub>
+
+<Sub n="4.4" title="Off-CPU and differential flame graphs">
+
+Two variants answer the questions a CPU flame graph can't:
+
+- **Off-CPU flame graphs** record a stack every time a thread **blocks**,
+  weighted by how long it stayed blocked. Width becomes time spent waiting,
+  on a lock, a read or a sleep. Collected with the `sched:sched_switch`
+  tracepoint via eBPF tools such as `offcputime`
+  ([chapter 48](/topics/48-ebpf) covers how).
+- **Differential flame graphs** compare two profiles, before and after a
+  change, and colour each frame by whether it grew or shrank. They're how you
+  answer "what got slower in this release?" without guessing.
+
+<Why>Why can't you just combine on-CPU and off-CPU into one?</Why>
+
+You can, but the units differ. An on-CPU sample is CPU time on one core; an
+off-CPU sample is waiting time for one thread. With 200 threads mostly idle in a
+pool, the off-CPU graph is dominated by idle waiting that's perfectly healthy.
+Filter to the threads that serve requests before reading it.
+
+</Sub>
+
+<Sub n="4.5" title="Symbols: JITs, containers and stripped binaries">
+
+Most "my flame graph is all `[unknown]`" problems are symbol problems, not
+stack problems:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| JVM frames all `[unknown]` or `Interpreter` | perf can't read JIT-compiled code's names | async-profiler, or `-XX:+PreserveFramePointer` plus a `perf-PID.map` agent |
+| Node.js frames missing | Same JIT problem | `node --perf-basic-prof` |
+| Everything in a container `[unknown]` | perf on the host can't see the binary at the path the container used | Run perf inside the container, or use `--symfs` |
+| libc frames `[unknown]` | No debug symbols installed | Install the `-dbg` or `debuginfod` package |
+| Stacks end after one or two frames | No frame pointers | Section 3.5 |
+
+That third row happened while writing this chapter. The first profile of the
+program in 3.4 was all `[unknown]`, because the binary was on a host-mounted
+path that `perf report` couldn't open from inside the container. Copying it to a
+local path fixed every symbol.
+
+</Sub>
+
+<SectionHeading n="05" id="counters">Hardware counters: why the CPU is slow</SectionHeading>
+
+A flame graph says **where** cycles go. It doesn't say **why** a function needs
+so many. For that, the CPU's performance monitoring unit (PMU) counts events:
+cycles, instructions, cache misses, branch mispredictions.
+
+<Sub n="5.1" title="IPC: the first number to read">
+
+`perf stat` runs a command and prints counter totals. Read **instructions per cycle** (IPC)
+first.
+
+| IPC | What it usually means | Where to look |
+|---|---|---|
+| Below about 1 | The core is mostly **stalled**, waiting on memory or on mispredicted branches | Cache misses, data layout ([chapter 02](/topics/02-memory-hierarchy)) |
+| Well above 1 | The core is retiring several instructions a cycle | Fewer instructions: better algorithm, less work |
+
+Modern cores can retire four or more instructions a cycle, so an IPC of 0.5
+means most of the machine is idle while it waits. Making such code do fewer
+instructions barely helps; making its memory accesses hit cache does.
+
+</Sub>
+
+<Sub n="5.2" title="Top-down analysis">
+
+Ahmad Yasin's [top-down method](https://www.semanticscholar.org/paper/A-Top-Down-method-for-performance-analysis-and-Yasin/6776ff919597ca4feccd413208dedc401f6e655d)
+(ISPASS 2014) splits every issue slot of the pipeline into four buckets:
+
+| Bucket | The slot was… | Typical cause |
+|---|---|---|
+| **Retiring** | Used by an instruction that completed | Good; reduce instruction count to go faster |
+| **Bad speculation** | Used by work thrown away | Branch mispredictions ([chapter 01](/topics/01-cpu-architecture)) |
+| **Frontend bound** | Empty because instructions weren't fetched and decoded in time | Large code, i-cache misses |
+| **Backend bound** | Empty because execution was waiting | Cache misses, long-latency operations |
+
+On Intel, `perf stat --topdown` and `toplev` compute these from the counters.
+Its value is that it tells you which of four very different fixes to
+try before you try any of them.
+
+</Sub>
+
+<Sub n="5.3" title="When the counters aren't there">
+
+Many VMs and containers don't expose the PMU. Here's the same `perf stat` in the
+container used for this chapter:
+
+<TryIt what="Ask for hardware counters inside a VM-backed container" lang="shell" toolchain="perf 6.8, linuxkit 6.10.14 aarch64, shared 4-CPU container">
+```shell
+perf stat -e cycles,instructions,cache-misses,task-clock,context-switches \
+  -- python3 -c "sum(range(10**6))"
+```
+
+<Output>
+```text
+   <not supported>      cycles
+   <not supported>      instructions
+   <not supported>      cache-misses
+             22.47 msec task-clock      #    0.992 CPUs utilized
+                 0      context-switches
+```
+
+Software events such as `task-clock` work. That's why `perf record` still
+sampled in section 3.4: it fell back to a timer. Hardware events don't exist
+here at all.
+</Output>
+</TryIt>
+
+<Why>What do you do then?</Why>
+
+Profile on hardware where the PMU is exposed (bare metal, or instance types that
+pass it through), or reason from timings instead: measure the same loop at
+several working-set sizes and watch for the steps
+[chapter 02](/topics/02-memory-hierarchy) shows at each cache level.
+
+</Sub>
+
+<SectionHeading n="06" id="benchmarks">Benchmarks that aren't lies</SectionHeading>
+
+Profiling tells you where time goes in a running system. A **benchmark** is an
+experiment you build to answer one question, usually "is B faster than A?" It's
+the easiest tool in this chapter to get wrong, because a broken benchmark still
+prints a number.
+
+<Sub n="6.1" title="The compiler deletes what you don't use">
+
+Here are three loops timed on an M4, each 100 million iterations:
+
+<TryIt what="Three loops, one of which the compiler keeps" lang="c" toolchain="Apple clang 21 -O2, Apple M4, macOS 26.5.1">
+```c
+// 1: result never used
+double s = 0;  for (int i = 0; i < N; i++) s += sqrt((double)i);
+// 2: result printed afterwards
+double s2 = 0; for (int i = 0; i < N; i++) s2 += sqrt((double)i);
+// 3: result printed, but it has a closed form
+uint64_t s3 = 0; for (uint64_t i = 0; i < N; i++) s3 += i * i;
+```
+
+<Output>
+```text
+unused result:   0.000 ns/iter
+used result:     0.585 ns/iter (sum=6.66667e+11)
+closed form:     0.000 ns/iter (sum=662921401752298880)
+```
+
+The same numbers came back in three runs. The `-O2` assembly contains exactly
+**one** loop. Loop 1 was deleted because nothing reads `s`; loop 3 was replaced
+by a formula for the sum of squares. At `-O0` all three take between 0.5 and
+0.9 ns per iteration.
+</Output>
+</TryIt>
+
+A benchmark that reports zero is easy to spot. The dangerous case is a
+benchmark where the compiler deletes *part* of the work, and the number looks
+plausible.
+
+<Why>How do real harnesses prevent it?</Why>
+
+By making the result escape somewhere the compiler can't see through. JMH
+passes results to a `Blackhole`; Google Benchmark has `DoNotOptimize`; Rust has
+`std::hint::black_box`. And they vary inputs, so constant folding can't
+precompute the answer.
+
+</Sub>
+
+<Sub n="6.2" title="The JIT hasn't finished yet">
+
+On a JVM, the code you time in the first second isn't the code you'll run in
+production. It starts in the interpreter, then gets compiled, and compiled again
+more aggressively once it's proven hot.
+
+This loop hashes a 10,000-element array 200 times per batch, for twenty batches,
+in one JVM:
+
+<Compare
+  cols={["Batch", "Fastest of 7 runs", "Median of 7 runs"]}
+  rows={[
+    ["1", "6.2 ms", "7.2 ms"],
+    ["2", "1.7 ms", "4.7 ms"],
+    ["10", "1.8 ms", "2.3 ms"],
+    ["20", "1.7 ms", "1.8 ms"],
+    ["20, interpreter only (-Xint)", "77 ms", "92 ms"],
+  ]}
+/>
+
+That's OpenJDK 21 on the shared 4-CPU container, whose load average touched 36
+during these runs, so the medians are noisy. Even the fastest runs show it:
+the first batch was roughly **3.6× slower** than steady state, and interpreted code
+roughly **45× slower**.
+
+<StepSequence
+  title="How a naive JVM benchmark measures the wrong thing"
+  actors={["Your timing loop", "JVM", "JIT compiler"]}
+  messages={[
+    { from: 0, to: 1, label: "call work() ×200", note: "You start the clock and call the method. The JVM runs it in the **interpreter**, the slowest tier." },
+    { from: 1, to: 2, label: "hot method: compile", note: "Invocation and loop counters cross a threshold. The JVM queues `work()` for compilation on a background thread." },
+    { from: 2, to: 1, label: "C1 code installed", note: "A quickly compiled version replaces the interpreter, partway through your measurement." },
+    { from: 1, to: 2, label: "still hot: optimise", note: "Profiling data from C1 says it's worth more effort. C2 compiles an optimised version, inlining and unrolling." },
+    { from: 2, to: 1, label: "C2 code installed", note: "Now it runs at full speed. If your clock stopped before this, you measured **a blend of three different programs**." },
+    { from: 1, to: 0, label: "DCE, if unused", dashed: true, note: "Worse: if the result isn't consumed, C2 may delete the work entirely, and the benchmark reports a speed no real caller will see." },
+  ]}
+/>
+
+<Callout label="Common mistake" kind="warn">
+Timing a JVM, .NET or JavaScript function from a cold start with a hand-written
+loop. Use a harness that runs warm-up iterations and forks fresh processes
+(JMH does both by default), and check the warm-up iterations have flattened
+before you trust the measured ones.
+</Callout>
+
+</Sub>
+
+<Sub n="6.3" title="The machine is noisy">
+
+Run eleven times back to back on the shared
+container, the binary from section 3.4 took between **2.8 and 5.8 seconds**. Nothing changed between runs
+except what other tenants were doing.
+
+<Why>How does anyone benchmark on a shared machine?</Why>
+
+By controlling what they can and reporting the rest honestly:
+
+| Source of noise | What it does | Control |
+|---|---|---|
+| Other tenants, other processes | Steals CPU, cache and memory bandwidth | Dedicated hosts; pin with `taskset`; interleave A and B runs |
+| CPU frequency scaling and turbo | The same work takes different time | Fix the governor; or measure cycles, not seconds |
+| Thermal throttling | Later runs slower than early ones | Interleave A and B, don't run all of A then all of B |
+| Memory layout | Alignment changes cache and branch behaviour | Randomise layout (below) |
+| Timer resolution | Short operations round to zero | Time batches, not single calls |
+
+For CPU-bound microbenchmarks, Chen and Revels argue for the
+[**minimum**](https://arxiv.org/abs/1608.04295) as the estimator, since noise
+only ever adds time. For anything a user waits on, report the **distribution**
+(p50, p99, max), because the noise is part of what the user experiences.
+
+</Sub>
+
+<Sub n="6.4" title="Measurement bias: wrong without doing anything wrong">
+
+Mytkowicz, Diwan, Hauswirth and Sweeney's ASPLOS 2009 paper,
+[*Producing Wrong Data Without Doing Anything Obviously Wrong!*](https://dl.acm.org/doi/10.1145/1508244.1508275),
+is the one to read before you trust a 5% result.
+
+They changed things that shouldn't matter: the size of the UNIX environment
+(an unused environment variable) and the order object files were linked.
+Changing the environment size alone changed a program's run time "frequently by
+about 33% and once by almost 300%", because the environment sits above the stack
+and shifts every stack variable's alignment.
+
+<Why>Why does that matter for your A/B test?</Why>
+
+Because the bias can flip the conclusion. Across link orders, the measured
+speedup of `-O3` over `-O2` for perlbench ranged so widely that "we may think we
+have a 7% slowdown when in fact we have a 8% speedup". Your optimisation can win
+or lose depending on which username ran the benchmark.
+
+Their remedy is **setup randomisation**: run each variant under many
+environments and layouts and compare distributions, so no single lucky layout
+decides the result.
+
+</Sub>
+
+<Sub n="6.5" title="Microbenchmarks versus the real thing">
+
+| | Microbenchmark | Macrobenchmark / load test |
+|---|---|---|
+| **Question** | Is this function faster? | Does the service meet its latency target at this load? |
+| **Strength** | Isolates one change; fast to iterate | Includes contention, GC, I/O, the network |
+| **Classic lie** | Data fits in L1; branch predictor learned the pattern | Load generator hides stalls (coordinated omission) |
+| **Report** | Minimum or median, with spread | Latency percentiles at a fixed offered rate |
+
+A function that got 30% faster on a 4 KB input might well get slower on production
+inputs that don't fit in cache. Always finish with the macro test.
+
+Load tests have their own traps. Coordinated omission, where a generator
+stops sending while the server stalls, is covered in
+[chapter 16](/topics/16-contention-tail-latency); running load tests for
+capacity is in [chapter 42](/topics/42-queueing-and-capacity).
+
+<Callout label="Design implication">
+A benchmark result is a claim, and it needs its conditions attached: hardware,
+compiler and flags, input size, warm-up, repetitions and spread. A number
+without those can't be reproduced, so it can't be checked, so it shouldn't
+decide anything.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="07" id="regressions">Keeping it fast: regressions and continuous profiling</SectionHeading>
+
+Most performance problems aren't discovered; they're introduced, one small
+release at a time. The cheapest time to catch one is the day it lands.
+
+<Sub n="7.1" title="Benchmarks in CI">
+
+Run a small benchmark suite on every merge, on the same dedicated machine, and
+compare against a stored baseline. Flag a change only when the difference is
+larger than the run-to-run spread you've measured on that machine.
+
+<Why>Why not a fixed threshold like 5%?</Why>
+
+Because the noise floor differs per benchmark. A test whose runs spread by 8%
+will alarm constantly at a 5% threshold, and one that spreads by 0.5% will hide a
+4% regression. Compare each benchmark against its own measured spread, with a
+statistical test such as Mann-Whitney U, which doesn't assume a normal
+distribution.
+
+</Sub>
+
+<Sub n="7.2" title="Continuous profiling in production">
+
+Sampling at 99 Hz costs little enough to leave on. Continuous profilers
+(Google-Wide Profiling, Parca, Pyroscope, Datadog's and others) sample every
+host all the time and store the folded stacks. When a release regresses, you
+diff this week's fleet profile against last week's.
+
+The frame-pointer argument in section 3.5 is what makes this practical: without
+them, always-on profiling means DWARF unwinding on every host, and section 3.5
+measured what that does to data volume.
+
+</Sub>
+
+<SectionHeading n="08" id="monday">A workflow for Monday</SectionHeading>
+
+<Sub n="8.1" title="From complaint to fix">
+
+1. **Write down the goal and the number.** "p99 of `/search` from 180 ms back
+   under 100 ms at 2,000 req/s."
+2. **RED on the service.** Which endpoint, since when, correlated with which
+   deploy or traffic change?
+3. **USE on the hosts and pools behind it.** Errors first, then saturation. In
+   containers, check throttling.
+4. **On-CPU or off-CPU?** Compare CPU time to wall time for slow requests.
+5. **Profile the right kind.** CPU flame graph for on-CPU; off-CPU graph or lock
+   and pool metrics for waiting.
+6. **Form one hypothesis and test it with one change.** A benchmark if it's a
+   function, a load test if it's the service.
+7. **Confirm in production** with the same RED metric you started from.
+
+</Sub>
+
+<Sub n="8.2" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Latency up, CPU flame graph unchanged | Time is off-CPU: locks, I/O, pools | Off-CPU profile; pool and lock metrics |
+| Container slow, node CPU looks idle | CFS quota throttling | Check `cpu.stat`; raise or remove the limit; smooth bursts |
+| Flame graph stacks one or two frames deep | No frame pointers | Rebuild with `-fno-omit-frame-pointer`, or `--call-graph dwarf` short-term |
+| Profile all `[unknown]` | Symbols unavailable: JIT, container path, stripped | async-profiler, perf maps, `--symfs`, debug packages |
+| Benchmark says 0 ns, or implausibly fast | Dead-code elimination or constant folding | `Blackhole` / `DoNotOptimize`; varied inputs |
+| JVM benchmark improves every run | JIT warm-up inside the measurement | JMH with warm-up iterations and forks |
+| A/B result flips between machines or days | Noise or measurement bias | Interleave runs, randomise setup, report spread |
+| Fast function, slow service | Microbenchmark didn't match production data or contention | Macro load test at production input sizes |
+| Low IPC in a hot loop | Stalled on memory | Improve locality; see [chapter 02](/topics/02-memory-hierarchy) |
+
+</Sub>
+
+<SectionHeading n="09" id="summary">Summary</SectionHeading>
+
+1. **Name the goal first.** Latency, throughput and efficiency pull in different
+   directions, and "faster" has to mean one of them.
+2. **Split on-CPU from off-CPU time.** A CPU profiler can't see a thread that's
+   waiting, and waiting is often most of a slow request.
+3. **Amdahl caps every optimisation.** Doubling the speed of a 10% slice saves
+   5%, so rank work by share of time.
+4. **USE finds the resource, RED finds the service.** Saturation is the column
+   that predicts latency.
+5. **Containers hide a saturation.** In the container used here, 41% of CPU
+   periods were throttled while the node had idle cores.
+6. **A sampling profiler is an interrupt plus a stack walk**, and the walk
+   follows frame pointers, a linked list the compiler may not have built.
+7. **Without frame pointers the ancestry breaks.** In the test here, `main`
+   appeared in 2 of 2,649 samples instead of all of them; DWARF recovered 87% at
+   66× the data.
+8. **A flame graph's width is share of samples, and its x-axis isn't time.**
+   Read wide plateaus, check a hot leaf's callers, and diff two profiles to find
+   a regression.
+9. **Compilers and JITs rewrite benchmarks.** Unused results are deleted, closed
+   forms are folded, and cold JVM code ran 3.6× slower than warm.
+10. **Shared machines and innocent setup changes bias results.** Interleave
+    runs, randomise setup, and report spread with every number.
+
+<SectionHeading n="10" id="build">Build this</SectionHeading>
+
+**A profiling and benchmarking kit for one service.**
+
+- Rebuild a service you own with frame pointers, profile it under load with
+  `perf record -F 99 -g`, fold the stacks, and draw a flame graph. Then do it
+  without frame pointers and compare the ancestry of its top three leaves.
+- Write a script that prints a USE pass for one host: `vmstat`, PSI, `iostat`,
+  `nstat`, and the cgroup's `cpu.stat` throttling ratio.
+- Take one hot function from the flame graph and benchmark it with a real
+  harness (JMH, Google Benchmark, `criterion`). Break it on purpose three ways,
+  with an unused result, no warm-up and a cache-resident input, and record how far
+  each moves the number.
+- Make a change, profile before and after, and produce a differential flame
+  graph that shows it.
+
+<SectionHeading n="11" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What's the USE method, and how is it different from RED?">
+USE checks every resource for utilisation, saturation and errors: CPUs, memory,
+disks, NICs, and software resources such as pools and locks. RED checks every
+service endpoint for rate, errors and duration. RED tells you which service is
+hurting users and since when; USE tells you which resource it's waiting on.
+Saturation is usually the most telling column, because it measures the queue
+directly.
+</QA>
+
+<QA level="beginner" q="Why sample at 99 Hz instead of 100 Hz?">
+To avoid sampling in lockstep with periodic activity. Lots of software runs on
+10 ms timers; sampling at exactly 100 Hz could keep catching the same phase of
+that timer and skew the profile.
+</QA>
+
+<QA level="intermediate" q="How do you read a flame graph?">
+Each box is a function in a stack; its width is the share of samples containing
+it; its parent is its caller. The x-axis is alphabetical, not time, so identical
+stacks merge. Look for wide boxes near the top with narrow children (functions
+doing work themselves), check the ancestry of hot leaves, and search for things
+like `malloc` or `lock` to total them across stacks.
+</QA>
+
+<QA level="intermediate" q="Your flame graph shows stacks that are only one or two frames deep. Why?">
+Probably missing frame pointers. The kernel's default stack walk follows saved
+frame-pointer and return-address pairs; code built with `-fomit-frame-pointer`
+breaks the chain. In a test here, only 2 of 2,649 samples reached `main`
+without frame pointers against all of them with. Fix it by rebuilding with
+`-fno-omit-frame-pointer` (Fedora 38 and Ubuntu 24.04 now do this by default), or
+use `--call-graph dwarf` at the cost of much bigger data: 66× in that test.
+</QA>
+
+<QA level="intermediate" q="A service in Kubernetes has high p99 but the node's CPU is 40% idle. What do you check?">
+CPU throttling from the container's CFS quota. Read `nr_throttled` against
+`nr_periods` in the cgroup's `cpu.stat`, or the cAdvisor throttling metric.
+Bursty work can use a pod's whole quota early in each 100 ms period and then
+wait, which adds latency while the node looks idle. Then check off-CPU time and
+pools, since a CPU profile won't show either.
+</QA>
+
+<QA level="deep" q="Your microbenchmark says the new version is 20% faster. What would make you not believe it?">
+Dead-code elimination or constant folding (is the result consumed, are inputs
+varied?); JIT warm-up inside the timed region; an input that fits in cache when
+production data doesn't; noise, if the difference is within run-to-run spread;
+and measurement bias from layout, which Mytkowicz et al. showed can move results
+by tens of percent and flip a conclusion. I'd want interleaved runs, a real
+harness, the spread, and a macro test at production input sizes.
+</QA>
+
+<QA level="deep" q="When is a CPU profile the wrong tool?">
+When the time isn't on the CPU: locks, I/O, pool waits, throttling, scheduler
+delay. A blocked thread executes no instructions, so a sampling CPU profiler
+never sees it. Compare CPU time to wall time for slow requests. If they differ
+a lot, use off-CPU profiling (stacks at `sched_switch`, weighted by blocked
+time), lock contention stats and pool metrics instead.
+</QA>
+
+<QA level="deep" q="What does top-down analysis tell you that a flame graph doesn't?">
+Why the hot code is slow, not where it is. It classifies each pipeline
+slot as retiring, bad speculation, frontend bound or backend bound. Backend bound
+with low IPC points at memory stalls and data layout; bad speculation at
+unpredictable branches; frontend bound at code size; retiring-dominated code at
+doing fewer instructions. Each needs a different fix, and the counters say which
+to try first, if the PMU is exposed at all.
+</QA>
+
+<SectionHeading n="12" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Two boxes sit side by side in a flame graph. Did the left one run first?">
+    No. The x-axis is sorted alphabetically so identical stacks merge. It
+    carries no time information.
+  </Q>
+  <Q q="Your benchmark reports 0.000 ns per iteration. What happened?">
+    The compiler removed the work, either because the result was never used or
+    because it computed a closed form. Consume the result through a barrier such
+    as `Blackhole` or `DoNotOptimize`, and vary the input.
+  </Q>
+  <Q q="perf stat prints <not supported> for cycles. Can you still profile?">
+    Yes, with software events: `perf record` falls back to a timer-based
+    `cpu-clock` or `task-clock` sample. Hardware counters such as IPC need a PMU
+    the VM exposes.
+  </Q>
+  <Q q="Where does off-CPU time come from in a flame graph?">
+    From stacks captured when a thread blocks, at the scheduler's switch point,
+    weighted by how long it stayed off the CPU.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Brendan Gregg — The USE Method" verdict="Read the Linux checklist once, then keep it open during incidents.">
+    The method, the [Linux checklist](https://www.brendangregg.com/USEmethod/use-linux.html),
+    and the reasoning for software resources.
+    [brendangregg.com/usemethod.html](https://www.brendangregg.com/usemethod.html).
+  </WildCard>
+  <WildCard name="Brendan Gregg — The Flame Graph (ACM Queue / CACM, 2016)">
+    The paper describing flame graphs, their variants, and how to read them.
+    Companion page with tools: [flamegraphs.html](https://www.brendangregg.com/flamegraphs.html).
+  </WildCard>
+  <WildCard name="Brendan Gregg — The Return of the Frame Pointers (2024)">
+    The history of the 2004 default, the overhead numbers, and the alternatives.
+    [Blog post](https://www.brendangregg.com/blog/2024-03-17/the-return-of-the-frame-pointers.html).
+  </WildCard>
+  <WildCard name="arch/arm64/kernel/stacktrace.c (Linux v6.10)">
+    The user-space frame-pointer walker perf uses on arm64, quoted in 3.3.
+    [Source](https://github.com/torvalds/linux/blob/v6.10/arch/arm64/kernel/stacktrace.c#L331).
+  </WildCard>
+  <WildCard name="Mytkowicz et al. — Producing Wrong Data Without Doing Anything Obviously Wrong! (ASPLOS 2009)" verdict="The paper to read before you trust any single-digit speedup.">
+    Environment size and link order bias SPEC results enough to flip
+    conclusions. [ACM DL](https://dl.acm.org/doi/10.1145/1508244.1508275).
+  </WildCard>
+  <WildCard name="Chen & Revels — Robust benchmarking in noisy environments (2016)">
+    The statistics behind Julia's BenchmarkTools, and the case for the minimum.
+    [arXiv:1608.04295](https://arxiv.org/abs/1608.04295).
+  </WildCard>
+  <WildCard name="Yasin — A Top-Down Method for Performance Analysis (ISPASS 2014)">
+    The four-bucket pipeline breakdown behind VTune and `toplev`.
+    [Paper](https://www.semanticscholar.org/paper/A-Top-Down-method-for-performance-analysis-and-Yasin/6776ff919597ca4feccd413208dedc401f6e655d).
+  </WildCard>
+  <WildCard name="Tom Wilkie — The RED Method">
+    Rate, errors and duration for every service, and how it relates to USE.
+    [Grafana blog](https://grafana.com/blog/2018/08/02/the-red-method-how-to-instrument-your-services/).
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="13" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Contention, Queueing & Tail Latency">
+    Why saturation turns into latency, lock convoys a CPU profile can't see, and
+    coordinated omission in load tests. [Chapter 16](/topics/16-contention-tail-latency).
+  </WildCard>
+  <WildCard name="Queueing, Capacity & Scaling">
+    Load testing for capacity, sizing a fleet, and autoscalers.
+    [Chapter 42](/topics/42-queueing-and-capacity).
+  </WildCard>
+  <WildCard name="Memory Hierarchy & Cache Coherence">
+    What a low IPC is usually waiting for, measured from L1 to DRAM.
+    [Chapter 02](/topics/02-memory-hierarchy).
+  </WildCard>
+  <WildCard name="eBPF: Running Your Code in the Kernel">
+    How off-CPU profilers and tracing tools attach to the scheduler.
+    [Chapter 48](/topics/48-ebpf).
+  </WildCard>
+</CardGrid>

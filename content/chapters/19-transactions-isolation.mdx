@@ -1,0 +1,893 @@
+---
+title: Transactions & Isolation Levels
+dek: "What BEGIN and COMMIT actually promise when two transactions touch the same data at once. How MVCC gives every transaction its own snapshot, which anomalies each isolation level lets through, why snapshot isolation still allows write skew, and what serializable costs in retries. Every anomaly reproduced on Postgres 16."
+readingTime: "~32 min"
+level: "Intermediate"
+versions: "PostgreSQL 16.15 (source at REL_16_4) · pgbench 16 · measured in a shared container, linuxkit 6.10.14 aarch64 on an Apple M4"
+prereqs: "SQL, what a lock is, chapter 18's row versions"
+updated: "2026-09-27"
+---
+
+Most application code treats a transaction as a box: put statements between
+`BEGIN` and `COMMIT`, and they happen together or not at all. That part is
+true. What's less clear is what the box protects you from while other
+transactions run at the same time.
+
+That depends on the isolation level, and the defaults are weaker than
+most people assume. Postgres defaults to read committed, where two requests
+can each read a counter, add one and write it back, and one increment
+vanishes. Its repeatable read is snapshot isolation, which lets two doctors
+both go off call when the rule says one must stay. MySQL's repeatable read and
+Oracle's serializable mean different things again.
+
+This chapter builds up the vocabulary of anomalies, shows the two ways
+databases isolate transactions, takes Postgres's MVCC apart down to the
+snapshot struct, and reproduces each anomaly with real sessions. It ends with
+serializable snapshot isolation, what it costs, and the retry loop you need at
+every level above read committed.
+
+<SectionHeading n="01" id="promise">What a transaction promises</SectionHeading>
+
+A transaction is a group of reads and writes the database treats as one unit.
+Its promises are usually summarised as ACID, and only one of the four letters
+is hard to pin down.
+
+<Sub n="1.1" title="ACID, letter by letter">
+
+| Letter | Promise | How Postgres keeps it |
+|---|---|---|
+| **Atomicity** | All of the transaction's writes happen, or none do | A commit record in the WAL. Without one, the writes are invisible ([chapter 18](/topics/18-storage-engines)) |
+| **Consistency** | Invariants hold before and after | Mostly your job: constraints, foreign keys, and the transactions you write |
+| **Isolation** | Concurrent transactions don't see each other's partial work | Snapshots and locks, at the strength the isolation level asks for |
+| **Durability** | A committed transaction survives a crash | The commit waits for `fdatasync` of the WAL |
+
+Atomicity and durability are about crashes. Isolation is about concurrency,
+and it's where the levels, the anomalies and the surprises live.
+
+</Sub>
+
+<Sub n="1.2" title="The gold standard: serializable">
+
+Strongest of all is **serializability**: the result of running
+transactions concurrently is the same as running them one at a time, in some
+order. If each transaction is correct on its own, a serializable database
+keeps them correct together.
+
+<Why>Why doesn't every database just do that?</Why>
+
+Because the obvious ways to get it cost throughput. Running one transaction at
+a time works (Redis and VoltDB do exactly that), but only if every transaction
+is short and in memory. Locking everything you read makes readers and writers
+wait for each other. So databases offer weaker levels that allow some
+anomalies in exchange for more concurrency, and leave it to you to know which
+ones you can live with.
+
+</Sub>
+
+<SectionHeading n="02" id="anomalies">The anomalies, by name</SectionHeading>
+
+An anomaly is an outcome no serial order could produce. There are about half
+a dozen that matter in practice, and each isolation level is defined by which
+ones it rules out.
+
+<Sub n="2.1" title="The catalogue">
+
+| Anomaly | What happens | Example |
+|---|---|---|
+| **Dirty write** | T2 overwrites a value T1 wrote but hasn't committed | Two transfers interleave writes to two accounts; the final balances match neither |
+| **Dirty read** | T2 reads T1's uncommitted write, then T1 aborts | A report includes an order that was rolled back |
+| **Non-repeatable read** | T1 reads a row twice and gets different values, because T2 committed in between | A check passes on the first read and fails on the second |
+| **Phantom** | T1 runs a query twice and gets a different *set* of rows | `count(*)` changes mid-transaction |
+| **Lost update** | T1 and T2 both read x, both write x+1; one increment disappears | A view counter, a stock level, a balance |
+| **Read skew** | T1 reads two related rows at different points in time | A transfer between two accounts looks like money vanished |
+| **Write skew** | T1 and T2 read overlapping data, then write *different* rows, and together they break an invariant | Two doctors each see the other on call and both go off |
+
+Adya's [1999 thesis](https://publications.csail.mit.edu/lcs/pubs/pdf/MIT-LCS-TR-786.pdf) gave these
+precise definitions in terms of dependency graphs, with names like G0 (dirty
+write), G1 (dirty reads and relatives), G2-item (write skew) and G2
+(anti-dependency cycles, including phantoms). Jepsen and Hermitage use those
+names, and so will the rest of this chapter where it matters.
+
+</Sub>
+
+<Sub n="2.2" title="The SQL standard's four levels, and why they don't fit">
+
+SQL-92 defines four isolation levels by which of three phenomena they
+prevent: dirty reads, non-repeatable reads and phantoms. Berenson, Bernstein,
+Gray and colleagues showed in
+[A Critique of ANSI SQL Isolation Levels](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-95-51.pdf)
+(1995) that those definitions are ambiguous, miss lost updates and write
+skew entirely, and have no place for **snapshot isolation**, the level most
+MVCC databases actually implement.
+
+<Why>So what does "repeatable read" mean in your database?</Why>
+
+Whatever the vendor decided. Martin Kleppmann's
+[Hermitage](https://github.com/ept/hermitage) project ran the same anomaly
+tests against each database and recorded what each level really is:
+
+| Database | Level asked for | What you actually get | Lost update? | Write skew? |
+|---|---|---|---|---|
+| **Postgres** | read committed (default) | Monotonic atomic view | Allowed | Allowed |
+| **Postgres** | repeatable read | Snapshot isolation | Prevented | Allowed |
+| **Postgres** | serializable | Serializable | Prevented | Prevented |
+| **MySQL / InnoDB** | repeatable read (default) | Monotonic atomic view | Allowed | Allowed |
+| **MySQL / InnoDB** | serializable | Serializable (by locking) | Prevented | Prevented |
+| **Oracle** | serializable | Snapshot isolation | Prevented | Allowed |
+| **SQL Server** | snapshot | Snapshot isolation | Prevented | Allowed |
+| **CockroachDB** | serializable (default) | Serializable | Prevented | Prevented |
+
+<Callout label="Common mistake" kind="warn">
+Porting code between databases and assuming the level name carries the
+guarantee. MySQL's default repeatable read lets lost updates through;
+Postgres's repeatable read doesn't. Oracle's "serializable" allows write skew.
+Read the Hermitage row for your database, not the standard.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="03" id="locks-or-versions">Two ways to isolate: locks and versions</SectionHeading>
+
+There are two basic mechanisms under every isolation level, and most
+databases mix them.
+
+<Sub n="3.1" title="Two-phase locking">
+
+Classic databases use **two-phase locking** (2PL). A transaction takes a
+shared lock on everything it reads and an exclusive lock on everything it
+writes, and releases nothing until it commits. The "two phases" are growing
+(acquiring) and shrinking (releasing all at once at the end).
+
+That's serializable, provided it also locks ranges, so that nobody can insert
+a row a query would have matched. You pay for it: readers block writers,
+writers block readers, and transactions that take locks in different orders
+deadlock. Here's a real one on Postgres:
+
+<StepSequence
+  title="Two transfers deadlock (Postgres 16, read committed)"
+  actors={["Transaction A", "Row 1", "Row 2", "Transaction B"]}
+  messages={[
+    { from: 0, to: 1, label: "UPDATE row 1", note: "A debits account 1 and takes an exclusive **row lock** on it." },
+    { from: 3, to: 2, label: "UPDATE row 2", note: "B debits account 2 and locks it. So far, no conflict." },
+    { from: 0, to: 2, label: "UPDATE row 2 (waits)", note: "A tries to credit account 2. B holds its lock, so **A waits**." },
+    { from: 3, to: 1, label: "UPDATE row 1 (waits)", note: "B tries to credit account 1. A holds it. Now each waits for the other, forever." },
+    { from: 1, to: 0, label: "ERROR 40P01", note: "After `deadlock_timeout` (1 s by default) a backend checks the wait graph, finds the cycle and aborts one: **deadlock detected after 1.00 s**." },
+    { from: 2, to: 3, label: "COMMIT", note: "B gets the lock and commits, also after 1.00 s. A's transfer has to be retried from the start." },
+  ]}
+/>
+
+Postgres uses row locks like this for writes at every level. What it doesn't
+do is lock what you read.
+
+</Sub>
+
+<Sub n="3.2" title="Multi-version concurrency control">
+
+**MVCC** keeps several versions of each row. A writer creates a new version
+instead of overwriting the old one, and each reader sees the versions that
+were committed as of its **snapshot**. Readers never wait for writers, and
+writers never wait for readers. Writers still wait for each other.
+
+| | Two-phase locking | MVCC (snapshot) |
+|---|---|---|
+| Reader vs writer | Block each other | Never block |
+| Writer vs writer | Block | Block (row locks), then conflict rules |
+| Serializable? | Yes, with range locks | No; snapshot isolation allows write skew |
+| Price | Lock waits, deadlocks | Old versions to store and clean up |
+| Used by | MySQL and SQL Server at `SERIALIZABLE`, Db2 | Postgres, Oracle, InnoDB consistent reads, CockroachDB |
+
+</Sub>
+
+<SectionHeading n="04" id="mvcc">MVCC in Postgres, from the row up</SectionHeading>
+
+Postgres's MVCC is simple enough to follow all the way down. Every row version
+carries two transaction IDs, and every statement carries a snapshot. Whether
+you see a row is a comparison between the two.
+
+<Sub n="4.1" title="xmin and xmax">
+
+Every heap tuple header records **`xmin`**, the ID of the transaction that
+created this version, and **`xmax`**, the ID of the transaction that deleted or
+replaced it (0 if none). You can select them as hidden columns. An `UPDATE` is
+an insert of a new version plus setting `xmax` on the old one;
+[chapter 18](/topics/18-storage-engines) shows both versions sitting in the
+same page.
+
+Transaction IDs (XIDs) are 32-bit counters handed out when a transaction first
+writes. Whether an XID committed or aborted is kept in a separate structure,
+the commit log (`pg_xact`), two bits per transaction.
+
+</Sub>
+
+<Sub n="4.2" title="A snapshot is three numbers and a list">
+
+A snapshot records which transactions count as finished for this reader:
+
+<SourceRead
+  file="src/include/utils/snapshot.h"
+  repo="postgres/postgres"
+  tag="REL_16_4"
+  href="https://github.com/postgres/postgres/blob/REL_16_4/src/include/utils/snapshot.h#L142"
+>
+```c
+typedef struct SnapshotData
+{
+	SnapshotType snapshot_type; /* type of snapshot */
+
+	/*
+	 * An MVCC snapshot can never see the effects of XIDs >= xmax. It can see
+	 * the effects of all older XIDs except those listed in the snapshot. xmin
+	 * is stored as an optimization to avoid needing to search the XID arrays
+	 * for most tuples.
+	 */
+	TransactionId xmin;			/* all XID < xmin are visible to me */
+	TransactionId xmax;			/* all XID >= xmax are invisible to me */
+
+	/*
+	 * For normal MVCC snapshot this contains the all xact IDs that are in
+	 * progress, unless the snapshot was taken during recovery ...
+	 *
+	 * note: all ids in xip[] satisfy xmin <= xip[i] < xmax
+	 */
+	TransactionId *xip;
+	uint32		xcnt;			/* # of xact ids in xip[] */
+	/* ... */
+```
+</SourceRead>
+
+Here's one taken live. A slow writer started first and is still running, a
+fast writer started after it and committed, and a third transaction inserted a
+row and committed. Then a reader took a snapshot:
+
+<TryIt what="Take a snapshot while one writer is still running" lang="python" toolchain="PostgreSQL 16.15, psycopg2 2.9.9">
+```python
+slow.execute("update acct set bal=bal-1 where id=2")    # xid 2051525, stays open
+fast.execute("update acct set bal=bal-1 where id=1")    # xid 2051526
+fast.commit()
+auto.execute("insert into acct values (4, 100)")         # xid 2051527, autocommit
+
+reader.execute("select pg_current_snapshot()")
+reader.execute("select id, bal, xmin, xmax from acct order by id")
+slow.commit()
+reader.execute("select id, bal from acct order by id")  # same snapshot (repeatable read)
+```
+
+<Output>
+```text
+reader snapshot 2051525:2051528:2051525
+reader sees [(1, 99,  '2051526', '0'),
+             (2, 100, '2051524', '2051525'),
+             (3, 100, '2051524', '0'),
+             (4, 100, '2051527', '0')]
+after slow writer commits, same snapshot: [(1, 99), (2, 100), (3, 100), (4, 100)]
+```
+
+The snapshot reads `xmin:xmax:xip`. Everything below 2051525 is settled,
+everything from 2051528 up is invisible, and 2051525 itself is listed as in
+progress. So the reader sees the fast writer's update (xid 2051526, not in
+the list), sees the insert, and for row 2 still sees the old version: its
+`xmax` is the slow writer, which the snapshot treats as uncommitted. Even after
+the slow writer commits, this repeatable-read snapshot keeps seeing 100.
+</Output>
+</TryIt>
+
+</Sub>
+
+<Sub n="4.3" title="The visibility check">
+
+For every tuple a scan finds, Postgres decides whether this snapshot sees it.
+Simplified, `HeapTupleSatisfiesMVCC` asks two questions: did the creator
+commit before my snapshot, and if someone deleted it, did *that* commit before
+my snapshot?
+
+<Steps
+  title="Is this row version visible to my snapshot?"
+  lanes={[
+    { t: "xmin", s: "who created it", icon: "+" },
+    { t: "Snapshot", s: "xmin : xmax : xip", icon: "◎" },
+    { t: "pg_xact", s: "commit log", icon: "≡" },
+    { t: "xmax", s: "who deleted it", icon: "−" },
+    { t: "Verdict", s: "", icon: "✓" },
+  ]}
+  steps={[
+    [0, "Read the tuple's `xmin`. If it's my own transaction, the row is visible (unless I deleted it)."],
+    [1, "`XidInMVCCSnapshot(xmin)`: below the snapshot's `xmin` means settled; at or above its `xmax`, or in `xip[]`, means **still running as far as I'm concerned**. Then the row is invisible."],
+    [2, "Otherwise look up `xmin` in **pg_xact**. Aborted means invisible. Committed means the creator counts, and a **hint bit** is set on the tuple so the next reader skips this lookup."],
+    [3, "Now `xmax`. Zero, aborted, or in progress for my snapshot: nobody has deleted it yet, from my point of view."],
+    [4, "**Visible** if the creator counts and the deleter doesn't. A committed deleter that my snapshot can see makes the version dead to me."],
+  ]}
+/>
+
+That snapshot test is short. Most XIDs are resolved by the two range
+checks at the top and never reach the array search:
+
+<SourceRead
+  file="src/backend/utils/time/snapmgr.c"
+  repo="postgres/postgres"
+  tag="REL_16_4"
+  href="https://github.com/postgres/postgres/blob/REL_16_4/src/backend/utils/time/snapmgr.c#L2287"
+>
+```c
+XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
+{
+	/* Any xid < xmin is not in-progress */
+	if (TransactionIdPrecedes(xid, snapshot->xmin))
+		return false;
+	/* Any xid >= xmax is in-progress */
+	if (TransactionIdFollowsOrEquals(xid, snapshot->xmax))
+		return true;
+	/* ... then search snapshot->subxip[] and snapshot->xip[] ... */
+```
+</SourceRead>
+
+<Why>Why the hint bits?</Why>
+
+Because checking `pg_xact` for every tuple on every scan would be slow and
+contended. Whichever reader first learns that a transaction committed records it
+on the tuple itself. This is also why a plain `SELECT` straight after a bulk
+load can write to disk: it's setting hint bits on every page.
+
+</Sub>
+
+<Sub n="4.4" title="Read committed vs repeatable read: when the snapshot is taken">
+
+In Postgres, the difference between the two lower levels is a single decision:
+
+| Level | Snapshot taken | Consequence |
+|---|---|---|
+| **Read committed** | At the start of **each statement** | Each statement sees everything committed before it began; two statements can disagree |
+| **Repeatable read** | At the **first statement** of the transaction | Every statement sees the same frozen view |
+
+An anomaly script for this chapter read a counter, let another session
+change it to 42 and commit, and read it again. Under read committed the second
+read returned **42**. Under repeatable read and serializable it returned **0**
+both times.
+
+</Sub>
+
+<Sub n="4.5" title="The cost: versions that can't be cleaned up">
+
+Old versions stay in the table until `VACUUM` removes them, and it can only
+remove a version that no running snapshot could still need. The oldest
+snapshot in the whole cluster sets that horizon.
+
+<TryIt what="Vacuum a table while an old repeatable-read transaction is open" lang="python" toolchain="PostgreSQL 16.15, psycopg2 2.9.9">
+```python
+old.execute("select count(*) from acct")    # repeatable read, snapshot now fixed
+auto.execute("update acct set bal=bal+1")   # 1,000 rows -> 1,000 dead versions
+auto.execute("vacuum (verbose) acct")
+old.commit()
+auto.execute("vacuum (verbose) acct")
+```
+
+<Output>
+```text
+tuples: 1 removed, 2000 remain, 1000 are dead but not yet removable
+...
+tuples: 1000 removed, 1000 remain, 0 are dead but not yet removable
+```
+
+With the old transaction open, vacuum couldn't remove any of the 1,000 dead
+versions. Once it committed, all 1,000 went.
+</Output>
+</TryIt>
+
+<Callout label="Common mistake" kind="warn">
+A session left **idle in transaction**: an application that opened a
+transaction, ran a query and then waited on a network call or a user. Its
+snapshot holds back vacuum for every table in the database, tables bloat and
+index scans slow down. Find it with `pg_stat_activity` (`state = 'idle in
+transaction'`, and `age(backend_xmin)`), and set
+`idle_in_transaction_session_timeout` so it can't last for hours.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="05" id="lost-update">Lost updates</SectionHeading>
+
+Lost updates are probably the anomaly application code hits most: read a
+value, compute a new one in the application, write it back.
+
+<Sub n="5.1" title="Reproducing it">
+
+Two sessions read a counter at 0, each writes back `n + 1`, and both try to
+commit. Here's what each level did on Postgres 16:
+
+| Level | Session A | Session B | Final value (two increments) |
+|---|---|---|---|
+| Read committed | Commits | Commits | **1**: one increment lost |
+| Repeatable read | Commits | `40001` could not serialize access due to concurrent update | 1, and B knows it failed |
+| Serializable | Commits | `40001` could not serialize access due to concurrent update | 1, and B knows it failed |
+
+<Why>Why does repeatable read catch it but read committed doesn't?</Why>
+
+Both levels make B's `UPDATE` wait for A's row lock. The difference is what
+happens when A commits. Under read committed, B re-reads the newest version
+of the row, checks it still matches the `WHERE` clause, and applies its write,
+which was computed from a stale value. Under repeatable read, the newest
+version is newer than B's snapshot, so Postgres refuses: **first updater
+wins**, and the second gets a serialization failure.
+
+</Sub>
+
+<Sub n="5.2" title="Four ways to not lose it">
+
+| Fix | How | When to use it |
+|---|---|---|
+| **Atomic update** | `UPDATE counter SET n = n + 1` | Whenever the new value can be computed in SQL. Read committed re-evaluates `n` on the newest version |
+| **Lock the row** | `SELECT … FOR UPDATE`, then compute, then `UPDATE` | When the logic has to run in the application |
+| **Optimistic check** | `UPDATE … SET n = $new, version = version + 1 WHERE id = $id AND version = $seen`; zero rows means retry | Long think time between read and write, such as a form submitted minutes later |
+| **Raise the level** | Repeatable read or serializable, plus a retry loop | When many code paths do read-modify-write and you can't audit them all |
+
+<Callout label="Design implication">
+Treat any "SELECT, compute in code, UPDATE" at read committed as a bug until
+proven otherwise. The atomic `UPDATE` form costs nothing and is correct at
+every level.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="06" id="write-skew">Write skew: what snapshots can't see</SectionHeading>
+
+Snapshot isolation stops lost updates because two transactions writing the
+same row conflict. Write skew is the case where they write **different** rows,
+so nothing conflicts, and the invariant breaks anyway.
+
+<Sub n="6.1" title="Two doctors, one rule">
+
+The standard example, adapted by Ports and Grittner from Cahill and colleagues: a
+hospital requires at least one doctor on call. Alice and Bob are both on call,
+and both feel ill at the same moment. Each one's transaction checks the rule
+and takes themselves off call:
+
+```sql
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM doctors WHERE on_call;          -- 2, so it's safe to leave
+UPDATE doctors SET on_call = false WHERE name = 'alice';   -- Bob's says 'bob'
+COMMIT;
+```
+
+<Predict
+  q="Alice's and Bob's transactions run concurrently at repeatable read (snapshot isolation) on Postgres. Both read 2 doctors on call. What happens at commit?"
+  options={[
+    "Both commit, and nobody is on call",
+    "The second to commit gets a serialization failure",
+    "The second UPDATE waits for the first transaction's lock",
+    "Postgres detects the broken invariant and rolls both back",
+  ]}
+  answer={0}
+>
+Both commit. Measured: **A COMMIT ok; B COMMIT ok; on call now = 0**. The two
+transactions updated different rows, so there's no write-write conflict for
+snapshot isolation to catch, and no lock to wait for. Each read a consistent
+snapshot and each made a correct decision from it. Together they broke the
+rule. Under serializable, the second commit failed with `40001 could not
+serialize access due to read/write dependencies among transactions`, and one
+doctor stayed on call.
+</Predict>
+
+<Why>Why can't snapshot isolation see it?</Why>
+
+Because its only conflict rule is about writes: two transactions that wrote
+the same row can't both commit. Here each transaction *read* a row the other
+one *wrote*. That's a read-write dependency in each direction, a cycle, and no
+serial order could produce the result. Snapshot isolation doesn't track reads,
+so the cycle is invisible to it.
+
+It seems contrived, but the same shape turns up well outside hospitals:
+
+| System | Invariant | Write skew |
+|---|---|---|
+| Meeting rooms | No overlapping bookings for a room | Two bookings check for overlaps, see none, and insert |
+| Usernames | Unique username (without a unique index) | Two sign-ups check, see it's free, both insert |
+| Spending limits | Total across accounts stays under a limit | Two withdrawals from different accounts each check the total |
+| Inventory | Don't oversell the last item across warehouses | Two orders each reserve from a different warehouse |
+
+</Sub>
+
+<Sub n="6.2" title="Fixing write skew without serializable">
+
+<Why>Why doesn't SELECT FOR UPDATE always fix it?</Why>
+
+It fixes the doctors case: `SELECT … FROM doctors WHERE on_call FOR UPDATE`
+locks both rows, so the second transaction waits and then sees the change.
+But `FOR UPDATE` only locks rows that exist. In the meeting-room and username
+cases the check is for the **absence** of a row, so there's nothing to lock.
+That's a phantom, and row locks can't stop it.
+
+| Fix | Works for | How |
+|---|---|---|
+| **Constraint** | Uniqueness, non-overlap | A unique index; an exclusion constraint (`EXCLUDE USING gist (room WITH =, during WITH &&)`) |
+| **Lock the rows read** | Checks over existing rows | `SELECT … FOR UPDATE` on everything the decision depends on |
+| **Materialise the conflict** | Checks for absence | Pre-create a row per room-and-slot and lock it, so there is something to conflict on |
+| **Serializable** | Everything | Let the database find the cycle, and retry |
+
+</Sub>
+
+<SectionHeading n="07" id="serializable">Serializable, and what it costs</SectionHeading>
+
+There are three ways to make every execution serializable, and databases use
+all three.
+
+<Sub n="7.1" title="Three implementations">
+
+| Approach | How | Who | Cost |
+|---|---|---|---|
+| **Actual serial execution** | One thread runs one transaction at a time | Redis, VoltDB | Transactions must be short and in memory; one core per partition |
+| **Strict 2PL** | Shared locks on reads, range (next-key) locks against phantoms | MySQL `SERIALIZABLE`, SQL Server, Db2 | Readers block writers; deadlocks |
+| **Serializable snapshot isolation (SSI)** | Snapshot isolation plus tracking of read-write conflicts; abort when a dangerous pattern appears | Postgres 9.1+ | Aborts, including some false positives; memory for read tracking |
+
+MySQL's version is literally locking reads: at `SERIALIZABLE`, InnoDB turns
+every plain `SELECT` into `SELECT … FOR SHARE` when autocommit is off
+([MySQL 8.4 manual](https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html)).
+
+</Sub>
+
+<Sub n="7.2" title="How SSI finds the cycle">
+
+Cahill, Röhm and Fekete's
+[Serializable Isolation for Snapshot Databases](https://dl.acm.org/doi/10.1145/1376616.1376690)
+(SIGMOD 2008) proved that every snapshot-isolation anomaly contains a
+particular shape: two consecutive read-write conflicts. Postgres's
+implementation notes put it like this:
+
+<SourceRead
+  file="src/backend/storage/lmgr/README-SSI"
+  repo="postgres/postgres"
+  tag="REL_16_4"
+  href="https://github.com/postgres/postgres/blob/REL_16_4/src/backend/storage/lmgr/README-SSI"
+>
+```text
+SSI is based on the observation [2] that each snapshot isolation
+anomaly corresponds to a cycle that contains a "dangerous structure"
+of two adjacent rw-conflict edges:
+
+      Tin ------> Tpivot ------> Tout
+            rw             rw
+
+SSI works by watching for this dangerous structure, and rolling
+back a transaction when needed to prevent any anomaly. This means it
+only needs to track rw-conflicts between concurrent transactions, not
+wr- and ww-dependencies. It also means there is a risk of false
+positives, because not every dangerous structure is embedded in an
+actual cycle.
+```
+</SourceRead>
+
+To see rw-conflicts, a serializable transaction records what it read as
+**SIREAD locks**. They never block anyone; they're markers checked when
+someone writes. Here's the doctors example under SSI:
+
+<StepSequence
+  title="Write skew under Postgres SERIALIZABLE"
+  actors={["Alice's txn (A)", "SIREAD locks", "doctors table", "Bob's txn (B)"]}
+  messages={[
+    { from: 0, to: 1, label: "SELECT count(*) … on_call", note: "A reads the on-call rows. A sequential scan records an **SIREAD lock on the whole relation**." },
+    { from: 3, to: 1, label: "SELECT count(*) … on_call", note: "B does the same. Both saw 2. Neither lock blocks anything." },
+    { from: 0, to: 2, label: "UPDATE alice", note: "A writes a row that **B has read**. Postgres records a rw-conflict edge B → A (B read something A overwrote)." },
+    { from: 3, to: 2, label: "UPDATE bob", note: "B writes a row A has read: edge A → B. Now each is both the in-edge and the out-edge of the other, a **dangerous structure**." },
+    { from: 0, to: 2, label: "COMMIT ok", note: "A commits first. With A committed and B still running, the cycle can only be broken by aborting B." },
+    { from: 2, to: 3, label: "ERROR 40001", note: "B's commit fails: **could not serialize access due to read/write dependencies among transactions**. Bob retries, sees one doctor on call, and stays." },
+  ]}
+/>
+
+Lock granularity matters. The same query through the primary key took a page
+lock on the index and a tuple lock on the row:
+
+```text
+count(*) with a seq scan:  [('relation', 'doctors', None, None)]
+WHERE name = 'alice':      [('page', 'doctors_pkey', 1, None), ('tuple', 'doctors', 0, 1)]
+```
+
+<Why>Why do false positives happen?</Why>
+
+Two reasons. SSI aborts on the dangerous structure without checking that it
+closes into a real cycle. And coarse SIREAD locks (a whole relation, from a
+sequential scan, or promoted from many tuple locks once
+`max_pred_locks_per_transaction` fills) conflict with writes that didn't touch
+anything the reader actually used. Indexes on the columns you filter by keep
+the locks fine-grained.
+
+</Sub>
+
+<Sub n="7.3" title="What it costs">
+
+Ports and Grittner's [VLDB 2012 paper](https://vldb.org/pvldb/vol5/p1850_danrkports_vldb2012.pdf)
+on the Postgres implementation measured SSI at "less than 7%" below snapshot
+isolation, and well ahead of strict 2PL on read-heavy workloads. Their RUBiS
+web-application benchmark:
+
+| Isolation | Throughput (req/s) | Serialization failures |
+|---|---|---|
+| Snapshot isolation | 435 | 0.004% |
+| SSI | 422 | 0.03% |
+| Strict 2PL | 208 | 0.76% |
+
+That's the cost of the tracking. What you'll probably feel first is different:
+**retries on hot rows**, which repeatable read pays too. I ran pgbench's
+TPC-B-like transaction (every transaction updates one of the branch rows)
+with 8 clients and `--max-tries=1000`, 15 seconds per run, median of three:
+
+| Setup | Level | tps | Transactions that needed a retry |
+|---|---|---|---|
+| 1 branch row (every txn collides) | Read committed | 1,581 | 0% |
+| | Repeatable read | 669 | 23.2% |
+| | Serializable | 672 | 26.4% |
+| 10 branch rows | Read committed | 5,827 | 0% |
+| | Repeatable read | 3,480 | 38.2% |
+| | Serializable | 4,105 | 38.4% |
+
+These are from a shared container, so the tps figures swing between runs; the
+retry percentages were stable to within roughly three points. With a single client,
+nothing was ever retried at any level.
+
+<Why>Why does read committed win so clearly here?</Why>
+
+Because on a write-write conflict it waits and then applies the update to the
+newest row version, while repeatable read and serializable throw the
+transaction away and start again. On this workload serializable cost roughly
+the same as repeatable read: the failures were almost all first-updater-wins
+conflicts, not SSI aborts.
+
+<Callout label="Design implication">
+Serializable is cheap when transactions rarely touch the same rows, and
+expensive in retries when they do, whatever the level above read committed.
+Before raising the level, look for the hot row (a global counter, a
+per-tenant total) and remove it: shard the counter, or aggregate
+asynchronously.
+</Callout>
+
+</Sub>
+
+<Sub n="7.4" title="Serializable is only as good as the implementation">
+
+In 2020, Jepsen tested
+[PostgreSQL 12.3](https://jepsen.io/analyses/postgresql-12.3) and found that
+"serializable" allowed G2-item, the write-skew class, during normal operation.
+The bug was in conflict detection with three concurrent transactions, was
+present in every release Jepsen checked from 9.5.22 to 13 beta, and was fixed
+in the next minor releases. Jepsen's other
+point was about names: Postgres's repeatable read is snapshot isolation, and
+saying so would "immediately clarify matters".
+
+</Sub>
+
+<SectionHeading n="08" id="operating">Working with isolation levels</SectionHeading>
+
+<Sub n="8.1" title="The retry loop is not optional">
+
+At repeatable read and serializable, `40001` (serialization failure) is a
+normal outcome, not an error to log and give up on. Deadlocks (`40P01`) can
+happen at any level. Both mean "run the whole transaction again", from the
+first statement, because every read it did may be stale.
+
+```python
+import psycopg2, random, time
+from psycopg2 import errorcodes
+
+RETRYABLE = {errorcodes.SERIALIZATION_FAILURE, errorcodes.DEADLOCK_DETECTED}
+
+def run_tx(conn, work, attempts=10):
+    for attempt in range(attempts):
+        try:
+            with conn:                         # BEGIN ... COMMIT, or ROLLBACK on error
+                with conn.cursor() as cur:
+                    return work(cur)           # all reads *and* writes, every time
+        except psycopg2.Error as e:
+            if e.pgcode not in RETRYABLE or attempt == attempts - 1:
+                raise
+            time.sleep(random.uniform(0, 0.01 * 2 ** attempt))   # jittered backoff
+```
+
+<Callout label="Common mistake" kind="warn">
+Retrying only the statement that failed, or retrying with values computed
+before the failure. A retry has to re-run the reads, because the reason it
+failed is that what you read is no longer true. Keep side effects (emails,
+HTTP calls) out of the retried function, or they happen once per attempt.
+</Callout>
+
+</Sub>
+
+<Sub n="8.2" title="Where to look">
+
+```sql
+-- Long-running and idle-in-transaction sessions, oldest snapshot first
+select pid, state, xact_start, age(backend_xmin) as xmin_age, left(query, 60)
+from pg_stat_activity where backend_xmin is not null order by xmin_age desc;
+
+-- Deadlocks and serialization conflicts, per database
+select datname, deadlocks, conflicts from pg_stat_database;
+
+-- Who is waiting on whom right now
+select pid, pg_blocking_pids(pid), wait_event_type, left(query, 60)
+from pg_stat_activity where cardinality(pg_blocking_pids(pid)) > 0;
+
+-- SIREAD locks held by serializable transactions
+select locktype, relation::regclass, page, tuple from pg_locks where mode = 'SIReadLock';
+```
+
+Set `log_lock_waits = on` so waits longer than `deadlock_timeout` are logged
+with both queries.
+
+</Sub>
+
+<Sub n="8.3" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Counters or balances drift low under load | Lost update at read committed | Atomic `UPDATE … SET n = n + 1`, or `FOR UPDATE` |
+| An invariant across rows breaks rarely | Write skew under snapshot isolation | Constraint, lock the rows read, or serializable with retries |
+| Sporadic `40001` errors reach users | Repeatable read or serializable without a retry loop | Retry the whole transaction with backoff |
+| `deadlock detected` in logs | Transactions lock rows in different orders | Lock in a consistent order (sort IDs); keep transactions short |
+| Tables and indexes bloat; vacuum reports "dead but not yet removable" | An old snapshot: idle in transaction, long report, abandoned replication slot | Find `backend_xmin`; `idle_in_transaction_session_timeout`; move reports to a replica |
+| Many `40001` under serializable on low-contention data | Coarse SIREAD locks from sequential scans | Index the filtered columns; declare read-only transactions `READ ONLY` |
+
+</Sub>
+
+<SectionHeading n="09" id="summary">Summary</SectionHeading>
+
+1. **Isolation is the ACID letter with options.** Atomicity and durability
+   come from the WAL; isolation depends on the level you ask for.
+2. **Level names don't carry across databases.** MySQL's repeatable read
+   allows lost updates, Postgres's doesn't, and Oracle's serializable allows
+   write skew.
+3. **MVCC means readers and writers don't block each other.** Writers still
+   lock rows and wait for each other.
+4. **A Postgres snapshot is `xmin:xmax:xip`.** Each row version's `xmin` and
+   `xmax` are compared against it, with `pg_xact` for commit status.
+5. **Read committed takes a snapshot per statement, repeatable read per
+   transaction.** That's the whole difference between them in Postgres.
+6. **Old snapshots stop vacuum.** One open repeatable-read transaction kept
+   1,000 dead rows from being removed.
+7. **Read committed loses updates done in application code.** Use atomic
+   `UPDATE`s or `FOR UPDATE`.
+8. **Snapshot isolation allows write skew.** Two transactions writing
+   different rows can break an invariant together; only serializable, a
+   constraint or explicit locking stops it.
+9. **SSI tracks reads with non-blocking SIREAD locks** and aborts on two
+   consecutive rw-conflicts, with some false positives.
+10. **Serializable's real cost is retries on hot rows**, which repeatable read
+    pays too: roughly a quarter of transactions retried on a single hot row.
+
+<SectionHeading n="10" id="build">Build this</SectionHeading>
+
+**Your own Hermitage.**
+
+- Write a harness that opens two or three connections and runs a scripted
+  interleaving of statements, recording each result and error code.
+- Encode seven tests: dirty write, dirty read, non-repeatable read, phantom,
+  lost update, read skew and write skew. Run each at every level Postgres
+  offers and check your table against section 2.2.
+- If you can, run the same tests against MySQL. The lost-update result at
+  repeatable read is the one that surprises people.
+- Add a contention sweep: pgbench's TPC-B-like script at scale 1, 10 and 100
+  with 8 clients, at each level, recording tps and retry rate. Plot retry rate
+  against scale.
+
+<SectionHeading n="11" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What's the difference between read committed and repeatable read in Postgres?">
+When the snapshot is taken. Read committed takes a new one for every
+statement, so two queries in one transaction can see different data.
+Repeatable read takes one at the first statement and uses it for the whole
+transaction, and a write to a row changed since then fails with a
+serialization error instead of overwriting it.
+</QA>
+
+<QA level="beginner" q="What is a lost update, and how do you prevent it?">
+Two transactions read the same value, each computes a new one, and the second
+write overwrites the first. Prevent it with an atomic `UPDATE … SET n = n +
+1`, a `SELECT … FOR UPDATE` before computing, an optimistic version column in
+the `WHERE`, or by running at repeatable read or serializable with retries.
+</QA>
+
+<QA level="intermediate" q="What is write skew? Give an example snapshot isolation allows.">
+Two transactions read overlapping data, make decisions based on it, and write
+different rows, so there's no write-write conflict to detect. Two on-call
+doctors each see the other on call and both go off: at Postgres repeatable
+read both commit and nobody is on call. Serializable, a constraint or locking
+the rows read prevents it.
+</QA>
+
+<QA level="intermediate" q="How does Postgres decide whether a row version is visible?">
+It compares the version's `xmin` (creator) and `xmax` (deleter) against the
+snapshot: XIDs below the snapshot's `xmin` are settled, XIDs at or above its
+`xmax` or listed in `xip` are treated as still running. A version is visible
+if its creator committed before the snapshot and its deleter, if any, didn't.
+Commit status comes from `pg_xact`, cached on the tuple as hint bits.
+</QA>
+
+<QA level="intermediate" q="Why can a long-running transaction hurt a database it's only reading from?">
+Its snapshot may still need old row versions, so vacuum can't remove any
+version newer than the oldest running snapshot, in any table. Dead tuples
+pile up, tables and indexes bloat, and scans slow down. The worst case is a
+session idle in transaction for hours.
+</QA>
+
+<QA level="deep" q="How does serializable snapshot isolation work, and why does it have false positives?">
+Each serializable transaction runs on a snapshot and records its reads as
+non-blocking SIREAD locks. When a write hits a row another concurrent
+transaction read, that's a rw-conflict edge. Every SI anomaly contains two
+consecutive rw-edges (Tin → Tpivot → Tout), so SSI aborts when it sees that
+structure, without proving a full cycle exists. That, and SIREAD locks coarsened
+to pages or whole relations, causes aborts where no anomaly would have
+happened.
+</QA>
+
+<QA level="deep" q="Your team wants to switch Postgres to serializable everywhere. What do you check first?">
+That every transaction runs inside a retry loop that re-executes it from the
+first read, with side effects outside the loop. Then hot rows: serializable
+and repeatable read both abort on write-write conflicts, which on a single
+hot row meant roughly a quarter of transactions retrying in a pgbench test.
+Then indexes on filtered columns, so SIREAD locks stay at tuple level, and
+marking read-only transactions `READ ONLY` (or `DEFERRABLE` for long reports).
+</QA>
+
+<SectionHeading n="12" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="A snapshot reads 2051525:2051528:2051525. Is a row with xmin 2051526 visible?">
+    Yes, if 2051526 committed. It's between xmin and xmax and not in the
+    in-progress list, so the snapshot counts it as finished.
+  </Q>
+  <Q q="Which Postgres level first prevents lost updates?">
+    Repeatable read. The second writer gets a 40001 serialization failure.
+  </Q>
+  <Q q="Two transactions write different rows. Can snapshot isolation abort either?">
+    No. Its only conflict rule is two writes to the same row. That's why write
+    skew gets through.
+  </Q>
+  <Q q="Why did a count(*) take a relation-level SIREAD lock?">
+    It used a sequential scan, which reads the whole relation, so any insert
+    or update to the table conflicts with it.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Berenson et al., A Critique of ANSI SQL Isolation Levels (1995)">
+    Why the standard's definitions are ambiguous, and where snapshot isolation
+    and write skew come from. Short and still the best starting point.
+  </WildCard>
+  <WildCard name="Adya, Weak Consistency (PhD thesis, MIT 1999)">
+    The G0, G1 and G2 definitions that Jepsen, Hermitage and most modern
+    papers use.
+  </WildCard>
+  <WildCard name="Cahill, Röhm & Fekete, Serializable Isolation for Snapshot Databases (SIGMOD 2008)">
+    The SSI algorithm: dangerous structures and why checking for them is
+    enough.
+  </WildCard>
+  <WildCard name="Ports & Grittner, Serializable Snapshot Isolation in PostgreSQL (VLDB 2012)">
+    How SSI was built into a production database: the predicate lock manager,
+    read-only optimisations, bounded memory and benchmarks.
+  </WildCard>
+  <WildCard name="Hermitage (Martin Kleppmann)">
+    Scripted tests of each anomaly against Postgres, MySQL, Oracle, SQL Server
+    and others, with the table of what each level really provides.
+  </WildCard>
+  <WildCard name="Postgres docs: Transaction Isolation (chapter 13.2)">
+    The official statement of what each level does, including the retry
+    advice and the serializable caveats.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="13" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Storage Engine Internals">
+    Where row versions live on the page, and how the commit record in the WAL
+    provides atomicity. [Chapter 18](/topics/18-storage-engines).
+  </WildCard>
+  <WildCard name="Locking Primitives, End to End">
+    The mutexes and wait queues under row locks, and deadlock in general.
+    [Chapter 13](/topics/13-locks).
+  </WildCard>
+  <WildCard name="Contention, Queueing & Tail Latency">
+    Why one hot row caps throughput, and what retries do to the tail.
+    [Chapter 16](/topics/16-contention-tail-latency).
+  </WildCard>
+  <WildCard name="Query Planning & Execution">
+    Why the same query takes a tuple-level or relation-level SIREAD lock:
+    the planner's choice of index or sequential scan.
+    [Chapter 20](/topics/20-query-execution).
+  </WildCard>
+</CardGrid>

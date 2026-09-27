@@ -1,0 +1,1137 @@
+---
+title: IAM & the Security Boundary
+dek: "Every AWS API call is judged against a stack of policies before anything happens. You'll learn the grammar those policies are written in, the order AWS evaluates them, how STS hands out temporary identities, and the two classic ways the boundary fails: stolen instance credentials and the confused deputy."
+readingTime: "~32 min"
+level: "Intermediate"
+versions: "AWS IAM, STS and Organizations docs as of September 2026 · Cedar source at v4.12.0 · cedarpy 4.12.1 measured on linuxkit 6.10.14 aarch64"
+prereqs: "HTTP APIs, JSON, AWS accounts and EC2 basics"
+updated: "2026-09-27"
+---
+
+In the cloud the network isn't really your security boundary. A VPC decides
+which packets reach an instance, but the valuable things (the S3 bucket, the
+KMS key, the database snapshot) sit behind a public HTTPS API. Anyone on the
+internet can send that API a request. What stops them is a signature and a
+policy check.
+
+That check is IAM. It runs on every call, it defaults to "no", and it's where
+many well-known cloud breaches turn out to have happened: a role that could
+do more than anyone meant, credentials that left the machine they were issued
+to, or a trusted service tricked into acting for the wrong customer.
+
+This chapter builds IAM up from one request. It covers the policy language,
+the evaluation order, what changes when a request crosses accounts, how STS
+issues temporary identities, how instance metadata leaks them, and how to
+debug an `AccessDenied` without guessing.
+
+<Callout label="How this chapter was built" kind="note">
+I don't have an AWS account to break for this chapter, so the AWS behaviour here
+comes from AWS's own documentation, the court filings in the Capital One case,
+and the papers linked in each section. Code I did run is labelled: a small
+Python model of the documented evaluation order, and timings of Cedar, AWS's
+open-source policy engine, on the shared lab container.
+</Callout>
+
+<SectionHeading n="01" id="the-request">What IAM decides, on every request</SectionHeading>
+
+Every call to an AWS API, from the console, the CLI or an SDK, is an HTTPS
+request. Before the service does any work, it has to answer two questions:
+who sent this, and are they allowed to do it?
+
+<Sub n="1.1" title="Authentication, then authorization">
+
+First comes **authentication**. SDKs sign each request with
+[Signature Version 4](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv.html):
+an HMAC over the method, path, headers and body, keyed from your secret access
+key. AWS recomputes the signature on its side and compares.
+
+<Why>Why sign instead of sending a password?</Why>
+
+Because the secret never crosses the network. What's signed covers the request
+and a timestamp, so a captured request can't be altered, and AWS rejects it
+once the timestamp is too old. Only the access key ID travels in the clear; the
+secret stays with you.
+
+Second comes **authorization**, and that's what the rest of this
+chapter is about. AWS gathers everything it knows about the request into a
+*request context* and checks it against every policy that applies.
+
+| Part of the context | Example | Where it comes from |
+|---|---|---|
+| **Principal** | `arn:aws:sts::111122223333:assumed-role/app/i-0abc` | The credentials that signed the request |
+| **Action** | `s3:GetObject` | The API operation being called |
+| **Resource** | `arn:aws:s3:::logs/app.log` | The thing the operation touches |
+| **Conditions** | `aws:SourceIp`, `aws:PrincipalOrgID`, `aws:MultiFactorAuthPresent` | The request, the caller's session and the resource's tags |
+
+</Sub>
+
+<Sub n="1.2" title="Principals and their names">
+
+A **principal** is whatever signed the request. There are only a few kinds,
+and each has its own ARN shape
+([IAM identifiers](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_identifiers.html)):
+
+| Principal | ARN | Credentials |
+|---|---|---|
+| Root user | `arn:aws:iam::123456789012:root` | Password, and access keys if someone made them |
+| IAM user | `arn:aws:iam::123456789012:user/John` | Long-lived keys, IDs starting `AKIA` |
+| IAM role | `arn:aws:iam::123456789012:role/S3Access` | None of its own. It has to be assumed |
+| Role session | `arn:aws:sts::123456789012:assumed-role/Accounting-Role/Mary` | Temporary keys, IDs starting `ASIA`, plus a session token |
+| Service principal | `cloudtrail.amazonaws.com` | Held by AWS, used when a service acts for you |
+
+<Why>Why does the role session have a different ARN from the role?</Why>
+
+Because a role is a template, not an actor. Nobody signs requests *as* a role.
+They assume it and get a session, and the session's ARN carries a session name
+you choose. Two engineers assuming the same role show up in CloudTrail as two
+different principals.
+
+That session name matters later. Section 3 shows that a policy granting the
+role ARN and a policy granting the session ARN are evaluated differently.
+
+<Callout label="Design implication">
+Long-lived `AKIA` keys are the credential you most want to avoid. They work from
+anywhere, forever, until someone deletes them. Humans should sign in through
+federation or IAM Identity Center, and code should run as a role, so every
+credential in play expires on its own.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="02" id="policy-grammar">The policy document</SectionHeading>
+
+IAM permissions are written as JSON **policies**. Every policy type uses the
+same grammar, so it's worth learning once, properly.
+
+<Sub n="2.1" title="A statement">
+
+A policy is a list of statements. Each statement says: for these actions, on
+these resources, for these principals, under these conditions, the effect is
+Allow or Deny.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadAppLogs",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::logs", "arn:aws:s3:::logs/app/*"],
+      "Condition": {
+        "StringEquals": { "aws:PrincipalOrgID": "o-exampleorgid" },
+        "Bool": { "aws:SecureTransport": "true" }
+      }
+    }
+  ]
+}
+```
+
+| Element | What it matches | Notes |
+|---|---|---|
+| `Effect` | `Allow` or `Deny` | There's no third option |
+| `Action` | `service:Operation`, wildcards allowed | `s3:Get*` matches every S3 read, including ones added next year |
+| `Resource` | ARNs, wildcards allowed | Bucket-level and object-level actions need different ARNs |
+| `Principal` | Who the statement applies to | Only in resource-based policies. Identity policies apply to whoever they're attached to |
+| `Condition` | Operators over context keys | Optional. Omit it and the statement always applies |
+
+`Version` isn't a date you pick. `2012-10-17` is the current policy language
+version, and you need it for policy variables like `${aws:username}` to work.
+
+</Sub>
+
+<Sub n="2.2" title="How conditions combine">
+
+Conditions have their own small logic, documented under
+[condition evaluation](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-logic-multiple-context-keys-or-values.html):
+
+| Inside a `Condition` block | Logic |
+|---|---|
+| Two different operators, or two different keys | AND: all must match |
+| Several values listed for one key | OR: any one may match |
+| Key missing from the request | The condition fails, unless you used an `...IfExists` operator |
+
+<Why>Why does a missing key matter so much?</Why>
+
+Because keys are only present when they make sense. `aws:SourceIp` isn't in
+the context when the request comes through a VPC endpoint, and
+`aws:MultiFactorAuthPresent` is only there for temporary credentials, never for
+long-lived access keys
+([global condition keys](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html)). A Deny that tests a key which is
+sometimes absent will sometimes quietly not fire.
+
+Key *names* are also case-insensitive. The
+[troubleshooting guide](https://docs.aws.amazon.com/IAM/latest/UserGuide/troubleshoot_access-denied.html)
+warns that a condition on `foo` matches `Foo` and `FOO`, so a request carrying
+two tags whose names differ only by case can be denied unexpectedly.
+
+</Sub>
+
+<Sub n="2.3" title="Three sharp edges">
+
+A few elements look harmless and aren't.
+
+- **`NotAction` with `Allow`.** It matches everything *except* the listed
+  actions. AWS's own example, `"NotAction": "iam:*"` on `"Resource": "*"`,
+  allows every action in every other service. AWS's
+  [warning](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_notaction.html)
+  is that it "could result in granting users more permissions than you intended."
+- **Incomplete ARNs.** In an identity policy, AWS fills missing ARN fields with
+  wildcards. `arn:aws:sqs` becomes `arn:aws:sqs:*:*:*`: every queue, in every
+  region, in every account.
+- **Friendly names get reused.** If a policy names `user/John` and John leaves,
+  the next John inherits his access. Resource policies can pin the unique ID
+  (`AIDA...`) instead.
+
+<Callout label="Common mistake" kind="warn">
+Writing `"Action": "s3:*"` because the exact list was tedious. Wildcards grow:
+every new S3 operation AWS ships is granted automatically, including ones that
+change bucket policy or replication. List the actions the code calls, or
+generate the list from CloudTrail (section 7).
+</Callout>
+
+</Sub>
+
+<Sub n="2.4" title="Seven places a policy can live">
+
+One grammar, many attachment points. Only two of them can grant access; the
+rest can only take it away.
+
+| Policy type | Attached to | Grants? | What it's for |
+|---|---|---|---|
+| **Identity-based** | A user, group or role | Yes | What this principal may do |
+| **Resource-based** | A bucket, key, queue, role (as its *trust policy*) | Yes | Who may touch this resource, including other accounts |
+| **Permissions boundary** | A user or role | No, only limits | The most an identity may ever do, whatever its policies say |
+| **Session policy** | One STS session, passed at `AssumeRole` | No, only limits | Narrowing a role for one task |
+| **SCP** | An account or OU in AWS Organizations | No, only limits | The most any principal in those accounts may do |
+| **RCP** | An account or OU in AWS Organizations | No, only limits | The most anyone, from anywhere, may do to resources in those accounts |
+| **VPC endpoint policy** | A VPC endpoint | No, only limits | What may pass through this private path |
+
+<Why>Why have so many limiters?</Why>
+
+Because they're owned by different people. Whoever writes a role's identity
+policy isn't the security team writing the SCP, and neither is the team that
+owns the bucket. Each limiter lets one owner cap everyone else without editing
+their policies.
+
+<Callout label="Design implication">
+An SCP that says `Allow *` gives nobody anything. SCPs and RCPs are filters: a
+request still needs an identity or resource policy that grants it. The
+[Organizations docs](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html)
+put it bluntly: "No permissions are granted by an SCP."
+</Callout>
+
+</Sub>
+
+<SectionHeading n="03" id="evaluation">The evaluation order</SectionHeading>
+
+With several policy types in play, the order of evaluation is what decides the
+answer. It's specified in AWS's
+[enforcement logic](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic_policy-eval-denyallow.html),
+and it's short enough to memorise.
+
+<Sub n="3.1" title="Two rules that override everything">
+
+Everything rests on two rules:
+
+1. **Default deny.** Every request starts denied. AWS's only listed exception
+   is the account's root user.
+2. **Explicit deny wins.** One matching `Deny` statement, in any policy of any
+   type, ends the evaluation with Deny. No number of Allows can outvote it.
+
+AWS names the two outcomes differently. An **implicit deny** means nothing
+allowed the request. An **explicit deny** means something forbade it. The
+distinction shows up in error messages, and it tells you which kind of fix you
+need: add an Allow somewhere, or find and remove a Deny.
+
+</Sub>
+
+<Sub n="3.2" title="Step by step">
+
+Here's the order for a request within one account. Step through it:
+
+<Steps
+  title="One request through the policy stack"
+  lanes={[
+    { t: "Deny scan", s: "every policy", icon: "⛔" },
+    { t: "RCPs", s: "resource's org", icon: "▣" },
+    { t: "SCPs", s: "principal's org", icon: "▤" },
+    { t: "Resource policy", s: "on the target", icon: "⌗" },
+    { t: "Identity policy", s: "on the caller", icon: "◉" },
+    { t: "Boundary · session", s: "caps", icon: "⊓" },
+  ]}
+  steps={[
+    [0, "AWS collects every policy that applies: SCPs, RCPs, the resource policy, identity policies, the boundary and the session policy. It looks for **any `Deny` that matches**. One match and the answer is **Deny**, final."],
+    [1, "If the resource's account has **RCPs**, one of them must allow the action. When RCPs are on, `RCPFullAWSAccess` is attached everywhere and can't be detached, so this only bites if you've added narrower ones."],
+    [2, "If the caller's account has **SCPs**, every level from the root down to the account must allow the action. A missing Allow at any level is an implicit **Deny**."],
+    [3, "The **resource policy** gets a look. If it names the caller's IAM user or **session ARN** directly, that alone is enough: the answer is **Allow**."],
+    [4, "Otherwise some **identity-based policy** on the caller must allow the action, or a resource policy must name the caller's role. If neither does, it's an implicit **Deny**."],
+    [5, "Last, the **permissions boundary** and the **session policy**, if present, must each allow the action too. Pass both and the request is **Allowed**."],
+  ]}
+/>
+
+</Sub>
+
+<Sub n="3.3" title="Union for grants, intersection for caps">
+
+Behind those steps is a simple pattern:
+
+| Combination | Result | From the docs |
+|---|---|---|
+| Identity policy + resource policy, same account | **Union**: either can grant | "If an action is allowed by an identity-based policy, a resource-based policy, or both, then AWS allows the action." |
+| Identity policy + permissions boundary | **Intersection**: both must allow | "the resulting permissions are the intersection of the two categories" |
+| Identity policy + SCP + RCP | **Intersection** | "an action must be allowed by all three policy types" |
+| Role policy + session policy | **Intersection** | A session policy can't "grant more permissions than those allowed by the identity-based policy of the role" |
+
+<Why>So can a bucket policy bypass a permissions boundary?</Why>
+
+Sometimes, and this is the subtle part. It depends on *which ARN* the bucket
+policy names.
+
+| Resource policy names... | Limited by an implicit deny in the boundary or session policy? |
+|---|---|
+| An IAM user ARN | No |
+| A role **session** ARN (`assumed-role/app/i-0abc`) | No: "Permissions granted directly to a session are not limited" |
+| The **role** ARN (`role/app`) | **Yes** |
+| Anyone, with a condition on `aws:PrincipalArn` and `Principal: "*"` | No, unless an identity policy has an explicit deny |
+
+An explicit deny still beats all of them. These exceptions only concern
+*implicit* denies.
+
+</Sub>
+
+<Sub n="3.4" title="A model you can run">
+
+AWS's documented order fits in about thirty lines of Python. This isn't AWS's
+code; it's a model of the published steps, useful for checking your own
+reading of them. Wildcards are matched with `fnmatch`, and conditions are left
+out.
+
+<TryIt what="A model of the single-account evaluation order" lang="python" toolchain="Python 3.12.3, shared 4-CPU container, linuxkit 6.10">
+```python
+def decide(req, pol):
+    allp = [s for k in ("rcp", "scp", "resource", "identity", "boundary", "session")
+            for s in pol.get(k, [])]
+    if matches(allp, req, "Deny"):                       return "Deny (explicit)"
+    for k in ("rcp", "scp"):
+        if k in pol and not matches(pol[k], req, "Allow"): return f"Deny (no {k} allows)"
+    # a resource policy naming the user or the SESSION ARN is enough on its own
+    if matches(pol.get("resource", []), req, "Allow") and req["kind"] in ("user", "session-arn"):
+        return "Allow (resource policy)"
+    rbp = matches(pol.get("resource", []), req, "Allow")  # named the role ARN
+    if not rbp and not matches(pol.get("identity", []), req, "Allow"):
+        return "Deny (no identity-based policy allows)"
+    if "boundary" in pol and not matches(pol["boundary"], req, "Allow"):
+        return "Deny (no permissions boundary allows)"
+    if "session" in pol and not matches(pol["session"], req, "Allow"):
+        return "Deny (no session policy allows)"
+    return "Allow"
+```
+
+Six cases, all for `s3:GetObject` on `arn:aws:s3:::logs/app.log` by a role
+session:
+
+<Output>
+```text
+1 identity allows                      -> Allow
+2 + SCP denies s3:*                    -> Deny (explicit)
+3 bucket policy names role, no id      -> Allow
+4 ...plus a boundary without s3        -> Deny (no permissions boundary allows)
+5 bucket policy names SESSION, same    -> Allow (resource policy)
+6 identity allows, session policy      -> Deny (no session policy allows)
+```
+
+Cases 4 and 5 differ only in the ARN the bucket policy names, and they get
+opposite answers. That's the table in section 3.3, executed.
+</Output>
+</TryIt>
+
+<Predict
+  q="A role has one identity policy: Allow s3:GetObject on arn:aws:s3:::logs/*. Someone calls AssumeRole with a session policy that allows only s3:ListBucket. Can the session read logs/app.log?"
+  options={[
+    "Yes: the identity policy allows it",
+    "Yes: session policies can only add permissions",
+    "No: the session gets the intersection, and GetObject isn't in both",
+    "No: session policies replace the role's identity policy entirely",
+  ]}
+  answer={2}
+>
+A session's permissions are the intersection of the role's identity policy
+and the session policy. `s3:GetObject` is allowed by one and not the other, so
+it's an implicit deny, and the error will say "because no session policy
+allows the s3:GetObject action". It's case 6 above. Session policies are how
+a broker hands out a narrowed copy of a broad role.
+</Predict>
+
+</Sub>
+
+<Sub n="3.5" title="The same rule in an open-source engine">
+
+AWS's own evaluator isn't public. [Cedar](https://github.com/cedar-policy/cedar)
+is: AWS's open-source policy language, used by Amazon Verified Permissions and
+described in an [OOPSLA 2024 paper](https://arxiv.org/abs/2403.04651). It has
+`permit` and `forbid` instead of Allow and Deny, and it lands on the same two
+rules:
+
+<SourceRead
+  file="cedar-policy-core/src/authorizer/partial_response.rs"
+  repo="cedar-policy/cedar"
+  tag="v4.12.0"
+  href="https://github.com/cedar-policy/cedar/blob/v4.12.0/cedar-policy-core/src/authorizer/partial_response.rs#L475"
+>
+```rust
+impl From<PartialResponse> for Response {
+    fn from(p: PartialResponse) -> Self {
+        let decision = if !p.satisfied_permits.is_empty() && p.satisfied_forbids.is_empty() {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        };
+        /* ... collect the determining policy IDs and any errors ... */
+    }
+}
+```
+</SourceRead>
+
+Allow needs at least one satisfied `permit` and zero satisfied `forbid`s.
+Everything else, including "no policy matched at all", is Deny. That's default
+deny and deny-wins in six lines.
+
+<Why>What does evaluation cost as policies pile up?</Why>
+
+Look at the loop that fills those lists, in
+[`authorizer.rs`](https://github.com/cedar-policy/cedar/blob/v4.12.0/cedar-policy-core/src/authorizer.rs#L109).
+It's `for p in pset.policies()`: every policy in the set is evaluated. I timed it
+through the `cedarpy` bindings with N team-scoped `permit`s plus one `forbid`,
+2,000 decisions per run, five runs each:
+
+<Compare
+  cols={["Policies in the set", "Engine time per decision (median)", "Per policy"]}
+  rows={[
+    ["11", "6 µs", "0.55 µs"],
+    ["101", "48 µs", "0.48 µs"],
+    ["1,001", "527 µs", "0.53 µs"],
+    ["10,001", "7.3 ms", "0.73 µs"],
+  ]}
+/>
+
+That's the engine's own `authz_duration_micros` metric, measured on the shared
+4-CPU container (linuxkit 6.10, cedarpy 4.12.1). Cost is linear in policy
+count, roughly half a microsecond each. That's probably why the authorizer's doc comment
+talks about deciding "with respect to the given `Slice`": callers are expected
+to pass only the policies that could apply to this request, not the whole
+store.
+
+</Sub>
+
+<SectionHeading n="04" id="cross-account">Crossing an account boundary</SectionHeading>
+
+An AWS account is the hardest boundary IAM has. Nothing in one account can
+touch another unless *both* sides say so.
+
+<Sub n="4.1" title="Two evaluations, both must allow">
+
+For a cross-account request, AWS runs the evaluation twice, per the
+[cross-account logic](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic-cross-account.html):
+once in the caller's account (the *trusted* account) and once in the
+resource's account (the *trusting* account). "The request is allowed only if
+both evaluations return a decision of Allow."
+
+Usually you cross by assuming a role in the other account. Step through it:
+
+<StepSequence
+  title="A service in account A reads a bucket in account B"
+  actors={["App (account A)", "STS", "Role in B", "S3 (account B)"]}
+  messages={[
+    { from: 0, to: 1, label: "AssumeRole(B:role/reader)", note: "The app calls STS. **Account A's** evaluation runs first: its identity policy must allow `sts:AssumeRole` on that role ARN, and A's SCPs must allow it too." },
+    { from: 1, to: 2, label: "check trust policy", note: "STS reads the role's **trust policy**, a resource policy on the role. It must name account A, or the app's role, as a principal allowed to `sts:AssumeRole`." },
+    { from: 1, to: 0, label: "ASIA… + token, 1 h", note: "Both sides allowed it. STS returns **temporary credentials** for a session of the role in B." },
+    { from: 0, to: 3, label: "GetObject (signed as B's role)", note: "The app now signs as `assumed-role/reader/...` in **account B**. This is an ordinary same-account request, judged by B's policies." },
+    { from: 3, to: 0, label: "200 OK", note: "B's identity policy on `reader`, B's SCPs, B's RCPs and the bucket policy all allowed it." },
+  ]}
+/>
+
+<Why>Why not just put account A in the bucket policy?</Why>
+
+You can. A bucket policy naming A's role works without any role in B, as long
+as A's identity policy also allows the S3 call. What changes is where control
+lives. With a role in B, account B owns and audits exactly what A can do. With
+a bucket policy, it's split across two accounts' policies, and both must agree.
+
+</Sub>
+
+<Sub n="4.2" title="Which organization policies apply where">
+
+SCPs follow the **principal**. RCPs follow the **resource**. That's the whole
+reason RCPs were added: an SCP can't touch a caller from outside your
+organization.
+
+| Policy | Applies to | Doesn't apply to |
+|---|---|---|
+| **SCP** | Principals in member accounts, including their root users | The management account; service-linked roles; principals from other organizations |
+| **RCP** | Resources in member accounts, whoever the caller is | The management account; calls by service-linked roles; AWS managed KMS keys |
+
+Organizations' docs give the example directly: a bucket in account A that
+grants access to account B outside the org. A's SCP "doesn't apply to those
+outside users". A's RCP "applies to the S3 bucket in Account A even when
+accessed by users from Account B."
+
+<Callout label="Common mistake" kind="warn">
+Running workloads in the Organizations management account. SCPs and RCPs don't
+affect it at all, so every guardrail you've written stops at its edge. Keep the
+management account empty except for billing and org administration.
+</Callout>
+
+</Sub>
+
+<Sub n="4.3" title="Two resources that insist on being named">
+
+For most resources in the same account, an Allow in *either* the identity
+policy or the resource policy is enough. Two exceptions, called out in the
+evaluation docs:
+
+| Resource | Rule |
+|---|---|
+| **IAM role trust policies** | Must explicitly allow the principal. An identity policy allowing `sts:AssumeRole` isn't enough by itself |
+| **KMS key policies** | Must explicitly allow access. If the key policy doesn't delegate to IAM, no identity policy can grant use of the key |
+
+That KMS rule is probably why "I'm an admin and I still can't decrypt" is
+such a common ticket. A key's policy is the root of trust for the key, not your identity
+policy.
+
+</Sub>
+
+<SectionHeading n="05" id="sts">STS and temporary credentials</SectionHeading>
+
+Roles don't have keys. AWS's **Security Token Service** mints short-lived ones
+on demand, and nearly every modern AWS credential, from Lambda's to a pod's to
+your SSO session's, comes from it.
+
+<Sub n="5.1" title="What AssumeRole returns">
+
+[`AssumeRole`](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html)
+returns three strings and a deadline:
+
+| Field | Looks like | Notes |
+|---|---|---|
+| `AccessKeyId` | `ASIAIOSFODNN7EXAMPLE` | `ASIA` marks a temporary key |
+| `SecretAccessKey` | 40 characters | Used to sign, never sent |
+| `SessionToken` | A long opaque blob | Sent with every request. AWS says to make "no assumptions about the maximum size" |
+| `Expiration` | A timestamp | After this, every request fails |
+
+How long that lasts:
+
+| Setting | Value |
+|---|---|
+| `DurationSeconds` range | 900 s (15 minutes) to the role's maximum |
+| Role maximum session duration | 1 to 12 hours |
+| Default | 3,600 s |
+| Role chaining (assuming a role *from* a role session) | 1 hour, hard cap. Asking for more "fails" |
+
+<Why>Why does role chaining cap at an hour?</Why>
+
+Because otherwise a session could renew itself forever. A role session that
+assumes another role, which assumes the first back, would never need the
+original credentials again. A one-hour cap means the chain has to return to a
+real identity regularly.
+
+</Sub>
+
+<Sub n="5.2" title="Narrowing a session">
+
+`AssumeRole` takes optional parameters that shape the session:
+
+| Parameter | Limit | Use |
+|---|---|---|
+| `Policy` + `PolicyArns` (session policies) | Up to 10 managed ARNs; 2,048 characters of plaintext across all of them | Intersect the role down for one job |
+| `Tags` (session tags) | Up to 50 | Attribute-based access, `aws:PrincipalTag/team` |
+| `TransitiveTagKeys` | Up to 50 | Tags that survive role chaining |
+| `SourceIdentity` | 2 to 64 characters, can't start with `aws:` | Who's really behind a chain, in CloudTrail |
+| `ExternalId` | 2 to 1,224 characters | Anti-confused-deputy check (section 8) |
+
+Session policies and tags ride inside the session token. Push too many in and
+STS rejects the call with `PackedPolicyTooLarge`, even when each individual
+limit is met. Watch `SessionTokenUtilization` in the response.
+
+</Sub>
+
+<Sub n="5.3" title="Pods: IRSA and EKS Pod Identity">
+
+A Kubernetes pod needs AWS credentials that belong to *it*, not to the node.
+EKS has two mechanisms, and both end in a role session.
+
+| | IRSA (IAM Roles for Service Accounts) | EKS Pod Identity |
+|---|---|---|
+| **What the pod gets** | A projected service-account token (a JWT) | A projected token for audience `pods.eks.amazonaws.com` |
+| **Who calls STS** | The SDK in your container, via `AssumeRoleWithWebIdentity` | The node's Pod Identity Agent, via `AssumeRoleForPodIdentity` |
+| **How the SDK finds it** | `AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE` | `AWS_CONTAINER_CREDENTIALS_FULL_URI` = `http://169.254.170.23/v1/credentials` |
+| **Trust policy names** | The cluster's OIDC provider, with a `:sub` condition on `system:serviceaccount:<ns>:<sa>` | The `pods.eks.amazonaws.com` service |
+| **Token rotation** | Kubelet rotates at 80% of TTL or after 24 hours | Token expires after 24 hours (86,400 s) |
+
+Sources: EKS's [best practices guide](https://docs.aws.amazon.com/eks/latest/best-practices/identity-and-access-management.html)
+and [how Pod Identity works](https://docs.aws.amazon.com/eks/latest/userguide/pod-id-how-it-works.html).
+
+<Why>Why does the IRSA trust policy need that sub condition?</Why>
+
+Because without it, the trust policy trusts the whole cluster's OIDC issuer.
+Any service account in any namespace could present its token and assume the
+role. Adding the `:sub` condition pins the role to one namespace and one service
+account.
+
+</Sub>
+
+<Sub n="5.4" title="The credential chain decides which identity you are">
+
+SDKs look for credentials in a fixed order, the
+[credential provider chain](https://docs.aws.amazon.com/sdkref/latest/guide/standardized-credentials.html):
+environment variables and config files, web identity, container credentials,
+and finally the EC2 instance metadata service. Whichever works first wins.
+
+<Callout label="Common mistake" kind="warn">
+Setting up Pod Identity and assuming it's in use. EKS's docs warn that if
+"credentials that are earlier in the chain" exist, such as an old
+`AWS_ACCESS_KEY_ID` in the environment, "those credentials will continue to be
+used". Run `aws sts get-caller-identity` from inside the pod and read the ARN it
+prints.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="06" id="imds">Instance metadata: credentials over HTTP</SectionHeading>
+
+An EC2 instance gets its role credentials from a web server only it can reach:
+the **Instance Metadata Service** at `169.254.169.254`. That design is
+convenient, and it's probably the most attacked piece of AWS IAM.
+
+<Sub n="6.1" title="How an instance gets its credentials">
+
+You attach a role to an instance through an *instance profile*. EC2 assumes the
+role for you, and code on the instance fetches the session from
+`http://169.254.169.254/latest/meta-data/iam/security-credentials/<role-name>`.
+
+<Why>Why is an HTTP endpoint for credentials dangerous?</Why>
+
+Because plenty of software makes HTTP requests on someone else's behalf:
+proxies, webhooks, URL previewers, PDF renderers, firewalls. If an attacker can
+steer one of them at `169.254.169.254`, the instance fetches its own
+credentials and hands them over. That's **server-side request forgery**, SSRF.
+In the original IMDSv1, a plain `GET` was all it took.
+
+</Sub>
+
+<Sub n="6.2" title="Capital One, 2019">
+
+Capital One is the best-documented case. Its
+[criminal complaint](https://www.justice.gov/usao-wdwa/united-states-v-paige-thompson)
+(filed July 29, 2019) and the later superseding indictment describe it in
+three commands. Both filings call the provider "the Cloud Computing Company" and
+redact the role's prefix.
+
+<StepSequence
+  title="From a misconfigured firewall to 700 buckets"
+  actors={["Attacker", "WAF on EC2", "Metadata service", "S3"]}
+  messages={[
+    { from: 0, to: 1, label: "crafted request", note: "The attacker scanned for **misconfigured web application firewalls**. The indictment says the misconfiguration \"permitted commands sent from outside the servers to reach and be executed by the servers.\"" },
+    { from: 1, to: 2, label: "fetch role credentials", note: "The first command \"obtained security credentials for an account known as `*****-WAF-Role`\". AWS's CISO later told Senator Wyden that an SSRF attack was used after the attacker got through the firewall." },
+    { from: 2, to: 0, label: "temporary keys", note: "The credentials worked from anywhere. On March 22, 2019 the complaint says they were used **from TOR exit nodes**." },
+    { from: 0, to: 3, label: "ListBuckets", note: "The second command listed buckets. Capital One said the WAF role \"does not, in the ordinary course of business, invoke the List Buckets Command.\" The list had **more than 700** folders or buckets." },
+    { from: 0, to: 3, label: "sync", note: "The third command copied data \"for which the `*****-WAF-Role` account had the requisite permissions\". DOJ puts the total at personal information of **more than 100 million people**." },
+  ]}
+/>
+
+<Why>Which part was an IAM failure?</Why>
+
+Arguably two of the three. Those credentials left the instance and still
+worked from TOR, because nothing bound them to where they were issued. And a firewall's
+role could list and read hundreds of buckets it had no business with. AWS's
+CISO described the permissions to Wyden as "likely broader than intended"
+([The Register](https://www.theregister.com/2019/10/24/wyden_warren_amazon/)).
+
+</Sub>
+
+<Sub n="6.3" title="IMDSv2: four small defenses">
+
+AWS shipped **IMDSv2** in November 2019
+([Colm MacCárthaigh's post](https://aws.amazon.com/blogs/security/defense-in-depth-open-firewalls-reverse-proxies-ssrf-vulnerabilities-ec2-instance-metadata-service/)).
+You `PUT` to get a session token first, then send it as a header:
+
+```shell
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/iam/security-credentials/
+```
+
+Each detail of that exchange blocks a different attack:
+
+| Defense | What it stops |
+|---|---|
+| **A `PUT` is required** to get a token | Most WAFs and reverse proxies won't forward `PUT`; per the post, "the vast majority do not permit HTTP PUT requests" |
+| **A custom header** carries the token | SSRF bugs that let an attacker choose the URL but not the headers |
+| **`PUT` with `X-Forwarded-For` is refused** | Open reverse proxies, which add that header |
+| **Response hop limit of 1** | The token reply's IP TTL is 1, so it dies before leaving the host through a misconfigured NAT, router or VPN |
+
+Token lifetimes run from one second to six hours (21,600 s). Since mid-2024,
+AWS has said newly released instance types use
+[IMDSv2 only](https://aws.amazon.com/blogs/aws/amazon-ec2-instance-metadata-service-imdsv2-by-default/),
+but older types still accept v1 unless you set `HttpTokens=required`.
+
+<Predict
+  q="An EKS node has IMDSv2 required and a hop limit of 1. A pod on its own network namespace (not hostNetwork) and without IRSA or Pod Identity asks the SDK for credentials. What happens?"
+  options={[
+    "It gets the node role's credentials, same as before",
+    "The token request's reply never arrives, so it can't reach IMDS",
+    "IMDS returns 401 Unauthorized",
+    "The pod gets its own credentials automatically",
+  ]}
+  answer={1}
+>
+A pod's traffic crosses one extra hop, the node's virtual interface, so a
+reply with IP TTL 1 is dropped before it reaches the pod. That's the EKS best
+practices guide's recommended way to stop pods inheriting the node's role:
+`--http-tokens required --http-put-response-hop-limit 1`. It also notes that
+eksctl and the official templates set the limit to 2, which lets pods through.
+</Predict>
+
+</Sub>
+
+<Sub n="6.4" title="Binding credentials to the machine">
+
+IMDSv2 makes theft harder. Two newer controls make stolen credentials less
+useful:
+
+| Control | What it does |
+|---|---|
+| `aws:EC2InstanceSourceVPC` and `aws:EC2InstanceSourcePrivateIPv4` | Condition keys present on every request signed with EC2 role credentials. Compare them with `aws:SourceVpc` and `aws:VpcSourceIp` in an SCP, and instance credentials work only from the instance they were issued to ([AWS security blog](https://aws.amazon.com/blogs/security/how-to-use-policies-to-restrict-where-ec2-instance-credentials-can-be-used-from/)) |
+| GuardDuty `InstanceCredentialExfiltration` | Flags instance credentials used from outside AWS (`.OutsideAWS`) or from another AWS account (`.InsideAWS`) |
+
+<Callout label="Design implication">
+Treat any component that fetches URLs for users as a credential-exfiltration
+risk. Require IMDSv2 everywhere, give that component a role scoped to its own
+job, and pin instance credentials to their VPC with an SCP. Any one of the
+three would have broken the Capital One chain.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="07" id="least-privilege">Least privilege in practice</SectionHeading>
+
+"Grant only what's needed" is easy to say. It's hard to do because nobody knows
+what's needed, and AWS has thousands of actions.
+
+<Sub n="7.1" title="Tools that find what's unused">
+
+In practice you start broad in a sandbox, observe what the code
+actually calls, then cut. AWS gives you three sources of evidence:
+
+| Tool | What it tells you | Caveats |
+|---|---|---|
+| **Last accessed information** ([docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_last-accessed.html)) | When each service, and for many services each management action, was last used by a principal | Tracks at least 400 days; recent activity takes up to four hours to appear; `iam:PassRole` isn't tracked; no data-plane events |
+| **Access Analyzer policy generation** | A policy built from the CloudTrail actions a role actually called over a date range | Only as good as the window you give it; rare code paths will probably be missed |
+| **Access Analyzer unused access** | Continuous findings for unused roles, keys, passwords, services and actions | Charged per role and user analyzed |
+
+<Why>Why does Access Analyzer's external-access check never miss?</Why>
+
+Because it doesn't test examples; it reasons about all of them. External
+access findings come from **Zelkova**, which translates policies into SMT
+formulas and asks a solver whether any request from outside the zone of trust
+could be allowed. The
+[FMCAD 2018 paper](https://www.amazon.science/publications/semantic-based-automated-reasoning-for-aws-access-policies-using-smt)
+notes that it "solves a PSPACE-complete problem and is invoked many millions of
+times daily."
+
+</Sub>
+
+<Sub n="7.2" title="iam:PassRole, the quiet escalation">
+
+Many services act for you with a role you give them: an EC2 instance profile, a
+Lambda execution role, a CodeBuild service role. Handing a role to a service
+takes the `iam:PassRole` permission.
+
+<Why>Why is PassRole dangerous?</Why>
+
+Because it lets you use a role's permissions without ever assuming it. The
+[PassRole docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_passrole.html)
+give the example: Alice can't touch S3, but if she can pass an S3-capable role
+to a service, "the service could perform Amazon S3 actions on behalf of Alice."
+A developer with `lambda:CreateFunction` and `iam:PassRole` on `*` can run
+code as any role in the account that trusts Lambda.
+
+It's also hard to audit. "`PassRole` is not an API call", so CloudTrail has no
+PassRole events. You find it in the `CreateFunction` or `RunInstances` event
+that received the role.
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "iam:PassRole",
+  "Resource": "arn:aws:iam::111122223333:role/lambda-app-*",
+  "Condition": { "StringEquals": { "iam:PassedToService": "lambda.amazonaws.com" } }
+}
+```
+
+Scope the `Resource` to a naming pattern, and pin the service with
+`iam:PassedToService`.
+
+</Sub>
+
+<Sub n="7.3" title="Boundaries for delegated admin">
+
+Permissions boundaries exist for one situation above all: letting teams create
+their own roles without letting them create a role more powerful than
+themselves.
+
+You allow `iam:CreateRole` only when the request attaches a
+specific boundary (the `iam:PermissionsBoundary` condition key), and to deny
+editing or removing that boundary. A team can then create any role it likes,
+and every one of them is capped by the boundary, whatever its identity policy
+says. It's the intersection rule from section 3.3, used on purpose.
+
+</Sub>
+
+<SectionHeading n="08" id="confused-deputy">The confused deputy</SectionHeading>
+
+Some failures need no stolen credentials at all. A trusted program is tricked
+into using *its own* authority for someone who shouldn't have it.
+
+<Sub n="8.1" title="Hardy's compiler, 1988">
+
+Norm Hardy named the problem in a two-page paper,
+[The Confused Deputy](http://cap-lore.com/CapTheory/ConfusedDeputy.html)
+(Operating Systems Review 22(4), 1988), about a timesharing system at Tymshare.
+
+A compiler, `(SYSX)FORT`, had a "home files license" so it could write a
+statistics file in its own directory, `SYSX`. Users could name a file to
+receive debugging output. One user named `(SYSX)BILL`, the billing file. The
+compiler opened it with its own license and wrote over it. "The billing
+information was lost."
+
+<Why>Whose fault was it?</Why>
+
+Nobody's code was wrong, which was Hardy's point. "The compiler serves two
+masters and carries some authority from each," he wrote, and "it has no way to
+keep them apart." The user supplied a *name*; the compiler supplied the
+*authority*. His fix was capabilities, where the thing that names
+a file is also the thing that authorizes writing to it.
+
+IAM, like Tymshare's system, is name-based: policies list ARNs. So the confused
+deputy is always possible, and AWS provides explicit checks to close it.
+
+</Sub>
+
+<Sub n="8.2" title="Cross-account: the external ID">
+
+AWS's version involves a SaaS vendor that assumes roles in its customers'
+accounts. Here's AWS's
+[own scenario](https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html),
+with the fix in place:
+
+<StepSequence
+  title="Example Corp as a deputy, with and without an external ID"
+  actors={["Other customer", "Example Corp", "STS", "Your role"]}
+  messages={[
+    { from: 0, to: 1, label: "\"my role is AWS1:ExampleRole\"", note: "Another customer signs up and gives Example Corp **your** role ARN. ARNs aren't secret; it learned or guessed it." },
+    { from: 1, to: 2, label: "AssumeRole(your ARN)", note: "Without an external ID, your trust policy trusts Example Corp's account, so this succeeds. Example Corp is now reading **your** account for the other customer. That's the confused deputy." },
+    { from: 1, to: 2, label: "AssumeRole(…, ExternalId=67890)", dashed: true, note: "The fix: Example Corp always sends **the ID it assigned to the customer who asked**. The other customer's is `67890`, and they can't change it." },
+    { from: 2, to: 3, label: "check sts:ExternalId", note: "Your trust policy requires `sts:ExternalId` = `12345`, the value Example Corp gave *you*. `67890` doesn't match." },
+    { from: 2, to: 1, label: "AccessDenied", note: "**Denied.** The deputy can't be confused because the request now carries whose behalf it's acting on." },
+  ]}
+/>
+
+What matters is who picks it: the external ID is generated and controlled by the
+vendor, unique per customer. If customers chose their own, the other customer
+would simply choose yours.
+
+</Sub>
+
+<Sub n="8.3" title="Cross-service: SourceArn and SourceAccount">
+
+AWS services are deputies too. A bucket policy that lets
+`cloudtrail.amazonaws.com` write logs trusts CloudTrail, not the person who
+configured the trail. AWS spells it out: that bucket "could receive
+CloudTrail logs from ... an unauthorized actor in their AWS account, if they
+know the name of the S3 bucket."
+
+You fix it by testing the context the service passes along:
+
+| Condition key | Pins the service to acting for |
+|---|---|
+| `aws:SourceArn` | One specific resource, such as one trail or one SNS topic |
+| `aws:SourceAccount` | One account |
+| `aws:SourceOrgID` | Your organization |
+| `aws:SourceOrgPaths` | One OU path in your organization |
+
+```json
+{
+  "Effect": "Allow",
+  "Principal": { "Service": "cloudtrail.amazonaws.com" },
+  "Action": "s3:PutObject",
+  "Resource": "arn:aws:s3:::central-logs/AWSLogs/111122223333/*",
+  "Condition": { "StringEquals": { "aws:SourceAccount": "111122223333" } }
+}
+```
+
+<Callout label="Design implication">
+Any statement whose `Principal` is a service should also have an
+`aws:SourceArn` or `aws:SourceAccount` condition. With RCPs you can enforce
+that organization-wide: AWS's example RCP denies service principals access to
+S3 when `aws:SourceOrgID` isn't your org, without editing a single bucket
+policy.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="09" id="debugging">Debugging AccessDenied</SectionHeading>
+
+An `AccessDenied` feels opaque, but it usually carries enough to find the cause
+in a few minutes, if you read it in the right order.
+
+<Sub n="9.1" title="Read the message">
+
+Most services now return
+[this shape](https://docs.aws.amazon.com/IAM/latest/UserGuide/troubleshoot_access-denied.html):
+
+```text
+User: arn:aws:iam::123456789012:user/John is not authorized to perform: codecommit:ListRepositories
+with an explicit deny in a service control policy: arn:aws:organizations::777788889999:policy/o-exampleorgid/service_control_policy/p-examplepolicyid123
+```
+
+| Phrase | Meaning | Where to look |
+|---|---|---|
+| `with an explicit deny in a <type> policy` | A `Deny` statement matched | That policy type; the ARN if it's given |
+| `because no <type> policy allows the <action> action` | Nothing of that type allowed it | Add an Allow of that type |
+| No context at all | This service doesn't use the new format | Work through the checklist below |
+
+Two caveats from the docs: if several policy types deny, the message names
+only one, and some services don't use this format at all.
+
+</Sub>
+
+<Sub n="9.2" title="A checklist, cheapest first">
+
+1. **Who am I?** `aws sts get-caller-identity`. A lot of AccessDenied
+   tickets probably come down to the wrong principal: the node role instead of
+   the pod's, an old profile, or an expired session.
+2. **Read the message** for the policy type, as above.
+3. **Is it an explicit deny?** Search SCPs, RCPs, boundaries and the resource
+   policy for a `Deny` that matches, including ones with conditions.
+4. **Is it cross-account?** Then both sides need an Allow (section 4).
+5. **Is it KMS?** The key policy has to allow it, whatever IAM says.
+6. **Encoded message?** Some services, EC2 among them, return an encoded
+   authorization message. `aws sts decode-authorization-message` turns it into
+   the policy context that denied it.
+7. **Test offline.** The IAM policy simulator, or Access Analyzer's
+   `check-access-not-granted`, before you change production policy.
+
+</Sub>
+
+<Sub n="9.3" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Admin role gets AccessDenied on one action in every account | An SCP denies it | Read the SCPs on the OU path; the message usually names "service control policy" |
+| Works in the dev account, denied in prod | Different SCPs, or a boundary only in prod | Compare `get-caller-identity` and the attached boundary |
+| "no identity-based policy allows" for a pod | The pod is using the node role, not IRSA or Pod Identity | `get-caller-identity` in the pod; fix the credential chain order |
+| Cross-account S3 read denied, bucket policy looks right | The caller's own account doesn't allow it | Add the Allow to the caller's identity policy too |
+| `kms:Decrypt` denied for an admin | Key policy doesn't allow the principal or delegate to IAM | Edit the key policy |
+| Session denied things its role allows | A session policy was passed at `AssumeRole` | Check the tool or broker that assumed the role |
+| `AssumeRole` with `DurationSeconds=7200` fails from a role session | Role chaining caps sessions at 1 hour | Ask for 3,600 or less, or assume from a non-session identity |
+| `PackedPolicyTooLarge` from STS | Session policies and tags overflow the token | Fewer tags, a managed session policy instead of inline JSON |
+| Condition on a key "doesn't fire" | The key is absent from this request | Use `...IfExists` deliberately, or add a `Null` check |
+| Third-party integration denied after hardening | Your new trust policy requires an external ID they don't send | Get the ID from the vendor; don't invent one |
+
+<Callout label="Common mistake" kind="warn">
+Fixing an AccessDenied by widening the policy until it works. Error messages name
+a policy type for a reason. Widen the wrong one, an identity policy when an SCP
+denied it, and nothing changes except that the role can now do more.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="10" id="summary">Summary</SectionHeading>
+
+1. **Every request is judged against a request context**: principal, action,
+   resource and conditions, after SigV4 proves who signed it.
+2. **Everything starts denied, and one explicit Deny ends it.** No number of
+   Allows can outvote a matching Deny in any policy type.
+3. **Only identity and resource policies grant.** SCPs, RCPs, boundaries and
+   session policies can only take permissions away.
+4. **Grants combine as a union, caps as an intersection.** Within an account,
+   either an identity or a resource policy can allow; every cap must also allow.
+5. **The ARN a resource policy names changes the answer.** A grant to a role
+   session ARN isn't limited by the boundary; a grant to the role ARN is.
+6. **Cross-account requests are evaluated twice**, once per account, and both
+   must allow. SCPs follow the principal; RCPs follow the resource.
+7. **STS credentials expire by design.** 15 minutes to 12 hours, one hour when
+   chaining, and `ASIA` marks them.
+8. **Instance credentials over HTTP are an SSRF target.** Require IMDSv2, keep
+   the hop limit at 1 where pods shouldn't reach it, and pin credentials to
+   their VPC.
+9. **`iam:PassRole` is an escalation path you won't see in CloudTrail.** Scope
+   it by role name and `iam:PassedToService`.
+10. **A deputy that holds its own authority can be confused.** External IDs and
+    `aws:SourceArn`/`aws:SourceAccount` make each request say whose behalf it's
+    acting on.
+
+<SectionHeading n="11" id="build">Build this</SectionHeading>
+
+**A policy evaluator that explains itself.**
+
+- Extend the model in section 3.4 to parse real IAM JSON: `Action`,
+  `NotAction`, `Resource`, `Principal` and a handful of condition operators
+  (`StringEquals`, `StringLike`, `Bool`, `IpAddress`, and the `IfExists`
+  variants).
+- Make it return the *reason* along with the decision, in the same words AWS
+  uses: "with an explicit deny in a service control policy", "because no
+  session policy allows the ... action".
+- Add a cross-account mode that evaluates twice and reports which side denied.
+- Write the ten rows of the table in section 9.3 as test cases, then check
+  your reading against AWS's IAM policy simulator in a free-tier account.
+- For comparison, express the same policies in Cedar and run them through
+  `cedarpy`. Note which AWS behaviours (the session-ARN rule, for one) seem to
+  have no direct Cedar equivalent.
+
+<SectionHeading n="12" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What's the difference between an implicit deny and an explicit deny?">
+An implicit deny means no applicable policy allowed the request; it's the
+default state of every request. An explicit deny means a `Deny` statement
+matched. It matters for the fix: an implicit deny is solved by
+adding an Allow in the right policy type, while an explicit deny can only be
+solved by changing or removing the Deny, because it overrides every Allow.
+</QA>
+
+<QA level="beginner" q="Why use IAM roles instead of IAM users with access keys?">
+Roles have no long-lived credentials. Assuming one returns temporary keys
+(`ASIA...`) with a session token that expire in 15 minutes to 12 hours, so a
+leaked credential stops working on its own. User access keys (`AKIA...`) work
+from anywhere until someone deletes them. Roles also give each session its own
+ARN and name, which makes CloudTrail attribution clearer.
+</QA>
+
+<QA level="intermediate" q="An SCP allows s3:*. A role in that account has no identity policies. Can it read from S3?">
+No. SCPs never grant permissions; they only set the maximum. It still
+needs an identity policy that allows the read, or a resource policy on the
+bucket that names it. With neither, the request is implicitly denied at the
+identity-policy step, and the error says "because no identity-based policy
+allows the s3:GetObject action".
+</QA>
+
+<QA level="intermediate" q="What's the difference between an SCP and an RCP?">
+An SCP caps what principals in your member accounts can do, wherever they call.
+An RCP caps what can be done to resources in your member accounts, by anyone,
+including principals from outside your organization. SCPs can't restrict an
+outside caller hitting your bucket; RCPs exist to fill that gap. Neither
+affects the management account or service-linked roles.
+</QA>
+
+<QA level="intermediate" q="Walk through a cross-account role assumption. What has to allow what?">
+In the caller's account, an identity policy must allow `sts:AssumeRole` on the
+target role ARN, and the caller's SCPs must allow it. In the target account, the
+role's trust policy must name the caller or its account. STS then returns
+temporary credentials for a session in the target account, and every later
+call with them is evaluated as a same-account request there: the role's
+permissions policy, that account's SCPs and RCPs, and any resource policies.
+</QA>
+
+<QA level="deep" q="Describe the Capital One breach in IAM terms, and what would have stopped it.">
+Per the court filings, a misconfigured web application firewall on EC2 let
+outside requests reach the server, and a command obtained credentials for the
+WAF's role, which AWS said involved SSRF. Those credentials were then used from
+TOR to list more than 700 buckets and copy data. Three controls each break it:
+IMDSv2 with a hop limit of 1 blocks the credential fetch through a proxying
+component; a role scoped to what a WAF needs blocks the bucket reads; an SCP
+comparing `aws:EC2InstanceSourceVPC` with `aws:SourceVpc` makes stolen instance
+credentials useless off the instance.
+</QA>
+
+<QA level="deep" q="What is the confused deputy problem, and how do the external ID and aws:SourceArn solve it?">
+A deputy is a program acting with its own authority on behalf of a caller. It's
+confused when the caller supplies a name (a file, an ARN) and the deputy
+applies its own authority to it, as in Hardy's 1988 compiler that overwrote the
+billing file. In AWS, a SaaS vendor assuming customer roles is the deputy; the
+external ID, unique per customer and chosen by the vendor, makes each
+`AssumeRole` state which customer it's for, so a request made for one customer
+can't open another's role. For AWS services acting as deputies, `aws:SourceArn`
+and `aws:SourceAccount` do the same job in resource policies.
+</QA>
+
+<QA level="deep" q="A bucket policy grants s3:GetObject to a role ARN. The role has a permissions boundary that allows only SQS. Same account. Allowed?">
+No. A resource policy that grants to a role ARN is limited by an implicit deny
+in the permissions boundary or a session policy, because the actual requester is
+the role session. If the bucket policy had named the specific session ARN
+(`arn:aws:sts::...:assumed-role/role/session`), the documented logic says the
+grant goes directly to the session and isn't limited by the boundary. An
+explicit deny anywhere would still win in both cases.
+</QA>
+
+<SectionHeading n="13" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="An access key ID starts with ASIA. What does that tell you?">
+    It's a temporary STS credential, so there's a session token with it and an
+    expiration. Long-lived IAM user keys start with AKIA.
+  </Q>
+  <Q q="You assume a role from inside another role session and ask for DurationSeconds=14400. What happens?">
+    The call fails. Role chaining caps the session at one hour, whatever the
+    role's maximum session duration is.
+  </Q>
+  <Q q="Which two resource types must explicitly allow a principal even in the same account?">
+    IAM role trust policies and KMS key policies. For most other resources, an
+    identity policy alone is enough within one account.
+  </Q>
+  <Q q="Why does IMDSv2 refuse a token PUT that carries X-Forwarded-For?">
+    Reverse proxies add that header. Refusing it stops a misconfigured open
+    proxy on the instance from fetching a token for an outside attacker.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="AWS: Policy evaluation logic">
+    The authoritative description of the order in section 3, including the
+    same-account rules for users, roles and sessions, and the cross-account
+    flowchart. Re-read it whenever a result surprises you.
+  </WildCard>
+  <WildCard name="Hardy, The Confused Deputy (1988)">
+    Two pages, a compiler and a billing file. Still the clearest argument for
+    why name-based access control needs extra context to be safe.
+  </WildCard>
+  <WildCard name="Backes et al., Zelkova (FMCAD 2018)">
+    How AWS encodes its policy language into SMT to answer "can anyone outside
+    my account ever do this?", the engine behind Access Analyzer.
+  </WildCard>
+  <WildCard name="Cutler et al., Cedar (OOPSLA 2024)">
+    AWS's open policy language: permit, forbid, entity hierarchies, a
+    validator, and a formally verified evaluator. Source at
+    cedar-policy/cedar.
+  </WildCard>
+  <WildCard name="MacCárthaigh, IMDSv2 (AWS Security Blog, 2019)">
+    Why each piece of IMDSv2 exists, attack by attack: open WAFs, reverse
+    proxies, SSRF and layer-3 misrouting.
+  </WildCard>
+  <WildCard name="United States v. Paige Thompson, W.D. Wash.">
+    The complaint and superseding indictment: the primary record of the
+    Capital One intrusion, including the three commands.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="14" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="VPC & Cloud Networking">
+    The other half of the cloud boundary: which packets reach an instance at
+    all, and why a VPC is a lookup table. [Chapter 33](/topics/33-vpc-networking).
+  </WildCard>
+  <WildCard name="Virtualization, Hypervisors & microVMs">
+    The Nitro hosts that serve instance metadata and keep tenants apart below
+    IAM. [Chapter 47](/topics/47-virtualization).
+  </WildCard>
+  <WildCard name="Containers from Scratch">
+    Namespaces and the extra network hop that makes a hop limit of 1 keep pods
+    away from the node's metadata. [Chapter 11](/topics/11-containers).
+  </WildCard>
+  <WildCard name="Compute Abstractions">
+    Lambda, Fargate and pods: where each gets its role credentials from.
+    [Chapter 36](/topics/36-compute-abstractions).
+  </WildCard>
+</CardGrid>

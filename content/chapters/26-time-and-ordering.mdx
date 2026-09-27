@@ -1,0 +1,1027 @@
+---
+title: "Time, Clocks & Ordering"
+dek: "A timestamp can answer three questions: what time is it, how long did that take, and which came first. Computers answer the first one approximately, and distributed systems get into trouble when they use it for the third. This chapter shows how clocks really behave, then walks through the logical, hybrid and bounded clocks that real databases use instead."
+readingTime: "~30 min"
+level: "Intermediate"
+versions: "Linux v6.10 source · CockroachDB v24.1.0 source · measured on linuxkit 6.10.14 aarch64 and Apple M4 · macOS 26.5.1"
+prereqs: "syscalls, message passing, replication basics"
+updated: "2026-09-27"
+---
+
+You meet time in distributed systems long before you go looking for it. A log
+line on one server says a request finished before it started on another. A
+Cassandra delete doesn't stick. A lock you thought was yours has already been
+handed to someone else, and both of you are writing.
+
+In each case, code trusted a timestamp to tell it the order of events. Clocks
+on different machines disagree by microseconds on a good day and by seconds on
+a bad one, and a clock on one machine can move backwards. Once you know how far
+they drift and why, you can pick the right tool for each question.
+
+This chapter starts with the clocks on one Linux box, then NTP and leap
+seconds. From there it builds the alternatives: Lamport clocks, vector clocks,
+hybrid logical clocks and Spanner's TrueTime. It ends with the two places
+clocks most often lose data: last-write-wins and leases.
+
+<SectionHeading n="01" id="three-questions">Three questions you ask of time</SectionHeading>
+
+"Get the time" sounds like one operation. It's really three, and each needs a
+different kind of clock.
+
+<Sub n="1.1" title="Now, elapsed, and before">
+
+| Question | Example | What you need | Wrong tool |
+|---|---|---|---|
+| **What time is it?** | A log timestamp, a certificate's expiry | A wall clock close to UTC | A counter since boot |
+| **How long did it take?** | A request's latency, a timeout, a lease | A clock that never jumps | The wall clock, which can be stepped |
+| **Which happened first?** | Two writes to one key on two replicas | A causal order between events | Either physical clock, on its own |
+
+Most time bugs answer one question with the tool for another. Latency measured
+with the wall clock breaks when NTP steps it. Writes ordered by wall clock
+break when two machines disagree about the time.
+
+<Why>Why can't two machines just agree on the time?</Why>
+
+Because the only way to learn another machine's clock is to send a message and
+wait for the reply, and you can't tell how the round trip split between the two
+directions. Every comparison between machines comes with an error bar of roughly
+half the round trip.
+
+Clocks also run at different rates. A quartz oscillator's frequency depends on
+temperature and on the crystal, so two machines set to the same time drift
+apart. Spanner's clock daemons assume a worst-case drift of **200 microseconds
+per second** ([Corbett et al.](https://storage.googleapis.com/gweb-research2023-media/pubtools/1974.pdf)):
+0.72 seconds an hour, if nothing corrected it.
+
+<Callout label="Design implication">
+Two timestamps from two machines only tell you which event came first if
+they're further apart than the clock error. If correctness depends on order,
+you either need to know that error bound or stop using physical time for
+ordering. The rest of this chapter is those two options.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="02" id="linux-clocks">The clocks on one Linux machine</SectionHeading>
+
+Even one machine has several clocks. Linux keeps one hardware counter and
+exposes several clocks built on it, each with its own rule about what may
+change it.
+
+<Sub n="2.1" title="The clock IDs">
+
+These are the ones you'll choose between, as the
+[`clock_gettime(2)`](https://man7.org/linux/man-pages/man2/clock_gettime.2.html)
+man page describes them:
+
+| Clock | Counts from | Jumps when the time is set? | Slewed by NTP? | Counts suspend? | Use it for |
+|---|---|---|---|---|---|
+| `CLOCK_REALTIME` | 1970-01-01 UTC, ignoring leap seconds | **Yes** | Yes | Yes | Timestamps humans read |
+| `CLOCK_MONOTONIC` | An unspecified point, in practice boot | No | Yes | No | Timeouts, latency, deadlines |
+| `CLOCK_MONOTONIC_RAW` | Same as MONOTONIC | No | **No** | No | Measuring the oscillator itself |
+| `CLOCK_BOOTTIME` | Same as MONOTONIC | No | Yes | **Yes** | Timers that must survive suspend |
+| `CLOCK_TAI` | Like REALTIME, but counts leap seconds | Only with it | Yes | Yes | Leap-second-free absolute time |
+| `CLOCK_REALTIME_COARSE` | Same as REALTIME | Yes | Yes | Yes | Cheap timestamps, one tick of error |
+
+<Why>Why is MONOTONIC slewed but not stepped?</Why>
+
+A **slew** changes the clock's rate: if NTP decides the oscillator runs 20 ppm
+fast, the kernel ticks a bit slower, and MONOTONIC gets that correction too,
+so your "one second" is closer to a real second. A **step** sets the time to a
+new value in one go, and only REALTIME takes it. MONOTONIC never goes backwards
+and never leaps.
+
+</Sub>
+
+<Sub n="2.2" title="How clock_gettime works">
+
+A `clock_gettime()` call usually never enters the kernel. The kernel maps a
+page of timekeeping data into every process, and the **vDSO** code in it reads
+the hardware counter and does the arithmetic in user space
+([chapter 07](/topics/07-syscalls-kernel-boundary) covers the mechanism):
+
+<SourceRead
+  file="lib/vdso/gettimeofday.c"
+  repo="torvalds/linux"
+  tag="v6.10"
+  href="https://github.com/torvalds/linux/blob/v6.10/lib/vdso/gettimeofday.c#L130"
+>
+```c
+static __always_inline int do_hres(const struct vdso_data *vd, clockid_t clk,
+				   struct __kernel_timespec *ts)
+{
+	const struct vdso_timestamp *vdso_ts = &vd->basetime[clk];
+	u64 cycles, sec, ns;
+	u32 seq;
+	/* ... */
+	do {
+		while (unlikely((seq = READ_ONCE(vd->seq)) & 1)) {
+			/* ... time namespace check ... */
+			cpu_relax();
+		}
+		smp_rmb();
+		/* ... */
+		cycles = __arch_get_hw_counter(vd->clock_mode, vd);
+		/* ... */
+		ns = vdso_calc_ns(vd, cycles, vdso_ts->nsec);
+		sec = vdso_ts->sec;
+	} while (unlikely(vdso_read_retry(vd, seq)));
+	/* ... normalise ns into ts ... */
+}
+```
+</SourceRead>
+
+Two details explain the table above:
+
+| Detail | What it means |
+|---|---|
+| `basetime[clk]` | Every clock ID is the **same hardware counter** plus its own base. A step moves REALTIME's base and nothing else. |
+| `vd->seq` | A sequence count, odd while the kernel updates the page. Readers retry if it changed, so they never see half an update. |
+
+`vdso_calc_ns()` scales the cycle count by a multiplier the kernel adjusts, and
+that's where NTP's slewing lands. The coarse clocks skip the counter and return
+the base, so they advance once per tick.
+
+<TryIt what="Cost of clock_gettime per clock, and what the kernel thinks of its own accuracy" lang="c" toolchain="gcc 13.3 -O2, linuxkit 6.10.14 aarch64">
+```c
+static void bench(const char *name, clockid_t id, int sys) {
+    struct timespec t, a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    for (int i = 0; i < 5000000; i++) {
+        if (sys) syscall(SYS_clock_gettime, id, &t);  // force the trap
+        else     clock_gettime(id, &t);               // vDSO
+    }
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    printf("%-24s %6.1f ns/call\n", name, ns(a, b) / 5000000);
+}
+/* ... REALTIME, MONOTONIC, MONOTONIC_RAW, BOOTTIME, TAI, REALTIME_COARSE ... */
+
+struct timex tx = {0};               // modes = 0: read only, changes nothing
+int state = adjtimex(&tx);
+```
+
+<Output>
+```text
+REALTIME                   18.3 ns/call
+MONOTONIC                  17.3 ns/call
+MONOTONIC_RAW              18.2 ns/call
+BOOTTIME                   17.3 ns/call
+TAI                        18.8 ns/call
+REALTIME_COARSE             3.8 ns/call
+MONOTONIC via syscall()   133.6 ns/call
+adjtimex state=5 offset=0 freq=0 maxerror=16000000 esterror=16000000 status=0x40
+```
+
+Medians of three runs in a shared 4-CPU container, linuxkit 6.10, clocksource
+`arch_sys_counter`. The fine-grained clocks all cost the same because they're
+one counter with different bases; forcing the syscall costs roughly 7× more. On
+the Apple M4 under macOS 26.5.1, REALTIME took 16.6 ns, MONOTONIC 23.4 ns and
+MONOTONIC_RAW 17.9 ns.
+
+The `adjtimex` line matters more. State 5 is `TIME_ERROR` and status `0x40` is
+`STA_UNSYNC`: nothing is disciplining this kernel's clock, and it reports a
+maximum error of 16,000,000 µs, **16 seconds**. The VM gets its time from the
+host some other way, and the kernel says honestly that it can't vouch for it.
+</Output>
+</TryIt>
+
+</Sub>
+
+<Sub n="2.3" title="Measuring elapsed time with the wall clock">
+
+The classic bug is `end - start` on wall-clock readings. It works until the
+clock is stepped back between the two reads, and then the duration is negative.
+
+That's what took down part of Cloudflare's DNS on 1 January 2017. A leap second
+made Go's `time.Now()` return an earlier value than a previous call, the
+negative duration reached `rand.Int63n()`, and it panicked
+([Cloudflare's postmortem](https://blog.cloudflare.com/how-and-why-the-leap-second-affected-cloudflare-dns/)).
+At peak about 0.2% of DNS queries were affected, over 6 hours 45 minutes.
+
+<Why>Why did Go change, and not just Cloudflare?</Why>
+
+Because every Go program measuring elapsed time had the same bug. The
+[monotonic time proposal](https://go.googlesource.com/proposal/+/master/design/12914-monotonic.md)
+cites the outage. Since Go 1.9, `time.Now()` carries a wall reading and a
+monotonic one, and `Sub`, `Since` and `Until` use the monotonic one. No API
+changed. Other runtimes make you choose:
+
+| Language | Wall clock | Monotonic clock |
+|---|---|---|
+| C / POSIX | `clock_gettime(CLOCK_REALTIME)` | `clock_gettime(CLOCK_MONOTONIC)` |
+| Java | `System.currentTimeMillis()`, `Instant.now()` | `System.nanoTime()` |
+| Python | `time.time()` | `time.monotonic()`, `time.perf_counter()` |
+| Go 1.9+ | `time.Now()`'s wall reading | `time.Now()`'s monotonic reading, used by `Sub` |
+| Rust | `SystemTime` | `Instant` |
+
+<Callout label="Common mistake" kind="warn">
+Computing a lease expiry as `currentTimeMillis() + ttl` and comparing against
+`currentTimeMillis()` later. A step forward expires every lease at once; a step
+back keeps them alive. Use the monotonic clock for anything that's a duration,
+and convert to wall time only for display.
+</Callout>
+
+</Sub>
+
+<Sub n="2.4" title="Clocks inside a VM">
+
+Virtual machines add their own error. The kernel's
+[KVM timekeeping notes](https://docs.kernel.org/virt/kvm/x86/timekeeping.html)
+warn that the host "may not be able to deliver the proper number of interrupts
+per second, and so guest time may fall behind", and that after a live
+migration the counter may run at a different rate. Paravirtual clocks like
+`kvm-clock` fix most of the rate problem. A paused guest still resumes with its
+wall clock behind, and stays behind until its NTP client corrects it.
+
+</Sub>
+
+<SectionHeading n="03" id="ntp">NTP, and what it actually achieves</SectionHeading>
+
+The Network Time Protocol ([RFC 5905](https://www.rfc-editor.org/rfc/rfc5905))
+keeps nearly every server's wall clock near UTC. `ntpd`, `chronyd` and
+`systemd-timesyncd` all speak it.
+
+<Sub n="3.1" title="Measuring an offset over a network">
+
+NTP collects four timestamps per exchange, two from each clock:
+
+<StepSequence
+  title="One NTP exchange, and the four timestamps it collects"
+  actors={["Client clock", "Network", "Server clock"]}
+  messages={[
+    { from: 0, to: 1, label: "request · T1", note: "The client records **T1** by its own clock and sends a request." },
+    { from: 1, to: 2, label: "arrives · T2", note: "The server records **T2** on arrival, by *its* clock. T2 − T1 is the outbound delay plus the offset between the clocks." },
+    { from: 2, to: 1, label: "reply · T3", note: "The server records **T3** as it sends the reply, carrying T1, T2 and T3 back." },
+    { from: 1, to: 0, label: "arrives · T4", note: "The client records **T4**. It now has four timestamps from two clocks it can't compare directly." },
+    { from: 0, to: 0, label: "solve", note: "Round-trip delay **δ = (T4 − T1) − (T3 − T2)**. Offset **θ = ((T2 − T1) + (T3 − T4)) / 2**, exact only if both legs took equal time." },
+  ]}
+/>
+
+<Why>Why does an asymmetric route ruin the estimate?</Why>
+
+The offset formula assumes both legs took the same time. If the request takes
+30 ms and the reply 10 ms, NTP reads the 10 ms difference as clock offset and
+sets your clock 10 ms wrong, and nothing in the four timestamps can reveal it.
+
+What NTP can do is bound it: the true offset is within **δ/2** of the estimate,
+whatever the asymmetry. So clients prefer samples with the smallest round trip,
+and a nearby server will probably beat a better one far away.
+
+</Sub>
+
+<Sub n="3.2" title="Slew or step">
+
+Once the client knows its offset, it can fix it two ways:
+
+| | Slew | Step |
+|---|---|---|
+| **What happens** | The clock runs slightly fast or slow until the offset is gone | The clock is set to the right value at once |
+| **Goes backwards?** | Never | It can |
+| **Speed** | ntpd: "each second of adjustment requires an amortization interval of 2000 s" ([docs](https://www.ntp.org/documentation/4.2.8-series/ntpd/)) | Instant |
+| **ntpd default** | Offsets under the 128 ms step threshold | Offsets over it |
+| **chrony default** | Everything, at up to 83,333 ppm (`maxslewrate`) | Only if configured, e.g. `makestep 0.1 3` |
+
+chrony's [`makestep`](https://chrony-project.org/doc/4.5/chrony.conf.html)
+steps only during the first few updates after the daemon starts, when a fresh
+machine is most likely to be far off. After that it slews.
+
+<Why>Why not always slew?</Why>
+
+Because slewing is slow on purpose. At ntpd's rate, a 600-second error "will
+take almost 14 days to complete", and the machine timestamps everything wrong
+the whole time. Stepping at boot and slewing afterwards gives you a fast start
+and no backwards jumps once your services run.
+
+</Sub>
+
+<Sub n="3.3" title="How close NTP gets you">
+
+It depends on the path to the time source:
+
+| Setup | Typical error | Source |
+|---|---|---|
+| NTP over the public internet | Tens of ms; 100 ms or more with asymmetric routes | [Wikipedia, NTP](https://en.wikipedia.org/wiki/Network_Time_Protocol) |
+| NTP on a LAN, good conditions | Under 1 ms | same |
+| Cloud VMs, as CockroachDB saw them | "On Azure, clock offsets between 250ms and 500ms are common. On AWS and GCE, clock offsets generally stay below 250ms." | [`pkg/base/constants.go`](https://github.com/cockroachdb/cockroach/blob/v24.1.0/pkg/base/constants.go#L16) |
+| Amazon Time Sync over NTP | Error bound under 100 µs on supported instances | [AWS, 2023](https://aws.amazon.com/blogs/compute/its-about-time-microsecond-accurate-clocks-on-amazon-ec2-instances/) |
+| Amazon Time Sync, PTP hardware clock | Under 40 µs | same |
+| Spanner's TrueTime | 1 to 7 ms, 4 ms most of the time | [Corbett et al.](https://storage.googleapis.com/gweb-research2023-media/pubtools/1974.pdf) |
+
+That CockroachDB comment sits right above the constant for its default maximum
+clock offset. It's what the authors saw on real cloud VMs, which probably makes
+it more useful than any spec sheet.
+
+<Callout label="Common mistake" kind="warn">
+Assuming "we run NTP" means "our clocks agree to a millisecond". Read the
+daemon's own estimate instead: `chronyc tracking` shows the offset and root
+dispersion, and `adjtimex` shows the kernel's `maxerror`. Alert on those
+numbers, not on whether the daemon is up.
+</Callout>
+
+</Sub>
+
+<Sub n="3.4" title="Leap seconds and smearing">
+
+The Earth's rotation isn't perfectly regular, so UTC occasionally inserts a
+**leap second**, 23:59:60. Unix time can't represent it, so the Linux kernel
+repeats a second: the wall clock goes back by one second at midnight UTC.
+
+Two well-documented failures came from it:
+
+- **30 June 2012.** Linux applied the leap second without notifying the
+  high-resolution timer subsystem, so futex timers kept expiring and
+  re-arming. JVMs, MySQL and other pthread-heavy programs sat at 100% CPU
+  ([Ubuntu bug 1020285](https://bugs.launchpad.net/bugs/1020285),
+  [LWN](https://lwn.net/Articles/504779/)).
+- **31 December 2016.** The Cloudflare outage from section 2.3.
+
+<Why>What does a leap smear do instead?</Why>
+
+It spreads the extra second over many hours, so no clock repeats a second.
+Google's [smear](https://developers.google.com/time/smear) is linear over 24
+hours, noon to noon UTC, slowing clocks by about 11.6 ppm. chrony can serve
+smeared time with `smoothtime`.
+
+The cost is that a smeared clock and an unsmeared one disagree by up to half a
+second during the smear. AWS doesn't recommend "mixing smeared and non-smeared
+time sources", and its PTP hardware clock has no smeared option. The problem
+is also ending: in 2022 the General Conference on Weights and Measures
+[resolved](https://www.bipm.org/en/cgpm-2022/resolution-4) to let UT1 and UTC
+drift further apart by 2035, which probably ends leap seconds for good.
+
+<Callout label="Design implication">
+Every machine that compares timestamps should share one leap-second policy. A
+fleet that mixes a smearing cloud time service with public pool servers has a
+built-in half-second disagreement whenever a leap second happens.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="04" id="lamport">Happened-before and Lamport clocks</SectionHeading>
+
+The first option from section 1, bounding the error, comes back in section 7.
+The second is to stop using physical time for ordering, and ask what order you
+actually need.
+
+<Sub n="4.1" title="What happened-before means">
+
+Leslie Lamport's 1978 paper
+[Time, Clocks, and the Ordering of Events in a Distributed System](https://lamport.azurewebsites.net/pubs/time-clocks.pdf)
+defined it. Event *a* **happened before** *b* (a → b) if:
+
+1. *a* and *b* are on the same process, and *a* came first; or
+2. *a* sends a message and *b* receives that message; or
+3. there's some *c* with a → c and c → b.
+
+If neither a → b nor b → a, the events are **concurrent**. That doesn't mean
+simultaneous. It means no information could have flowed from one to the other.
+
+<Why>Why is that the right order to care about?</Why>
+
+Because it's the order your program can observe. A handler can only depend on
+what reached it, and everything that reaches it travels along the message paths
+happened-before describes. Two events with no path between them can't depend on
+each other, so any order you pick for them is consistent with what every
+process saw.
+
+</Sub>
+
+<Sub n="4.2" title="The Lamport clock">
+
+A Lamport clock is one integer per process, with three rules:
+
+- Before each local event, increment the counter.
+- Attach the counter to every message you send.
+- On receive, set the counter to `max(local, received) + 1`.
+
+Step through three processes and two messages:
+
+<StepSequence
+  title="Lamport clocks on three processes"
+  actors={["P1", "P2", "P3"]}
+  messages={[
+    { from: 0, to: 0, label: "a · L=1", note: "P1 does a local event **a**. Its counter goes 0 → **1**." },
+    { from: 0, to: 1, label: "send m1 · L=2", note: "P1 sends m1 stamped **2**. P2's own counter is still 0." },
+    { from: 1, to: 1, label: "recv · L=3", note: "P2 receives m1: `max(0, 2) + 1` = **3**. The counter jumps forward to stay ahead of everything that causally precedes it." },
+    { from: 2, to: 2, label: "c · L=1", note: "Meanwhile P3 does event **c** at **1**. Nothing connects c to P1 or P2, so it's concurrent with everything so far." },
+    { from: 1, to: 2, label: "send m2 · L=4", note: "P2 sends m2 stamped **4**." },
+    { from: 2, to: 2, label: "recv · L=5", note: "P3 receives it: `max(1, 4) + 1` = **5**. Now a → recv(m2), and the counters agree: 1 < 5." },
+  ]}
+/>
+
+The guarantee runs one way: **if a → b, then `L(a) < L(b)`**, because every step
+along a causal path increases the counter. Break ties by process ID, comparing
+`(L, pid)` pairs, and you get a total order that every process computes the
+same way. Lamport's paper builds a distributed mutual exclusion algorithm on
+exactly that.
+
+</Sub>
+
+<Sub n="4.3" title="What a Lamport clock can't tell you">
+
+<Predict
+  q="Event x on node A has Lamport timestamp 5. Event y on node B has timestamp 9. What can you conclude?"
+  options={[
+    "x happened before y",
+    "y did not happen before x",
+    "x and y are concurrent",
+    "y happened at least 4 events after x",
+  ]}
+  answer={1}
+>
+Only that y didn't happen before x: if it had, the rules would force
+`L(y) < L(x)`. But x → y and concurrency are both still possible, since B's
+counter could have reached 9 through events unrelated to A. A smaller Lamport
+timestamp never proves happened-before.
+</Predict>
+
+That gap matters when you need to **detect** concurrency. Two replicas that
+accepted writes to one key during a partition should know those writes were
+concurrent, so they can keep or merge both. A Lamport clock orders them anyway,
+and whichever sorts second silently wins.
+
+</Sub>
+
+<SectionHeading n="05" id="vector-clocks">Vector clocks and version vectors</SectionHeading>
+
+A **vector clock** closes the gap by keeping one counter per process. Colin
+Fidge and Friedemann Mattern described it independently in 1988.
+
+<Sub n="5.1" title="The rules, and the comparison">
+
+Process *i* keeps a vector `V` with one entry per process. Before a local
+event, it increments `V[i]`. It attaches the whole vector to every message. On
+receive, it takes the element-wise max with the received vector, then
+increments `V[i]`. Comparing two vectors gives three answers:
+
+| Relation | Condition | Meaning |
+|---|---|---|
+| a → b | `V(a) ≤ V(b)` in every entry, and they differ | a happened before b |
+| b → a | `V(b) ≤ V(a)` in every entry, and they differ | b happened before a |
+| a ∥ b | Neither dominates | **Concurrent**, and you can tell |
+
+This works both ways: a → b exactly when `V(a) < V(b)`. Here's the case Lamport
+clocks miss:
+
+<StepSequence
+  title="Two replicas, one key, and a conflict the vectors catch"
+  actors={["Client", "Replica A", "Replica B"]}
+  messages={[
+    { from: 0, to: 1, label: "put cart=[book]", note: "A accepts the first write and stamps it **[A:1, B:0]**." },
+    { from: 1, to: 2, label: "replicate [A:1]", note: "B receives it and adopts the same version, **[A:1, B:0]**." },
+    { from: 0, to: 1, label: "put +pen", note: "The network partitions. A client adds a pen on A: **[A:2, B:0]**." },
+    { from: 0, to: 2, label: "put +mug", note: "Another client adds a mug on B, which only has [A:1]: **[A:1, B:1]**." },
+    { from: 1, to: 2, label: "heal: [A:2,B:0]", note: "The partition heals. [A:2, B:0] is ahead in one entry, [A:1, B:1] in the other. **Neither dominates, so the writes were concurrent.**" },
+    { from: 2, to: 0, label: "read → 2 siblings", note: "The store keeps both and hands them to the next reader to merge. The merged cart, [book, pen, mug], is written back as **[A:2, B:1]**, which dominates both." },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="5.2" title="Version vectors, and Dynamo's shopping cart">
+
+Storage systems strictly keep a **version vector**: one counter per *replica*,
+bumped only when that replica coordinates a write to the object. It tracks one
+piece of data's history, not every event, so it's much smaller.
+
+Amazon's [Dynamo paper](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf)
+(SOSP 2007) made this famous, with the cart above as its example. Concurrent
+versions go back to the application to reconcile. Over 24 hours of the cart
+service, **99.94%** of requests saw exactly one version, and the paper blames
+the rest mostly on concurrent writers ("busy robots"), not failures.
+
+<Why>Why not just merge automatically?</Why>
+
+Because the store doesn't know what the values mean. Union seems a reasonable
+merge for a cart, though a deleted item can reappear. For a bank balance,
+neither union nor either value is correct. Vectors tell you *that* you have a
+conflict; domain logic, or a CRDT whose merge is defined for you, has to
+resolve it.
+
+</Sub>
+
+<Sub n="5.3" title="The size problem">
+
+A vector has one entry per writer, and entries never leave on their own. With
+clients as writers, or sloppy quorums that let many nodes coordinate, it keeps
+growing. Dynamo truncates: "when the number of (node, counter) pairs in the
+vector clock reaches a threshold (say 10), the oldest pair is removed". The
+paper admits this weakens reconciliation, and says the problem "has not
+surfaced in production".
+
+Riak hit a worse one, **sibling explosion**. Plain version vectors can say two
+updates are concurrent but not which value came from which, so retried writes
+could pile up duplicate siblings without bound
+([Riak docs](https://docs.riak.com/riak/kv/2.2.3/learn/concepts/causal-context/index.html)).
+Riak 2.0 switched to **dotted version vectors**
+([Preguiça et al., 2010](https://arxiv.org/abs/1011.5808)), which tag each
+value with the one event, the "dot", that created it. Siblings then stay
+"proportional to the number of concurrent updates".
+
+| Mechanism | Size | Detects concurrency? | Near wall time? | Used in |
+|---|---|---|---|---|
+| Physical timestamp | 8 bytes | No, and misorders under skew | Yes | Cassandra cells |
+| Lamport clock | 8 bytes | No | No | Lamport's mutex; the logical half of every HLC |
+| Version vector | One entry per writer | **Yes** | No | Dynamo, Riak before 2.0 |
+| Dotted version vector | Per replica, plus a dot per value | **Yes**, without sibling explosion | No | Riak 2.0+ |
+| Hybrid logical clock | 8 bytes | No | **Yes**, within the clock offset | CockroachDB, MongoDB |
+| TrueTime interval | Two timestamps | Orders non-overlapping intervals | Yes, with a bound | Spanner |
+
+</Sub>
+
+<SectionHeading n="06" id="hlc">Hybrid logical clocks</SectionHeading>
+
+Lamport and vector clocks can't tell you *when* anything happened, and a
+database that serves "read as of 10:00" needs that. A **hybrid logical clock**
+respects causality like a Lamport clock and stays close to wall time.
+
+<Sub n="6.1" title="The algorithm">
+
+Kulkarni, Demirbas and colleagues described it in
+[Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases](https://cse.buffalo.edu/tech-reports/2014-04.pdf)
+(2014). A timestamp is a pair `(l, c)`: `l` is the largest physical time the
+node has heard of, and `c` is a counter for when `l` hasn't moved.
+
+- **Local or send:** `l = max(l, physical_now)`. If `l` didn't change,
+  increment `c`; otherwise reset it to 0.
+- **Receive:** `l` is the max of local `l`, the message's `l` and physical
+  now. `c` comes from whichever contributed the winner, plus one, or 0 if
+  physical time won outright.
+
+Compare `l` first, then `c`. As with Lamport, a → b implies
+`hlc(a) < hlc(b)`. Unlike Lamport, `l` never runs further ahead of a node's
+physical clock than the offset between clocks, ε.
+
+<Why>Why doesn't the counter grow without bound?</Why>
+
+Because `c` only climbs while `l` is stuck at a value from a node whose clock
+ran ahead. Once the local clock passes that value, `l` takes physical time and
+`c` resets. On four EC2 nodes in the paper's experiments, `c` stayed below 4,
+so the authors pack it into 64 bits: 48 bits of NTP time for `l`, still
+microsecond granularity, and 16 bits for `c`.
+
+</Sub>
+
+<Sub n="6.2" title="CockroachDB's HLC, line by line">
+
+CockroachDB keeps an HLC per node and every KV request carries its timestamp.
+Taking a new one is the paper's send rule:
+
+<SourceRead
+  file="pkg/util/hlc/hlc.go"
+  repo="cockroachdb/cockroach"
+  tag="v24.1.0"
+  href="https://github.com/cockroachdb/cockroach/blob/v24.1.0/pkg/util/hlc/hlc.go#L399"
+>
+```go
+func (c *Clock) NowAsClockTimestamp() ClockTimestamp {
+	physicalClock := c.getPhysicalClockAndCheck(context.TODO())
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mu.timestamp.WallTime >= physicalClock {
+		// The wall time is ahead, so the logical clock ticks.
+		c.mu.timestamp.Logical++
+	} else {
+		// Use the physical clock, and reset the logical one.
+		atomic.StoreInt64(&c.mu.timestamp.WallTime, physicalClock)
+		c.mu.timestamp.Logical = 0
+	}
+
+	c.enforceWallTimeWithinBoundLocked()
+	return c.mu.timestamp
+}
+```
+</SourceRead>
+
+The receive side is where it gets dangerous, since a remote node can push your
+clock forward:
+
+<SourceRead
+  file="pkg/util/hlc/hlc.go"
+  repo="cockroachdb/cockroach"
+  tag="v24.1.0"
+  href="https://github.com/cockroachdb/cockroach/blob/v24.1.0/pkg/util/hlc/hlc.go#L494"
+>
+```go
+func (c *Clock) UpdateAndCheckMaxOffset(ctx context.Context, rt ClockTimestamp) error {
+	physicalClock := c.getPhysicalClockAndCheck(ctx)
+
+	offset := time.Duration(rt.WallTime - physicalClock)
+	if c.maxOffset > 0 && offset > c.maxOffset {
+		return errors.Mark(
+			errors.Errorf("remote wall time is too far ahead (%s) to be trustworthy", offset),
+			errUntrustworthyRemoteWallTimeErr,
+		)
+	}
+
+	if physicalClock > rt.WallTime {
+		c.Update(ClockTimestamp{WallTime: physicalClock})
+	} else {
+		c.Update(rt)
+	}
+
+	return nil
+}
+```
+</SourceRead>
+
+| Line | What it does |
+|---|---|
+| `offset > c.maxOffset` | Refuses a remote timestamp more than the maximum offset ahead, so one node an hour fast can't drag the cluster an hour forward. |
+| `c.Update(...)` | Ratchets the local clock to the later of the two. Unlike the paper, receive doesn't bump the logical part; the next `Now` does. |
+| `enforceWallTimeWithinBoundLocked()` | `log.Fatalf` if the clock passes an upper bound persisted earlier, so a restarted node can't reissue timestamps it may already have used. |
+
+</Sub>
+
+<Sub n="6.3" title="Max offset, uncertainty and self-termination">
+
+The maximum offset is the operator's promise that no two clocks differ by more
+than this. It defaults to **500 ms**
+([CockroachDB FAQ](https://docs.cockroachlabs.com/docs/stable/operational-faqs)).
+
+<Why>Why does a database built on HLCs need a clock bound at all?</Why>
+
+Because an HLC only orders events linked by messages. Say T1 commits on a node
+whose clock is 100 ms slow, and then the user starts T2 on an accurate node.
+T2's read timestamp may be *earlier* than T1's commit, though T1 finished
+first in real time, and T2 would miss the write.
+
+So a read at `t` treats any value stamped in `(t, t + max offset]` as possibly
+in its past, and on finding one does an "uncertainty restart" just above it
+([Living Without Atomic Clocks](https://www.cockroachlabs.com/blog/living-without-atomic-clocks/)).
+In the post's words, "While Spanner always waits after writes, CockroachDB
+sometimes retries reads."
+
+That only works if the promise holds, so nodes check each other's clocks over
+RPC heartbeats. A node whose clock is off from at least half the others by
+**80% of the maximum offset** "spontaneously shuts down". A crashed node is an
+outage. A node serving reads outside its uncertainty window returns wrong
+answers.
+
+<Callout label="Design implication">
+HLCs don't remove the clock requirement; they turn a violation into an outage
+instead of silent anomalies. Put clock offset on the dashboard for these nodes,
+and don't raise the maximum offset to silence restarts: it widens every read's
+uncertainty window.
+</Callout>
+
+</Sub>
+
+<Sub n="6.4" title="MongoDB's cluster time">
+
+MongoDB uses the same idea with a coarser physical part. Per Tyulenev et al.'s
+[SIGMOD 2019 paper](https://dl.acm.org/doi/10.1145/3299869.3314049), cluster
+time pairs a 32-bit count of Unix seconds with a 32-bit increment for writes in
+the same second. It advances on writes to a primary's oplog, and every message
+carries the highest value the sender has seen.
+
+<Why>Why is MongoDB's cluster time signed?</Why>
+
+Because clients gossip it too. A malicious client could send a cluster time
+near the maximum and push every node there, after which no write could get a
+larger timestamp. So servers sign it with an HMAC: anyone can read it, only
+MongoDB processes can mint one. A causally consistent session then reads with
+`afterClusterTime` set to its last `operationTime`, and the serving node waits
+until its oplog catches up.
+
+</Sub>
+
+<SectionHeading n="07" id="truetime">TrueTime and commit wait</SectionHeading>
+
+Spanner takes the other road from section 1: measure how wrong the clocks are,
+and wait out the error.
+
+<Sub n="7.1" title="A clock that returns an interval">
+
+`TT.now()` returns `[earliest, latest]` and guarantees the true time is inside.
+`TT.after(t)` is true if `t` has definitely passed. ε is half the interval's
+width. From the Spanner paper
+([Corbett et al., OSDI 2012](https://storage.googleapis.com/gweb-research2023-media/pubtools/1974.pdf),
+quoted from the extended TOCS version):
+
+| Piece | How it works |
+|---|---|
+| **Time masters** | A set per datacenter. Most have GPS receivers; the rest, "Armageddon masters", have atomic clocks, because the two fail in unrelated ways. |
+| **Timeslave daemon** | One per machine. It polls several masters, rejects liars with a variant of Marzullo's algorithm, and syncs to the rest. |
+| **Drift bound** | Between polls, ε grows at an assumed worst case of 200 µs/s. Machines that drift faster are evicted. |
+| **Resulting ε** | A sawtooth "from about 1 to 7 ms over each poll interval", polling every 30 s: 0–6 ms of drift plus 1 ms of network delay. "ε is therefore 4 ms most of the time." |
+
+<Why>How much do you have to trust the bound?</Why>
+
+Completely. If a clock drifts faster than 200 µs/s, TrueTime's guarantee is
+false and so is Spanner's consistency. The paper's argument is empirical: "bad
+CPUs are 6 times more likely than bad clocks". A clock you measure and evict is
+as trustworthy as the rest of the hardware.
+
+</Sub>
+
+<Sub n="7.2" title="Commit wait, step by step">
+
+An interval clock gives Spanner **external consistency**: if T1 commits before
+T2 starts in real time, T1's timestamp is smaller. It takes two rules:
+
+<Steps
+  title="Commit wait for one Spanner transaction"
+  lanes={[
+    { t: "Client", s: "sends commit", icon: "◉" },
+    { t: "Coordinator leader", s: "picks s", icon: "⚑" },
+    { t: "Paxos", s: "replicates", icon: "⇅" },
+    { t: "Commit wait", s: "until TT.after(s)", icon: "⏳" },
+    { t: "Visible", s: "reply, unlock", icon: "✓" },
+  ]}
+  steps={[
+    [0, "The client asks the coordinator leader to commit transaction T, which already holds its write locks."],
+    [1, "**Start rule.** On arrival, the leader picks commit timestamp `s` no less than `TT.now().latest`, so `s` is at or after the true time of the request."],
+    [2, "The leader logs the commit record through **Paxos**. In the paper's latency benchmark, a Paxos round took about 10 ms."],
+    [3, "**Commit-wait rule.** Nothing is visible until `TT.after(s)` is true, so `s` is guaranteed to be in the past. The expected wait is at least **2ε**, and it overlaps the Paxos round."],
+    [4, "Now the leader replies and releases locks. Any transaction starting after this picks a timestamp of at least its own `TT.now().latest`, which must exceed `s`."],
+  ]}
+/>
+
+The paper's proof chains the rules: `s1` is before T1's real commit time
+(commit wait), T1's commit is before T2 starts (assumption), T2 starts before
+it reaches its leader (causality), and that arrival is at or before `s2`
+(start). So `s1 < s2`, with no message between the transactions.
+
+<Predict
+  q="ε is 4 ms and a Paxos round takes 10 ms. Roughly how much latency does commit wait add to a write?"
+  options={[
+    "About 4 ms",
+    "About 8 ms",
+    "About 14 ms",
+    "Possibly none",
+  ]}
+  answer={3}
+>
+The wait is about 2ε, roughly 8 ms, counted from when `s` was picked. But it runs in
+parallel with Paxos, which takes longer, so by the time replication finishes
+`TT.after(s)` is already true and the reply isn't delayed at all. Commit wait
+hurts when ε is large compared to replication time, which is why Google paid
+for GPS and atomic clocks to keep ε small.
+</Predict>
+
+</Sub>
+
+<Sub n="7.3" title="TrueTime outside Google">
+
+You can build the same interval on AWS. The
+[ClockBound](https://github.com/aws/clock-bound) daemon reads chrony's state
+and publishes `earliest`, `latest` and a sync status, with the NTP error bound
+computed as **|local offset| + root dispersion + root delay / 2**. It grows
+between updates, like TrueTime's sawtooth. With bounds under 100 µs, a 2ε
+commit wait is roughly 0.2 ms at most.
+
+| Approach | Clock requirement | What you pay | If the bound breaks |
+|---|---|---|---|
+| **Spanner / TrueTime** | A measured, enforced ε | Commit wait of about 2ε | Consistency violation, prevented by evicting bad clocks |
+| **CockroachDB / HLC** | An operator-promised max offset, 500 ms default | Read restarts in the uncertainty window | Stale reads, prevented by self-termination |
+| **Pure logical clocks** | None | No wall-time reads or real-time order | Nothing to break |
+| **Wall-clock LWW** | Implicit, rarely stated | Nothing up front | Silently lost writes |
+
+</Sub>
+
+<SectionHeading n="08" id="clocks-decide">When the clock decides who wins</SectionHeading>
+
+That last row is the common one. Two patterns cause most clock-related data
+loss, and neither announces itself.
+
+<Sub n="8.1" title="Last-write-wins">
+
+Cassandra resolves conflicting writes to a cell by timestamp, highest wins. By
+default "the coordinator will use the current time (in microseconds) at the
+start of statement execution"; clients can supply one with `USING TIMESTAMP`
+([Cassandra docs](https://cassandra.apache.org/doc/latest/cassandra/developing/cql/dml.html)).
+
+<Why>What goes wrong when one coordinator's clock is fast?</Why>
+
+Every write it coordinates is stamped in the future. With its clock 200 ms
+ahead:
+
+- A write through it at 12:00:00.000 is stamped 12:00:00.200.
+- A later write through an accurate node at 12:00:00.100 **loses**. Both
+  clients were told success.
+- A `DELETE` is a timestamped tombstone. Delete a row within 200 ms of writing
+  it through the fast node, and the tombstone is older than the data. The row
+  stays.
+
+Kyle Kingsbury's [Jepsen analysis of Cassandra](https://aphyr.com/posts/294-call-me-maybe-cassandra)
+showed acknowledged writes to one cell silently discarded under LWW, and makes
+the general point: an LWW register only guarantees your write survives when
+the value is immutable.
+
+<Callout label="Common mistake" kind="warn">
+Using LWW for read-modify-write data: counters, lists, balances. Concurrent
+read-modify-writes lose an update under LWW even with perfect clocks, and skew
+picks which. Use lightweight transactions (Paxos-backed compare-and-set), a
+CRDT type, or immutable append-only rows.
+</Callout>
+
+</Sub>
+
+<Sub n="8.2" title="Leases and fencing tokens">
+
+A **lease** is a lock with an expiry. It stops a crashed holder blocking
+everyone forever, but it assumes the holder notices when its time is up.
+
+Martin Kleppmann's [How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)
+(2016) walks through the failure. Client 1 takes the lease and pauses in a long
+GC. The lease expires, client 2 takes it, and client 1 wakes still believing
+it holds the lock. Both write. No clock on client 1 could prevent this; it
+wasn't running to read one.
+
+<Why>What's a fencing token?</Why>
+
+A number that goes up with every grant, checked by the resource instead of the
+client. Client 1 gets token 33 and pauses; client 2 gets 34 and writes. When
+client 1 writes with 33, the storage "remembers that it has already processed a
+write with a higher token number (34), and so it rejects the request".
+
+That moves the ordering decision from a clock to a counter, the same move
+Lamport made in 1978. The lock service has to issue tokens in strict order,
+which in practice means a consensus store: ZooKeeper's zxid or etcd's revision.
+[Chapter 27](/topics/27-consensus) covers how those stay safe, including the
+leases Raft leaders use for reads.
+
+<Callout label="Design implication">
+Any lease holder can be paused past expiry: GC, VM migration, a page fault on a
+swapped heap, `SIGSTOP`. If the protected resource doesn't check a fencing
+token, the lease is an efficiency hint, not a safety guarantee.
+</Callout>
+
+</Sub>
+
+<Sub n="8.3" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Negative durations, panics or huge timeouts after a clock change | Elapsed time measured on the wall clock | Monotonic clock for every duration |
+| Every lease or session expires at once | Wall clock stepped forward; expiry in wall time | Monotonic deadlines; step only at boot |
+| Cross-host logs show effects before causes | Normal clock skew | Propagate trace IDs or a logical clock; don't sort by host time |
+| Cassandra deletes don't stick, recent writes vanish | A fast coordinator or client clock under LWW | Fix time sync, alert on offset, avoid client timestamps |
+| CockroachDB nodes shut themselves down | Offset past 80% of the maximum | Fix chrony on that node; don't just raise the max |
+| Half-second disagreements on a leap day | Mixed smeared and unsmeared sources | One leap policy fleet-wide |
+| Two clients both "hold" the lock | A paused holder past its lease | Fencing tokens checked by the resource |
+
+<Why>What should you check on Monday?</Why>
+
+First, grep for durations computed from wall-clock calls. Second, find every
+place a timestamp decides which write wins, and ask what happens if one
+machine is a second fast. Third, run `chronyc tracking` on a few hosts, check
+they share sources and a leap policy, and graph the offset.
+
+</Sub>
+
+<SectionHeading n="09" id="summary">Summary</SectionHeading>
+
+1. **"Time" is three questions.** Now, elapsed and before each need a different
+   clock.
+2. **Clocks disagree by about half a round trip.** You can't see how a delay
+   splits between directions, so NTP's error is bounded by δ/2.
+3. **The wall clock can go backwards.** Steps and leap seconds move
+   `CLOCK_REALTIME`; `CLOCK_MONOTONIC` is only slewed.
+4. **Every Linux clock is one counter with a different base.** Each costs roughly
+   17 ns through the vDSO in the test above, so use the right one.
+5. **NTP accuracy depends on the path.** Tens of milliseconds over the internet,
+   under 100 µs with Amazon's local service, hundreds of milliseconds on some
+   cloud VMs by CockroachDB's account.
+6. **Leap seconds break code that assumes time only moves forward.** Smear them,
+   with one policy fleet-wide.
+7. **Lamport clocks give a causal total order, not concurrency.** A smaller
+   timestamp never proves happened-before.
+8. **Vector clocks detect concurrency at a size cost.** Dynamo truncated them;
+   Riak moved to dotted version vectors.
+9. **HLCs stay near wall time but still need a clock bound.** CockroachDB
+   enforces its 500 ms default with read restarts and self-termination.
+10. **Clocks shouldn't decide who wins.** LWW drops writes under skew, and
+    leases need fencing tokens because a paused holder can't read any clock.
+
+<SectionHeading n="10" id="build">Build this</SectionHeading>
+
+**A clock-skew test bench for a toy key-value store.**
+
+- Write a three-node store where each node's "wall clock" is a function you
+  control, so you can add an offset or drift per node without touching the
+  real clock.
+- Implement three conflict rules: LWW on wall time, LWW on an HLC, and version
+  vectors that keep siblings. Drive the same random mix of puts, deletes and
+  read-modify-writes through each.
+- Skew one node by 0, 10, 100 and 1,000 ms and count lost acknowledged writes
+  and resurrected deletes. Then add CockroachDB's max-offset check and see
+  which failures become errors.
+
+<SectionHeading n="11" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Why measure a request's latency with a monotonic clock instead of the wall clock?">
+The wall clock can be stepped by NTP, an operator or a leap second, so the
+difference of two readings can be wrong or negative. `CLOCK_MONOTONIC` is only
+slewed, never set. Cloudflare's 2017 DNS outage came from a negative duration
+measured on the wall clock during a leap second.
+</QA>
+
+<QA level="beginner" q="What does it mean for two events to be concurrent in Lamport's sense?">
+Neither happened before the other: no chain of local steps and messages links
+them. It says nothing about real time, only that no process could have known
+about one when it did the other.
+</QA>
+
+<QA level="intermediate" q="What can a Lamport clock do that a vector clock can't, and the other way round?">
+A Lamport clock gives each event one number and, with a node-ID tie-break, a
+total order consistent with causality, in 8 bytes. A vector clock can tell you
+two events were concurrent, which a Lamport clock can't, since `L(a) < L(b)`
+fits both a → b and concurrency. It costs one entry per writer.
+</QA>
+
+<QA level="intermediate" q="How does NTP estimate clock offset, and what's the error bound?">
+From four timestamps T1 to T4. Delay is `(T4 − T1) − (T3 − T2)`, offset is
+`((T2 − T1) + (T3 − T4)) / 2`. That assumes symmetric paths; if they aren't,
+the error can be up to half the delay and NTP can't detect it, so clients
+prefer low-delay samples and nearby servers.
+</QA>
+
+<QA level="intermediate" q="Your Cassandra cluster loses recent updates, and some deletes don't take effect. What do you suspect?">
+Clock skew under last-write-wins. A fast node or client stamps writes in the
+future, so later writes lose, and a tombstone can be older than the data it
+targets. Check offsets on coordinators and on clients using `USING TIMESTAMP`;
+move read-modify-write data to lightweight transactions or a CRDT.
+</QA>
+
+<QA level="deep" q="Explain Spanner's commit wait and why it gives external consistency.">
+The coordinator picks s ≥ `TT.now().latest`, then hides the commit until
+`TT.after(s)`, so s is definitely past when anyone sees it. A later
+transaction takes its timestamp from `TT.now().latest` after that, so it's
+larger. The wait is about 2ε, 8 ms at the paper's typical 4 ms, overlapped
+with Paxos.
+</QA>
+
+<QA level="deep" q="CockroachDB uses HLCs. Why does it still need synchronized clocks, and what happens if they drift?">
+Transactions with no message between them are ordered only by physical time,
+so a slow clock can give a later transaction an earlier timestamp. Reads treat
+values within the max offset (500 ms default) above their timestamp as
+uncertain and restart above them. A node off from half its peers by 80% of
+the max shuts down, and remote timestamps beyond the max are refused.
+</QA>
+
+<QA level="deep" q="Why isn't a lease with a TTL enough for mutual exclusion?">
+The holder can pause past expiry while another client takes the lease, then
+resume and write. No client-side clock check helps, because it wasn't running.
+The fix is a fencing token that increases with each grant and is checked by
+the resource, which rejects anything lower than the highest it has seen.
+</QA>
+
+<SectionHeading n="12" id="resources">Go deeper</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Lamport, Time, Clocks, and the Ordering of Events (1978)">
+    Happened-before, logical clocks and the mutex algorithm in eight pages.
+    [PDF](https://lamport.azurewebsites.net/pubs/time-clocks.pdf).
+  </WildCard>
+  <WildCard name="Corbett et al., Spanner (OSDI 2012)">
+    TrueTime, commit wait and its proof, and ε measured across thousands of
+    machines. [PDF](https://storage.googleapis.com/gweb-research2023-media/pubtools/1974.pdf).
+  </WildCard>
+  <WildCard name="Kulkarni et al., Logical Physical Clocks (2014)">
+    The HLC paper, including why the naive version is unbounded.
+    [PDF](https://cse.buffalo.edu/tech-reports/2014-04.pdf).
+  </WildCard>
+  <WildCard name="pkg/util/hlc/hlc.go, CockroachDB v24.1.0">
+    A production HLC with jump detection, the max-offset check and a persisted
+    upper bound. [Source](https://github.com/cockroachdb/cockroach/blob/v24.1.0/pkg/util/hlc/hlc.go).
+  </WildCard>
+  <WildCard name="DeCandia et al., Dynamo (SOSP 2007)">
+    Version vectors in production and the truncation trade-off.
+    [PDF](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf).
+  </WildCard>
+  <WildCard name="Kleppmann, How to do distributed locking (2016)">
+    Leases, GC pauses and fencing tokens.
+    [Post](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html).
+  </WildCard>
+  <WildCard name="RFC 5905, NTPv4">
+    The protocol and its clock discipline, with the offset and delay maths.
+    [RFC](https://www.rfc-editor.org/rfc/rfc5905).
+  </WildCard>
+  <WildCard name="aws/clock-bound">
+    A TrueTime-style interval clock on top of chrony.
+    [Repo](https://github.com/aws/clock-bound).
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="13" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Consensus: Raft, Paxos & Leases">
+    Ordered logs, fencing tokens, and the clock assumptions behind a leader's
+    lease read. [Chapter 27](/topics/27-consensus).
+  </WildCard>
+  <WildCard name="Syscalls, Interrupts & the Kernel Boundary">
+    The vDSO that makes `clock_gettime` cost 17 ns instead of 130.
+    [Chapter 07](/topics/07-syscalls-kernel-boundary).
+  </WildCard>
+  <WildCard name="The Memory Model & Atomics">
+    Happens-before inside one machine, enforced by fences instead of messages.
+    [Chapter 03](/topics/03-memory-model-atomics).
+  </WildCard>
+  <WildCard name="Redis Internals">
+    The acknowledged write that vanishes in a failover: silent loss like LWW's,
+    from asynchronous replication. [Chapter 22](/topics/22-redis).
+  </WildCard>
+</CardGrid>
