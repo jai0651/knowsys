@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Menu, X } from "lucide-react";
@@ -14,7 +15,12 @@ export function MobileMenu({ groups }: { groups: Pick<Group, "slug" | "name" | "
   const path = usePathname();
   useEffect(() => {
     document.body.style.overflow = open ? "hidden" : "";
-    return () => { document.body.style.overflow = ""; };
+    if (!open) return () => { document.body.style.overflow = ""; };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    window.addEventListener("keydown", onKey);
+    // Open at the chapter you're on, not at the top of a 48-item list.
+    requestAnimationFrame(() => document.querySelector('[data-mobile-current="true"]')?.scrollIntoView({ block: "center" }));
+    return () => { document.body.style.overflow = ""; window.removeEventListener("keydown", onKey); };
   }, [open]);
 
   return (
@@ -26,8 +32,11 @@ export function MobileMenu({ groups }: { groups: Pick<Group, "slug" | "name" | "
       >
         <Menu className="size-[19px]" />
       </button>
-      {open && (
-        <div className="fixed inset-0 z-[80] lg:hidden">
+      {/* Portalled to <body>: the header's backdrop-filter makes it the
+          containing block for fixed children, which trapped this drawer inside
+          the 64px bar where nobody could see it. */}
+      {open && createPortal(
+        <div className="fixed inset-0 z-[80] lg:hidden" role="dialog" aria-modal="true" aria-label="Contents">
           <div className="absolute inset-0 bg-ink/30" onClick={() => setOpen(false)} />
           <nav onClick={(e) => { if ((e.target as HTMLElement).closest("a")) setOpen(false); }} className="absolute inset-y-0 left-0 w-[min(86vw,340px)] overflow-y-auto border-r border-line bg-bg px-5 pb-10 pt-4">
             <div className="mb-4 flex items-center justify-between">
@@ -49,6 +58,7 @@ export function MobileMenu({ groups }: { groups: Pick<Group, "slug" | "name" | "
                   <Link
                     key={p.slug}
                     href={p.href}
+                    data-mobile-current={p.href === path ? "true" : undefined}
                     className={cn(
                       "block py-1.5 text-[15px] leading-snug",
                       p.href === path ? "font-medium text-accent" : p.status === "live" ? "text-ink" : "text-faint",
@@ -61,7 +71,8 @@ export function MobileMenu({ groups }: { groups: Pick<Group, "slug" | "name" | "
               </div>
             ))}
           </nav>
-        </div>
+        </div>,
+        document.body,
       )}
     </>
   );

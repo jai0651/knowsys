@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { createPortal } from "react-dom";
 import { CornerDownLeft, Search as SearchIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -69,8 +70,6 @@ export function Search() {
       .map((r) => r.h);
   }, [idx, q]);
 
-  useEffect(() => setCur(0), [q]);
-
   const go = useCallback(
     (h: Hit) => {
       setOpen(false);
@@ -103,7 +102,9 @@ export function Search() {
         <kbd className="hidden rounded border border-line px-1.5 py-0.5 font-mono text-[10px] md:inline">⌘K</kbd>
       </button>
 
-      {open && (
+      {/* Portalled for the same reason as the mobile drawer: a fixed element
+          inside the blurred header is positioned against the header. */}
+      {open && createPortal(
         <>
           <div className="fixed inset-0 z-[70] bg-ink/25 backdrop-blur-[2px]" onClick={() => setOpen(false)} />
           <div className="glass fixed left-1/2 top-[12vh] z-[71] w-[min(94vw,640px)] -translate-x-1/2 overflow-hidden rounded-xl">
@@ -112,7 +113,7 @@ export function Search() {
               <input
                 autoFocus
                 value={q}
-                onChange={(e) => setQ(e.target.value)}
+                onChange={(e) => { setQ(e.target.value); setCur(0); }}
                 onKeyDown={onKeyDown}
                 placeholder="Search chapters and sections…"
                 className="w-full bg-transparent py-4 text-[15px] text-ink outline-none placeholder:text-faint"
@@ -156,7 +157,8 @@ export function Search() {
               )}
             </div>
           </div>
-        </>
+        </>,
+        document.body,
       )}
     </>
   );
