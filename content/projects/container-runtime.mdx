@@ -1,0 +1,246 @@
+---
+title: Docker, from scratch
+tagline: "A container runtime in a few hundred lines: namespaces, a root filesystem, cgroup limits, layered images and a network, until docker run stops being magic."
+difficulty: 3
+time: "4–6 weekends"
+languages: ["Go", "Rust", "C"]
+icon: "▣"
+order: 4
+chapters: ["11-containers", "06-processes-scheduling", "08-filesystems", "10-linux-networking", "07-syscalls-kernel-boundary"]
+---
+
+`docker run alpine sh` feels like starting a tiny virtual machine. It isn't. It's
+one ordinary Linux process that the kernel has been asked to lie to in a few
+specific ways, plus a cgroup that bills it for what it uses.
+
+Building your own runtime is the fastest way to see that. By the end you'll have
+a program that pulls a real image from Docker Hub, unpacks its layers, starts a
+process that thinks it's PID 1 on its own machine, with its own filesystem,
+hostname and network, and kills it if it uses more than its memory limit. It's probably a
+few hundred lines, and every line maps to a kernel feature you can name.
+
+<SectionHeading n="01" id="why">Why build this</SectionHeading>
+
+Almost everything you deploy now runs in a container, and most engineers treat
+the runtime as a black box. Building one changes how you debug production:
+
+- **OOM kills stop being mysterious.** You'll have written the `memory.max`
+  line that triggers them.
+- **"Works on my machine, not in the pod" gets easier.** You'll know exactly
+  which parts of the environment a container replaces and which it shares, like
+  the kernel.
+- **Security reviews make sense.** You'll know why a container isn't a VM, and
+  which of capabilities, seccomp and user namespaces closes which hole.
+- **Kubernetes gets thinner.** Under the CRI, containerd and runc do what your
+  program will do.
+
+It's also probably one of the best-scoped systems projects there is. Each milestone runs
+on its own and is useful, so you can stop at any point with something that works.
+
+<SectionHeading n="02" id="shape">What you're building</SectionHeading>
+
+The finished runtime does these steps for every `run`:
+
+<Steps
+  title="What your runtime does on `run alpine sh`"
+  lanes={[
+    { t: "Image", s: "pull + unpack", icon: "⬇" },
+    { t: "Rootfs", s: "overlayfs", icon: "▦" },
+    { t: "Namespaces", s: "clone()", icon: "◌" },
+    { t: "cgroup", s: "limits", icon: "▤" },
+    { t: "Network", s: "veth + bridge", icon: "⇄" },
+    { t: "exec", s: "PID 1", icon: "▶" },
+  ]}
+  steps={[
+    [0, "Fetch the image manifest from the registry and download its layers: gzipped tarballs, each one a set of file changes."],
+    [1, "Stack the layers read-only with **overlayfs**, plus one empty writable layer on top for this container."],
+    [2, "`clone()` a child in new **PID, mount, UTS, IPC, network and cgroup namespaces**. From inside, it's alone on the machine."],
+    [3, "Create a **cgroup** directory, write `memory.max`, `cpu.max` and `pids.max`, and move the child into it."],
+    [4, "Create a **veth pair**, push one end into the child's network namespace, and plug the other into a bridge with NAT."],
+    [5, "Inside the child, `pivot_root` into the overlay, mount `/proc`, drop capabilities, and `exec` the command. It runs as **PID 1**."],
+  ]}
+/>
+
+<Why>Why is there no "container" object in the kernel?</Why>
+
+Because Linux never added one. Namespaces, cgroups and mounts are separate
+features, added over about a decade, that happen to compose. A "container" is
+just the name for a process with all of them applied. That's why you can build
+one piece at a time.
+
+<SectionHeading n="03" id="before">Before you start</SectionHeading>
+
+| You need | Why | Where to get it |
+|---|---|---|
+| A Linux machine you can be root on | Namespaces and cgroups are Linux kernel features | A VM, or `docker run --privileged` on a Mac |
+| Kernel 5.x or newer, cgroup v2 | The limits API used below | Any current distro |
+| Comfort with `fork`, `exec` and file descriptors | You'll call them directly | [Chapter 07](/topics/07-syscalls-kernel-boundary) |
+| One systems language | Direct syscalls | Go is easiest, Rust is safest, C shows the most |
+
+<Callout label="Design implication">
+Work inside a throwaway VM. Early bugs in milestones 2 and 5 may well unmount things
+on your host or move your real network interface into a namespace that then
+exits. A VM turns that into a reboot instead of a bad afternoon.
+</Callout>
+
+<SectionHeading n="04" id="roadmap">The roadmap</SectionHeading>
+
+Eight milestones. Each one is usable on its own, and each introduces one kernel
+idea.
+
+<Milestone n={1} title="A process that thinks it's alone" time="1 evening" learn={["clone()", "CLONE_NEWPID", "CLONE_NEWUTS", "PID 1"]} done="`hostname` inside differs from the host, and `echo $$` prints 1.">
+
+Start the child with `clone()` (in Go, `SysProcAttr.Cloneflags`) and ask for new
+**UTS** and **PID** namespaces. Set a hostname inside. The child now has its own
+hostname and sees itself as PID 1.
+
+Run `ps` inside and you'll still see every host process. That's the first
+surprise, and the next milestone fixes it: `ps` reads `/proc`, and you haven't
+given the child its own yet.
+
+</Milestone>
+
+<Milestone n={2} title="Its own root filesystem" time="1 weekend" learn={["mount namespace", "pivot_root", "MS_PRIVATE", "/proc"]} done="`ls /` shows Alpine's tree, `ps` shows only your process, and the host's mount table is untouched.">
+
+Download Alpine's "minirootfs" tarball and unpack it into a directory. Add
+**CLONE_NEWNS**, make every mount private so nothing propagates back to the
+host, then `pivot_root` into the directory and mount a fresh `/proc`.
+
+Use `pivot_root`, not `chroot`. A `chroot` can be escaped by a root process;
+`pivot_root` swaps the real root and lets you unmount the old one completely.
+
+</Milestone>
+
+<Milestone n={3} title="Limits with cgroups v2" time="1 evening" learn={["cgroupfs", "memory.max", "cpu.max", "pids.max", "OOM kills"]} done="A memory hog inside is killed at your limit, and `memory.events` shows `oom_kill 1`.">
+
+Create a directory under `/sys/fs/cgroup`, write `64M` to `memory.max`,
+`50000 100000` to `cpu.max` (half a CPU), and `64` to `pids.max`. Write the
+child's PID into `cgroup.procs` before it execs.
+
+Then break it on purpose. Allocate past the limit and watch the kernel kill it.
+Run a fork bomb and watch it stop at 64 processes. That's essentially all a
+Kubernetes resource limit is.
+
+</Milestone>
+
+<Milestone n={4} title="Layered images with overlayfs" time="1 weekend" learn={["overlayfs", "lowerdir / upperdir", "copy-up", "whiteouts"]} done="Two containers share one read-only image; changes in one never appear in the other or in the image.">
+
+Keep the unpacked image read-only as `lowerdir`, and give each container its
+own empty `upperdir` and `workdir`. Mount the overlay and pivot into that.
+
+Write to a file that came from the image, and overlayfs **copies it up** into the
+upper layer first. Delete one, and it leaves a **whiteout** marker. You'll need
+both ideas in milestone 6.
+
+</Milestone>
+
+<Milestone n={5} title="A network of its own" time="1 weekend" learn={["network namespace", "veth pairs", "bridges", "NAT", "resolv.conf"]} done="The container can `ping` another container by IP and fetch a web page from the internet.">
+
+Add **CLONE_NEWNET**, and the child has only a loopback interface. Create a
+**veth pair** (two interfaces joined like a cable), move one end into the child's
+namespace, and attach the other to a bridge on the host. Give each end an
+address, add a default route inside, and set up NAT on the host so traffic can
+leave.
+
+Copy a `resolv.conf` in, or DNS won't work. That's probably the most common
+"networking is broken" bug at this stage.
+
+</Milestone>
+
+<Milestone n={6} title="Pull real images" time="1–2 weekends" learn={["OCI distribution API", "image manifests", "content addressing", "layer tarballs"]} done="`run nginx` pulls from Docker Hub, unpacks every layer in order, and serves a page.">
+
+Talk to a registry over HTTPS. Get a token, fetch the **manifest** for a tag
+(choosing your CPU architecture from the index), then download each **layer** by
+its sha256 digest. Every blob is **content-addressed**, so verify the digest as
+you download.
+
+Unpack the layers in order, applying whiteouts, and you have a lowerdir for
+milestone 4. This is also where you learn why images are cached by digest, not by
+name.
+
+</Milestone>
+
+<Milestone n={7} title="Make it safe" time="1 weekend" learn={["capabilities", "seccomp", "user namespaces", "no_new_privs"]} done="Root inside the container can't mount filesystems, load kernel modules, or change the host clock.">
+
+Root inside your container is still root on the host kernel. Close that down in
+layers:
+
+- **Drop capabilities** to the short list Docker uses, so "root" can't
+  `mount`, load modules or change the time.
+- **Set `no_new_privs`**, so setuid binaries can't grant anything back.
+- **Add a seccomp filter** that refuses dangerous syscalls.
+- **Try user namespaces** last, mapping container root to an unprivileged host
+  user. That's "rootless" containers.
+
+</Milestone>
+
+<Milestone n={8} title="Lifecycle: PID 1, signals and exec" time="1 weekend" learn={["zombie reaping", "signal forwarding", "setns()", "exit codes"]} done="`stop` ends the container cleanly, no zombies remain, and `exec` opens a shell in a running container.">
+
+PID 1 has duties no other process has: it must **reap orphaned children** and it
+only receives signals it has handlers for. Either make your runtime inject a
+tiny init (the way `docker run --init` adds tini), or reap and forward signals
+yourself.
+
+Then add `exec`: open the running container's namespace files in
+`/proc/<pid>/ns/` and `setns()` into each one before running a new command.
+That's exactly what `docker exec` and `kubectl exec` do.
+
+</Milestone>
+
+<SectionHeading n="05" id="traps">Traps that catch everyone</SectionHeading>
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Mounts made inside the container appear on the host | Mount propagation is shared by default | Remount `/` as `MS_PRIVATE` or `MS_SLAVE` before anything else |
+| `ps` inside shows host processes | `/proc` is still the host's | Mount a new `proc` after `pivot_root` |
+| The host loses its network | Your script moved the host's real interface into the namespace | Always create and move a fresh veth end; never touch `eth0` |
+| The memory limit does nothing | You tested from `nsenter`, which doesn't join the cgroup, or the kernel uses cgroup v1 | Put the PID into `cgroup.procs`; check `stat -fc %T /sys/fs/cgroup` says `cgroup2fs` |
+| Deleted files reappear from the image | Whiteout files were ignored while unpacking | Handle `.wh.` entries and opaque directories |
+| `docker stop` takes 10 seconds | Your PID 1 ignores SIGTERM | Forward signals, or run a minimal init |
+| DNS fails, ping by IP works | No `resolv.conf` in the rootfs | Write one in, or bind-mount the host's |
+
+<Callout label="Common mistake" kind="warn">
+Treating the container as a security boundary too early. Until milestone 7,
+root inside your container can do nearly anything root on the host can, because
+they share one kernel. [Chapter 11](/topics/11-containers) explains exactly where
+the boundary is.
+</Callout>
+
+<SectionHeading n="06" id="stretch">Stretch goals</SectionHeading>
+
+- **Speak the OCI runtime spec.** Read a `config.json` bundle like runc does, and
+  containerd can run your runtime in place of runc.
+- **Rootless by default.** Run the runtime as a normal user with user
+  namespaces and `newuidmap`.
+- **Checkpoint and restore.** Freeze a container with the cgroup freezer and look
+  at how CRIU serialises a running process.
+- **A tiny orchestrator.** Run several containers from a YAML file with a shared
+  network and restart policies: a miniature docker compose.
+
+<SectionHeading n="07" id="references">References worth your time</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Liz Rice, Containers From Scratch">
+    A talk that builds a container live in Go in about 20 minutes. The best
+    first hour you can spend on this project.
+  </WildCard>
+  <WildCard name="Linux containers in 500 lines of code">
+    Lizzie Dixon's annotated C runtime, with capabilities, seccomp and user
+    namespaces done properly.
+  </WildCard>
+  <WildCard name="bocker">
+    Docker's core ideas in about 100 lines of bash. Useful for seeing how small
+    the essential logic is.
+  </WildCard>
+  <WildCard name="OCI runtime and image specs">
+    What runc and every registry actually implement: the bundle format, the
+    manifest, and the layer rules.
+  </WildCard>
+  <WildCard name="man7.org: namespaces(7), cgroups(7)">
+    The authoritative description of every flag and file you'll touch.
+  </WildCard>
+  <WildCard name="runc and crun source">
+    Production runtimes in Go and C. Read them after milestone 8, when you'll
+    recognise every piece.
+  </WildCard>
+</CardGrid>

@@ -1,0 +1,263 @@
+---
+title: a database storage engine
+tagline: "A key-value store that grows into a real engine: fixed-size pages on disk, a B+tree or an LSM tree, a write-ahead log, crash recovery and a buffer pool, with a small SQL layer on top if you keep going."
+difficulty: 4
+time: "6–10 weekends"
+languages: ["Rust", "Go", "C", "C++"]
+icon: "⛁"
+order: 5
+chapters: ["18-storage-engines", "19-transactions-isolation", "09-storage-devices", "08-filesystems", "20-query-execution"]
+---
+
+Every database you use is, underneath the query planner and the wire protocol,
+a program that turns "put this key" into bytes on a disk and promises to find
+them again after the power goes out. That promise is a bit harder than it looks, and
+most of the interesting engineering in Postgres, SQLite and RocksDB goes into
+keeping it.
+
+This project builds that bottom layer. You'll start with a hash map that writes
+to a file, and end with an engine that stores sorted data in pages, survives
+`kill -9` in the middle of a write, keeps hot pages in memory, and answers range
+scans. If you keep going, you put a tiny SQL front end on it and run
+`SELECT` against your own files.
+
+<SectionHeading n="01" id="why">Why build this</SectionHeading>
+
+Most engineers meet the storage engine only when it misbehaves. Having written
+one changes what you notice:
+
+- **Write amplification stops being jargon.** You'll count how many bytes hit
+  the disk for every byte the user wrote, and see why it differs so much between
+  a B+tree and an LSM.
+- **`fsync` becomes a real decision.** You'll know what "durable" costs, and why
+  a database that skips `fsync` benchmarks so well.
+- **Index choices make sense.** Once you've split a B+tree node by hand, you'll
+  know why random UUID keys hurt inserts and why a covering index saves a lookup.
+- **Postgres and RocksDB settings get readable.** `shared_buffers`,
+  `checkpoint_timeout`, compaction style and bloom filter bits are all knobs on
+  pieces you will have built.
+
+It also rewards stopping early. A log-structured KV store with recovery is a
+useful program by milestone 3.
+
+<SectionHeading n="02" id="shape">What you're building</SectionHeading>
+
+A write in the finished engine goes through these stages:
+
+<Steps
+  title="What your engine does on `put(k, v)`"
+  lanes={[
+    { t: "API", s: "put / get / scan", icon: "⌨" },
+    { t: "WAL", s: "append + fsync", icon: "✎" },
+    { t: "Buffer pool", s: "cached pages", icon: "▤" },
+    { t: "Index", s: "B+tree or LSM", icon: "⋔" },
+    { t: "Checkpoint", s: "flush dirty pages", icon: "⇩" },
+    { t: "Recovery", s: "replay the log", icon: "↻" },
+  ]}
+  steps={[
+    [0, "The caller asks to store a key and value. Nothing has touched the disk yet, so nothing is promised."],
+    [1, "Append a record describing the change to the **write-ahead log** and `fsync` it. Once that returns, the write is durable, even though no data page has changed."],
+    [2, "Ask the **buffer pool** for the page that should hold the key. If it isn't in memory, read it from the data file, evicting a cold page if needed."],
+    [3, "Modify the page in memory: insert into a **B+tree leaf**, splitting it if full, or add the key to an in-memory **memtable** if you built an LSM. Mark the page dirty."],
+    [4, "Later, a **checkpoint** writes dirty pages back to the data file and records how far the log is now covered. Older log segments can be deleted."],
+    [5, "After a crash, **recovery** starts at the last checkpoint and replays the log forward, so every acknowledged write is back before the first new request."],
+  ]}
+/>
+
+<Why>Why write everything twice, once to the log and once to the page?</Why>
+
+Because the two writes have different shapes. A log append is sequential and
+small, so it's cheap to `fsync` on every commit. A page update lands wherever
+the key lives, and a page can be torn if the power fails halfway through
+writing it. The log lets you acknowledge fast and fix the pages lazily, and it
+gives recovery a record of what the pages should contain.
+
+<SectionHeading n="03" id="before">Before you start</SectionHeading>
+
+| You need | Why | Where to get it |
+|---|---|---|
+| Comfort with file I/O: `pread`, `pwrite`, `fsync` | Every milestone reads and writes pages at offsets | [Chapter 08](/topics/08-filesystems) |
+| A mental model of what a disk does with a write | Durability and torn writes depend on it | [Chapter 09](/topics/09-storage-devices) |
+| Binary encoding: fixed-width ints, varints, checksums | Pages and log records are byte layouts you design | Your language's byte-buffer library, plus CRC32 |
+| A way to kill your process mid-write | You can't test recovery politely | `kill -9` in a loop from a shell script |
+| One systems language | You need control over bytes and memory | Rust or Go are comfortable; C shows every byte |
+
+<Callout label="Design implication">
+Pick a page size (4 KiB matches most filesystems and SSDs) and never write
+anything to the data file that isn't a whole, aligned page. Every later
+milestone, from the buffer pool to checksums to recovery, gets simpler when the
+unit of I/O and the unit of caching are the same thing.
+</Callout>
+
+<SectionHeading n="04" id="roadmap">The roadmap</SectionHeading>
+
+Eight milestones. Milestones 4 and 5 fork: build a B+tree, an LSM, or both if
+you want to see the trade-off for yourself.
+
+<Milestone n={1} title="An append-only log store" time="1 evening" learn={["append-only files", "record framing", "in-memory index", "Bitcask"]} done="Restarting the process keeps every key, and a `get` costs one seek into the file.">
+
+Write each `put` as a record at the end of a file: length, key, value. Keep a
+hash map in memory from key to file offset. A `get` looks up the offset and
+reads one record. On startup, scan the file and rebuild the map.
+
+It's the design of Bitcask, and it's pretty fast. Its limits show up
+right away: the file only grows, the index must fit in RAM, and range scans are
+impossible because a hash map has no order.
+
+</Milestone>
+
+<Milestone n={2} title="Survive a crash" time="1 weekend" learn={["fsync", "torn writes", "checksums", "durability vs throughput"]} done="A script that `kill -9`s the store mid-write 1,000 times never finds a corrupt record or a lost acknowledged write.">
+
+Add a CRC to every record and, on startup, stop reading at the first record
+whose checksum fails. That's how you detect a write the crash cut in half.
+Then decide when to `fsync`: on every write, or batched every few milliseconds.
+
+Measure both. The gap is probably larger than you expect, and it's the trade every database
+exposes as a setting, like `synchronous_commit` in Postgres or `appendfsync` in
+Redis. Write down which writes you promise to keep and test that promise.
+
+</Milestone>
+
+<Milestone n={3} title="Compaction" time="1 evening" learn={["garbage collection", "atomic rename", "hint files", "space amplification"]} done="After overwriting one key a million times the data file is small again, and a crash during compaction loses nothing.">
+
+Old versions of overwritten keys waste space. Write the live records to a new
+file, `fsync` it, then `rename` it over the old one. `rename` is atomic on
+POSIX filesystems, so a crash leaves either the old file or the new one.
+
+Remember to `fsync` the directory too. Without it the rename itself can be
+lost, which is one of the more obscure ways to lose data on Linux.
+
+</Milestone>
+
+<Milestone n={4} title="Sorted pages: a B+tree" time="2–3 weekends" learn={["slotted pages", "node splits", "fan-out", "range scans"]} done="A million random inserts followed by a full scan returns every key in sorted order, and the tree's height stays small.">
+
+Lay out the file as fixed-size pages. Each page holds a header, an array of
+slot offsets, and variable-length cells packed from the end. Interior pages
+hold separator keys and child page numbers; leaves hold keys and values and
+link to their right sibling for scans.
+
+The hard part is the split. When a leaf is full, move half its cells to a new
+page and push a separator into the parent, which may split too. Get inserts
+right before you attempt deletes and merges. Postgres, for one, never merges
+half-empty pages; it only reclaims pages once they're completely empty.
+
+</Milestone>
+
+<Milestone n={5} title="Or sorted runs: an LSM tree" time="2–3 weekends" learn={["memtable", "SSTables", "bloom filters", "leveled vs tiered compaction"]} done="Writes run at close to sequential disk speed, and a `get` for a missing key skips most SSTables thanks to the bloom filters.">
+
+Buffer writes in a sorted in-memory **memtable** backed by your log from
+milestone 2. When it's full, write it out as an immutable sorted file (an
+**SSTable**) with an index block at the end. Reads check the memtable, then
+SSTables from newest to oldest.
+
+Reads now get slower as files pile up, so add a **bloom filter** per SSTable,
+then background **compaction** that merges files. Deletes become tombstones that
+compaction eventually drops. You'll see exactly why LSMs win on writes and pay
+for it on reads.
+
+</Milestone>
+
+<Milestone n={6} title="A buffer pool" time="1 weekend" learn={["page cache", "pinning", "LRU / clock eviction", "dirty pages"]} done="With a pool of 64 pages, a workload over 10,000 pages runs correctly, and a hot-key benchmark shows a hit rate above 95%.">
+
+Stop reading pages straight from the file. Keep a fixed array of in-memory
+frames and a map from page number to frame. Callers **pin** a page while they
+use it, and only unpinned pages can be evicted. A dirty page has to be written
+back before its frame is reused.
+
+Start with LRU, then try **clock**, which is roughly LRU without a linked list
+to update on every hit. A sequential scan will flush your hot pages out of a
+naive LRU. Postgres fights that with ring buffers for large scans.
+
+</Milestone>
+
+<Milestone n={7} title="A write-ahead log and real recovery" time="2 weekends" learn={["WAL", "LSNs", "redo logging", "checkpoints", "torn pages"]} done="`kill -9` during a burst of B+tree splits, restart, and every acknowledged key is present and the tree passes a structural check.">
+
+Now pages are updated in place, so a crash can leave a split half-written: a new
+page exists, but the parent doesn't point to it. Log every page change before
+you make it, stamp each page with the **LSN** of its last change, and never
+flush a page before its log records are on disk.
+
+Recovery reads from the last checkpoint and redoes any change whose LSN is newer
+than the page's. That's the redo half of ARIES. The undo half only matters once
+you have transactions that can abort, so leave it for the stretch goals.
+
+</Milestone>
+
+<Milestone n={8} title="Transactions, a little" time="1–2 weekends" learn={["atomic batches", "commit records", "snapshot reads", "MVCC basics"]} done="A batch of 100 writes interrupted by `kill -9` is either fully present or fully absent after restart.">
+
+Group writes into a batch with a single commit record in the log. Recovery
+applies a batch only if it finds the commit. That gives you atomicity.
+
+For isolation, the cheapest start is a single writer plus snapshot reads: tag
+each version with a sequence number and let readers ignore anything newer than
+the one they started at. It's a small version of how RocksDB snapshots and
+Postgres MVCC let reads run without blocking writes.
+
+</Milestone>
+
+<SectionHeading n="05" id="traps">Traps that catch everyone</SectionHeading>
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Data written just before a crash is gone | `write` returned, but the bytes were still in the OS page cache | `fsync` the file before acknowledging; test with `kill -9` and, better, a VM power-off |
+| A renamed file vanishes after a crash | The directory entry was never flushed | `fsync` the parent directory after `rename` |
+| Recovery reads garbage at the end of the log | A torn final record | Checksum every record and stop at the first bad one |
+| The B+tree loses keys after many inserts | A split updated the child but not the parent, or the reverse | Write a checker that walks the tree and verifies key order and parent pointers after every test |
+| Everything works until the dataset outgrows RAM | The buffer pool never evicts, or evicts pinned pages | Test with a pool much smaller than the data from the start |
+| LSM reads get slower every hour | Compaction can't keep up with writes | Measure the number of SSTables per read; throttle writes or compact more aggressively |
+| Endianness bugs when reading old files | Integers written in native byte order | Pick little-endian and encode explicitly |
+
+<Callout label="Common mistake" kind="warn">
+Testing recovery only with clean shutdowns. A `close()` path that flushes
+everything proves nothing. Crash the process at random points, thousands of
+times, and compare against a model of what was acknowledged. Most of the bugs
+you'll find in this project show up only that way.
+</Callout>
+
+<SectionHeading n="06" id="stretch">Stretch goals</SectionHeading>
+
+- **A small SQL layer.** Parse `CREATE TABLE`, `INSERT` and `SELECT ... WHERE`,
+  encode rows as values keyed by primary key, and run a scan with a filter. Add
+  a secondary index as a second tree. [Chapter 20](/topics/20-query-execution)
+  covers the executor side.
+- **Concurrency.** Latch crabbing in the B+tree so readers and writers can work on
+  different parts of the tree at once.
+- **Full ARIES.** Undo logging, compensation records, and aborting a transaction
+  after its pages were flushed.
+- **Direct I/O.** Bypass the OS page cache with `O_DIRECT` and see what your
+  buffer pool has to do that the kernel used to do for you.
+- **Compression and prefix encoding** in pages or SSTable blocks, and a
+  benchmark that shows what it buys.
+
+<SectionHeading n="07" id="references">References worth your time</SectionHeading>
+
+<CardGrid>
+  <WildCard name="cstack, Let's Build a Simple Database">
+    A step-by-step SQLite clone in C, from a REPL to a B-tree on disk. A good
+    companion for milestone 4 if you get stuck on the page layout.
+  </WildCard>
+  <WildCard name="Alex Petrov, Database Internals">
+    The book for this project. Part I covers B-trees, page layout, buffer
+    management, recovery and LSM trees in the depth you need.
+  </WildCard>
+  <WildCard name="CMU 15-445/645, Database Systems">
+    Andy Pavlo's course. The lectures are free online, and the BusTub projects
+    (buffer pool, B+tree index, query execution) line up with milestones 4 to 8.
+  </WildCard>
+  <WildCard name="Martin Kleppmann, Designing Data-Intensive Applications">
+    Chapter 3 compares log-structured and page-oriented engines more clearly
+    than anything else. Read it before choosing between milestones 4 and 5.
+  </WildCard>
+  <WildCard name="Mohan et al., ARIES">
+    The 1992 paper behind recovery in most relational databases. Dense, but after
+    milestone 7 you'll follow the redo pass without trouble.
+  </WildCard>
+  <WildCard name="SQLite file format documentation">
+    A precise description of a production B-tree page layout, rollback journal
+    and WAL, from a database small enough to read end to end.
+  </WildCard>
+  <WildCard name="LevelDB source">
+    A compact LSM engine from Google, and the ancestor of RocksDB. The memtable,
+    SSTable and compaction code are all short enough to read in a weekend.
+  </WildCard>
+</CardGrid>

@@ -3,6 +3,7 @@ import path from "node:path";
 import matter from "gray-matter";
 import { allPages, groups } from "./manifest";
 import { allPosts } from "./posts";
+import { allProjects } from "./projects";
 
 export interface Hit {
   /** page slug */
@@ -76,6 +77,13 @@ export function buildIndex(): Hit[] {
       s: p.slug, t: p.title, g: "Field notes", k: "page", n: "✎",
       status: "live", u: `/blog/${p.slug}`,
       x: `${p.title} ${p.dek} ${p.tags.join(" ")} ${strip(p.body).slice(0, 1200)}`.toLowerCase(),
+    });
+  }
+  for (const p of allProjects()) {
+    out.push({
+      s: p.slug, t: `Build ${p.title}`, g: "Projects", k: "page", n: "⚒",
+      status: "live", u: `/projects/${p.slug}`,
+      x: `${p.title} ${p.tagline} ${p.languages.join(" ")} ${strip(p.body).slice(0, 1200)}`.toLowerCase(),
     });
   }
   return out;

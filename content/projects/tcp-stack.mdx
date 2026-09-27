@@ -1,0 +1,270 @@
+---
+title: a TCP/IP stack in userspace
+tagline: "A network stack that runs as an ordinary process on a TAP device: Ethernet, ARP, IPv4, ICMP and UDP, then a TCP that handshakes, retransmits, respects windows and backs off under congestion, until curl can fetch a page through it."
+difficulty: 5
+time: "8–12 weekends"
+languages: ["C", "Rust", "Go"]
+icon: "⇅"
+order: 7
+chapters: ["10-linux-networking", "07-syscalls-kernel-boundary", "34-load-balancing", "16-contention-tail-latency"]
+---
+
+A `connect()` call looks like one step. Underneath, the kernel resolves a MAC
+address, builds headers for three protocols, computes checksums, runs a
+handshake, and then spends the life of the connection guessing how fast it may
+send without drowning the network. Almost none of that is visible from the
+socket API, and all of it shows up in production as timeouts, resets and
+throughput you can't explain.
+
+This project moves the stack out of the kernel and into a program you write.
+Linux gives you a virtual network card, a TAP device, that hands you raw
+Ethernet frames as bytes and accepts frames back. From there you build each
+layer: answer ARP, reply to `ping`, echo UDP, and finally run TCP well enough
+that a real client on the host completes a handshake with you and downloads a
+file.
+
+<SectionHeading n="01" id="why">Why build this</SectionHeading>
+
+TCP is the protocol most engineers depend on and fewest have read. Building it
+pays off in ordinary debugging:
+
+- **Packet captures become readable.** After writing the header parser, a
+  Wireshark trace of SYN, SYN-ACK, dup ACKs and retransmits reads like a log of
+  decisions you've coded yourself.
+- **Connection states mean something.** `TIME_WAIT` piling up on a load
+  balancer, `CLOSE_WAIT` leaking in a service: you'll know which side is stuck
+  and why.
+- **Throughput limits get explicable.** Window size, round-trip time and packet
+  loss decide how fast a connection goes. You'll have implemented each one.
+- **Retries and timeouts in your own systems improve.** TCP's retransmission
+  timer is a small, well-studied answer to "how long should I wait before
+  trying again?"
+
+It's the hardest project in this list. Still, each layer below TCP
+works on its own, and it's pretty satisfying to see real tools answered by code you wrote.
+
+<SectionHeading n="02" id="shape">What you're building</SectionHeading>
+
+An incoming TCP segment's path through the finished stack:
+
+<Steps
+  title="What your stack does when a segment arrives"
+  lanes={[
+    { t: "TAP", s: "read frame", icon: "⇩" },
+    { t: "Ethernet", s: "demux", icon: "▭" },
+    { t: "IPv4", s: "validate", icon: "◇" },
+    { t: "TCP", s: "state machine", icon: "⇄" },
+    { t: "Buffers", s: "send / receive", icon: "▤" },
+    { t: "App", s: "socket API", icon: "▶" },
+  ]}
+  steps={[
+    [0, "`read()` on the TAP file descriptor returns one **Ethernet frame**: destination MAC, source MAC, EtherType, payload."],
+    [1, "The EtherType says IPv4 or ARP. ARP requests for your address get an **ARP reply**; IPv4 goes up a layer; everything else is dropped."],
+    [2, "Check the **IPv4 header**: version, length, checksum, and that the destination is you. The protocol field routes it to ICMP, UDP or TCP."],
+    [3, "Find the connection by its **four-tuple**, verify the TCP checksum over the pseudo-header, and feed the segment to that connection's **state machine**."],
+    [4, "In-order data goes into the **receive buffer**; out-of-order data is held until the gap fills. ACKed bytes are released from the **send buffer**, and the retransmission timer resets."],
+    [5, "The application's `read` returns the new bytes. Your stack sends an **ACK** advertising how much room is left in the receive window."],
+  ]}
+/>
+
+<Why>Why does TCP need so much state per connection?</Why>
+
+Because IP promises almost nothing. Packets can be lost, duplicated, reordered
+or delayed, and the other end can vanish without a word. TCP builds a reliable,
+ordered byte stream on top by numbering every byte, remembering what's been
+sent and acknowledged, and keeping timers for everything it's waiting on. Each
+piece of state exists to cover one specific way IP can let you down.
+
+<SectionHeading n="03" id="before">Before you start</SectionHeading>
+
+| You need | Why | Where to get it |
+|---|---|---|
+| A Linux machine or VM with root | TAP devices are a Linux kernel feature | Any current distro; a VM is safest |
+| `ip`, `tcpdump` or Wireshark, `ping`, `nc`, `curl` | Your test clients and your debugger | Distro packages |
+| RFC 826, 791, 792, 768 and 9293 | The exact byte layouts and rules | rfc-editor.org |
+| Comfort with bit fields and byte order | Every header is big-endian with packed fields | [Chapter 10](/topics/10-linux-networking) for the kernel's side |
+| A systems language with precise control of bytes | You'll serialise headers by hand | C matches the RFCs' examples; Rust catches more mistakes |
+
+<Callout label="Design implication">
+Give your stack its own IP address on the TAP subnet, different from the
+address you assign to the TAP interface on the host. The host talks to your
+stack's address as if it were another machine on the wire. If you reuse the
+host's address, the kernel answers first and your stack never sees the packets.
+</Callout>
+
+<SectionHeading n="04" id="roadmap">The roadmap</SectionHeading>
+
+Nine milestones. Milestones 1 to 4 take roughly an evening or two each. TCP starts at
+milestone 5 and probably takes most of your time.
+
+<Milestone n={1} title="Frames off the wire" time="1 evening" learn={["TUN vs TAP", "/dev/net/tun", "IFF_TAP | IFF_NO_PI", "EtherType"]} done="Your program prints the source MAC and EtherType of every frame while `ping` runs against its address.">
+
+Open `/dev/net/tun`, create a TAP interface with `ioctl(TUNSETIFF)`, bring it
+up with an address on the host, and read from the file descriptor in a loop.
+Each read returns one Ethernet frame.
+
+A TUN device would hand you IP packets and skip Ethernet. Use TAP anyway: ARP
+only exists at layer 2, and the host won't send you any IP until you answer it.
+
+</Milestone>
+
+<Milestone n={2} title="Answer ARP" time="1 evening" learn={["ARP request / reply", "MAC addresses", "ARP cache", "network byte order"]} done="`ip neigh` on the host lists your stack's IP with the MAC you chose.">
+
+When the host wants to reach your IP, it broadcasts "who has this address?".
+Parse the ARP packet, and if the target is you, reply with your MAC. Keep a
+small **ARP cache** of senders you've seen, because you'll need their MACs to
+send anything back.
+
+Byte order bites here first. Every multi-byte field is big-endian on the wire.
+Wrap the conversions in one place, so you don't scatter byte swaps through the
+code.
+
+</Milestone>
+
+<Milestone n={3} title="IPv4 and ping" time="1 weekend" learn={["IPv4 header", "Internet checksum", "ICMP echo", "TTL"]} done="`ping` from the host gets replies from your stack, and Wireshark shows no checksum errors.">
+
+Parse the IPv4 header, check its checksum, and drop anything not addressed to
+you. For ICMP echo requests, swap source and destination, change the type to
+echo reply, recompute both checksums, and send it back inside a new Ethernet
+frame.
+
+The **Internet checksum** from RFC 1071 is a one's-complement sum of 16-bit
+words. It's a few lines, and it's used again in UDP and TCP, so write it once and
+test it against a captured packet.
+
+</Milestone>
+
+<Milestone n={4} title="UDP" time="1 evening" learn={["ports", "pseudo-header checksum", "demultiplexing", "a socket-like API"]} done="`nc -u` from the host sends a line to your stack and gets it echoed back.">
+
+UDP adds only ports, a length and a checksum. The checksum covers a
+**pseudo-header** made from the IP addresses as well as the UDP header, which is
+the first time a layer reaches down into the one below it.
+
+Build a tiny API here: bind a port, receive a datagram, send one. You'll reuse
+the shape for TCP, and it keeps the protocol code apart from the application.
+
+</Milestone>
+
+<Milestone n={5} title="The TCP handshake" time="1–2 weekends" learn={["sequence numbers", "SYN / SYN-ACK / ACK", "the TCB", "RST"]} done="`nc` on the host connects to your stack, and `ss -t` shows the connection as ESTAB.">
+
+Keep a **transmission control block** per connection, keyed by the four-tuple,
+holding the send and receive sequence variables from RFC 9293 (`SND.UNA`,
+`SND.NXT`, `RCV.NXT` and friends). On a SYN to a listening port, pick an initial
+sequence number and reply SYN-ACK. On the final ACK, move to ESTABLISHED.
+
+Send RST for segments to ports nobody is listening on. Compare sequence numbers
+with wraparound arithmetic from the start: they're 32-bit and they wrap.
+
+</Milestone>
+
+<Milestone n={6} title="Moving data" time="1–2 weekends" learn={["byte-stream ACKs", "receive window", "out-of-order segments", "PSH"]} done="`curl` on the host fetches a page from a tiny HTTP responder running on your stack.">
+
+Accept in-order data into a receive buffer, advance `RCV.NXT`, and ACK it.
+Queue out-of-order segments until the gap fills, instead of dropping them. On
+the send side, split application data into segments no larger than the peer's
+MSS and within its advertised window.
+
+A tiny HTTP responder on top gives you a real client to test against. Once
+`curl` works, capture the exchange and compare it with the same request to a
+kernel socket.
+
+</Milestone>
+
+<Milestone n={7} title="Closing, all eleven states" time="1 weekend" learn={["FIN handshake", "half-close", "TIME_WAIT", "simultaneous close"]} done="Connections closed from either side reach CLOSED on both, and your stack holds TIME_WAIT before reusing a four-tuple.">
+
+Implement FIN in both directions: the side that closes first goes through
+FIN_WAIT_1, FIN_WAIT_2 and TIME_WAIT, the other through CLOSE_WAIT and
+LAST_ACK. Each direction closes independently, so one side can keep sending
+after the other is done.
+
+Draw the state diagram from RFC 9293 and put it next to your code. Most TCP
+bugs at this stage are a transition the diagram has and your `match` or
+`switch` doesn't.
+
+</Milestone>
+
+<Milestone n={8} title="Retransmission" time="1–2 weekends" learn={["RTO", "SRTT and RTTVAR", "Karn's algorithm", "exponential backoff"]} done="With `tc netem` dropping 10% of packets on the TAP interface, a file transfer still completes byte for byte.">
+
+Keep unacknowledged segments and a retransmission timer. Estimate round-trip
+time the way RFC 6298 describes, with a smoothed average and a variance term,
+and set the timeout from both. Don't sample RTT from retransmitted segments,
+since you can't tell which copy the ACK is for.
+
+Double the timeout on every consecutive retransmission. Then use `tc qdisc ...
+netem` to add loss, delay and reordering, and watch your stack recover.
+
+</Milestone>
+
+<Milestone n={9} title="Flow and congestion control" time="2 weekends" learn={["slow start", "congestion avoidance", "fast retransmit", "zero-window probes"]} done="Under induced loss, a plot of your congestion window shows slow start, a sawtooth, and a halving after three duplicate ACKs.">
+
+Respect the receiver's window, including a zero window: stop sending and probe
+periodically until it opens. Then add a **congestion window** from RFC 5681.
+Start small and grow it quickly in slow start, grow linearly after a threshold,
+cut it on loss.
+
+On three duplicate ACKs, retransmit right away instead of waiting for the
+timer. Log the congestion window on every ACK and plot it. That sawtooth is a
+better picture of how TCP behaves than any diagram.
+
+</Milestone>
+
+<SectionHeading n="05" id="traps">Traps that catch everyone</SectionHeading>
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The host never sends you IP packets | ARP isn't answered, or your IP equals the TAP interface's | Answer ARP first; use a separate address on the same subnet |
+| Wireshark flags every packet's checksum | Wrong byte order, odd-length payload not padded, or the checksum field not zeroed first | Zero the field, pad to 16 bits, test against a captured packet |
+| The host sends RST to your SYN-ACK | You're using raw sockets and the kernel doesn't know the connection | Use a TAP device so the kernel stack stays out of the way |
+| Long transfers break at a seemingly random point | Sequence numbers compared with plain `<`, which fails once they wrap | Compare using signed 32-bit differences |
+| Transfers stall under loss | No retransmission of the last segment, or timer never restarted | Restart the timer whenever new data is ACKed and something is still in flight |
+| Throughput collapses on reordering | Each out-of-order segment was dropped | Queue out-of-order data and send an ACK that tells the peer what's missing |
+| Stuck in CLOSE_WAIT | Your app never closed its side | CLOSE_WAIT means the local application hasn't called close; the fix is in the app |
+
+<Callout label="Common mistake" kind="warn">
+Testing only on a perfect link. A TAP device on one machine never drops or
+reorders anything, so a stack with no retransmission at all seems to work.
+Add `netem` loss and reordering from milestone 6 onward, and keep it on.
+</Callout>
+
+<SectionHeading n="06" id="stretch">Stretch goals</SectionHeading>
+
+- **A real socket API.** Expose your stack through a library with
+  `connect`, `accept`, `read` and `write`, and run an unmodified program on it.
+- **TCP options.** MSS, window scaling and timestamps from RFC 7323, then SACK
+  from RFC 2018.
+- **A modern congestion controller.** Implement CUBIC and compare its window
+  graph with Reno's under the same loss.
+- **IPv6 and NDP.** Replace ARP with Neighbor Discovery and see how much of the
+  stack carries over.
+- **DHCP and DNS clients**, so your stack can join a real network and resolve
+  names without help from the host.
+
+<SectionHeading n="07" id="references">References worth your time</SectionHeading>
+
+<CardGrid>
+  <WildCard name="saminiir, Let's code a TCP/IP stack">
+    A five-part blog series building a userspace stack in C on a TAP device, from
+    Ethernet and ARP to TCP retransmission. The closest match to this roadmap.
+  </WildCard>
+  <WildCard name="RFC 9293, Transmission Control Protocol">
+    The 2022 consolidation of RFC 793 and its many updates. Keep the state
+    diagram and the segment-arrival rules open while you code.
+  </WildCard>
+  <WildCard name="Kevin Fall and W. Richard Stevens, TCP/IP Illustrated, Volume 1">
+    The protocol suite explained through real packet traces. The TCP chapters
+    are the best companion to milestones 5 to 9.
+  </WildCard>
+  <WildCard name="Jon Gjengset, Implementing TCP in Rust">
+    A long livestream series writing a TCP implementation on a TUN device,
+    reading RFC 793 line by line. Good for seeing the debugging, not just the
+    result.
+  </WildCard>
+  <WildCard name="RFC 6298 and RFC 5681">
+    Computing the retransmission timer, and TCP congestion control. Both are
+    short and precise.
+  </WildCard>
+  <WildCard name="smoltcp and lwIP">
+    Two small, production-quality TCP/IP stacks for embedded systems, in Rust and
+    C. Read them to see how real code organises the layers you built.
+  </WildCard>
+</CardGrid>

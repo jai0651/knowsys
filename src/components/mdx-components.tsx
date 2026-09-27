@@ -5,6 +5,7 @@ import { SectionHeading, Why } from "./section";
 import { Steps, StepSequence } from "./steps";
 import { Predict } from "./predict";
 import { RaceLab } from "./labs/race-lab";
+import { Milestone } from "./milestone";
 import { Sub, Approach, Estimate, Figure, Quiz, Q, Compare } from "./scaffold";
 import { MemoryLayout, Flow, Sequence, Tree, Cells, Plot } from "./diagrams";
 import { Panel } from "./terminal-frame";
@@ -26,6 +27,7 @@ export const mdxComponents: MDXComponents = {
   StepSequence,
   Predict,
   RaceLab,
+  Milestone,
   Panel,
   Sub,
   Approach,

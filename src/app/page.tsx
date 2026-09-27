@@ -5,6 +5,8 @@ import { groups, topics, labs, livePages, pageBySlug } from "@/lib/manifest";
 import { readDoc } from "@/lib/mdx";
 import { allPosts, formatDate } from "@/lib/posts";
 import { StartPath } from "@/components/start-path";
+import { allProjects } from "@/lib/projects";
+import { Difficulty } from "@/components/difficulty";
 import { cn } from "@/lib/utils";
 
 const TINT: Record<string, string> = {
@@ -43,6 +45,7 @@ export default function Home() {
     return { slug: s.slug, href: p.href, title: p.short, why: s.why, time: readDoc("chapters", s.slug)?.frontmatter.readingTime?.replace(/^~/, "") };
   });
   const liveTopics = livePages.filter((p) => p.kind === "topic").length;
+  const projects = allProjects().slice(0, 6);
 
   return (
     <>
@@ -147,6 +150,38 @@ export default function Home() {
             })}
           </div>
         </section>
+
+        {/* ── projects ─────────────────────────────────────────────────── */}
+        {projects.length > 0 && (
+          <section className="pb-20">
+            <div className="mb-8 flex flex-wrap items-end justify-between gap-4">
+              <div>
+                <h2 className="mb-2 text-[30px] font-extrabold tracking-[-0.03em] text-ink sm:text-[36px]">
+                  Build it <span className="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-transparent">yourself</span>
+                </h2>
+                <p className="max-w-[58ch] text-[16px] leading-relaxed text-muted">
+                  A game engine, a browser, a kernel, Docker. Roadmaps for the projects that teach
+                  systems best, one milestone at a time.
+                </p>
+              </div>
+              <Link href="/projects" className="inline-flex items-center gap-1 text-[14.5px] font-semibold text-accent">
+                All projects <ArrowRight className="size-4" />
+              </Link>
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {projects.map((p) => (
+                <Link key={p.slug} href={`/projects/${p.slug}`} className="group flex gap-4 rounded-2xl border border-line bg-surface p-5 shadow-[var(--shadow)] transition hover:-translate-y-0.5 hover:border-accent">
+                  <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-accent to-accent-2 text-[20px] text-white">{p.icon}</span>
+                  <span className="min-w-0">
+                    <span className="mb-1 block text-[16px] font-bold leading-snug text-ink">Build {p.title}</span>
+                    <span className="mb-2.5 block text-[13.5px] leading-snug text-muted">{p.tagline}</span>
+                    <Difficulty level={p.difficulty} showLabel={false} />
+                  </span>
+                </Link>
+              ))}
+            </div>
+          </section>
+        )}
 
         {/* ── field notes ──────────────────────────────────────────────── */}
         {posts.length > 0 && (
