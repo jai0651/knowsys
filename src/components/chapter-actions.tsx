@@ -11,7 +11,7 @@ export function ChapterActions({ slug, firstId }: { slug: string; firstId?: stri
       {firstId && (
         <a
           href={`#${firstId}`}
-          className="inline-flex items-center gap-2 rounded-[10px] bg-gradient-to-r from-accent to-accent-2 px-4 py-2.5 text-[14px] font-semibold text-white shadow-[0_8px_24px_-10px_var(--accent)] transition-opacity hover:opacity-90"
+          className="inline-flex items-center gap-2 rounded-[10px] bg-gradient-to-r from-accent to-accent-2 px-4 py-2.5 text-[14px] font-semibold text-on-accent shadow-[0_8px_24px_-10px_var(--accent)] transition-opacity hover:opacity-90"
         >
           <Play className="size-3.5 fill-current" /> Start reading
         </a>

@@ -34,7 +34,7 @@ export function StartPath({
                 <span
                   className={cn(
                     "tnum mt-0.5 grid size-7 shrink-0 place-items-center rounded-full text-[12.5px] font-bold",
-                    isDone ? "bg-ok text-white" : isNext ? "bg-gradient-to-br from-accent to-accent-2 text-white" : "border border-line-2 text-muted",
+                    isDone ? "bg-ok text-white" : isNext ? "bg-gradient-to-br from-accent to-accent-2 text-on-accent" : "border border-line-2 text-muted",
                   )}
                 >
                   {isDone ? <Check className="size-3.5" strokeWidth={3} /> : i + 1}

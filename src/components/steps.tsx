@@ -184,7 +184,7 @@ export function StepSequence({
             <path d="M0 0 L10 5 L0 10 z" fill="#e2e8f0" />
           </marker>
           <marker id="seq-arrow-on" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-            <path d="M0 0 L10 5 L0 10 z" fill="#f472b6" />
+            <path d="M0 0 L10 5 L0 10 z" fill="#38bdf8" />
           </marker>
         </defs>
         {actors.map((a, k) => (
@@ -202,11 +202,11 @@ export function StepSequence({
           return (
             <g key={k} style={{ opacity: shown ? 1 : 0.08, transition: "opacity .45s" }}>
               {self ? (
-                <path d={`M${x(m.from)} ${y - 8} h36 v16 h-36`} fill="none" stroke={on ? "#f472b6" : "#e2e8f0"} strokeWidth={on ? 2.4 : 1.6} markerEnd={`url(#${on ? "seq-arrow-on" : "seq-arrow"})`} />
+                <path d={`M${x(m.from)} ${y - 8} h36 v16 h-36`} fill="none" stroke={on ? "#38bdf8" : "#e2e8f0"} strokeWidth={on ? 2.4 : 1.6} markerEnd={`url(#${on ? "seq-arrow-on" : "seq-arrow"})`} />
               ) : (
                 <line
                   x1={x(m.from)} y1={y} x2={x(m.to) + (m.to > m.from ? -4 : 4)} y2={y}
-                  stroke={on ? "#f472b6" : "#e2e8f0"} strokeWidth={on ? 2.4 : 1.6}
+                  stroke={on ? "#38bdf8" : "#e2e8f0"} strokeWidth={on ? 2.4 : 1.6}
                   strokeDasharray={m.dashed ? "6 5" : undefined}
                   markerEnd={`url(#${on ? "seq-arrow-on" : "seq-arrow"})`}
                 />

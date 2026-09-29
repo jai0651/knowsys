@@ -150,7 +150,7 @@ export function Notes({ title }: { title: string }) {
         <Highlighter className="size-4 text-accent" />
         <span className="hidden sm:inline">Notes</span>
         {count > 0 && (
-          <span className="tnum grid min-w-[20px] place-items-center rounded-full bg-accent px-1.5 py-0.5 font-mono text-[10.5px] font-semibold text-deep">
+          <span className="tnum grid min-w-[20px] place-items-center rounded-full bg-accent px-1.5 py-0.5 font-mono text-[10.5px] font-semibold text-on-accent">
             {count}
           </span>
         )}

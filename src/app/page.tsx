@@ -81,7 +81,7 @@ export default function Home() {
             <div className="flex flex-wrap items-center gap-3">
               <Link
                 href="/topics/01-cpu-architecture"
-                className="group inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-accent to-accent-2 px-5 py-3.5 text-[15px] font-semibold text-white shadow-[0_10px_30px_-10px_var(--accent)] transition-opacity hover:opacity-90"
+                className="group inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-accent to-accent-2 px-5 py-3.5 text-[15px] font-semibold text-on-accent shadow-[0_10px_30px_-10px_var(--accent)] transition-opacity hover:opacity-90"
               >
                 Start learning
                 <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
@@ -180,7 +180,7 @@ export default function Home() {
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
               {projects.map((p) => (
                 <Link key={p.slug} href={`/projects/${p.slug}`} className="group flex gap-4 rounded-2xl border border-line bg-surface p-5 shadow-[var(--shadow)] transition hover:-translate-y-0.5 hover:border-accent">
-                  <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-accent to-accent-2 text-[20px] text-white">{p.icon}</span>
+                  <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-accent to-accent-2 text-[20px] text-on-accent">{p.icon}</span>
                   <span className="min-w-0">
                     <span className="mb-1 block text-[16px] font-bold leading-snug text-ink">Build {p.title}</span>
                     <span className="mb-2.5 block text-[13.5px] leading-snug text-muted">{p.tagline}</span>

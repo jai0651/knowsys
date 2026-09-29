@@ -5,8 +5,8 @@ export function Logo({ className = "size-7" }: { className?: string }) {
     <svg viewBox="0 0 64 64" className={className} aria-hidden>
       <defs>
         <linearGradient id="ks-logo" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stopColor="#7c3aed" />
-          <stop offset="1" stopColor="#ec4899" />
+          <stop offset="0" stopColor="#0d9488" />
+          <stop offset="1" stopColor="#0284c7" />
         </linearGradient>
       </defs>
       <rect width="64" height="64" rx="15" fill="url(#ks-logo)" />

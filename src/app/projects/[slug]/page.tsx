@@ -69,7 +69,7 @@ export default async function ProjectPage({ params }: { params: Promise<{ slug: 
                 <Link href="/projects" className="text-faint hover:text-ink">← All projects</Link>
               </nav>
               <div className="mb-5 flex items-center gap-4">
-                <span className="grid size-14 place-items-center rounded-2xl bg-gradient-to-br from-accent to-accent-2 text-[26px] text-white shadow-[0_10px_24px_-10px_var(--accent)]">{p.icon}</span>
+                <span className="grid size-14 place-items-center rounded-2xl bg-gradient-to-br from-accent to-accent-2 text-[26px] text-on-accent shadow-[0_10px_24px_-10px_var(--accent)]">{p.icon}</span>
                 <span className="rounded-full bg-accent-soft px-3 py-1 text-[13px] font-semibold text-accent">Build it yourself</span>
               </div>
               <h1 className="mb-4 text-[38px] font-extrabold leading-[1.06] tracking-[-0.035em] text-ink sm:text-[52px]">

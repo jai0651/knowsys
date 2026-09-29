@@ -31,7 +31,7 @@ export function Milestone({
   return (
     <section id={`m${n}`} className="relative my-6 scroll-mt-24 pl-10 sm:pl-14">
       <span className="absolute bottom-[-24px] left-[13px] top-9 w-px bg-line sm:left-[17px] sm:top-11" aria-hidden />
-      <span className="absolute left-0 top-0 grid size-7 place-items-center rounded-lg text-[12px] sm:size-9 sm:rounded-xl bg-gradient-to-br from-accent to-accent-2 text-[14px] font-extrabold text-white shadow-[0_8px_20px_-8px_var(--accent)]">
+      <span className="absolute left-0 top-0 grid size-7 place-items-center rounded-lg text-[12px] sm:size-9 sm:rounded-xl bg-gradient-to-br from-accent to-accent-2 text-[14px] font-extrabold text-on-accent shadow-[0_8px_20px_-8px_var(--accent)]">
         {n}
       </span>
       <div className="rounded-2xl border border-line bg-surface p-4 shadow-[var(--shadow)] sm:p-5">

@@ -40,7 +40,7 @@ export default function ProjectsPage() {
               href={`/projects/${p.slug}`}
               className="group flex flex-col rounded-2xl border border-line bg-surface p-6 shadow-[var(--shadow)] transition hover:-translate-y-1 hover:border-accent"
             >
-              <span className="mb-5 grid size-12 place-items-center rounded-2xl bg-gradient-to-br from-accent to-accent-2 text-[22px] text-white shadow-[0_10px_24px_-10px_var(--accent)]">
+              <span className="mb-5 grid size-12 place-items-center rounded-2xl bg-gradient-to-br from-accent to-accent-2 text-[22px] text-on-accent shadow-[0_10px_24px_-10px_var(--accent)]">
                 {p.icon}
               </span>
               <h2 className="mb-2 text-[20px] font-bold leading-snug tracking-[-0.02em] text-ink">{p.title.charAt(0).toUpperCase() + p.title.slice(1)}</h2>
