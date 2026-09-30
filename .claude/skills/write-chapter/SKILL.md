@@ -42,12 +42,26 @@ Then read `docs/CHAPTER_FORMAT.md` (component syntax) and a reference chapter:
    every `Sub n` (must match its section), and prose such as "section 6 shows".
    `grep -n -E '[Ss]ection [0-9]+'` afterwards (two-digit references and the
    `versions:` frontmatter line are easy to miss when renumbering by regex).
+   Don't shift section numbers that cite an outside paper or spec ("Llama 3
+   paper, section 3.3.4"); read each hit rather than trusting the regex. Renumbering misses these: plural ("sections 3 to 5"), line-broken ("section\n4"),
+   and cross-chapter refs ("chapter 16, sections 2 to 4") when the target chapter
+   was itself renumbered. Grep for all three. Diff old and new refs
+   (`git show HEAD:<file> | grep -n -E '[Ss]ection [0-9]+'`) and check every
+   one that sits inside a WildCard/paper citation.
 3. Update `updated:` and `level:` in the frontmatter. Check other files for links
    to section ids you renamed.
 4. One chapter at a time, and open the page (`npm run dev`, `/topics/<id>`)
    before moving on.
 
 ## Checks
+
+Run every `<TryIt>` exactly as written, from a clean directory, and paste what it
+prints. `python3 scripts/verify-tryit.py <n>` does this for the python, c and
+cpp blocks; shell blocks (Docker, Redis, openssl) you run by hand. Things that
+went wrong before: a command that needs `docker run` shown without it, a
+setup step (`sleep`, waiting for a server) missing from the block, output
+whitespace that didn't match, and a claim like "both times 68.3 ns" true of one
+run only. Say when numbers vary, and give the range.
 
 ```
 npm run -s check:mdx

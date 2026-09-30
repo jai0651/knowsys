@@ -1,36 +1,74 @@
 ---
 title: Replication & Consistency Models
-dek: "What you can read after a write depends on how the copies of your data are kept in step. This chapter defines linearizable, sequential, causal and eventual consistency precisely, shows how Postgres, Kafka, Dynamo-style stores and CRDTs actually implement them, and does the quorum arithmetic so you can tell which guarantee a configuration really buys."
+dek: "What you can read after a write depends on how the copies of your data are kept in step. You'll start by updating a row on a Postgres primary and reading a stale copy from its replica, then see linearizable, sequential, causal and eventual consistency defined precisely, and how Postgres, Kafka, Dynamo-style stores and CRDTs implement them."
 readingTime: "~32 min"
-level: "Intermediate"
+level: "Beginner"
 versions: "PostgreSQL 16.15 measured, source at REL_16_4 · Kafka source at 3.7.0 · measured in a shared 4-CPU container, linuxkit 6.10, and on an Apple M4"
-prereqs: "a database with replicas, basic networking, what a transaction is"
-updated: "2026-09-27"
+prereqs: "a terminal and Docker; a database with replicas, basic networking and transactions help"
+updated: "2026-09-30"
 ---
 
-You meet replication the first time a user updates their profile, reloads the
-page, and sees the old one. The write succeeded. The read went to a replica that
-hadn't caught up yet, and nothing in your stack considered that a bug.
+A company keeps its price list at head office and sends photocopies to each branch by courier. When head office changes a price, the branches get the new sheet later: the same day, maybe, or next week. A customer who phones a branch in between hears the old price. Nothing is broken, since the branch is answering from the copy it has. It's just behind.
 
-Every system that keeps more than one copy of its data has to decide what a
-reader is allowed to see while the copies disagree. That decision has a name,
-the **consistency model**, and it's usually made for you by a default you've
-never read: `synchronous_commit`, `acks`, a consistency level, a
-`ConsistentRead` flag.
+Any system that keeps more than one copy of its data behaves like this, and it decides how far behind a reader is allowed to see. The decision is called a consistency model. Most of the time it's made by a default nobody has read. You can watch a stale read happen with two Postgres servers.
 
-This chapter makes that decision visible. It defines the models precisely,
-from linearizable down to eventual, then follows each through a real system:
-Postgres streaming replication, Kafka's in-sync replicas, Dynamo-style quorums,
-and CRDTs. Along the way you'll measure what each guarantee costs, and learn to
-check what a configuration actually promises before production checks it for you.
+<SectionHeading n="01" id="stale-read">Read a stale copy from a replica</SectionHeading>
 
-<SectionHeading n="01" id="why-replicate">Why keep more than one copy</SectionHeading>
+You need Docker. The setup below starts a Postgres primary and a replica that copies from it. The replica is configured to wait 3 seconds before applying each change, so the lag is easy to see. A real replica lags by less, but it lags the same way.
+
+<Sub n="1.1" title="Update on the primary, read from the replica">
+
+<TryIt what="Start a primary and a delayed replica, update a row on the primary, and read the replica once a second" lang="shell" toolchain="PostgreSQL 16.15 (postgres:16-alpine) on Docker Desktop, linuxkit 6.10.14 aarch64">
+```shell
+# primary, and a replica that takes a base backup from it and applies WAL 3 s late
+docker network create pgnet
+docker run -d --name pgp --network pgnet -e POSTGRES_PASSWORD=x postgres:16-alpine \
+  -c wal_level=replica -c max_wal_senders=5 -c hot_standby=on
+until docker exec pgp pg_isready -U postgres; do sleep 1; done; sleep 2
+docker exec pgp sh -c 'echo "host replication all all scram-sha-256" >> /var/lib/postgresql/data/pg_hba.conf'
+docker exec pgp psql -U postgres -c "select pg_reload_conf()"
+docker run -d --name pgr --network pgnet -e PGPASSWORD=x --entrypoint sleep postgres:16-alpine infinity
+docker exec pgr sh -c 'mkdir -p /var/lib/postgresql/data2 && chown postgres /var/lib/postgresql/data2 && chmod 700 /var/lib/postgresql/data2'
+docker exec -u postgres -e PGPASSWORD=x pgr pg_basebackup -h pgp -U postgres -D /var/lib/postgresql/data2 -R -X stream
+docker exec -u postgres pgr pg_ctl -D /var/lib/postgresql/data2 \
+  -o "-c recovery_min_apply_delay=3s -c hot_standby=on -p 5433" -l /tmp/pgr.log start
+
+# then: create a row, change it on the primary, and poll the replica
+docker exec pgp psql -U postgres -c "CREATE TABLE profile (id int PRIMARY KEY, name text); INSERT INTO profile VALUES (1,'Old Name')"
+sleep 5                                          # let the replica replay the setup
+docker exec pgp psql -U postgres -c "UPDATE profile SET name='New Name' WHERE id=1"
+for i in 1 2 3 4 5; do docker exec pgr psql -U postgres -p 5433 -qAt -c "select name from profile where id=1"; sleep 1; done
+```
+<Output>
+```
+Old Name
+Old Name
+Old Name
+New Name
+New Name
+```
+</Output>
+</TryIt>
+
+The setup commands print container ids and status lines, and only the poll results are shown. The update committed on the primary at time zero. The first three reads returned `Old Name` and the last two returned `New Name`. Timing the polls in this run put the reads at 0.1, 1.2, 2.4, 3.5 and 4.6 seconds after the update, so the replica switched to the new name between 2.4 and 3.5 seconds, once its delayed replay caught up.
+
+</Sub>
+
+<Sub n="1.2" title="Is that a bug?">
+
+Not by itself. The primary's answer was correct the whole time, and so was the replica's, for the state it had reached. The problem is when the application read from the replica right after writing and assumed it would see its own change. A user who saves their profile, reloads the page and sees the old name has hit the same gap.
+
+Whether that's acceptable is a design choice with a name. The chapter defines the choices precisely, from linearizable (a read always sees the latest write) down to eventual (a read sees it sometime), and follows each through real systems.
+
+</Sub>
+
+<SectionHeading n="02" id="why-replicate">Why keep more than one copy</SectionHeading>
 
 A single database server is simple to reason about. Every read sees every write
 that finished before it, because there's only one place to look. Replication
 breaks that on purpose, and it's worth being clear about what you get in return.
 
-<Sub n="1.1" title="Four reasons, four different requirements">
+<Sub n="2.1" title="Four reasons, four different requirements">
 
 | Reason | What it needs from the copies | Example |
 |---|---|---|
@@ -53,7 +91,7 @@ copies, and being precise about what readers can see as a result.
 
 </Sub>
 
-<Sub n="1.2" title="Three ways to arrange the copies">
+<Sub n="2.2" title="Three ways to arrange the copies">
 
 | Topology | Who accepts writes | How conflicts arise | Real systems |
 |---|---|---|---|
@@ -67,14 +105,14 @@ place, in one region, and it has to be up.
 
 </Sub>
 
-<SectionHeading n="02" id="models">Consistency models, from strongest to weakest</SectionHeading>
+<SectionHeading n="03" id="models">Consistency models, from strongest to weakest</SectionHeading>
 
 A consistency model is a contract about which values a read may return. It's
 defined by what a client can *observe*, not by how the system is built. That's
 what makes it useful: you can test a system against it from outside.
 [Jepsen](https://jepsen.io/consistency) does exactly that.
 
-<Sub n="2.1" title="Linearizability: one copy, one moment">
+<Sub n="3.1" title="Linearizability: one copy, one moment">
 
 A system is **linearizable** if it behaves as though there's a single copy of
 the data, and every operation takes effect at one instant somewhere between its
@@ -98,7 +136,7 @@ election, distributed locks, unique usernames, and "is this seat still free".
 
 </Sub>
 
-<Sub n="2.2" title="Sequential and causal consistency">
+<Sub n="3.2" title="Sequential and causal consistency">
 
 **Sequential consistency** ([Lamport, 1979](https://www.microsoft.com/en-us/research/publication/make-multiprocessor-computer-correctly-executes-multiprocess-programs/))
 keeps the single order but drops the link to real time. All clients see the
@@ -122,7 +160,7 @@ stronger variant is the strongest model that can.
 
 </Sub>
 
-<Sub n="2.3" title="Eventual consistency and session guarantees">
+<Sub n="3.3" title="Eventual consistency and session guarantees">
 
 **Eventual consistency** promises only this: if writes stop, all replicas will
 converge on the same value. It says nothing about what you read in the
@@ -146,7 +184,7 @@ for the one user who noticed without paying for linearizability for everyone.
 
 </Sub>
 
-<Sub n="2.4" title="The models side by side">
+<Sub n="3.4" title="The models side by side">
 
 | Model | Real-time order | One global order | Available in a partition | Typical mechanism |
 |---|---|---|---|---|
@@ -169,13 +207,13 @@ for the one user who noticed without paying for linearizability for everyone.
 Read your writes: the client failed to see its own write. It's also allowed by
 the system's actual model (eventual), so nothing logged an error. The
 bug is a mismatch between what the app assumed and what the replica promises.
-Section 3.4 shows the fixes, most of which cost far less than making every read
+Section 4.4 shows the fixes, most of which cost far less than making every read
 go to the primary.
 </Predict>
 
 </Sub>
 
-<Sub n="2.5" title="What CAP actually says">
+<Sub n="3.5" title="What CAP actually says">
 
 Gilbert and Lynch's [proof](https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf)
 of the CAP theorem is narrower than its reputation. It says a system can't be
@@ -198,13 +236,13 @@ see once a year.
 
 </Sub>
 
-<SectionHeading n="03" id="single-leader">Single-leader replication, measured on Postgres</SectionHeading>
+<SectionHeading n="04" id="single-leader">Single-leader replication, measured on Postgres</SectionHeading>
 
 In single-leader replication the primary writes each change to its log, the
 write-ahead log (WAL), and streams the log to standbys, which replay it. The
 interesting question is when the primary tells the client "committed".
 
-<Sub n="3.1" title="Five answers to 'when is it committed?'">
+<Sub n="4.1" title="Five answers to 'when is it committed?'">
 
 Postgres makes the choice per transaction with
 [`synchronous_commit`](https://www.postgresql.org/docs/16/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT),
@@ -239,7 +277,7 @@ Step through one commit with a synchronous standby:
 
 </Sub>
 
-<Sub n="3.2" title="What each level costs">
+<Sub n="4.2" title="What each level costs">
 
 <Callout label="The machines" kind="note">
 **Linux:** PostgreSQL 16.15 on kernel 6.10.14-linuxkit, aarch64, in a shared
@@ -280,7 +318,7 @@ You can set it per transaction, so the important writes can keep `on`.
 
 </Sub>
 
-<Sub n="3.3" title="The escape hatch in synchronous replication">
+<Sub n="4.3" title="The escape hatch in synchronous replication">
 
 Synchronous replication has a failure mode that surprises people. Stop the
 standby, and every commit on the primary waits forever. In the test above, a
@@ -361,7 +399,7 @@ prefers `s1` and falls back to `s2` in order.
 
 </Sub>
 
-<Sub n="3.4" title="Reading your own writes from a replica">
+<Sub n="4.4" title="Reading your own writes from a replica">
 
 Now the profile bug from the introduction, measured. A client updates one row on
 the primary, then immediately reads it from the standby, 2,000 times in a row.
@@ -397,7 +435,7 @@ give up waiting and go to the primary.
 
 </Sub>
 
-<Sub n="3.5" title="Kafka's version: in-sync replicas">
+<Sub n="4.5" title="Kafka's version: in-sync replicas">
 
 Kafka partitions are single-leader too, but Kafka doesn't count a fixed set of
 standbys. It keeps a dynamic **in-sync replica set** (ISR): followers that have
@@ -439,14 +477,14 @@ can fail without losing an acknowledged write or blocking producers.
 
 </Sub>
 
-<SectionHeading n="04" id="quorums">Leaderless replication and quorum arithmetic</SectionHeading>
+<SectionHeading n="05" id="quorums">Leaderless replication and quorum arithmetic</SectionHeading>
 
 Amazon's [Dynamo paper](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf)
 (2007) removed the leader. Any replica accepts a write; the client, or a
 coordinator acting for it, sends each operation to several replicas and waits for
 some of them. Cassandra, Riak and ScyllaDB work this way.
 
-<Sub n="4.1" title="N, W and R">
+<Sub n="5.1" title="N, W and R">
 
 Three numbers describe a leaderless configuration:
 
@@ -483,7 +521,7 @@ slow.
 
 </Sub>
 
-<Sub n="4.2" title="A quorum read, with read repair">
+<Sub n="5.2" title="A quorum read, with read repair">
 
 Step through a read at `R = 2` when one replica missed the latest write:
 
@@ -502,7 +540,7 @@ Step through a read at `R = 2` when one replica missed the latest write:
 
 </Sub>
 
-<Sub n="4.3" title="Why W + R > N isn't linearizable">
+<Sub n="5.3" title="Why W + R > N isn't linearizable">
 
 The overlap rule promises that a read sees the latest *completed* write. It says
 nothing about a write that's still in flight, and that gap is enough to break
@@ -537,7 +575,7 @@ and not just overlap.
 
 </Sub>
 
-<Sub n="4.4" title="Sloppy quorums, hinted handoff and anti-entropy">
+<Sub n="5.4" title="Sloppy quorums, hinted handoff and anti-entropy">
 
 Dynamo had one more trick. If some of a key's N home replicas are down, a write
 goes to the next healthy nodes on the ring instead, which keep a **hint** and
@@ -565,7 +603,7 @@ back.
 
 </Sub>
 
-<Sub n="4.5" title="Quorums in a storage engine: Aurora">
+<Sub n="5.5" title="Quorums in a storage engine: Aurora">
 
 Quorum arithmetic isn't only for key-value stores. Amazon Aurora
 ([SIGMOD 2017](https://www.amazon.science/publications/amazon-aurora-design-considerations-for-high-throughput-cloud-native-relational-databases))
@@ -585,13 +623,13 @@ not lose data.
 
 </Sub>
 
-<SectionHeading n="05" id="conflicts">Conflicts, version vectors and CRDTs</SectionHeading>
+<SectionHeading n="06" id="conflicts">Conflicts, version vectors and CRDTs</SectionHeading>
 
 With multiple leaders or no leader, two replicas can accept different writes to
 the same key at the same time. Something has to decide what the value is
 afterwards.
 
-<Sub n="5.1" title="Last writer wins, and what it throws away">
+<Sub n="6.1" title="Last writer wins, and what it throws away">
 
 The simplest rule: every write carries a timestamp, and the highest timestamp
 wins. Cassandra does this per column.
@@ -610,7 +648,7 @@ writes were concurrent.
 
 </Sub>
 
-<Sub n="5.2" title="Detecting concurrency with version vectors">
+<Sub n="6.2" title="Detecting concurrency with version vectors">
 
 A **version vector** keeps one counter per replica. Each replica increments its
 own entry when it accepts a write, and a write carries the vector it was based
@@ -629,7 +667,7 @@ removed item from one the other replica never had.
 
 </Sub>
 
-<Sub n="5.3" title="CRDTs: data types that merge themselves">
+<Sub n="6.3" title="CRDTs: data types that merge themselves">
 
 A **conflict-free replicated data type** is a data structure whose merge
 function needs no application help, and always converges. Shapiro, Preguiça,
@@ -669,7 +707,7 @@ decrements (a **PN-counter**).
 
 </Sub>
 
-<Sub n="5.4" title="An OR-set keeps the cart honest">
+<Sub n="6.4" title="An OR-set keeps the cart honest">
 
 Dynamo's cart problem has a CRDT answer: the **observed-remove set**. Each add
 gets a unique tag, and a remove deletes only the tags it has *seen*. An add that
@@ -731,9 +769,9 @@ databases, and the collaborative-editing libraries Automerge and Yjs.
 
 </Sub>
 
-<SectionHeading n="06" id="choosing">Choosing and running a consistency level</SectionHeading>
+<SectionHeading n="07" id="choosing">Choosing and running a consistency level</SectionHeading>
 
-<Sub n="6.1" title="Match the requirement to the mechanism">
+<Sub n="7.1" title="Match the requirement to the mechanism">
 
 | You need | Weakest model that does it | Mechanism to reach for |
 |---|---|---|
@@ -756,7 +794,7 @@ eventually consistent.
 
 </Sub>
 
-<Sub n="6.2" title="Watching replication in production">
+<Sub n="7.2" title="Watching replication in production">
 
 ```sql
 -- Postgres, on the primary: one row per standby
@@ -784,7 +822,7 @@ last repaired.
 
 </Sub>
 
-<Sub n="6.3" title="Symptom, cause, fix">
+<Sub n="7.3" title="Symptom, cause, fix">
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -798,7 +836,7 @@ last repaired.
 
 </Sub>
 
-<SectionHeading n="07" id="summary">Summary</SectionHeading>
+<SectionHeading n="08" id="summary">Summary</SectionHeading>
 
 1. **Replication trades freshness for latency and availability.** Every design
    waits for some copies and not others; the consistency model says what readers
@@ -825,12 +863,12 @@ last repaired.
 10. **CRDTs can't protect invariants.** Anything with a uniqueness or a bound
     needs a leader or consensus.
 
-<SectionHeading n="08" id="build">Build this</SectionHeading>
+<SectionHeading n="09" id="build">Build this</SectionHeading>
 
 **A consistency checker for your own database.**
 
 - Start a Postgres primary and one standby (`pg_basebackup -R` does most of the
-  work) and reproduce the stale-read table in section 3.4. Then add
+  work) and reproduce the stale-read table in section 4.4. Then add
   `pg_current_wal_insert_lsn()` to every write, make the reader wait for
   `pg_last_wal_replay_lsn()` to pass it, and show the stale count go to zero
   with `synchronous_commit = local`.
@@ -838,11 +876,11 @@ last repaired.
   configurable N, W, R and a per-message random delay. Record every operation's
   start time, end time and result, then check the history for a read that
   returned an older value than a read that finished before it started. Find
-  the anomaly from section 4.3, then add read repair and show it disappear.
+  the anomaly from section 5.3, then add read repair and show it disappear.
 - Implement a PN-counter and an OR-set, and write a randomized test that merges
   replicas in random orders with duplicated messages. Assert they all converge.
 
-<SectionHeading n="09" id="interview">Interview questions</SectionHeading>
+<SectionHeading n="10" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="What's the difference between synchronous and asynchronous replication?">
 With asynchronous replication the primary acknowledges a commit once it's
@@ -913,7 +951,7 @@ shopping-cart write should never be refused; a stale read, reconciled later by
 merging, was the acceptable cost.
 </QA>
 
-<SectionHeading n="10" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="11" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
   <Q q="synchronous_commit = on, and the commit returns. Where is the row visible?">
@@ -969,7 +1007,7 @@ merging, was the acceptable cost.
   </WildCard>
 </CardGrid>
 
-<SectionHeading n="11" id="related">Related chapters</SectionHeading>
+<SectionHeading n="12" id="related">Related chapters</SectionHeading>
 
 <CardGrid>
   <WildCard name="Consensus: Raft, Paxos & Leases">

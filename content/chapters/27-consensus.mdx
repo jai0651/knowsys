@@ -1,29 +1,77 @@
 ---
 title: "Consensus: Raft, Paxos & Leases"
-dek: "How a handful of servers agree on one ordered log when any of them can crash and any message can be late. This chapter reads Raft through the etcd source, shows why Paxos says the same thing in a harder way, and measures what a linearizable read and a quorum write actually cost."
+dek: "How a handful of servers agree on one ordered log when any of them can crash and any message can be late. You'll start by running a three-node etcd cluster and killing its leader, then read Raft through the etcd source, see why Paxos says the same thing in a harder way, and measure what a linearizable read and a quorum write cost."
 readingTime: "~34 min"
-level: "Advanced"
+level: "Intermediate"
 versions: "go.etcd.io/raft v3.6.0 source · etcd 3.6.5 measured in a shared 4-CPU container, linuxkit 6.10.14 aarch64"
-prereqs: "RPCs and timeouts, fsync, what a write-ahead log is"
-updated: "2026-09-27"
+prereqs: "a terminal and Docker; RPCs, timeouts, fsync and write-ahead logs help"
+updated: "2026-09-30"
 ---
 
-You use consensus every day without calling it. Kubernetes keeps every object
-in etcd. CockroachDB and TiDB replicate each range of keys with Raft. Kafka's
-KRaft controllers, Consul and Vault run it too. When one of those systems
-"loses its leader" and stops taking writes for a second, this is the machinery
-that's working.
+Three friends are choosing a restaurant by group chat, and the rule is that any decision needs at least two of them to agree. One friend, the organiser, proposes places and collects the votes. If the organiser's phone dies, the other two notice the silence, pick a new organiser between them, and carry on. If a second friend also drops out, the last one can't decide anything, because one vote isn't a majority.
 
-Most engineers never need to implement Raft. You probably do need to know what it
-promises, what it costs per request, and which knobs trade safety for speed,
-because those knobs are exposed to you: etcd's serializable reads, lease-based
-reads, election timeouts, and the choice between three replicas and five.
+That's consensus. A group of servers agrees on one ordered list of decisions, survives losing a minority of its members, and stops when it has lost a majority, because guessing could split the cluster. Kubernetes keeps all its state in a system that works this way. You can build a small one and break it in a couple of minutes.
 
-This chapter builds Raft one rule at a time with the etcd source open, puts
-Paxos beside it, then covers reads, leases, and what quorum operations cost on a
-real cluster.
+<SectionHeading n="01" id="kill-the-leader">Kill the leader of a three-node cluster</SectionHeading>
 
-<SectionHeading n="01" id="the-problem">The problem: one log, many machines</SectionHeading>
+You need Docker. The commands start three etcd nodes on one Docker network, ask them who's leading, then stop nodes one by one.
+
+<Sub n="1.1" title="Three nodes, then two, then one">
+
+<TryIt what="Start a three-node etcd cluster, stop the leader and write again, then stop a second node and try to write" lang="shell" toolchain="etcd 3.6.5 on Docker Desktop, linuxkit 6.10.14 aarch64">
+```shell
+docker network create etcdnet
+CL="e1=http://e1:2380,e2=http://e2:2380,e3=http://e3:2380"
+for n in e1 e2 e3; do
+  docker run -d --name $n --network etcdnet quay.io/coreos/etcd:v3.6.5 etcd \
+    --name $n --initial-advertise-peer-urls http://$n:2380 --listen-peer-urls http://0.0.0.0:2380 \
+    --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://$n:2379 \
+    --initial-cluster $CL --initial-cluster-state new --initial-cluster-token demo
+done
+
+# status <endpoints>: leader flag, Raft term and log index of each node (JSON, trimmed to those fields)
+status() { docker exec e1 etcdctl --endpoints="$1" endpoint status -w json | python3 -c "
+import json,sys
+for e in json.load(sys.stdin):
+    s=e['Status']; print(f\"{e['Endpoint']:<8} leader={str(s['leader']==s['header']['member_id']).lower():<5} term={s['raftTerm']}  index={s['raftIndex']}\")"; }
+
+status e1:2379,e2:2379,e3:2379
+docker exec e1 etcdctl --endpoints=e1:2379 put greeting hello
+docker stop e2                                   # stop the leader
+status e1:2379,e3:2379
+docker exec e1 etcdctl --endpoints=e1:2379,e3:2379 put greeting "still writable"
+docker stop e3                                   # now only one of three is left
+docker exec e1 etcdctl --endpoints=e1:2379 --command-timeout=3s put greeting "no quorum"
+```
+<Output>
+```
+e1:2379  leader=false term=2  index=8
+e2:2379  leader=true  term=2  index=8
+e3:2379  leader=false term=2  index=8
+OK
+
+e1:2379  leader=true  term=3  index=10
+e3:2379  leader=false term=3  index=10
+OK
+
+Error: etcdserver: request timed out
+```
+</Output>
+</TryIt>
+
+At first `e2` leads at Raft term 2, and all three nodes are at the same log index. After `e2` is stopped, the other two hold an election within a few seconds: `e1` becomes leader at term 3, and a write still succeeds. After the second node is stopped, the write fails with a timeout instead of succeeding on the one node left.
+
+</Sub>
+
+<Sub n="1.2" title="What the numbers mean">
+
+The **term** counts elections. It went from 2 to 3 because the loss of the leader forced a new one, and any node seeing a higher term knows the older leader is out of date. The **index** is the position in the shared log. The index went from 8 to 10 in the surviving nodes when the election and the new write were recorded.
+
+The last result is the important one. One node alone could have accepted the write. But it couldn't know whether the two missing nodes were still running somewhere and had elected their own leader and accepted a different write. Waiting for a majority is what stops two halves of a cluster from disagreeing. The chapter builds this behaviour one rule at a time, reading the etcd source alongside.
+
+</Sub>
+
+<SectionHeading n="02" id="the-problem">The problem: one log, many machines</SectionHeading>
 
 A single database server is easy to reason about. Every write happens in some
 order, and every read sees the writes before it. Trouble is, it's one
@@ -34,7 +82,7 @@ clients write different values to two replicas at the same moment, and now you
 have two histories. Consensus is the tool that gives you replicas *and* a single
 history.
 
-<Sub n="1.1" title="The replicated state machine">
+<Sub n="2.1" title="The replicated state machine">
 
 The standard framing is the **replicated state machine**. Each server holds a
 deterministic state machine (a key-value store, say) and a log of commands. If
@@ -52,7 +100,7 @@ shipping the state around.
 
 </Sub>
 
-<Sub n="1.2" title="What consensus promises">
+<Sub n="2.2" title="What consensus promises">
 
 Every practical algorithm gives the same two kinds of guarantee, and it matters
 which kind you're relying on.
@@ -84,12 +132,12 @@ one election timeout.
 
 </Sub>
 
-<SectionHeading n="02" id="quorums">Quorums: why a majority is enough</SectionHeading>
+<SectionHeading n="03" id="quorums">Quorums: why a majority is enough</SectionHeading>
 
 Every decision in Raft and Paxos is made by a **quorum**, and for both it's a
 simple majority of the voting members: 2 of 3, 3 of 5, 4 of 7.
 
-<Sub n="2.1" title="Any two majorities overlap">
+<Sub n="3.1" title="Any two majorities overlap">
 
 The whole safety argument rests on one counting fact. Any two majorities of the
 same set share at least one member. With five servers, two groups of three
@@ -125,14 +173,14 @@ and etcd use plain majorities for both.
 
 </Sub>
 
-<SectionHeading n="03" id="election">Raft, part one: electing a leader</SectionHeading>
+<SectionHeading n="04" id="election">Raft, part one: electing a leader</SectionHeading>
 
 Raft ([Ongaro and Ousterhout, USENIX ATC 2014](https://raft.github.io/raft.pdf))
 makes one server the **leader** and routes every write through it. That turns
 consensus into two smaller problems: pick a leader safely, then have it copy
 its log to everyone else.
 
-<Sub n="3.1" title="Terms, and three states">
+<Sub n="4.1" title="Terms, and three states">
 
 Time in Raft is divided into **terms**, numbered 1, 2, 3 and upward. Each term
 starts with an election and has at most one leader. A term number is a logical
@@ -183,7 +231,7 @@ func (r *raft) becomeCandidate() {
 
 </Sub>
 
-<Sub n="3.2" title="One election, message by message">
+<Sub n="4.2" title="One election, message by message">
 
 A follower that hears nothing from a leader for its election timeout starts an
 election. Each server votes at most once per term, first come first served, and
@@ -236,7 +284,7 @@ somewhere in `[1.0 s, 2.0 s)` before it campaigns.
 
 </Sub>
 
-<Sub n="3.3" title="The election restriction">
+<Sub n="4.3" title="The election restriction">
 
 Not every server may become leader. A voter refuses any candidate whose log is
 less up-to-date than its own, where "more up-to-date" means a later last term,
@@ -299,7 +347,7 @@ covers the restriction:
 
 </Sub>
 
-<Sub n="3.4" title="How long a failover takes">
+<Sub n="4.4" title="How long a failover takes">
 
 To see the timeout in practice, I ran a three-member etcd 3.6.5 cluster with
 default flags, sent a `put` every 5 ms through a follower, and `kill -9`'d the
@@ -335,14 +383,14 @@ election timeout of at least ten times the round-trip time between members.
 
 </Sub>
 
-<SectionHeading n="04" id="replication">Raft, part two: replicating the log</SectionHeading>
+<SectionHeading n="05" id="replication">Raft, part two: replicating the log</SectionHeading>
 
 Once elected, the leader takes client commands, appends each to its own log,
 and sends it to the followers in `AppendEntries` RPCs. An entry is
 **committed** once it's stored on a majority. Committed entries are applied to
 the state machine and never lost.
 
-<Sub n="4.1" title="One write through a three-node cluster">
+<Sub n="5.1" title="One write through a three-node cluster">
 
 <Steps
   title="One put, from client to applied, in etcd"
@@ -372,7 +420,7 @@ five-node cluster waits for the second-fastest of four.
 
 </Sub>
 
-<Sub n="4.2" title="The Log Matching Property">
+<Sub n="5.2" title="The Log Matching Property">
 
 Every `AppendEntries` carries the index and term of the entry just before the
 new ones. The follower rejects the RPC unless it has an entry at that index
@@ -431,7 +479,7 @@ guarantees the leader already holds every committed one.
 
 </Sub>
 
-<Sub n="4.3" title="Computing the commit index">
+<Sub n="5.3" title="Computing the commit index">
 
 The leader tracks, for each voter, the highest index known to be on that
 voter's disk. The commit index is the largest index that a majority has
@@ -472,13 +520,13 @@ With five voters at match indexes 9, 7, 7, 5 and 3, the sorted slice is
 
 </Sub>
 
-<SectionHeading n="05" id="figure-8">The rule everyone gets wrong: Figure 8</SectionHeading>
+<SectionHeading n="06" id="figure-8">The rule everyone gets wrong: Figure 8</SectionHeading>
 
 The last section said "committed once stored on a majority". That's true for
 entries from the leader's current term. For entries from older terms, it's
 false, and the Raft paper spends its most famous figure showing why.
 
-<Sub n="5.1" title="An entry on a majority that still gets erased">
+<Sub n="6.1" title="An entry on a majority that still gets erased">
 
 Five servers, and the entry at index 2 is the one to watch. `[2:t2]` means
 "index 2, written in term 2".
@@ -516,7 +564,7 @@ safe, and the paper mentions it, but Raft doesn't rely on it.
 
 </Sub>
 
-<Sub n="5.2" title="The rule in code, and the no-op entry">
+<Sub n="6.2" title="The rule in code, and the no-op entry">
 
 In etcd the whole rule is one term check. `maybeCommit` passes the leader's
 *current* term along with the quorum index, and the log only advances if the
@@ -573,7 +621,7 @@ that no-op commits everything before it. In etcd it's the last thing
 ```
 </SourceRead>
 
-That no-op also matters for reads, which section 9 comes back to: until it
+That no-op also matters for reads, which section 10 comes back to: until it
 commits, a new leader doesn't know its own commit index.
 
 <Callout label="Common mistake" kind="warn">
@@ -586,13 +634,13 @@ Figure 8 on purpose.
 
 </Sub>
 
-<SectionHeading n="06" id="membership">Changing the members</SectionHeading>
+<SectionHeading n="07" id="membership">Changing the members</SectionHeading>
 
 Clusters change: a disk dies, you move to new hardware, you grow from three
 to five. The set of voters is itself part of the replicated state, and
 changing it is the most delicate operation in Raft.
 
-<Sub n="6.1" title="Why you can't just switch">
+<Sub n="7.1" title="Why you can't just switch">
 
 Servers learn the new configuration at different moments. Go from three
 servers to five directly, and for a while S1 and S2 may still count majorities
@@ -615,7 +663,7 @@ and the simple single-step changes still work.
 
 </Sub>
 
-<Sub n="6.2" title="The bug in the simple version">
+<Sub n="7.2" title="The bug in the simple version">
 
 Ongaro's dissertation presented single-server changes as the easier path. In
 July 2015 he posted to raft-dev that there's
@@ -638,13 +686,13 @@ dead member has no slack while you do it, so it's probably worth running five if
 
 </Sub>
 
-<SectionHeading n="07" id="prevote">Keeping elections quiet: PreVote and CheckQuorum</SectionHeading>
+<SectionHeading n="08" id="prevote">Keeping elections quiet: PreVote and CheckQuorum</SectionHeading>
 
 Basic Raft is safe under any network. It isn't always *available*. A
 single server with a bad link can keep the whole cluster in elections. Two
 extensions fix most of that, and you usually have to turn them on.
 
-<Sub n="7.1" title="The disruptive server">
+<Sub n="8.1" title="The disruptive server">
 
 Picture S3 cut off from the others. It times out, bumps its term to 6, fails,
 and repeats: 7, 8, 9. When the link heals, its `RequestVote` carries term 9,
@@ -692,13 +740,13 @@ func (r *raft) campaign(t CampaignType) {
 </SourceRead>
 
 The etcd server enables it (`--pre-vote` defaults to `true` in 3.6.5). In the
-section 3.4 failovers, each survivor went pre-candidate at term N, collected
+section 4.4 failovers, each survivor went pre-candidate at term N, collected
 `MsgPreVoteResp` from itself and the other survivor, then became candidate and
 leader at N+1.
 
 </Sub>
 
-<Sub n="7.2" title="CheckQuorum: a leader that notices it's alone">
+<Sub n="8.2" title="CheckQuorum: a leader that notices it's alone">
 
 Then there's the opposite problem: a leader cut off from a majority that doesn't know it.
 It keeps accepting proposals it can never commit, and clients connected to it
@@ -743,12 +791,12 @@ if !force && inLease {
 }
 ```
 
-The variable is called `inLease` for a reason. Section 9 uses that exact
+The variable is called `inLease` for a reason. Section 10 uses that exact
 property to make reads cheaper.
 
 </Sub>
 
-<Sub n="7.3" title="When the network is only half broken">
+<Sub n="8.3" title="When the network is only half broken">
 
 Full partitions are the easy case. The hard one is a **partial** partition,
 where A can reach B, B can reach C, and A can't reach C.
@@ -784,14 +832,14 @@ server turns PreVote on; code embedding the library must set both.
 
 </Sub>
 
-<SectionHeading n="08" id="paxos">Paxos, and why it's harder to read</SectionHeading>
+<SectionHeading n="09" id="paxos">Paxos, and why it's harder to read</SectionHeading>
 
 Paxos came first. Lamport published it as
 [The Part-Time Parliament](https://lamport.azurewebsites.net/pubs/lamport-paxos.pdf)
 (ACM TOCS, 1998), and it's probably still the best-known consensus algorithm: it's behind Google's Chubby and Spanner. Most papers
 in the field are written in its terms, so you need to be able to read it.
 
-<Sub n="8.1" title="Single-decree Paxos: choosing one value">
+<Sub n="9.1" title="Single-decree Paxos: choosing one value">
 
 Basic Paxos decides **one** value, not a log. It has proposers, which suggest
 values, and acceptors, which vote. In a real system every server plays both
@@ -825,7 +873,7 @@ in all but name.
 
 </Sub>
 
-<Sub n="8.2" title="Multi-Paxos: from one value to a log">
+<Sub n="9.2" title="Multi-Paxos: from one value to a log">
 
 A log is a sequence of single-decree instances, one per slot. Run phase 1 for
 every slot and each write costs two round trips. **Multi-Paxos** has a stable
@@ -843,7 +891,7 @@ repair, snapshots and membership its own way. Google's Chubby team wrote in
 
 </Sub>
 
-<Sub n="8.3" title="Same algorithm, different explanation">
+<Sub n="9.3" title="Same algorithm, different explanation">
 
 Raft was designed as the fix. In the paper's user study, 33 of 43 students who
 learned both answered questions about Raft better than about Paxos. Howard and
@@ -869,12 +917,12 @@ doesn't specify.
 
 </Sub>
 
-<SectionHeading n="09" id="reads">Reads: the log, ReadIndex, and leases</SectionHeading>
+<SectionHeading n="10" id="reads">Reads: the log, ReadIndex, and leases</SectionHeading>
 
 Reads don't change state, so it's tempting to have the leader answer them from
 memory. That's where many subtle bugs in consensus-backed systems live.
 
-<Sub n="9.1" title="Why a leader can't just read locally">
+<Sub n="10.1" title="Why a leader can't just read locally">
 
 A leader may have been replaced without knowing it. A GC pause, a stalled
 disk or a one-way partition can leave it believing it leads while a newer
@@ -893,11 +941,11 @@ There are three ways to serve a read safely, and one way to serve it fast.
 
 </Sub>
 
-<Sub n="9.2" title="ReadIndex, step by step">
+<Sub n="10.2" title="ReadIndex, step by step">
 
 The paper lays out two precautions for reading without the log. The leader
 must know which entries are committed, which it learns by committing its no-op
-from section 5. And it "must check whether it has been deposed" before
+from section 6. And it "must check whether it has been deposed" before
 answering, by exchanging heartbeats with a majority.
 
 <StepSequence
@@ -964,11 +1012,11 @@ and etcd's server issues one ReadIndex for a batch of concurrent client reads.
 
 </Sub>
 
-<Sub n="9.3" title="Leases: reading on the clock">
+<Sub n="10.3" title="Leases: reading on the clock">
 
 A lease replaces the heartbeat round with a promise about time. After a
 majority acknowledges a heartbeat, followers won't vote for anyone else for
-about an election timeout. That's CheckQuorum's `inLease` rule from section 7.
+about an election timeout. That's CheckQuorum's `inLease` rule from section 8.
 So the leader can assume nobody else will lead until then, and answer reads
 locally.
 
@@ -1026,7 +1074,7 @@ oversubscribed VMs, keep ReadIndex, and measure before you give it up.
 
 </Sub>
 
-<Sub n="9.4" title="etcd's two read modes, and a stale read on demand">
+<Sub n="10.4" title="etcd's two read modes, and a stale read on demand">
 
 etcd exposes the choice per request. The default is linearizable (ReadIndex).
 A request can ask for **serializable**, which "may access stale data with
@@ -1077,7 +1125,7 @@ caches that tolerate a second of staleness.
 
 </Sub>
 
-<Sub n="9.5" title="Leases held by clients are a different thing">
+<Sub n="10.5" title="Leases held by clients are a different thing">
 
 Clients hold leases too. etcd leases, Chubby locks and ZooKeeper ephemeral
 nodes give a client a lock for a TTL, with the same pause problem from the
@@ -1092,13 +1140,13 @@ older than a revision it has already seen.
 
 </Sub>
 
-<SectionHeading n="10" id="cost">What a quorum costs</SectionHeading>
+<SectionHeading n="11" id="cost">What a quorum costs</SectionHeading>
 
 Every consensus operation is some number of round trips and some number of
 fsyncs on the critical path. Once you know which, the latency of any
 deployment is arithmetic.
 
-<Sub n="10.1" title="The critical path of each operation">
+<Sub n="11.1" title="The critical path of each operation">
 
 | Operation | Round trips to a majority | fsyncs on the path |
 |---|---|---|
@@ -1118,7 +1166,7 @@ loss."
 
 </Sub>
 
-<Sub n="10.2" title="Measured: three members on one box">
+<Sub n="11.2" title="Measured: three members on one box">
 
 Two thousand sequential requests per case, 100-byte values over the HTTP gRPC
 gateway on one keep-alive connection, five runs, median of the per-run
@@ -1144,7 +1192,7 @@ where the virtual disk shows.
 
 </Sub>
 
-<Sub n="10.3" title="The same arithmetic across a network">
+<Sub n="11.3" title="The same arithmetic across a network">
 
 On a real deployment the round trip dominates. Here's the arithmetic, using
 the RTTs from etcd's own tuning guide: 10 ms as its worked example, and about
@@ -1171,9 +1219,9 @@ pipeline anything sequential.
 
 </Sub>
 
-<SectionHeading n="11" id="operating">Running a consensus cluster</SectionHeading>
+<SectionHeading n="12" id="operating">Running a consensus cluster</SectionHeading>
 
-<Sub n="11.1" title="What to look at">
+<Sub n="12.1" title="What to look at">
 
 ```shell
 # Who leads, at what term, and is everyone at the same index?
@@ -1198,7 +1246,7 @@ too close to the real round trip.
 
 </Sub>
 
-<Sub n="11.2" title="Symptom, cause, fix">
+<Sub n="12.2" title="Symptom, cause, fix">
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -1210,7 +1258,7 @@ too close to the real round trip.
 
 </Sub>
 
-<Sub n="11.3" title="What you give up">
+<Sub n="12.3" title="What you give up">
 
 <Compare
   cols={["Choice", "Gain", "Cost"]}
@@ -1225,7 +1273,7 @@ too close to the real round trip.
 
 </Sub>
 
-<SectionHeading n="12" id="summary">Summary</SectionHeading>
+<SectionHeading n="13" id="summary">Summary</SectionHeading>
 
 1. **Consensus is agreement on a log.** Replicas that apply the same commands in
    the same order end up in the same state; the algorithm only decides the order.
@@ -1253,7 +1301,7 @@ too close to the real round trip.
     leases cost a clock assumption, and serializable reads can be stale; a
     paused leader returned stale serializable reads five times out of five.
 
-<SectionHeading n="13" id="build">Build this</SectionHeading>
+<SectionHeading n="14" id="build">Build this</SectionHeading>
 
 **Break a three-node etcd cluster on purpose, and measure each break.**
 
@@ -1261,7 +1309,7 @@ too close to the real round trip.
   writer that records the gap between successful puts, and `kill -9` the
   leader ten times. Plot the gaps against the `[1 s, 2 s)` window, then halve
   `--election-timeout` and `--heartbeat-interval` and do it again.
-- Reproduce the paused-leader stale read in section 9.4 with `SIGSTOP`. Then
+- Reproduce the paused-leader stale read in section 10.4 with `SIGSTOP`. Then
   try the same read with `--consistency=l` and record every error the client
   sees. Your retry logic has to handle all of them.
 - In throwaway VMs or network namespaces, run all members with
@@ -1272,7 +1320,7 @@ too close to the real round trip.
 - Stretch goal: implement Raft against the MIT 6.5840 test harness until the
   Figure 8 tests pass.
 
-<SectionHeading n="14" id="interview">Interview questions</SectionHeading>
+<SectionHeading n="15" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="Why do consensus clusters have an odd number of members?">
 A cluster of `2f + 1` tolerates `f` failures, because any majority of it still
@@ -1328,7 +1376,7 @@ it has already seen. If the store can't check tokens, the lock can't give you
 mutual exclusion.
 </QA>
 
-<SectionHeading n="15" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="16" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
   <Q q="Five voters report match indexes 9, 7, 7, 5 and 3, all in the leader's term. What's the commit index?">
@@ -1375,7 +1423,7 @@ mutual exclusion.
   </WildCard>
 </CardGrid>
 
-<SectionHeading n="16" id="related">Related chapters</SectionHeading>
+<SectionHeading n="17" id="related">Related chapters</SectionHeading>
 
 <CardGrid>
   <WildCard name="Time, Clocks & Ordering">
@@ -1383,7 +1431,7 @@ mutual exclusion.
     drift, and TrueTime's bounded uncertainty. [Chapter 26](/topics/26-time-and-ordering).
   </WildCard>
   <WildCard name="Filesystems & the Page Cache">
-    What the fsync on every Raft write actually guarantees, and what it costs.
+    What the fsync on every Raft write guarantees, and what it costs.
     [Chapter 08](/topics/08-filesystems).
   </WildCard>
   <WildCard name="Contention, Queueing & Tail Latency">
