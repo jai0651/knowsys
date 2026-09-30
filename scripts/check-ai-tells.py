@@ -17,6 +17,11 @@ PATTERNS = {
  "announcing":          r"\b(let's (dive|explore|break this down)|here's what you need to know|without further ado|now let's look)\b",
  "fake-candid open":    r"(^|[.!?]\s)(Honestly\?|Look,|Here's the thing|The thing is,|Let's be honest)",
  "generic uplift":      r"\b(the future looks|exciting times|a major step in the right direction|continues to thrive)\b",
+ "it's not X, it's Y":  r"\b(it'?s|that'?s|this is|they'?re|isn'?t|wasn'?t|aren'?t) not (about |just |only |a |an |the )?[^.;:\n]{2,50}[,.;]?\s+(it'?s|that'?s|it is|but|they'?re|this is)\b",
+ "not because X but Y": r"\bnot because [^.;\n]{3,60}[.,]?\s+(but|it'?s) because\b",
+ "not by doing X":      r"\bnot by [a-z]+ing [^.;\n]{2,50},?\s+but by\b",
+ "No X. No Y. Just Z":  r"\bno [a-z ]{2,25}\.\s+no [a-z ]{2,25}\.\s+just\b",
+ "rhetorical Q+answer": r"\b(the (result|outcome|upshot|catch|kicker|takeaway|difference|cost|fix|answer|problem)\?|and the [a-z]+\?)\s",
  "filler":              r"\b(in order to|due to the fact that|at this point in time|it is important to note that|has the ability to)\b",
 }
 

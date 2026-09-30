@@ -1,37 +1,123 @@
 ---
 title: Processes, Threads & Scheduling
-dek: "Your thread is runnable far more often than it's running, and most latency under load lives in that gap. You'll learn how the scheduler decides who runs, what a context switch really costs, and why a container can stall at 30% CPU."
-readingTime: "~26 min"
-level: "Intermediate"
+dek: "Your machine runs hundreds of programs on a handful of cores, and every one of them believes it has a core to itself. You'll start by poking at that on your own laptop, then learn what a process is, how the scheduler shares cores, what a context switch costs, and why a container can stall at 30% CPU."
+readingTime: "~28 min"
+level: "Beginner"
 versions: "Measured on Apple M4 (4P + 6E cores) · Linux EEVDF behaviour attributed"
-prereqs: "virtual memory, locks"
-updated: "2026-09-26"
+prereqs: "a terminal; virtual memory helps"
+updated: "2026-09-30"
 ---
 
-A core runs one instruction stream at a time. Your laptop has maybe ten cores
-and, right now, a few thousand threads that would like to run. Something has to
-decide who gets a core, when and for how long.
+Picture a single cook in a kitchen with forty orders on the rail. The cook can only work on one dish at a time, but nobody waiting believes they've been forgotten. The cook chops for a minute, puts a pot on to simmer, starts a sauce while it heats, and comes back when something needs attention.
 
-That decision explains a lot of latency no profiler ever shows you. A service's
-p99 doubles under load while the CPU graph sits at 60%. A Kubernetes pod stalls
-while its average usage looks comfortable. The JVM and Go had to learn to size
-their thread pools from the container's limit, not the host's core count, and
-Postgres, which gives every connection its own process, is usually put behind a
-pooler.
+Your computer is that cook. A core runs one instruction stream at a time, and the operating system's job is to keep every program feeling looked after. Before any theory, let's see how lopsided the numbers are on your own machine.
 
-This chapter starts from the crudest scheduler and builds up to what Linux
-does. It walks through a time slice, a context switch and a cgroup throttle one
-step at a time, measures what the primitives cost, and ends with how to watch
-it all in production.
+<SectionHeading n="01" id="look-first">Look at your own machine first</SectionHeading>
 
-<SectionHeading n="01" id="why-a-scheduler">Why a scheduler exists</SectionHeading>
+Open a terminal. Nothing here needs setup.
 
-Start with the crudest answer to "who runs next": run one program until it
-finishes, then the next.
+<Sub n="1.1" title="How many programs, how many cores">
 
-<Sub n="1.1" title="Run to completion, and what breaks">
+<TryIt what="Count processes, count cores, count what's running right now" lang="shell" toolchain="macOS 26.5.1, Apple M4">
+```shell
+ps -A | wc -l                                   # every process on the machine
+sysctl -n hw.ncpu                               # cores (on Linux: nproc)
+ps -Ao state | awk 'NR>1{c[substr($1,1,1)]++} END{for(k in c) print k, c[k]}'
+```
+<Output>
+```
+716
+10
+R 2
+S 713
+```
+</Output>
+</TryIt>
 
-Two things go wrong at once:
+That's 715 processes (the first line counts the `ps` header) sharing 10 cores. When the command sampled them, **2 were running and 713 were sleeping**.
+
+Run it a few times. The number running barely moves, however busy the machine feels.
+
+</Sub>
+
+<Sub n="1.2" title="What that tells you">
+
+Most programs, most of the time, are waiting: for a keypress, a network packet, a timer, a disk. A sleeping process costs almost nothing, so ten cores can look after hundreds of them.
+
+The trouble starts when more processes want to run than there are cores. Then the operating system has to choose, and every choice makes somebody wait. The rest of this chapter is about how that choice is made and what the waiting costs you.
+
+</Sub>
+
+<SectionHeading n="02" id="process">What a process is</SectionHeading>
+
+The word has a precise meaning, and it's smaller than the "program" you think of.
+
+<Sub n="2.1" title="A program that's running">
+
+A program is a file on disk. A **process** is that file brought to life: the kernel gives it an **address space** (chapter 04), a set of open files, permissions, and one or more threads to execute it.
+
+A **thread** is one line of execution, with its own registers and its own stack. The core runs threads. The process is the container they run inside.
+
+</Sub>
+
+<Sub n="2.2" title="Where processes come from">
+
+On Unix, new processes come from an oddly simple pair of calls. `fork()` clones the calling process, and the child starts as a near-exact copy. `waitpid()` lets the parent pause until the child finishes.
+
+<TryIt what="Fork once and print both process ids" lang="python" toolchain="Python 3, macOS 26.5.1">
+```python
+import os
+pid = os.fork()
+if pid == 0:
+    print("child  pid", os.getpid(), "parent", os.getppid(), flush=True)
+    os._exit(0)
+os.waitpid(pid, 0)
+print("parent pid", os.getpid(), flush=True)
+```
+<Output>
+```
+child  pid 83340 parent 83339
+parent pid 83339
+```
+</Output>
+</TryIt>
+
+The child reports the parent's pid as its own parent. Each run prints different numbers.
+
+<Why>Doesn't copying a whole process take forever?</Why>
+
+It would, if the kernel copied the memory. It doesn't: parent and child share the same physical pages until one of them writes. That's copy-on-write, and it's why Redis can snapshot a 50 GB dataset with `fork()`. Chapter 04 walks through it.
+
+To run a different program, the child calls `exec()`, which replaces its contents with the new program. A shell is `fork`, `exec` and `wait` in a loop.
+
+</Sub>
+
+<Sub n="2.3" title="Thread or process?">
+
+Both are schedulable. What differs is what they share. Threads in one process share an address space, file descriptors and signal handlers; processes share nothing by default.
+
+| | Threads in one process | Separate processes |
+|---|---|---|
+| Share | Address space, file descriptors, signal handlers | Nothing by default |
+| Creating one | Cheaper | More expensive |
+| A crash | Takes the whole process with it | Stays inside that process |
+| Scheduling | Almost identical | Almost identical |
+
+<Callout label="Design implication">
+"Thread or process" comes down to a question: do you want a shared address
+space, or a failure boundary? Threads are cheaper to create, and easier to corrupt. The
+scheduler treats them almost identically either way.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="03" id="sharing-a-core">Sharing one core</SectionHeading>
+
+Now the cook's problem. There's one core and several programs that want it. What's the simplest thing the OS could do?
+
+<Sub n="3.1" title="Run to completion, and what breaks">
+
+Run one program until it finishes, then the next. Two things go wrong at once:
 
 - **A program that waits wastes the core.** One that stops to read from disk
   leaves the core idle for the whole wait.
@@ -42,47 +128,48 @@ take the core back.
 
 </Sub>
 
-<Sub n="1.2" title="Threads, processes and the context switch">
+<Sub n="3.2" title="Switching, and taking the core back">
 
-You fix the first by switching away whenever a program has to wait. To do that
-the kernel saves everything the core was holding for it (registers, the stack
-pointer, where it was in the code) and loads someone else's.
+To switch away whenever a program has to wait, the kernel saves everything the core was holding for it (registers, the stack pointer, where it was in the code) and loads someone else's. That's a **context switch**.
 
-That's a **context switch**, and the unit being switched is a **thread**: one
-line of execution with its own registers and stack. A **process** is the
-container around one or more threads: an address space, open files,
-permissions.
-
-<Why>So should this be a thread or a process?</Why>
-
-Both are schedulable. What differs is what they share. Threads in one process
-share an address space, file descriptors and signal handlers; processes share
-nothing by default.
-
-| | Threads in one process | Separate processes |
-|---|---|---|
-| Share | Address space, file descriptors, signal handlers | Nothing by default |
-| Creating one | Cheaper | More expensive |
-| A crash | Takes the whole process with it | Stays inside that process |
-| Scheduling | Almost identical | Almost identical |
-
-<Callout label="Design implication">
-"Thread or process" is really "do I want a shared address space, or do I want
-a failure boundary". Threads are cheaper to create, and easier to corrupt. The
-scheduler treats them almost identically either way.
-</Callout>
+To take the core back, it needs a timer. The hardware interrupts the core every few milliseconds, and the kernel gets a chance to take the core away from whoever has it. That's **preemption**, and the part of the kernel that picks what runs next is the **scheduler**.
 
 </Sub>
 
-<Sub n="1.3" title="Preemption and the three states">
+<Sub n="3.3" title="The states of a thread">
 
-For the second problem you need a timer. The hardware interrupts the core every
-few milliseconds, and the kernel gets a chance to take the core away from
-whoever has it.
+From the scheduler's point of view, a thread is always in one of a few states. The universal picture has four, and every language and kernel is a refinement of it (Java exposes six, Go hides them behind goroutines).
 
-That's **preemption**, and the part of the kernel that picks what runs next is
-the **scheduler**. From its point of view every thread is in one of three
-states:
+<Steps
+  title="A thread's life, from creation to exit"
+  lanes={[
+    { t: "New", s: "being created", icon: "+" },
+    { t: "Runnable", s: "ready, waiting for a core", icon: "◌" },
+    { t: "Running", s: "on a core right now", icon: "▶" },
+    { t: "Blocked", s: "waiting on I/O, a lock, a timer", icon: "⏸" },
+    { t: "Exited", s: "finished", icon: "■" },
+  ]}
+  steps={[
+    [0, "The thread is created and handed to the scheduler."],
+    [1, "It joins the **run queue**: ready to go, but no core is free yet."],
+    [2, "The scheduler picks it and it **runs**, until its time slice ends or it has to wait."],
+    [1, "Slice over: the timer **preempts** it and it goes back to the queue. It did nothing wrong; someone else has a turn."],
+    [3, "It asks for something slow (a disk read, a lock, a sleep) and **blocks**. It leaves the queue and uses no CPU."],
+    [1, "What it was waiting for arrives. It becomes runnable again, and queues for a core like everyone else."],
+    [4, "It returns from its main function and exits."],
+  ]}
+/>
+
+| From | To | Because |
+|---|---|---|
+| New | Runnable | The thread is started |
+| Runnable | Running | The scheduler picks it |
+| Running | Runnable | Its time slice ran out (preemption) |
+| Running | Blocked | It waits on I/O, a lock or a timer |
+| Blocked | Runnable | What it waited for is ready. It doesn't run yet |
+| Running | Exited | It finishes |
+
+Notice the arrow that's missing. Nothing goes straight from Blocked to Running: a woken thread always queues for a core first. The next section shows what that queue costs.
 
 <Compare
   cols={["State", "Meaning", "Shows up in"]}
@@ -93,17 +180,15 @@ states:
   ]}
 />
 
-The middle row is the one that matters, and section 2 shows why.
-
 </Sub>
 
-<SectionHeading n="02" id="time-slicing">Sharing a core, worked through</SectionHeading>
+<SectionHeading n="04" id="time-slicing">Sharing a core, worked through</SectionHeading>
 
 Here's a small example to see what sharing costs. One core, four runnable
 threads, each needing 10 ms of CPU, and the scheduler hands out 4 ms slices in
 turn.
 
-<Sub n="2.1" title="Four threads, 4 ms slices">
+<Sub n="4.1" title="Four threads, 4 ms slices">
 
 <Predict
   q="One core, four threads, each needing 10 ms of CPU, 4 ms slices in turn. When does the first thread finish?"
@@ -145,14 +230,14 @@ extra time wasn't spent computing anything.
 
 </Sub>
 
-<Sub n="2.2" title="Why a profile can't see waiting">
+<Sub n="4.2" title="Why a profile can't see waiting">
 
 <Why>What does a CPU profile show for those 24 ms of waiting?</Why>
 
 Nothing. A runnable thread burns no cycles, so it never appears in a flame
 graph, and every symptom looks like something else.
 
-**Runnable-but-not-running is where latency under load actually comes from.**
+**Runnable-but-not-running is where latency under load comes from.**
 When a service's p99 doubles while the CPU graph sits at 60%, runnable time is
 usually where the missing milliseconds are.
 
@@ -164,12 +249,12 @@ Runnable and blocked time need run queue depth (`vmstat`'s `r` column),
 
 </Sub>
 
-<SectionHeading n="03" id="linux-scheduler">How Linux picks the next thread</SectionHeading>
+<SectionHeading n="05" id="linux-scheduler">How Linux picks the next thread</SectionHeading>
 
 A scheduler promises that every runnable thread eventually runs. That's close
 to the entire guarantee, and it's weaker than most people design against.
 
-<Sub n="3.1" title="Eventually, and nothing more">
+<Sub n="5.1" title="Eventually, and nothing more">
 
 It doesn't promise when. It doesn't promise for how long. It doesn't promise
 which core, and on a machine with fast and slow cores it doesn't promise they
@@ -180,7 +265,7 @@ somewhere else: priorities, affinity, or a real-time class.
 
 </Sub>
 
-<Sub n="3.2" title="From CFS to EEVDF">
+<Sub n="5.2" title="From CFS to EEVDF">
 
 Linux ran CFS for fifteen years and replaced it with **EEVDF** in 6.6, Peter
 Zijlstra's rewrite. Both are fair-share schedulers: each thread gets CPU time
@@ -194,17 +279,17 @@ proportional to its weight, with weight derived from nice value.
 | Picks | The thread furthest behind on its share | A thread that has been starved first |
 
 In practice EEVDF improves latency for threads that wake rarely, which covers
-most interactive and I/O-bound work. It's worth knowing which one you're on,
-because latency behaviour for those threads changed noticeably.
+most interactive and I/O-bound work. Check which one you're on: latency
+behaviour for those threads changed noticeably.
 
 <Why>Does fair share guarantee my thread a slice?</Why>
 
-No. Fair share is a target the scheduler converges toward, not a contract for
-any individual slice.
+No. Fair share is a target the scheduler converges toward. It says nothing
+about any individual slice.
 
 </Sub>
 
-<Sub n="3.3" title="Heterogeneous cores">
+<Sub n="5.3" title="Heterogeneous cores">
 
 This machine has performance and efficiency cores. So does every recent phone,
 and so do Intel's P/E designs. The scheduler places threads based on
@@ -212,18 +297,18 @@ utilisation history and thermal state, and **the same thread can run at very
 different speeds depending on where it lands.**
 
 That breaks a background assumption in almost every benchmark: that threads
-are interchangeable. Section 6 shows it directly. Going from one thread to five
+are interchangeable. Section 8 shows it directly. Going from one thread to five
 gives 4.3× instead of the 5× you'd expect, probably because those five didn't
 all get equal hardware.
 
 </Sub>
 
-<SectionHeading n="04" id="context-switch">The context switch, step by step</SectionHeading>
+<SectionHeading n="06" id="context-switch">The context switch, step by step</SectionHeading>
 
 A context switch is the moment the scheduler's decision takes effect. The save
 and restore are the cheap part.
 
-<Sub n="4.1" title="What the kernel saves and swaps">
+<Sub n="6.1" title="What the kernel saves and swaps">
 
 <Steps
   title="Switching a core from thread A to thread B"
@@ -258,7 +343,7 @@ every kernel entry.
 
 </Sub>
 
-<Sub n="4.2" title="The cost you cannot see in the switch">
+<Sub n="6.2" title="The cost you cannot see in the switch">
 
 Counting the switch itself undersells it. The incoming thread finds a cache
 full of somebody else's data and a TLB that no longer describes its address
@@ -272,12 +357,12 @@ but everything each woken thread has to re-warm.
 
 </Sub>
 
-<SectionHeading n="05" id="failure">Where scheduling goes wrong</SectionHeading>
+<SectionHeading n="07" id="failure">Where scheduling goes wrong</SectionHeading>
 
 Each failure here looks like something else from inside the application. The
 first one is the most common in containerised services.
 
-<Sub n="5.1" title="Throttled at 30% CPU">
+<Sub n="7.1" title="Throttled at 30% CPU">
 
 Container CPU limits are enforced by quota over a period, by default 100 ms. A
 container with a 0.5 CPU limit gets 50 ms of CPU per 100 ms window. Spend it in
@@ -324,16 +409,16 @@ most under-diagnosed latency problem in containerised services, and the
 <Callout label="Design implication">
 Years of incident reports about services throttled at 30% CPU moved the
 Kubernetes community to a rare consensus: set requests, skip CPU limits, and
-let the scheduler do its job. More threads make throttling worse, not better,
-so size thread pools from the container's limit, not the host's core count.
+let the scheduler do its job. More threads make throttling worse, so size thread pools from the
+container's limit. The host's core count is the wrong input.
 </Callout>
 
 </Sub>
 
-<Sub n="5.2" title="Oversubscription and priority inversion">
+<Sub n="7.2" title="Oversubscription and priority inversion">
 
 More runnable threads than cores means time-slicing, which means every thread's
-latency grows even though throughput may not. Section 6 measures the point
+latency grows even though throughput may not. Section 8 measures the point
 where adding threads stops helping.
 
 Priority inversion belongs here too. Chapter 13 covers it, but note that Linux
@@ -342,7 +427,7 @@ still holds any lock it took.
 
 </Sub>
 
-<Sub n="5.3" title="Thundering herds">
+<Sub n="7.3" title="Thundering herds">
 
 Wake a hundred threads for one available unit of work and ninety-nine wake up,
 context switch, find nothing, and go back to sleep.
@@ -358,16 +443,16 @@ it's probably a bug: every other waiter pays a context switch to find nothing.
 
 </Sub>
 
-<SectionHeading n="06" id="cost">What the primitives cost</SectionHeading>
+<SectionHeading n="08" id="cost">What the primitives cost</SectionHeading>
 
 <Callout label="The machine" kind="note">
 Apple M4, 10 cores, macOS 26.5.1, clang 21 `-O2`. Core placement is the
 scheduler's choice and this chip has both performance and efficiency cores, so
 the scaling numbers reflect a heterogeneous machine. That's the normal case
-now, not an exotic one.
+now.
 </Callout>
 
-<Sub n="6.1" title="The primitives">
+<Sub n="8.1" title="The primitives">
 
 <Cost items={[
   { what: "Create and join an OS thread", value: "13.8 µs", source: "2,000 iterations" },
@@ -380,7 +465,7 @@ chapter 15 works it through.
 
 </Sub>
 
-<Sub n="6.2" title="Where adding threads stops helping">
+<Sub n="8.2" title="Where adding threads stops helping">
 
 Fixed total work, 40 million multiply-adds, split across an increasing number
 of threads on a 10-core machine:
@@ -415,7 +500,7 @@ machine you'd blame memory bandwidth.
 Here the likelier explanation is efficiency cores doing less work per unit
 time: the threads aren't running on equivalent hardware. I haven't isolated
 that with core pinning, which macOS makes awkward, so treat it as the leading
-hypothesis and not a proven cause. On Linux it's one `taskset` away.
+hypothesis; it is unproven. On Linux it's one `taskset` away.
 
 **Oversubscription costs almost nothing here.** Going from 10 to 40 threads,
 4× the runnable threads, changed wall time by under 1%. Time-slicing overhead
@@ -426,9 +511,9 @@ Chapter 16 has that side.
 
 </Sub>
 
-<SectionHeading n="07" id="operating">Watching the scheduler</SectionHeading>
+<SectionHeading n="09" id="operating">Watching the scheduler</SectionHeading>
 
-<Sub n="7.1" title="Finding scheduling problems">
+<Sub n="9.1" title="Finding scheduling problems">
 
 ```shell
 # Runnable-but-not-running. The number that matters, and the one nobody watches.
@@ -451,7 +536,7 @@ measurement in a throttled container means anything.
 
 </Sub>
 
-<Sub n="7.2" title="Symptom, cause, check">
+<Sub n="9.2" title="Symptom, cause, check">
 
 | Symptom | Likely cause | Check |
 |---|---|---|
@@ -463,7 +548,7 @@ measurement in a throttled container means anything.
 
 </Sub>
 
-<Sub n="7.3" title="What you give up">
+<Sub n="9.3" title="What you give up">
 
 | You get | You pay | When the bill arrives |
 |---|---|---|
@@ -475,30 +560,30 @@ measurement in a throttled container means anything.
 
 </Sub>
 
-<SectionHeading n="08" id="summary">Summary</SectionHeading>
+<SectionHeading n="10" id="summary">Summary</SectionHeading>
 
 1. **A thread is running, runnable or blocked.** Only running shows up in a CPU
    profile.
 2. **Runnable time is where latency under load hides.** Four threads sharing a
    core took 34 to 40 ms to do 10 ms of work each.
-3. **Threads and processes differ in what they share**, not in how they're
-   scheduled. Choose a shared address space or a failure boundary.
+3. **Threads and processes differ in what they share.** The scheduler treats
+   them almost the same. Choose a shared address space or a failure boundary.
 4. **The scheduler promises "eventually", nothing more.** Timing guarantees
    have to come from priorities, affinity or a real-time class.
 5. **Linux replaced CFS with EEVDF in 6.6.** It adds lag and deadlines, so
    rarely-waking threads get picked sooner.
 6. **A process switch swaps the page table root.** That's why it costs more
    than a thread switch.
-7. **The real cost of a switch comes after it**, as cache and TLB refills
+7. **Most of a switch's cost comes after it**, as cache and TLB refills
    charged to the incoming thread.
 8. **A CPU limit is a quota per 100 ms period.** Spend it early and the whole
    cgroup freezes for the rest; more threads spend it faster.
 9. **Creating a thread cost about 127× a round trip** between live ones (13.8 µs
    against 109 ns), which is the case for pools.
-10. **Past the core count, extra threads add latency, not throughput.** Forty
+10. **Past the core count, extra threads add latency and no throughput.** Forty
     threads ran within 1% of ten on a ten-core M4.
 
-<SectionHeading n="09" id="build">Build this</SectionHeading>
+<SectionHeading n="11" id="build">Build this</SectionHeading>
 
 **Reproduce cgroup throttling on purpose**, because recognising its signature
 once is worth more than reading about it three times.
@@ -513,7 +598,7 @@ Then read `cpu.stat` and match `throttled_usec` against the gaps you plotted.
 Once you've seen that shape you'll recognise it in a production dashboard in
 about five seconds.
 
-<SectionHeading n="10" id="interview">Interview questions</SectionHeading>
+<SectionHeading n="12" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="What's the difference between a process and a thread?">
 What they share. Threads within a process share an address space, file
@@ -521,8 +606,7 @@ descriptors and signal handlers; processes share none of that by default. Both
 are scheduled the same way on Linux: the kernel schedules tasks and doesn't
 much care which kind you made.
 
-So what you're really choosing is a shared address space or a failure
-boundary. A crashed thread takes the process with it; a crashed process doesn't.
+So the choice is a shared address space or a failure boundary. A crashed thread takes the process with it; a crashed process doesn't.
 </QA>
 
 <QA level="intermediate" q="Your containerised service has p99 latency at almost exactly 100 ms multiples and uses 30% CPU. What is it?">
@@ -567,7 +651,7 @@ didn't do it. On Linux it's one `taskset` away, and that's the experiment that
 would settle it.
 </QA>
 
-<SectionHeading n="11" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="13" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
   <Q q="Which thread state is invisible in a CPU flame graph?">
@@ -607,7 +691,7 @@ would settle it.
   </WildCard>
 </CardGrid>
 
-<SectionHeading n="12" id="related">Related chapters</SectionHeading>
+<SectionHeading n="14" id="related">Related chapters</SectionHeading>
 
 <CardGrid>
   <WildCard name="Virtual Memory & Page Tables">
@@ -619,7 +703,7 @@ would settle it.
     descheduled. [Chapter 13](/topics/13-locks).
   </WildCard>
   <WildCard name="Concurrency Models">
-    Thread pools, and the creation-versus-reuse ratio from section 6 worked
+    Thread pools, and the creation-versus-reuse ratio from section 8 worked
     through. [Chapter 15](/topics/15-concurrency-models).
   </WildCard>
   <WildCard name="Contention, Queueing & Tail Latency">

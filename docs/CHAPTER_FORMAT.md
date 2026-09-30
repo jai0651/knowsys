@@ -1,5 +1,10 @@
 # Chapter format
 
+Tone, pacing and the ease-in-then-deep arc live in
+`.claude/skills/write-chapter/SKILL.md`; this file covers structure, components
+and checks. Reference chapters: `06-processes-scheduling` (gentle start),
+`04-virtual-memory` (problem-first opening), `10-linux-networking` (components).
+
 The reference chapter is `content/chapters/10-linux-networking.mdx`. Read it in
 full before converting or writing a chapter. The model it follows is a good
 course lesson (AlgoMaster's system-design lessons are the benchmark the site
