@@ -17,7 +17,7 @@ import { cn } from "@/lib/utils";
 
 const LANE = ["#60a5fa", "#c084fc", "#fbbf24", "#34d399", "#f472b6", "#22d3ee", "#fb923c", "#a3e635"];
 
-function Inline({ text }: { text: string }) {
+export function Inline({ text }: { text: string }) {
   const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
   return (
     <>
@@ -34,7 +34,7 @@ function Inline({ text }: { text: string }) {
   );
 }
 
-function useStepper(n: number) {
+export function useStepper(n: number) {
   const [i, setI] = useState(0);
   const [playing, setPlaying] = useState(false);
   const go = useCallback((d: number) => setI((x) => Math.max(0, Math.min(n - 1, x + d))), [n]);
@@ -53,7 +53,7 @@ function useStepper(n: number) {
   return { i, go, playing, setPlaying, reset: () => { setPlaying(false); setI(0); } };
 }
 
-function Frame({
+export function Frame({
   title, hint, i, n, go, playing, setPlaying, reset, caption, children,
 }: {
   title: string;

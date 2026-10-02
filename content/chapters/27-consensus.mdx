@@ -1,22 +1,119 @@
 ---
 title: "Consensus: Raft, Paxos & Leases"
-dek: "How a handful of servers agree on one ordered log when any of them can crash and any message can be late. You'll start by running a three-node etcd cluster and killing its leader, then read Raft through the etcd source, see why Paxos says the same thing in a harder way, and measure what a linearizable read and a quorum write cost."
-readingTime: "~34 min"
+dek: "Follow one write, x = 3, through a cluster of servers that can crash at any moment: how they agree on one ordered history, what happens when the leader dies, and what it costs to read and write safely. You'll kill a real etcd leader, then read Raft's rules against the etcd source."
+readingTime: "~45 min"
 level: "Intermediate"
-versions: "go.etcd.io/raft v3.6.0 source · etcd 3.6.5 measured in a shared 4-CPU container, linuxkit 6.10.14 aarch64"
+versions: "go.etcd.io/raft v3.6.0 source · etcd 3.6.5 on Docker (linuxkit 6.10.14 aarch64)"
 prereqs: "a terminal and Docker; RPCs, timeouts, fsync and write-ahead logs help"
-updated: "2026-09-30"
+updated: "2026-10-02"
 ---
 
-Three friends are choosing a restaurant by group chat, and the rule is that any decision needs at least two of them to agree. One friend, the organiser, proposes places and collects the votes. If the organiser's phone dies, the other two notice the silence, pick a new organiser between them, and carry on. If a second friend also drops out, the last one can't decide anything, because one vote isn't a majority.
+You're running a small service that stores configuration, and a client asks it to set a key `x` to 3. One server can do that and answer "OK", and for a while it's all you need. Then its disk dies, or the machine reboots for a kernel update, and everything that depended on `x` has nothing to read. Kubernetes keeps everything it knows, which nodes exist and which pods should be running, in a small database called etcd, so when etcd is unavailable the whole cluster can't change.
 
-That's consensus. A group of servers agrees on one ordered list of decisions, survives losing a minority of its members, and stops when it has lost a majority, because guessing could split the cluster. Kubernetes keeps all its state in a system that works this way. You can build a small one and break it in a couple of minutes.
+So you run three servers, each holding a copy of `x`, and the service survives the loss of any one of them. It sounds like a matter of sending "set `x` to 3" to all three, but the copies can disagree. Two clients can write at the same moment. A server can be switched off for a minute and miss a write. And when a server stops answering, you can't tell whether it has crashed or is only slow. Once a write has been acknowledged to the client, every later read has to see it, whatever fails afterwards.
 
-<SectionHeading n="01" id="kill-the-leader">Kill the leader of a three-node cluster</SectionHeading>
+Getting several servers to agree on what has been written, and in what order, while any of them can crash and any message can arrive late, is called **consensus**. This chapter follows the write `x = 3` through a cluster running the Raft algorithm, which is what etcd uses. The question to carry along is this: when any server can die at any moment, how can the survivors still agree on what `x` is, so that a write that was acknowledged is never lost? We'll see why copies drift apart and what rule stops it, watch a real cluster lose its leader, read Raft's rules against etcd's source code, and finish with what reads and writes cost.
 
-You need Docker. The commands start three etcd nodes on one Docker network, ask them who's leading, then stop nodes one by one.
+<SectionHeading n="01" id="order">Why copies need an order</SectionHeading>
 
-<Sub n="1.1" title="Three nodes, then two, then one">
+<Sub n="1.1" title="Copies that drift">
+
+Take three servers, S1, S2 and S3, each holding its own copy of `x`. Each copy is a **replica**. Suppose a client writes by sending the new value to all three. Now two clients write at the same moment: client A sends `x = 3` and client B sends `x = 4`. Messages take different paths through the network, so S1 happens to hear A's write first and B's second, and ends with `x = 4`. S3 hears B's first and A's second, and ends with `x = 3`. Nobody crashed, every message arrived, and the replicas disagree. Each server did exactly what it was told, in the order it heard it.
+
+A second failure has the same flavour. S3 is off for a minute while it restarts and misses both writes. When it comes back it holds an old value, and nothing tells it that it's behind.
+
+Both problems come from the servers having no shared idea of what happened first, so we'll give them one. Instead of changing `x` the moment a message arrives, the servers first agree on a numbered list of commands: slot 1 is `set x = 3`, slot 2 is `set x = 4`. Each server applies the commands in slot order. The list is the **log**, and the program that applies it (a key-value store, here) is the **state machine**. If the state machine is deterministic, meaning the same commands in the same order always produce the same state, then servers holding the same log hold the same `x`.
+
+| Server | Slot 1 | Slot 2 | Value of `x` |
+|---|---|---|---|
+| S1 | set x = 3 | set x = 4 | 4 |
+| S2 | set x = 3 | set x = 4 | 4 |
+| S3 | set x = 3 | (not yet received) | 3 |
+
+Look at S3 in this table. It holds an older but valid version of the history: its log is a prefix of the others', and it can catch up by copying slot 2. A group of servers that each apply the same log to their own state machine is a **replicated state machine**, and it turns our problem into something smaller. The servers only have to agree on what goes in each slot, and applying the commands afterwards is ordinary code.
+
+<Why>Why agree on a log, and not on the state itself?</Why>
+
+Because each slot is decided once. "Slot 2 holds `set x = 4`" is a small, final decision that never changes. Agreeing on the whole state of a database after every write would mean shipping that state around, and two servers could still disagree about which version of it is newer.
+
+</Sub>
+
+<Sub n="1.2" title="The open question">
+
+Agreeing on a slot is still the hard part. Suppose S1 wants slot 2 to be `x = 4` while S2 wants it to be `x = 5`, and S3 hasn't spoken yet. How many servers have to agree before the slot is settled?
+
+</Sub>
+
+<SectionHeading n="02" id="quorums">How many servers must agree</SectionHeading>
+
+<Sub n="2.1" title="Everyone, anyone, or a majority">
+
+Most people's first answer is everyone: a slot is settled once all three servers have stored it. That's safe, and it's also fragile. One server down for maintenance, or one unplugged cable, stops every write. A cluster that needs all three machines is less available than a single machine, because any of three things can stop it.
+
+At the other extreme, one server's word could be enough. S1 stores `x = 4` in slot 2 and tells the client "done". Now suppose a **network partition**, a failure that splits the servers into groups that can't talk to each other, cuts S1 off from the other two. On the other side, S2 settles slot 2 as `x = 5` on its own word. When the network heals there are two different slot 2s, both acknowledged to clients, and we're back to two histories.
+
+Every practical algorithm sits between the two: a slot is settled when a **majority** of the servers have stored it, which is 2 of 3, 3 of 5, or 4 of 7. A group large enough to decide is called a **quorum**, and for Raft and Paxos the quorum is a simple majority of the voting members. Three friends picking a restaurant in a group chat work the same way, if the rule is that a decision needs two of them. An entry that is stored on a majority is **committed**, and the cluster promises never to lose it. (Section 7 adds a catch about which entries a leader may count, but this definition is enough for now.)
+
+</Sub>
+
+<Sub n="2.2" title="Any two majorities overlap">
+
+The majority rule works because of one counting fact: any two majorities of the same set share at least one member. With five servers, two groups of three can't be disjoint, because that would need six servers. In our partition story, S1 alone isn't a majority of three, so it could never have settled slot 2. S2 and S3 together are one, so they could. When a partition splits the servers into groups, at most one group holds a majority, which means at most one side can settle anything.
+
+The overlap also matters over time. Suppose S1 and S2 settled slot 2 yesterday, and today S2 and S3 are the majority deciding something new. S2 was in both groups, and it remembers slot 2. Any later majority includes at least one server that saw the earlier decision, and that server is what stops a committed entry from being forgotten.
+
+<Why>Why not require every server to agree, then?</Why>
+
+Because then one dead server stops the cluster. The majority rule lets a cluster of `2f + 1` servers keep working with `f` of them down, and overlap still holds. Here is what that gives for the usual sizes:
+
+| Voters | Majority | Failures tolerated | Notes |
+|---|---|---|---|
+| 1 | 1 | 0 | No replication; etcd still runs Raft, trivially |
+| 3 | 2 | 1 | The usual default: etcd, Consul, a CockroachDB range |
+| 4 | 3 | 1 | Same tolerance as 3, one more vote to wait for |
+| 5 | 3 | 2 | Survives a failure during planned maintenance |
+| 7 | 4 | 3 | Rare; every write waits on the fourth-fastest server |
+
+Notice that 4 voters tolerate no more failures than 3, and every write has to wait for one more acknowledgment.
+
+<Callout label="Common mistake" kind="warn">
+Running four or six voters "for extra safety". An even count tolerates no more
+failures than the odd count below it, and every write needs one more
+acknowledgment. If you want more read capacity, add non-voting members
+(learners in etcd), which receive the log but don't count toward quorums.
+</Callout>
+
+A majority settles how many servers must store a slot. It doesn't settle who proposes what goes in it. If all five servers proposed their own slot 2 at once, we'd be back where we started, with competing histories. The obvious fix is to let one server do the proposing for everyone, and the next section watches a real cluster do that and then lose that server.
+
+</Sub>
+
+<SectionHeading n="03" id="kill-the-leader">Watching a cluster lose its leader</SectionHeading>
+
+<Sub n="3.1" title="A leader and numbered terms">
+
+The algorithm etcd uses, **Raft**, makes exactly that choice. At any moment one server is the **leader**. Clients send their writes to it, it decides which slot each command takes, and it copies the command to the other servers, the **followers**. The leader also sends the followers a tiny message every so often, a **heartbeat**, that says "still here". If the heartbeats stop, the followers choose a new leader among themselves. Each period of leadership gets a number, the **term**: the first leader's reign is term 1, the next is term 2, and so on. We'll also talk about the **index** of a log entry, which is just the number of its slot.
+
+With those four words (leader, follower, term, index) we can watch a real cluster. The next experiment starts three etcd servers in Docker, named `e1`, `e2` and `e3`, asks them who's leading, stops the leader, and writes again. Then it stops a second server and tries one more write. Before running it, think about that last write.
+
+<Predict
+  q="Two of the three servers have been stopped, and the one left, e1, is healthy and reachable. A client sends it `put greeting 'no quorum'`. What happens?"
+  options={[
+    "It succeeds: e1 is alive and can store the value itself",
+    "It fails after a timeout: e1 can't reach a majority, so it won't accept the write",
+    "It succeeds, but the value may be lost later",
+    "e1 promotes itself to a one-server cluster and carries on",
+  ]}
+  answer={1}
+>
+Three servers need two for a majority, and e1 is one. Section 4 explains why it
+refuses instead of guessing, and the experiment shows the refusal as a timeout.
+</Predict>
+
+</Sub>
+
+<Sub n="3.2" title="Three nodes, then two, then one">
+
+The script uses a few commands. `docker network create` makes a private network, so the containers can reach each other by name. Each `docker run -d` starts one etcd server in the background, and its `--initial-cluster` flag tells it the addresses of all three members. The `status` function asks every endpoint you give it about itself, using `etcdctl endpoint status`, and trims the JSON down to the endpoint plus three fields: whether that node is the leader, its Raft term, and its log index. `etcdctl`, etcd's command-line client, writes a key with `put`, and `docker stop` is the failure, standing in for a crashed machine.
 
 <TryIt what="Start a three-node etcd cluster, stop the leader and write again, then stop a second node and try to write" lang="shell" toolchain="etcd 3.6.5 on Docker Desktop, linuxkit 6.10.14 aarch64">
 ```shell
@@ -59,135 +156,68 @@ Error: etcdserver: request timed out
 </Output>
 </TryIt>
 
-At first `e2` leads at Raft term 2, and all three nodes are at the same log index. After `e2` is stopped, the other two hold an election within a few seconds: `e1` becomes leader at term 3, and a write still succeeds. After the second node is stopped, the write fails with a timeout instead of succeeding on the one node left.
+</Sub>
+
+<Sub n="3.3" title="Reading the output">
+
+At first `e2` leads at Raft term 2, and all three nodes are at the same log index, 8. (The count doesn't start from zero because etcd records the starting membership and some of its own bookkeeping in the log as it boots, and the first leader's term is 2 because the boot entries were written in term 1.) After `e2` is stopped, the other two hold an election within a few seconds. `e1` becomes leader at term 3, and the write still succeeds. The term went from 2 to 3 because losing the leader forced a new one, and any node that sees a higher term than its own knows an older leader is out of date.
+
+The index went from 8 to 10 on both survivors before the second write, so two entries were added. One is `put greeting hello`, written while `e2` still led. The other is an empty entry that `e1` appended for its own term the moment it became leader; section 7 shows why a new leader does that.
+
+Of the three results, the last matters most. After the second node is stopped, the write fails with a timeout, even though `e1` is running and could have stored the value itself. The next section explains why that refusal is on purpose.
 
 </Sub>
 
-<Sub n="1.2" title="What the numbers mean">
+<SectionHeading n="04" id="safety-liveness">Why a cluster stalls instead of guessing</SectionHeading>
 
-The **term** counts elections. It went from 2 to 3 because the loss of the leader forced a new one, and any node seeing a higher term knows the older leader is out of date. The **index** is the position in the shared log. The index went from 8 to 10 in the surviving nodes when the election and the new write were recorded.
+<Sub n="4.1" title="Two kinds of promise">
 
-The last result is the important one. One node alone could have accepted the write. But it couldn't know whether the two missing nodes were still running somewhere and had elected their own leader and accepted a different write. Waiting for a majority is what stops two halves of a cluster from disagreeing. The chapter builds this behaviour one rule at a time, reading the etcd source alongside.
+Put yourself in `e1`'s position after the second node stopped. From where `e1` sits, "e2 and e3 have both crashed" looks exactly like "e2 and e3 are running, can't reach me, and have elected a leader between them". In the second case they hold a majority and are free to accept writes. If `e1` accepted one as well, there would be two histories, which is the problem the whole chapter exists to prevent. When a server can't reach a majority, the only safe thing it can do is wait.
 
-</Sub>
-
-<SectionHeading n="02" id="the-problem">The problem: one log, many machines</SectionHeading>
-
-A single database server is easy to reason about. Every write happens in some
-order, and every read sees the writes before it. Trouble is, it's one
-machine, and machines die.
-
-Copying the data to more machines fixes durability and breaks ordering. Two
-clients write different values to two replicas at the same moment, and now you
-have two histories. Consensus is the tool that gives you replicas *and* a single
-history.
-
-<Sub n="2.1" title="The replicated state machine">
-
-The standard framing is the **replicated state machine**. Each server holds a
-deterministic state machine (a key-value store, say) and a log of commands. If
-every server applies the same commands in the same order, every server ends up
-in the same state.
-
-So the job reduces to agreeing on the log, slot by slot. Applying the commands
-is ordinary code.
-
-<Why>Why agree on a log, and not on the state itself?</Why>
-
-Because each slot is decided once. "Slot 7 holds `put x=3`" is a small, final
-decision; agreeing on a whole database's state after every write would mean
-shipping the state around.
-
-</Sub>
-
-<Sub n="2.2" title="What consensus promises">
-
-Every practical algorithm gives the same two kinds of guarantee, and it matters
-which kind you're relying on.
+That gives consensus two separate kinds of guarantee, and it matters which one you're relying on.
 
 | Property | Promise | Depends on timing? |
 |---|---|---|
 | **Safety** | No two servers ever decide different values for the same log slot | Never. Holds under any delays, crashes and restarts |
 | **Liveness** | New entries eventually get decided | Yes. Needs a majority up and messages arriving in bounded time |
 
-That asymmetry is deliberate. When the network misbehaves, a correct
-implementation stops making progress; it doesn't make a wrong decision.
+That asymmetry is deliberate. When the network misbehaves, a correct implementation stops making progress, and it never makes a wrong decision.
 
-<Why>Why can't an algorithm guarantee both?</Why>
+</Sub>
+
+<Sub n="4.2" title="Why not have both always?">
 
 Fischer, Lynch and Paterson proved in 1985 that no deterministic algorithm can
-guarantee agreement in a fully asynchronous system if even one process may
+guarantee agreement in a fully asynchronous system, one with no bound on how late a message can be, if even one process may
 crash ([FLP, JACM 1985](https://dl.acm.org/doi/10.1145/3149.214121)). A slow
 server and a dead one look the same from outside, so any rule that waits could
 wait forever, and any rule that stops waiting can be fooled.
 
 Real systems accept this by using timeouts only for liveness. Raft uses a timer
-to decide *when to hold an election*, never to decide *what's committed*.
+to decide *when to hold an election*, never to decide *what's committed*. Safety
+is built from the majority-overlap argument and doesn't care how late anything is.
 
 <Callout label="Design implication">
 Every consensus system you run can stall, because it picks unavailability
-over inconsistency. Size client timeouts and retries for a pause of at least
-one election timeout.
+over inconsistency. Size client timeouts and retries to ride out a pause of a
+few seconds while the servers choose a new leader.
 </Callout>
+
+So a timer's only job is to decide when to give up on a leader and look for a new one. Next we'll see how a follower decides that, and how the survivors choose.
 
 </Sub>
 
-<SectionHeading n="03" id="quorums">Quorums: why a majority is enough</SectionHeading>
-
-Every decision in Raft and Paxos is made by a **quorum**, and for both it's a
-simple majority of the voting members: 2 of 3, 3 of 5, 4 of 7.
-
-<Sub n="3.1" title="Any two majorities overlap">
-
-The whole safety argument rests on one counting fact. Any two majorities of the
-same set share at least one member. With five servers, two groups of three
-can't be disjoint, because that would need six servers.
-
-That shared member carries knowledge from one decision to the next: any later
-majority includes someone who saw the earlier one.
-
-<Why>Why not require every server to agree?</Why>
-
-Because then one dead server stops the cluster. A majority rule lets a cluster
-of `2f + 1` servers keep working with `f` of them down, and overlap still
-holds.
-
-| Voters | Majority | Failures tolerated | Notes |
-|---|---|---|---|
-| 1 | 1 | 0 | No replication; etcd still runs Raft, trivially |
-| 3 | 2 | 1 | The usual default: etcd, Consul, a CockroachDB range |
-| 4 | 3 | 1 | Same tolerance as 3, one more vote to wait for |
-| 5 | 3 | 2 | Survives a failure during planned maintenance |
-| 7 | 4 | 3 | Rare; every write waits on the fourth-fastest server |
-
-<Callout label="Common mistake" kind="warn">
-Running four or six voters "for extra safety". An even count tolerates no more
-failures than the odd count below it, and every write needs one more
-acknowledgment. If you want more read capacity, add non-voting members
-(learners in etcd), which receive the log but don't count toward quorums.
-</Callout>
-
-Strictly, only the election quorum has to overlap the replication quorum;
-[Flexible Paxos (2016)](https://arxiv.org/abs/1608.06696) builds on that. Raft
-and etcd use plain majorities for both.
-
-</Sub>
-
-<SectionHeading n="04" id="election">Raft, part one: electing a leader</SectionHeading>
+<SectionHeading n="05" id="election">Electing a leader</SectionHeading>
 
 Raft ([Ongaro and Ousterhout, USENIX ATC 2014](https://raft.github.io/raft.pdf))
-makes one server the **leader** and routes every write through it. That turns
-consensus into two smaller problems: pick a leader safely, then have it copy
-its log to everyone else.
+splits consensus into two smaller problems: pick a leader safely, then have it
+copy its log to everyone else. This section is the first half.
 
-<Sub n="4.1" title="Terms, and three states">
+<Sub n="5.1" title="Three states, and a term on every message">
 
-Time in Raft is divided into **terms**, numbered 1, 2, 3 and upward. Each term
-starts with an election and has at most one leader. A term number is a logical
-clock: every message carries the sender's term, and a server that sees a higher
-term than its own adopts it and becomes a follower at once.
+Servers talk to each other with RPCs (remote procedure calls), requests that one server sends and another answers, much like calling a function on a different machine. Every Raft message carries the sender's term. Term numbers work as a logical clock: a server that sees a higher term than its own adopts it and becomes a follower at once.
 
-Each server is in one of three states:
+Each follower also runs an **election timer**, a countdown that starts over every time it hears from the leader. While the leader is alive the timer never reaches zero. If it does, the follower concludes the leader is gone. With that, each server is always in one of three states:
 
 | State | What it does | How it leaves |
 |---|---|---|
@@ -195,15 +225,10 @@ Each server is in one of three states:
 | **Candidate** | Increments its term, votes for itself, asks everyone for votes | Wins a majority, sees a leader for this term, or times out |
 | **Leader** | Appends client commands to its log and replicates them; sends heartbeats | Sees a higher term |
 
-<Why>Why does a stale leader step down just from seeing a bigger number?</Why>
+The last row says a leader gives up its job just because a message carries a bigger number. Why should it trust that number? A term only goes up when some server starts an election, so a higher term means an election happened without this leader, and it can't know whether somebody won. Stepping down is the safe guess. For a while two servers can each *believe* they lead, in different terms, but the majority that voted in the new term has moved past the old one and rejects the older leader's messages, so only the newer one can get anything committed.
 
-Because a higher term proves an election happened without it, and it can't
-know whether someone won. Two servers can each *believe* they lead, in
-different terms, but only the one in the higher term can get anything
-committed.
-
-Here's that transition in the etcd library. Becoming a candidate bumps the term
-and records a vote for itself; `reset()` clears the old vote whenever the term
+Here's the transition into candidate in the etcd library. Becoming a candidate bumps the term
+and records a vote for itself, and `reset()` clears the old vote whenever the term
 changes.
 
 <SourceRead
@@ -231,33 +256,63 @@ func (r *raft) becomeCandidate() {
 
 </Sub>
 
-<Sub n="4.2" title="One election, message by message">
+<Sub n="5.2" title="One election, message by message">
 
-A follower that hears nothing from a leader for its election timeout starts an
+The length of that countdown is the **election timeout**, and a follower whose timer runs out starts an
 election. Each server votes at most once per term, first come first served, and
 the vote is written to disk before it's sent, so a restart can't make a server
-vote twice.
+vote twice. Here is a five-server cluster, S1 to S5 (five, so that a majority is three), in which the leader of term 4 dies and S3 wins term 5. The votes travel as little tokens, so you can count them.
 
-<StepSequence
+<Scene
   title="Leader S1 dies; S3 wins term 5"
-  actors={["S1 (old leader)", "S2", "S3", "S4", "S5"]}
-  messages={[
-    { from: 0, to: 0, label: "crash", note: "S1 has been leader of **term 4**. It crashes, and its heartbeats stop. Nobody is told; the followers only notice the silence." },
-    { from: 2, to: 2, label: "timeout → term 5", note: "S3's randomized election timer fires first. It **increments its term to 5**, votes for itself and persists that vote." },
-    { from: 2, to: 1, label: "RequestVote(t5)", note: "S3 sends `RequestVote` to every server with its term and the **index and term of its last log entry**." },
-    { from: 1, to: 2, label: "vote granted", note: "S2 hasn't voted in term 5 and S3's log is at least as up-to-date as its own, so it grants. S3 now has **2 of 5**." },
-    { from: 3, to: 2, label: "vote granted", note: "S4 grants too. **Three votes is a majority of five**: S3 is leader of term 5, even though S5 hasn't answered." },
-    { from: 2, to: 4, label: "AppendEntries(t5)", note: "S3 immediately sends heartbeats (empty `AppendEntries`). S5 sees term 5, resets its timer, and never starts an election of its own." },
+  regions={[
+    { id: "s1", label: "S1", col: 0, row: 0 },
+    { id: "s2", label: "S2", col: 1, row: 0 },
+    { id: "s3", label: "S3", col: 2, row: 0 },
+    { id: "s4", label: "S4", col: 3, row: 0 },
+    { id: "s5", label: "S5", col: 4, row: 0 },
+  ]}
+  frames={[
+    { caption: "S1 has been leader of **term 4**, sending heartbeats to the others. Every server is at term 4.",
+      items: [
+        { id: "r1", at: "s1", label: "leader", sub: "term 4", tone: "ok" },
+        { id: "r2", at: "s2", label: "follower", sub: "term 4" },
+        { id: "r3", at: "s3", label: "follower", sub: "term 4" },
+        { id: "r4", at: "s4", label: "follower", sub: "term 4" },
+        { id: "r5", at: "s5", label: "follower", sub: "term 4" },
+      ],
+      focus: ["s1"] },
+    { caption: "S1 crashes and its heartbeats stop. Nobody is told; the followers only notice the silence.",
+      change: [{ id: "r1", label: "crashed", sub: "no heartbeats", tone: "bad" }], focus: ["s1"] },
+    { caption: "S3's randomized election timer fires first. It **increments its term to 5**, votes for itself and writes that vote to disk.",
+      change: [{ id: "r3", label: "candidate", sub: "term 5", tone: "accent" }],
+      add: [{ id: "v3", at: "s3", label: "vote: S3", sub: "own vote", tone: "new" }], focus: ["s3"] },
+    { caption: "S3 sends `RequestVote` to every other server, with its term and the **index and term of its last log entry**. (The arrow shows one of the four.)",
+      focus: ["s3", "s4"], arrow: { from: "s3", to: "s4", label: "RequestVote" } },
+    { caption: "S2 and S4 haven't voted in term 5, and S3's log is at least as up-to-date as their own, so each grants its vote and writes it to disk.",
+      add: [
+        { id: "v2", at: "s2", label: "vote: S3", sub: "persisted", tone: "new" },
+        { id: "v4", at: "s4", label: "vote: S3", sub: "persisted", tone: "new" },
+      ], focus: ["s2", "s4"] },
+    { caption: "The votes arrive. S3 holds **three votes, a majority of five**, so it is leader of term 5. S5 hasn't answered, and it doesn't need to.",
+      change: [
+        { id: "v2", at: "s3", tone: "ok" }, { id: "v4", at: "s3", tone: "ok" },
+        { id: "v3", tone: "ok" },
+        { id: "r3", label: "leader", sub: "term 5", tone: "ok" },
+      ], focus: ["s3"], arrow: { from: "s4", to: "s3", label: "vote granted" } },
+    { caption: "S3 sends heartbeats at once (empty `AppendEntries` messages). S5 sees term 5, resets its timer, and never starts an election of its own.",
+      remove: ["v2", "v3", "v4"],
+      change: [
+        { id: "r2", sub: "term 5" }, { id: "r4", sub: "term 5" }, { id: "r5", sub: "term 5" },
+      ], focus: ["s5"], arrow: { from: "s3", to: "s5", label: "AppendEntries" } },
   ]}
 />
 
-<Why>Why randomize the timeout?</Why>
+Why did S3's timer fire before everyone else's? Probably just luck, because the timeouts are random on purpose. If every follower waited the same time, they'd all become candidates together,
+split the vote so nobody reaches a majority, time out together, and repeat. Randomizing spreads them out, so
+one probably starts first and wins before the others wake.
 
-If every follower waited the same time, they'd all become candidates together,
-split the vote, time out together, and repeat. Randomizing spreads them out so
-one usually starts first and wins before the others wake.
-
-Ongaro and Ousterhout measured this. With no randomness, elections "consistently took
+Ongaro and Ousterhout tested this. With no randomness, elections "consistently took
 longer than 10 seconds" because of split votes; adding just 5 ms of randomness
 brought the median downtime to 287 ms. Their recommendation is a conservative
 timeout such as 150–300 ms.
@@ -284,9 +339,9 @@ somewhere in `[1.0 s, 2.0 s)` before it campaigns.
 
 </Sub>
 
-<Sub n="4.3" title="The election restriction">
+<Sub n="5.3" title="Only an up-to-date server can win">
 
-Not every server may become leader. A voter refuses any candidate whose log is
+In the scene, S2 and S4 granted their votes because S3's log was at least as up-to-date as their own. That check is the **election restriction**, and it matters more than it looks. A voter refuses any candidate whose log is
 less up-to-date than its own, where "more up-to-date" means a later last term,
 or the same last term and a longer log.
 
@@ -308,7 +363,7 @@ func (l *raftLog) isUpToDate(their entryID) bool {
 
 Because a committed entry is on a majority, and a winning candidate needs votes
 from a majority. The two sets overlap in at least one server that holds the
-entry. That server refuses any candidate missing it, so every new leader
+entry, the counting fact from section 2 at work. That server refuses any candidate missing it, so every new leader
 already has every committed entry. The paper calls this the **Leader
 Completeness Property**, and it means a leader never has to fetch data from
 followers. Data only ever flows from leader to follower.
@@ -347,11 +402,11 @@ covers the restriction:
 
 </Sub>
 
-<Sub n="4.4" title="How long a failover takes">
+<Sub n="5.4" title="How long a failover takes">
 
-To see the timeout in practice, I ran a three-member etcd 3.6.5 cluster with
-default flags, sent a `put` every 5 ms through a follower, and `kill -9`'d the
-leader. Five runs:
+How long does all this take on a real cluster? Take a three-member etcd 3.6.5 cluster with
+default flags, send a `put` every 5 ms through a follower, and `kill -9` the
+leader, which ends the process at once and gives it no chance to shut down cleanly. In five runs, writes were blocked for these times:
 
 | Run | Writes blocked for |
 |---|---|
@@ -362,68 +417,83 @@ leader. Five runs:
 | 5 | 1.58 s |
 
 The median was **1.54 s**, inside the `[1.0, 2.0)` second window the code
-predicts. By comparison, the election itself was tiny. In the survivor's log,
-from "became pre-candidate" to "became leader" took **17 ms** in one run and
+predicts. The election itself was tiny. In the survivor's log,
+from the log line "became pre-candidate" (the first step of an election, which section 9 explains) to "became leader" took **17 ms** in one run and
 **12 ms** in another. Roughly 99% of the outage is the timer waiting to be sure
-the leader is gone.
+the leader is gone. All three members ran on one computer, so their messages crossed no real network, and their disk was a virtual one. Treat these times as rough lower bounds: a real deployment adds network delay to every step.
 
-<Callout label="The machine" kind="note">
-All etcd measurements in this chapter: etcd 3.6.5 (raft v3.6.0), three members
-on loopback in one shared 4-CPU container, linuxkit 6.10.14 aarch64, data
-directories on a Docker Desktop bind mount. Loopback hides network latency, and
-the disk is virtual, so treat these as floors for a real deployment.
-</Callout>
-
-<Why>So why not set the election timeout to 100 ms?</Why>
-
-Because the timer can't tell a dead leader from a slow one. The paper's rule is
-`broadcastTime ≪ electionTimeout ≪ MTBF`; a long GC pause or a slow fsync looks
-like death to a short timer. etcd's guide asks for an
+So why not set the election timeout to 100 ms? Because the timer can't tell a dead leader from a slow one. The paper's rule is
+`broadcastTime ≪ electionTimeout ≪ MTBF` (message round trips much shorter than the election timeout, which is much shorter than the mean time between failures); a long GC pause (the language runtime freezing the program for a moment) or a slow fsync (the call that waits until data is safely on disk) looks
+like death to a short timer. etcd's tuning guide asks for an
 election timeout of at least ten times the round-trip time between members.
+
+A new leader now exists, and it holds every committed entry. Its next job is to take new writes and copy them to the others.
 
 </Sub>
 
-<SectionHeading n="05" id="replication">Raft, part two: replicating the log</SectionHeading>
+<SectionHeading n="06" id="replication">Copying the log</SectionHeading>
 
 Once elected, the leader takes client commands, appends each to its own log,
-and sends it to the followers in `AppendEntries` RPCs. An entry is
-**committed** once it's stored on a majority. Committed entries are applied to
-the state machine and never lost.
+and sends it to the followers in `AppendEntries` messages. An entry is
+committed once it's stored on a majority, as in section 2. Committed entries are applied to
+the state machine and never lost. Each server keeps its log in a **write-ahead log** (WAL), a file on disk that it appends every entry to, and calls `fsync` on (chapter 08 explains what that does) before acknowledging, so a restarted server still remembers what it promised.
 
-<Sub n="5.1" title="One write through a three-node cluster">
+<Sub n="6.1" title="One write through a three-node cluster">
 
-<Steps
-  title="One put, from client to applied, in etcd"
-  lanes={[
-    { t: "Client", s: "put x=3", icon: "◉" },
-    { t: "Leader log", s: "append + fsync", icon: "≡" },
-    { t: "Followers", s: "append + fsync", icon: "⇆" },
-    { t: "Commit index", s: "majority match", icon: "✓" },
-    { t: "State machine", s: "apply to bbolt", icon: "▦" },
-    { t: "Reply", s: "to the client", icon: "↩" },
+Here is `put x=3` from the client to the answer, with three servers. Their logs already hold entry 8, written in term 2, which set `x` to 2.
+
+<Scene
+  title="put x=3: from client to applied, in a three-server cluster"
+  regions={[
+    { id: "client", label: "Client", col: 0, row: 0 },
+    { id: "sm", label: "State machine", sub: "on the leader · key x", col: 1, row: 0, span: 2 },
+    { id: "s1", label: "S1", sub: "leader · log", col: 0, row: 1 },
+    { id: "s2", label: "S2", sub: "follower · log", col: 1, row: 1 },
+    { id: "s3", label: "S3", sub: "follower · log", col: 2, row: 1 },
   ]}
-  steps={[
-    [0, "The client sends `put x=3` to any member. A follower forwards it to the leader as a proposal (`MsgProp`)."],
-    [1, "The leader appends the entry at the next index with its **current term**, and writes it to its write-ahead log with an **fsync**."],
-    [2, "In parallel, it sends `AppendEntries` carrying the new entry plus the **index and term of the entry before it**. Each follower checks that previous entry matches, appends, **fsyncs**, and replies with its last index."],
-    [3, "The leader takes the median of the match indexes. Once a majority, **counting itself**, has the entry, it advances the **commit index**. With three members, that's itself plus the fastest follower."],
-    [4, "The entry is applied to the state machine, which in etcd is the bbolt key-value store. Followers learn the new commit index on the next `AppendEntries` or heartbeat and apply it too."],
-    [5, "The leader answers the client. The slowest follower may still be fsyncing, and the write is already safe."],
+  itemWidth={104}
+  frames={[
+    { caption: "A client sends `put x=3` to the leader, S1. (If it asks a follower, the follower forwards the request to the leader.) Entry 8, from term 2, is already in all three logs, and `x` is 2.",
+      items: [
+        { id: "put", at: "client", label: "put x=3", tone: "new" },
+        { id: "x", at: "sm", label: "x = 2", tone: "ok" },
+        { id: "p1", at: "s1", label: "8 · term 2", sub: "x=2", tone: "dim" },
+        { id: "p2", at: "s2", label: "8 · term 2", sub: "x=2", tone: "dim" },
+        { id: "p3", at: "s3", label: "8 · term 2", sub: "x=2", tone: "dim" },
+      ],
+      focus: ["s1"], arrow: { from: "client", to: "s1", label: "put x=3" } },
+    { caption: "The leader appends the command at the next index, 9, tagged with its **current term**, and writes it to its write-ahead log with an **fsync**. It is on one server, so not yet committed.",
+      add: [{ id: "e1", at: "s1", label: "9 · term 2", sub: "x=3", tone: "dirty" }], focus: ["s1"] },
+    { caption: "In parallel it sends `AppendEntries` to both followers, carrying the new entry plus the **index and term of the entry before it** (8, term 2). A follower accepts only if its own entry 8 matches.",
+      add: [
+        { id: "e2", at: "s2", label: "9 · term 2", sub: "x=3", tone: "new" },
+        { id: "e3", at: "s3", label: "9 · term 2", sub: "x=3", tone: "new" },
+      ], focus: ["s2", "s3"], arrow: { from: "s1", to: "s2", label: "AppendEntries" } },
+    { caption: "S2 is the faster follower. It appends, runs **fsync**, and replies with its last index, 9. Now two of three servers, S1 and S2, have the entry. S3 is still working on its fsync.",
+      change: [{ id: "e2", tone: "accent" }], focus: ["s2", "s1"], arrow: { from: "s2", to: "s1", label: "ack 9" } },
+    { caption: "A majority has entry 9, counting the leader itself, so the leader moves its **commit index**, the highest entry it knows is committed, from 8 to 9. Entry 9 will never be lost.",
+      change: [{ id: "e1", tone: "ok" }, { id: "e2", tone: "ok" }], focus: ["s1"] },
+    { caption: "The leader applies entry 9 to its state machine, and `x` becomes 3. Followers learn the new commit index on the next `AppendEntries` or heartbeat and apply it too.",
+      change: [{ id: "x", label: "x = 3" }], focus: ["sm"], arrow: { from: "s1", to: "sm", label: "apply" } },
+    { caption: "The leader answers the client. S3 may still be fsyncing, and the write is already safe, because two of three servers have it.",
+      change: [{ id: "put", sub: "OK", tone: "ok" }], focus: ["client"], arrow: { from: "s1", to: "client", label: "OK" } },
   ]}
 />
+
+Notice that the write didn't wait for S3. A majority needs the leader plus one follower, and the leader can count itself.
 
 <Why>Why does the leader need only the fastest follower?</Why>
 
 Because commit needs a majority, and the leader is one of them. In a
-three-node cluster a write waits for one follower's round trip plus fsync; a
+three-node cluster a write waits for one follower's round trip plus its fsync; a
 five-node cluster waits for the second-fastest of four.
 
 </Sub>
 
-<Sub n="5.2" title="The Log Matching Property">
+<Sub n="6.2" title="How a follower checks it's in sync">
 
-Every `AppendEntries` carries the index and term of the entry just before the
-new ones. The follower rejects the RPC unless it has an entry at that index
+The scene showed the check in passing: every `AppendEntries` carries the index and term of the entry just before the
+new ones, and the follower rejects the message unless it has an entry at that index
 with that term.
 
 That consistency check gives Raft its **Log Matching Property**: if two logs
@@ -431,10 +501,8 @@ contain an entry with the same index and term, the logs are identical in all
 entries up to that index. An entry is identified by `(term, index)` alone, so
 comparing two numbers compares whole histories.
 
-<Why>What happens when a follower's log has diverged?</Why>
-
-So the leader backs up. When a follower rejects, the leader moves that follower's
-`nextIndex` back and retries, until they agree on some earlier entry. The
+What happens when a follower's log has diverged? That can happen after a leader crashes with entries that only some servers received. The leader backs up. When a follower rejects, the leader moves that follower's
+`nextIndex` (its guess of where the follower's log ends) back and retries, until they agree on some earlier entry. The
 follower then deletes everything after that point and takes the leader's
 entries. etcd's follower returns a hint so the leader can skip a whole run of
 conflicting entries in one step:
@@ -479,11 +547,11 @@ guarantees the leader already holds every committed one.
 
 </Sub>
 
-<Sub n="5.3" title="Computing the commit index">
+<Sub n="6.3" title="Computing the commit index">
 
 The leader tracks, for each voter, the highest index known to be on that
-voter's disk. The commit index is the largest index that a majority has
-reached. etcd computes it by sorting and picking the element a majority sits
+voter's disk, which etcd calls the voter's **match index**. The commit index
+is then the largest index that a majority of match indexes have reached. etcd computes it by sorting those numbers and picking the one a majority sits
 at or above:
 
 <SourceRead
@@ -518,34 +586,18 @@ func (c MajorityConfig) CommittedIndex(l AckedIndexer) Index {
 With five voters at match indexes 9, 7, 7, 5 and 3, the sorted slice is
 `[3 5 7 7 9]`, `pos` is 2, and the commit index is 7.
 
+We've been saying that an entry is committed once it's on a majority. That's true for entries the current leader wrote itself, and it's false for older ones. The Raft paper devotes its most famous figure to showing why.
+
 </Sub>
 
-<SectionHeading n="06" id="figure-8">The rule everyone gets wrong: Figure 8</SectionHeading>
+<SectionHeading n="07" id="figure-8">Committing entries from earlier terms</SectionHeading>
 
-The last section said "committed once stored on a majority". That's true for
-entries from the leader's current term. For entries from older terms, it's
-false, and the Raft paper spends its most famous figure showing why.
+<Sub n="7.1" title="An entry on a majority that still gets erased">
 
-<Sub n="6.1" title="An entry on a majority that still gets erased">
-
-Five servers, and the entry at index 2 is the one to watch. `[2:t2]` means
-"index 2, written in term 2".
-
-<StepSequence
-  title="Figure 8 of the Raft paper, one step at a time"
-  actors={["S1", "S2", "S3", "S4", "S5"]}
-  messages={[
-    { from: 0, to: 1, label: "append [2:t2]", note: "**(a)** S1 leads term 2. It writes `[2:t2]` and replicates it to S2 only, then crashes. Two of five have it." },
-    { from: 4, to: 4, label: "leader t3, [2:t3]", note: "**(b)** S5 wins term 3 with votes from S3, S4 and itself (their logs end at term 1, so S5 is up-to-date enough). It writes a *different* entry `[2:t3]` locally, then crashes." },
-    { from: 0, to: 2, label: "append [2:t2]", note: "**(c)** S1 restarts, wins term 4, and keeps replicating its old `[2:t2]`. Now **S1, S2 and S3 have it: a majority**. Is it committed?" },
-    { from: 4, to: 1, label: "RequestVote t5", note: "**(d)** S1 crashes again. S5 asks for votes in term 5. Its last entry has term 3, later than term 2 on S2, S3 and S4, so **they all vote for it**." },
-    { from: 4, to: 2, label: "overwrite [2:t3]", note: "S5 leads term 5 and replicates `[2:t3]`, **erasing `[2:t2]` from a majority of servers**. If S1 had told a client that entry was committed, the cluster just lied." },
-    { from: 0, to: 2, label: "append [3:t4]", note: "**(e)** The fix: in term 4, S1 must first get an entry *from term 4* onto a majority. Once `[3:t4]` is there, S5's last term (3) loses to theirs (4), S5 can't win, and `[2:t2]` is committed along with it." },
-  ]}
-/>
+Leaders crash and come back, so a new leader often finds entries in its log that an earlier leader wrote and never finished committing. Here is the question that situation raises, before we look at the example the paper uses to answer it.
 
 <Predict
-  q="In step (c), S1 is leader of term 4 and the term-2 entry at index 2 sits on S1, S2 and S3. Can S1 mark index 2 committed and apply it?"
+  q="A leader of term 4 finds that an entry it holds from term 2 is now stored on three of the five servers. Can it mark that entry committed and apply it?"
   options={[
     "Yes: it's on a majority, which is the definition of committed",
     "No: an older-term entry is only committed once an entry from the current term above it is on a majority",
@@ -554,17 +606,89 @@ Five servers, and the entry at index 2 is the one to watch. `[2:t2]` means
   ]}
   answer={1}
 >
-Step (d) shows the failure: a later leader whose last entry has a higher term
-can still win votes from the servers holding `[2:t2]` and overwrite it. Raft
-"never commits log entries from previous terms by counting replicas". It
-commits an entry from its own term, and everything before that entry becomes
-committed with it through the Log Matching Property. Option C would also be
-safe, and the paper mentions it, but Raft doesn't rely on it.
+Step (d) of the scene below shows the failure: a later leader whose last entry
+has a higher term can still win votes from the servers holding the term-2 entry
+and overwrite it. Raft "never commits log entries from previous terms by
+counting replicas". It commits an entry from its own term, and everything
+before that entry becomes committed with it through the Log Matching Property.
+Option C would also be safe, and the paper mentions it, but Raft doesn't rely
+on it.
 </Predict>
+
+Figure 8 of the paper is the story of one log entry in a five-server cluster, and it's easier to follow as pictures than as prose. Watch the entry at index 2. We write `2 · t2` for "index 2, written in term 2". Each box below is a server's log, with index 1 at the top. Entry 1, from term 1, is the same everywhere.
+
+<Scene
+  title="Figure 8 of the Raft paper, one step at a time"
+  regions={[
+    { id: "s1", label: "S1", col: 0, row: 0 },
+    { id: "s2", label: "S2", col: 1, row: 0 },
+    { id: "s3", label: "S3", col: 2, row: 0 },
+    { id: "s4", label: "S4", col: 3, row: 0 },
+    { id: "s5", label: "S5", col: 4, row: 0 },
+  ]}
+  frames={[
+    { caption: "Five servers. Every log holds entry 1, from term 1. We'll follow what happens to index 2.",
+      items: [
+        { id: "a1", at: "s1", label: "1 · t1", tone: "dim" },
+        { id: "a2", at: "s2", label: "1 · t1", tone: "dim" },
+        { id: "a3", at: "s3", label: "1 · t1", tone: "dim" },
+        { id: "a4", at: "s4", label: "1 · t1", tone: "dim" },
+        { id: "a5", at: "s5", label: "1 · t1", tone: "dim" },
+      ] },
+    { caption: "**(a)** S1 leads term 2. It writes `2 · t2` and replicates it to S2 only, then crashes. Two of five servers have it.",
+      add: [
+        { id: "c1", at: "s1", label: "2 · t2", tone: "new" },
+        { id: "c2", at: "s2", label: "2 · t2", tone: "new" },
+        { id: "x1", at: "s1", label: "crashed", tone: "bad" },
+      ], focus: ["s1", "s2"], arrow: { from: "s1", to: "s2", label: "AppendEntries" } },
+    { caption: "**(b)** S5 wins term 3 with votes from S3, S4 and itself (their logs end at term 1, so S5's log is up-to-date enough). It writes a *different* entry at index 2, `2 · t3`, only on itself, then crashes.",
+      add: [
+        { id: "d5", at: "s5", label: "2 · t3", tone: "dirty" },
+        { id: "x5", at: "s5", label: "crashed", tone: "bad" },
+      ], focus: ["s5"] },
+    { caption: "**(c)** S1 restarts, wins term 4, and keeps replicating its old `2 · t2`. Now **S1, S2 and S3 have it, a majority**. Is it committed?",
+      remove: ["x1"],
+      add: [{ id: "c3", at: "s3", label: "2 · t2", tone: "new" }],
+      change: [{ id: "c1", tone: "accent" }, { id: "c2", tone: "accent" }],
+      focus: ["s1", "s2", "s3"], arrow: { from: "s1", to: "s3", label: "AppendEntries" } },
+    { caption: "**(d)** S1 crashes again, and S5 comes back and asks for votes in term 5. Its last entry has term 3. The last entries on S2 and S3 have term 2 and on S4 term 1, so **all three vote for it**.",
+      remove: ["x5"],
+      add: [{ id: "x1b", at: "s1", label: "crashed", tone: "bad" }],
+      focus: ["s5", "s3"], arrow: { from: "s5", to: "s3", label: "RequestVote" } },
+    { caption: "S5 leads term 5 and is about to replicate its own `2 · t3`. The `2 · t2` entries on S2 and S3 are about to be overwritten.",
+      change: [{ id: "c2", tone: "bad" }, { id: "c3", tone: "bad" }],
+      focus: ["s5"], arrow: { from: "s5", to: "s3", label: "AppendEntries" } },
+    { caption: "`2 · t2` is **erased from S2 and S3, two of the three servers that had it**, and now S2, S3, S4 and S5 all hold `2 · t3`. If S1 had told a client that entry was committed, the cluster just broke that promise.",
+      remove: ["c2", "c3"],
+      change: [{ id: "d5", tone: "ok" }],
+      add: [
+        { id: "d2", at: "s2", label: "2 · t3", tone: "ok" },
+        { id: "d3", at: "s3", label: "2 · t3", tone: "ok" },
+        { id: "d4", at: "s4", label: "2 · t3", tone: "ok" },
+      ], focus: ["s2", "s3", "s4"] },
+    { caption: "**(e)** The fix, replaying (c): before crashing, S1 gets an entry from its own term, `3 · t4`, onto a majority. Now S5's last term (3) is lower than term 4 on S1, S2 and S3, none of them votes for it, and `2 · t2` is committed along with `3 · t4`.",
+      items: [
+        { id: "f1", at: "s1", label: "1 · t1", tone: "dim" },
+        { id: "g1", at: "s1", label: "2 · t2", tone: "ok" },
+        { id: "h1", at: "s1", label: "3 · t4", tone: "ok" },
+        { id: "f2", at: "s2", label: "1 · t1", tone: "dim" },
+        { id: "g2", at: "s2", label: "2 · t2", tone: "ok" },
+        { id: "h2", at: "s2", label: "3 · t4", tone: "ok" },
+        { id: "f3", at: "s3", label: "1 · t1", tone: "dim" },
+        { id: "g3", at: "s3", label: "2 · t2", tone: "ok" },
+        { id: "h3", at: "s3", label: "3 · t4", tone: "ok" },
+        { id: "f4", at: "s4", label: "1 · t1", tone: "dim" },
+        { id: "f5", at: "s5", label: "1 · t1", tone: "dim" },
+        { id: "g5", at: "s5", label: "2 · t3", tone: "dirty" },
+      ], focus: ["s1", "s2", "s3"] },
+  ]}
+/>
+
+So the definition from section 2 needs a correction. A leader may count replicas to commit an entry only if the entry is from its own term. Older entries get committed along with a newer entry on top of them.
 
 </Sub>
 
-<Sub n="6.2" title="The rule in code, and the no-op entry">
+<Sub n="7.2" title="The rule in code, and the no-op entry">
 
 In etcd the whole rule is one term check. `maybeCommit` passes the leader's
 *current* term along with the quorum index, and the log only advances if the
@@ -598,11 +722,11 @@ func (l *raftLog) maybeCommit(at entryID) bool {
 ```
 </SourceRead>
 
-<Why>What if no client writes anything after an election?</Why>
+What if no client writes anything after an election? Then the old entries would sit uncommitted forever, because the leader has no entry of its own term to count.
 
-Then old entries would sit uncommitted forever. So every new Raft leader
-appends an **empty entry** in its own term the moment it's elected. Committing
-that no-op commits everything before it. In etcd it's the last thing
+<Why>What does a new leader do when nobody is writing?</Why>
+
+Every new Raft leader appends an **empty entry**, a **no-op**, in its own term the moment it's elected. Committing that no-op commits everything before it. This is also the extra entry you saw in the experiment, where the index rose by two. In etcd the append is the last thing
 `becomeLeader` does:
 
 <SourceRead
@@ -621,26 +745,26 @@ that no-op commits everything before it. In etcd it's the last thing
 ```
 </SourceRead>
 
-That no-op also matters for reads, which section 10 comes back to: until it
+That no-op matters for reads too, which section 11 comes back to: until it
 commits, a new leader doesn't know its own commit index.
 
-<Callout label="Common mistake" kind="warn">
-Writing a "simple" Raft that commits on replica count alone. It passes every
+Writing a "simple" Raft that commits on replica count alone is probably the most common mistake. It passes every
 test that doesn't crash two leaders in a row, and then loses acknowledged
 writes. If you implement Raft, model-check it or run it against a test harness
-like the [MIT 6.5840 labs](https://pdos.csail.mit.edu/6.824/) that reproduce
+like the [MIT 6.5840 labs](https://pdos.csail.mit.edu/6.824/), which reproduce
 Figure 8 on purpose.
-</Callout>
+
+Elections, replication and the commit rule all assume that the set of voters is fixed. Real clusters change, and changing the voters is the most delicate operation of all.
 
 </Sub>
 
-<SectionHeading n="07" id="membership">Changing the members</SectionHeading>
+<SectionHeading n="08" id="membership">Changing the members</SectionHeading>
 
 Clusters change: a disk dies, you move to new hardware, you grow from three
-to five. The set of voters is itself part of the replicated state, and
-changing it is the most delicate operation in Raft.
+to five. The set of voters is itself part of the replicated state, so changing it
+has to go through the log like any other write.
 
-<Sub n="7.1" title="Why you can't just switch">
+<Sub n="8.1" title="Why you can't just switch">
 
 Servers learn the new configuration at different moments. Go from three
 servers to five directly, and for a while S1 and S2 may still count majorities
@@ -648,22 +772,20 @@ out of `{S1, S2, S3}` while S3, S4 and S5 count out of all five. Two out of thre
 and three out of five are both majorities, and they don't have to overlap. Two
 leaders in one term becomes possible.
 
-<Why>So how do you change the rules while the game is running?</Why>
-
-Raft offers two answers.
+So how do you change the rules while the game is running? Diego Ongaro, who designed Raft with John Ousterhout, gave two answers: one in the Raft paper and a simpler one in his PhD thesis. A third row is a precaution that goes with either.
 
 | Approach | How it works | Trade-off |
 |---|---|---|
 | **Joint consensus** (paper, §6) | First commit a joint config `C_old,new`: every decision needs a majority of old *and* a majority of new. Then commit `C_new` | Any change in two steps, with no unsafe window. More code |
 | **Single-server changes** (thesis, ch. 4) | Add or remove one voter at a time. A majority of N and a majority of N±1 always overlap | Simple. Bigger changes are a series of steps |
-| **Learners first** | Add the new server as a non-voter until it catches up, then promote | Avoids a new empty member dragging down the commit quorum |
+| **Learners first** (a precaution for either) | Add the new server as a non-voter until it catches up, then promote | Avoids a new empty member dragging down the commit quorum |
 
 etcd's library implements both: `ConfChangeV2` supports joint configurations,
 and the simple single-step changes still work.
 
 </Sub>
 
-<Sub n="7.2" title="The bug in the simple version">
+<Sub n="8.2" title="The bug in the simple version">
 
 Ongaro's dissertation presented single-server changes as the easier path. In
 July 2015 he posted to raft-dev that there's
@@ -676,40 +798,38 @@ entry until it has committed an entry from its current term." It's the Figure 8
 rule again, applied to configurations. The dissertation's
 [README](https://github.com/ongardie/dissertation) still links the post.
 
-<Callout label="Design implication">
-Do membership changes one at a time, and wait for each to finish. In etcd that
+In practice that means doing membership changes one at a time and waiting for each to finish. In etcd that
 means `etcdctl member add` (ideally as `--learner`), start the new member, wait
 until it has caught up, `member promote`, and only then touch the next one.
 Replacing a dead member is remove-then-add, and a three-node cluster with one
 dead member has no slack while you do it, so it's probably worth running five if maintenance is routine.
-</Callout>
+
+Even a correctly changing cluster can be disturbed by a single misbehaving member, and the next section covers that.
 
 </Sub>
 
-<SectionHeading n="08" id="prevote">Keeping elections quiet: PreVote and CheckQuorum</SectionHeading>
+<SectionHeading n="09" id="prevote">Keeping elections quiet</SectionHeading>
 
-Basic Raft is safe under any network. It isn't always *available*. A
+Basic Raft is safe under any network. It isn't always *available*: a
 single server with a bad link can keep the whole cluster in elections. Two
 extensions fix most of that, and you usually have to turn them on.
 
-<Sub n="8.1" title="The disruptive server">
+<Sub n="9.1" title="The disruptive server">
 
-Picture S3 cut off from the others. It times out, bumps its term to 6, fails,
+Go back to the five-server cluster where S3 won term 5, and picture S4 cut off from the others. Its election timer runs out, it bumps its term to 6, can't win because nobody hears it,
 and repeats: 7, 8, 9. When the link heals, its `RequestVote` carries term 9,
-and the healthy leader at term 5 steps down. Writes stop for an election
+and S3, the healthy leader at term 5, sees the higher term and steps down. Writes stop for an election
 nobody needed.
 
-<Why>Why doesn't the cluster just ignore S3?</Why>
-
-Because "higher term means step down" is what keeps stale leaders harmless,
-and it can't tell a real new term from an inflated one.
+Why doesn't the cluster just ignore S3? Because "higher term means step down" is what keeps stale leaders harmless,
+and a server can't tell a real new term from an inflated one.
 
 **PreVote** (thesis §9.6) fixes it by making a candidate ask first. Before
 bumping its term, a would-be candidate sends a `PreVote` for `term + 1`. Voters
 answer yes only if its log is up-to-date and they themselves haven't heard from
 a leader recently. Only with a majority of yeses does the candidate increment
-its term and run a real election. S3's pre-votes all fail, its term never
-moves, and it rejoins quietly.
+its term and run a real election. While S4 is cut off, its pre-votes reach nobody, so its term never
+moves, and it rejoins quietly at term 5.
 
 etcd's `campaign` shows the two phases. A pre-candidate sends votes for a term
 it hasn't adopted:
@@ -739,16 +859,16 @@ func (r *raft) campaign(t CampaignType) {
 ```
 </SourceRead>
 
-The etcd server enables it (`--pre-vote` defaults to `true` in 3.6.5). In the
-section 4.4 failovers, each survivor went pre-candidate at term N, collected
-`MsgPreVoteResp` from itself and the other survivor, then became candidate and
-leader at N+1.
+The etcd server enables it (`--pre-vote` defaults to `true` in 3.6.5). The
+failovers of section 5.4 went through both phases. In each run's log, the
+winning survivor became a pre-candidate at term N, collected `MsgPreVoteResp`
+from itself and the other survivor, then became candidate and leader at N+1.
 
 </Sub>
 
-<Sub n="8.2" title="CheckQuorum: a leader that notices it's alone">
+<Sub n="9.2" title="CheckQuorum: a leader that notices it's alone">
 
-Then there's the opposite problem: a leader cut off from a majority that doesn't know it.
+The opposite problem is a leader cut off from a majority that doesn't know it.
 It keeps accepting proposals it can never commit, and clients connected to it
 hang.
 
@@ -778,7 +898,7 @@ heard from a majority. If not, it steps down:
 ```
 </SourceRead>
 
-CheckQuorum has a second half in `Step`. A follower that has heard from its
+CheckQuorum has a second half in `Step`, the function every incoming message passes through. A follower that has heard from its
 leader within the election timeout *ignores* vote requests with a higher term:
 
 ```go
@@ -791,14 +911,14 @@ if !force && inLease {
 }
 ```
 
-The variable is called `inLease` for a reason. Section 10 uses that exact
+That variable is called `inLease` for a reason. Section 11 uses that exact
 property to make reads cheaper.
 
 </Sub>
 
-<Sub n="8.3" title="When the network is only half broken">
+<Sub n="9.3" title="When the network is only half broken">
 
-Full partitions are the easy case. The hard one is a **partial** partition,
+A full partition is the easy case. The hard one is a **partial** partition,
 where A can reach B, B can reach C, and A can't reach C.
 
 On 2 November 2020, Cloudflare's control plane lost its API and dashboard for
@@ -830,16 +950,18 @@ Assuming your Raft library enables these. In etcd's library, `PreVote` and
 server turns PreVote on; code embedding the library must set both.
 </Callout>
 
+That completes Raft: elections, replication, a commit rule, membership changes and two extensions for a quiet network. Before we turn to reads, a detour to the other algorithm you'll meet, because most papers in the field are written in its terms.
+
 </Sub>
 
-<SectionHeading n="09" id="paxos">Paxos, and why it's harder to read</SectionHeading>
+<SectionHeading n="10" id="paxos">Paxos, and why it's harder to read</SectionHeading>
 
 Paxos came first. Lamport published it as
 [The Part-Time Parliament](https://lamport.azurewebsites.net/pubs/lamport-paxos.pdf)
-(ACM TOCS, 1998), and it's probably still the best-known consensus algorithm: it's behind Google's Chubby and Spanner. Most papers
+(ACM TOCS, 1998), and it's probably still the best-known consensus algorithm: it's behind Google's Chubby lock service and its Spanner database. Most papers
 in the field are written in its terms, so you need to be able to read it.
 
-<Sub n="9.1" title="Single-decree Paxos: choosing one value">
+<Sub n="10.1" title="Single-decree Paxos: choosing one value">
 
 Basic Paxos decides **one** value, not a log. It has proposers, which suggest
 values, and acceptors, which vote. In a real system every server plays both
@@ -855,25 +977,21 @@ states the protocol in two phases:
 
 A value is **chosen** once a majority has accepted the same proposal.
 
-<Why>Why must a proposer adopt someone else's value?</Why>
-
-It's the same majority-overlap argument as Raft's election restriction. If a
+Why must a proposer adopt someone else's value? It's the same majority-overlap argument as Raft's election restriction. If a
 value might already be chosen, it was accepted by a majority, and the
 proposer's phase-1 majority overlaps it. Adopting the highest-numbered value it
 hears about guarantees it re-proposes the chosen value, never a new one. Raft
 avoids this step by refusing to elect a leader that lacks committed entries;
 Paxos lets anyone lead and makes them catch up first.
 
-<Why>What stops two proposers from fighting forever?</Why>
-
-Nothing, in basic Paxos. A prepares with 1, B with 2, A retries with 3, and so
+What stops two proposers from fighting forever? Nothing, in basic Paxos. A prepares with 1, B with 2, A retries with 3, and so
 on. Lamport's fix is a "distinguished proposer", the only one allowed to
 propose; electing it reliably needs timeouts or randomness, by FLP. That seems a lot like Raft's leader, and it is one
 in all but name.
 
 </Sub>
 
-<Sub n="9.2" title="Multi-Paxos: from one value to a log">
+<Sub n="10.2" title="Multi-Paxos: from one value to a log">
 
 A log is a sequence of single-decree instances, one per slot. Run phase 1 for
 every slot and each write costs two round trips. **Multi-Paxos** has a stable
@@ -882,7 +1000,7 @@ write. In steady state that's one round trip to a majority, the same as Raft.
 
 The catch is that Multi-Paxos isn't one algorithm. Lamport's paper sketches it
 in a few paragraphs, and every implementation fills in leader election, log
-repair, snapshots and membership its own way. Google's Chubby team wrote in
+repair, snapshots (compact copies of the state that let a long log be cut short) and membership its own way. Google's Chubby team wrote in
 [Paxos Made Live (PODC 2007)](https://research.google.com/archive/paxos_made_live.pdf):
 
 > There are significant gaps between the description of the Paxos algorithm and
@@ -891,7 +1009,7 @@ repair, snapshots and membership its own way. Google's Chubby team wrote in
 
 </Sub>
 
-<Sub n="9.3" title="Same algorithm, different explanation">
+<Sub n="10.3" title="Same algorithm, different explanation">
 
 Raft was designed as the fix. In the paper's user study, 33 of 43 students who
 learned both answered questions about Raft better than about Paxos. Howard and
@@ -905,32 +1023,75 @@ how its paper presents it.
 | **Log holes** | Slots can be decided out of order; holes allowed | Log is contiguous; no holes |
 | **Terms / ballots** | Proposal numbers, unique per proposer | Terms, at most one leader each |
 | **Spec covers** | One value; the rest is folklore | Election, replication, membership, snapshots, clients |
-| **Where you'll meet it** | Chubby, Spanner, many papers | etcd, Consul, CockroachDB, TiDB, KRaft |
+| **Where you'll meet it** | Chubby, Spanner, many papers | etcd, Consul, CockroachDB, TiDB, KRaft (Kafka's Raft) |
 
-<Callout label="Design implication">
 When you read a paper or a design doc in Paxos vocabulary, translate: ballot
-or proposal number = term, phase 1 = election, phase 2 = `AppendEntries`,
-"distinguished proposer" = leader. The safety arguments carry over
-unchanged. The differences that matter in practice are in the parts Paxos
+or proposal number is a term, phase 1 is an election, phase 2 is `AppendEntries`,
+and a "distinguished proposer" is the leader. The safety arguments carry over
+unchanged, and the differences that matter in practice are in the parts Paxos
 doesn't specify.
-</Callout>
+
+Reading Paxos this way also shows that the two majorities do different jobs.
+The phase-1 majority (an election, in Raft terms) has to overlap every phase-2
+majority (the servers that store an entry), so that a new leader always hears
+about anything already chosen. Strictly, that one overlap is all safety needs,
+and [Flexible Paxos (2016)](https://arxiv.org/abs/1608.06696) builds on it by
+letting the two quorums have different sizes. Raft and etcd use plain
+majorities for both.
+
+So far every operation has been a write that goes through the log. Reads don't change anything, which makes them look easy, and the next section shows where they go wrong.
 
 </Sub>
 
-<SectionHeading n="10" id="reads">Reads: the log, ReadIndex, and leases</SectionHeading>
+<SectionHeading n="11" id="reads">Reads: the log, ReadIndex, and leases</SectionHeading>
 
 Reads don't change state, so it's tempting to have the leader answer them from
-memory. That's where many subtle bugs in consensus-backed systems live.
+its own memory. That's where many subtle bugs in consensus-backed systems live.
 
-<Sub n="10.1" title="Why a leader can't just read locally">
+<Sub n="11.1" title="Why a leader can't just read locally">
 
-A leader may have been replaced without knowing it. A GC pause, a stalled
-disk or a one-way partition can leave it believing it leads while a newer
-leader has already committed writes. Its local copy seems current and is stale, and a read
-from it breaks linearizability: a client can write through the new leader and
-then read the old value back.
+A leader may have been replaced without knowing it. A pause (a long garbage-collection pause, where the language runtime stops the program for a moment, or a stalled disk, or a one-way partition) can leave a server believing it still leads while a newer
+leader has already committed writes. Its local copy looks current and is stale. A read
+from it isn't **linearizable**, meaning it doesn't reflect every write that finished before the read started: a client can write through the new leader and
+then read the old value back. Here it is on our key `x`:
 
-There are three ways to serve a read safely, and one way to serve it fast.
+<Scene
+  title="A paused leader answers a read with an old value"
+  regions={[
+    { id: "client", label: "Client", col: 0, row: 0, span: 3 },
+    { id: "s1", label: "S1", sub: "old leader", col: 0, row: 1 },
+    { id: "s2", label: "S2", sub: "", col: 1, row: 1 },
+    { id: "s3", label: "S3", sub: "", col: 2, row: 1 },
+  ]}
+  itemWidth={104}
+  frames={[
+    { caption: "S1 is leader of term 2, and all three servers hold `x = 3`.",
+      items: [
+        { id: "l1", at: "s1", label: "leader", sub: "term 2", tone: "ok" },
+        { id: "x1", at: "s1", label: "x = 3" },
+        { id: "x2", at: "s2", label: "x = 3" },
+        { id: "x3", at: "s3", label: "x = 3" },
+      ], focus: ["s1"] },
+    { caption: "S1 freezes: a long GC pause, a stalled VM, anything that stops the process without stopping the clock. It sends no heartbeats.",
+      add: [{ id: "p1", at: "s1", label: "paused", tone: "bad" }], focus: ["s1"] },
+    { caption: "After an election timeout S2 and S3 elect S2 leader of **term 3**. S1 knows nothing about it: when it wakes, it will still think it leads term 2.",
+      add: [{ id: "l2", at: "s2", label: "leader", sub: "term 3", tone: "accent" }], focus: ["s2", "s3"] },
+    { caption: "A client writes `x = 4` through S2. Two of three servers, S2 and S3, store it, so it's **committed**. S1 still holds `x = 3`.",
+      add: [{ id: "put", at: "client", label: "put x=4", sub: "OK", tone: "ok" }],
+      change: [{ id: "x2", label: "x = 4", tone: "ok" }, { id: "x3", label: "x = 4", tone: "ok" }],
+      focus: ["s2", "s3"], arrow: { from: "client", to: "s2", label: "put x=4" } },
+    { caption: "S1 wakes. Nothing has told it about term 3, so it still believes it's the leader. A client asks it for `x`, and S1 answers from its own memory: **3**. That value is stale: the client has already seen the write of 4 succeed.",
+      remove: ["p1", "put"],
+      add: [{ id: "got", at: "client", label: "got x = 3", sub: "stale", tone: "bad" }],
+      change: [{ id: "x1", tone: "bad" }],
+      focus: ["s1", "client"], arrow: { from: "s1", to: "client", label: "x = 3" } },
+    { caption: "A linearizable read prevents this. S1 must first check with a majority that it's still leader. S2 answers with term 3, S1 steps down, and the read never returns the old value: it gets `x = 4`, or fails with an error and the client retries.",
+      change: [{ id: "l1", label: "follower", sub: "term 3", tone: "dim" }, { id: "got", label: "got x = 4", sub: "after retry", tone: "ok" }],
+      focus: ["s1", "s2"], arrow: { from: "s1", to: "s2", label: "heartbeat" } },
+  ]}
+/>
+
+There are three ways to serve a read safely, and one way that is fast and may be stale. Here they are side by side, and the next three subsections take them one at a time.
 
 | Read path | What it does | Cost | Safe if |
 |---|---|---|---|
@@ -941,11 +1102,11 @@ There are three ways to serve a read safely, and one way to serve it fast.
 
 </Sub>
 
-<Sub n="10.2" title="ReadIndex, step by step">
+<Sub n="11.2" title="ReadIndex, step by step">
 
 The paper lays out two precautions for reading without the log. The leader
 must know which entries are committed, which it learns by committing its no-op
-from section 6. And it "must check whether it has been deposed" before
+from section 7. And it "must check whether it has been deposed" before
 answering, by exchanging heartbeats with a majority.
 
 <StepSequence
@@ -1012,11 +1173,11 @@ and etcd's server issues one ReadIndex for a batch of concurrent client reads.
 
 </Sub>
 
-<Sub n="10.3" title="Leases: reading on the clock">
+<Sub n="11.3" title="Leases: reading on the clock">
 
-A lease replaces the heartbeat round with a promise about time. After a
+A **lease** replaces the heartbeat round with a promise about time. After a
 majority acknowledges a heartbeat, followers won't vote for anyone else for
-about an election timeout. That's CheckQuorum's `inLease` rule from section 8.
+about an election timeout. That's CheckQuorum's `inLease` rule from section 9.
 So the leader can assume nobody else will lead until then, and answer reads
 locally.
 
@@ -1049,9 +1210,7 @@ library says the same, and refuses the unsafe combination:
 ```
 </SourceRead>
 
-<Why>What does a lease need from the clock, exactly?</Why>
-
-What it needs is agreement on **rates**: the leader's lease must run
+What does a lease need from the clock, exactly? It needs agreement on **rates**: the leader's lease must run
 out before any follower's election timer can. Measure the lease from when the
 heartbeat was *sent*, keep it shorter than the followers' timeout, and it's
 safe while no clock drifts by more than the margin. Chubby does this: "The master maintains a shorter timeout for the
@@ -1065,16 +1224,13 @@ sending the reply. A long GC pause after the check makes the reply that stale,
 and no clock discipline fixes it. Monotonic clocks, and the ways wall clocks jump, are
 covered in [chapter 26](/topics/26-time-and-ordering).
 
-<Callout label="Design implication">
-Lease reads buy latency with an assumption about your runtime, not your
-network. They're a reasonable trade in a system built to bound its clock
-uncertainty and check it, the way Spanner does with TrueTime. In a JVM or Go service running on
+So a lease read saves a round trip by assuming something about your servers: that no process pauses, and no clock runs fast or slow, by more than the safety margin. That's a reasonable trade in a system built to bound its clock
+uncertainty and check it, the way Spanner does with TrueTime, Google's clock service that reports how uncertain the time is (chapter 26 covers it). In a JVM or Go service running on
 oversubscribed VMs, keep ReadIndex, and measure before you give it up.
-</Callout>
 
 </Sub>
 
-<Sub n="10.4" title="etcd's two read modes, and a stale read on demand">
+<Sub n="11.4" title="etcd's two read modes, and a stale read on demand">
 
 etcd exposes the choice per request. The default is linearizable (ReadIndex).
 A request can ask for **serializable**, which "may access stale data with
@@ -1083,10 +1239,10 @@ reliance on live consensus"
 ([etcd API guarantees](https://etcd.io/docs/v3.6/learning/api_guarantees/)). In
 `etcdctl` it's `--consistency=s`; in the Go client, `clientv3.WithSerializable()`.
 
-To make the difference concrete, here's a paused leader. The script writes
-`old`, freezes the leader with `SIGSTOP` for three seconds (a stand-in for a
-GC pause or a stalled VM), writes `new` through another member once a new
-leader exists, resumes the old leader, and reads from it straight away.
+To make the difference concrete, here's the paused leader of the scene above on a real cluster. The script writes
+`old`, freezes the leader with `SIGSTOP` (a Unix signal that freezes a process, a stand-in for a
+GC pause or a stalled VM) for three seconds, writes `new` through another member once a new
+leader exists, resumes the old leader with `SIGCONT`, and reads from it straight away. `put` and `get` stand for small helpers that call etcd's HTTP interface on a given member's port, and `get` can ask for a serializable read or a linearizable one. The helpers also print a labelled line for each step, which is what the output shows. The script uses the words `old` and `new` where the scene used 3 and 4.
 
 <TryIt what="Freeze the etcd leader, write around it, read from it" lang="python" toolchain="Python 3.12, etcd 3.6.5 gRPC gateway, shared 4-CPU container, linuxkit 6.10">
 ```python
@@ -1109,13 +1265,10 @@ old leader, serializable: old
 old leader, linearizable: new
 old leader, serializable after 0.5s: new
 ```
-
-In five runs, the serializable read returned `old` five times: the woken node
-answered before it had heard of the new term. The linearizable read never did.
-Three times it returned `new`; twice it failed with
-`etcdserver: leader changed`, leaving the retry to the client.
 </Output>
 </TryIt>
+
+The first serializable read returned `old`: the woken server answered from its own copy before it had heard of the new term. That's the scene's fifth frame happening for real. Half a second later the same server had caught up, and the serializable read returned `new`. Across five runs of this script the first serializable read returned `old` every time. The linearizable read never returned the old value. Three times it waited for the heartbeat round, found out about the new leader and returned `new`. Twice it failed with `etcdserver: leader changed`, which leaves the retry to the client.
 
 <Callout label="Common mistake" kind="warn">
 Using serializable reads for anything that makes a decision: a leader check,
@@ -1125,28 +1278,37 @@ caches that tolerate a second of staleness.
 
 </Sub>
 
-<Sub n="10.5" title="Leases held by clients are a different thing">
+<Sub n="11.5" title="Leases held by clients are a different thing">
 
-Clients hold leases too. etcd leases, Chubby locks and ZooKeeper ephemeral
-nodes give a client a lock for a TTL, with the same pause problem from the
-client's side: it can believe it holds a lock after the lease has expired.
+Clients hold leases too, and these are a separate mechanism with the same
+name. An etcd lease, a Chubby lock or a ZooKeeper ephemeral node (an entry
+that disappears when the client that made it stops checking in) gives a client
+a lock for a TTL (time to live). It has the same pause problem, seen from the
+client's side: a client that pauses can wake up believing it holds a lock
+whose lease has already expired and been granted to someone else.
 
-Jepsen's [etcd 3.4.3 analysis (January 2020)](https://jepsen.io/analyses/etcd-3.4.3)
-found the key-value operations strict serializable, and the locks
-"fundamentally unsafe": "multiple processes can hold an etcd lock
-concurrently, even in healthy clusters." The fix is a **fencing token**: pass
-the lock key's revision to the protected resource, which rejects anything
-older than a revision it has already seen.
+Jepsen, a testing firm that checks databases under failures, analysed etcd 3.4.3 in January 2020 ([Jepsen's etcd 3.4.3 analysis](https://jepsen.io/analyses/etcd-3.4.3)).
+It found the key-value operations strict serializable (the strongest
+guarantee: transactions behave as if they ran one at a time, in real-time
+order), and the locks "fundamentally unsafe": "multiple processes can hold an
+etcd lock concurrently, even in healthy clusters." The fix is a **fencing
+token**, a number that grows every time the lock changes hands. etcd gives
+every change to its data a **revision** number, so the lock key's revision
+works as one. The client passes it along with each write to the protected
+resource, and the resource rejects anything older than a revision it has
+already seen.
+
+That covers what can go wrong. What does each of these paths cost?
 
 </Sub>
 
-<SectionHeading n="11" id="cost">What a quorum costs</SectionHeading>
+<SectionHeading n="12" id="cost">What a quorum costs</SectionHeading>
 
 Every consensus operation is some number of round trips and some number of
 fsyncs on the critical path. Once you know which, the latency of any
 deployment is arithmetic.
 
-<Sub n="11.1" title="The critical path of each operation">
+<Sub n="12.1" title="The critical path of each operation">
 
 | Operation | Round trips to a majority | fsyncs on the path |
 |---|---|---|
@@ -1166,12 +1328,14 @@ loss."
 
 </Sub>
 
-<Sub n="11.2" title="Measured: three members on one box">
+<Sub n="12.2" title="The operations with the network taken out">
 
-Two thousand sequential requests per case, 100-byte values over the HTTP gRPC
-gateway on one keep-alive connection, five runs, median of the per-run
-medians. Loopback, so the round trip is close to free and what's left is fsync
-and software.
+To see what each operation costs apart from the network, put three members on
+one machine, where a message between them takes almost no time. Send 2,000
+requests per operation, one after another, with 100-byte values, through etcd's
+HTTP interface on one connection that stays open. With the round trip close to
+free, what's left is fsync and software. Each figure is the median across five
+such runs:
 
 <Compare
   cols={["Operation", "p50", "p99"]}
@@ -1185,18 +1349,19 @@ and software.
   ]}
 />
 
-A serializable get is the floor, roughly 150 µs of HTTP, JSON and bbolt. The
+(p50 is the median and p99 is the time that 99% of requests beat.) A serializable get is the floor, roughly 150 µs of HTTP, JSON and bbolt (etcd's on-disk key-value store). The
 linearizable get adds roughly 100 µs on the leader and 170 µs on a follower:
-one heartbeat round, plus the forwarding hop. Puts add fsync, and their p99 is
-where the virtual disk shows.
+one heartbeat round, plus the forwarding hop. Puts add an fsync on the leader
+and a follower, and the slow fsyncs are what stretch their p99 to several
+milliseconds.
 
 </Sub>
 
-<Sub n="11.3" title="The same arithmetic across a network">
+<Sub n="12.3" title="The same arithmetic across a network">
 
 On a real deployment the round trip dominates. Here's the arithmetic, using
-the RTTs from etcd's own tuning guide: 10 ms as its worked example, and about
-130 ms for a cross-continent cluster.
+the round-trip times from etcd's own tuning guide: 10 ms as its worked example, and about
+130 ms, which the guide gives as a reasonable round trip within the continental United States.
 
 <Estimate
   rows={[
@@ -1204,9 +1369,9 @@ the RTTs from etcd's own tuning guide: 10 ms as its worked example, and about
     { label: "Linearizable read at the leader, RTT 10 ms", math: "1 × RTT", value: "≈ 10 ms" },
     { label: "Write at the leader, RTT 10 ms", math: "1 × RTT + follower fsync", value: "≈ 10–11 ms" },
     { label: "Write via a remote follower, RTT 10 ms", math: "2 × RTT + fsync", value: "≈ 20 ms" },
-    { label: "Write at the leader, cross-continent (≈130 ms)", math: "1 × RTT + fsync", value: "≈ 130 ms" },
+    { label: "Write at the leader, coast to coast (≈130 ms)", math: "1 × RTT + fsync", value: "≈ 130 ms" },
   ]}
-  result={{ label: "A sequential client doing 100 linearizable ops, cross-continent", value: "≈ 13 s" }}
+  result={{ label: "A sequential client doing 100 linearizable ops, coast to coast", value: "≈ 13 s" }}
 />
 
 <Callout label="Design implication">
@@ -1219,24 +1384,26 @@ pipeline anything sequential.
 
 </Sub>
 
-<SectionHeading n="12" id="operating">Running a consensus cluster</SectionHeading>
+<SectionHeading n="13" id="operating">Running a consensus cluster</SectionHeading>
 
-<Sub n="12.1" title="What to look at">
+<Sub n="13.1" title="What to look at">
+
+Each question from the chapter has a signal that answers it on a running cluster.
 
 ```shell
-# Who leads, at what term, and is everyone at the same index?
+# Who leads, at what term, and is everyone at the same index? (sections 3 and 5)
 etcdctl --endpoints=$ENDPOINTS endpoint status -w table
 
-# Leader changes and failed proposals since start (Prometheus counters)
+# Leader changes and failed proposals since start (Prometheus counters) (sections 5 and 9)
 curl -s http://127.0.0.1:2379/metrics | grep -E 'etcd_server_leader_changes_seen_total|etcd_server_proposals_failed_total'
 
-# Disk: WAL fsync and backend commit latency histograms
+# Disk: WAL fsync and backend commit latency histograms (section 6)
 curl -s http://127.0.0.1:2379/metrics | grep -E 'etcd_disk_wal_fsync_duration_seconds|etcd_disk_backend_commit_duration_seconds'
 
-# Round trip between members, as etcd sees it
+# Round trip between members, as etcd sees it (sections 5.4 and 12)
 curl -s http://127.0.0.1:2379/metrics | grep etcd_network_peer_round_trip_time_seconds
 
-# Election timing in the logs
+# Election timing in the logs (section 5)
 journalctl -u etcd | grep -E 'became (pre-candidate|candidate|leader)|lost leader'
 ```
 
@@ -1246,19 +1413,19 @@ too close to the real round trip.
 
 </Sub>
 
-<Sub n="12.2" title="Symptom, cause, fix">
+<Sub n="13.2" title="Symptom, cause, fix">
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Writes stall for 1–2 s now and then | Leader elections; each blocks writes for about an election timeout | Find why the leader looked dead: fsync latency, CPU throttling, GC. Then consider the timeout |
-| Frequent leader changes, no crashes | Heartbeats late because of slow disk or starved CPU | Dedicated disk, `ionice`, CPU requests; don't co-locate with noisy neighbours |
+| Frequent leader changes, no crashes | Heartbeats late because of slow disk or starved CPU | Dedicated disk, `ionice` (to lower other processes' disk priority), CPU requests; don't co-locate with noisy neighbours |
 | Cluster read-only, one node down, another "healthy" | Lost quorum: 2 of 3 unreachable from each other | Check pairwise connectivity; partial partitions look healthy to health checks |
 | Reads return an old value after a write | Serializable reads, or a lease read on a paused leader | Use linearizable reads for decisions |
 | Two clients both believe they hold a lock | Client lease expired during a pause | Fencing tokens checked by the resource |
 
 </Sub>
 
-<Sub n="12.3" title="What you give up">
+<Sub n="13.3" title="What you give up">
 
 <Compare
   cols={["Choice", "Gain", "Cost"]}
@@ -1273,43 +1440,29 @@ too close to the real round trip.
 
 </Sub>
 
-<SectionHeading n="13" id="summary">Summary</SectionHeading>
+<SectionHeading n="14" id="summary">Summary</SectionHeading>
 
-1. **Consensus is agreement on a log.** Replicas that apply the same commands in
-   the same order end up in the same state; the algorithm only decides the order.
-2. **Safety never depends on timing; liveness always does.** FLP rules out
-   both in a fully asynchronous system, so real systems stall instead of
-   diverging.
-3. **Majorities work because any two overlap.** That overlap carries every
-   committed decision into every later election. An even size adds cost and no
-   tolerance.
-4. **Raft elects a leader per term, with randomized timeouts.** A follower
-   waits one to two election timeouts in etcd; measured failover was a median
-   of 1.54 s, with the election itself taking about 15 ms.
-5. **Only up-to-date servers can win.** The election restriction means a new
-   leader already holds every committed entry, so data flows one way.
-6. **Leaders commit only entries from their own term by counting.** Figure 8
-   shows an older entry on a majority being erased; the no-op on election
-   is what commits the old ones.
-7. **Change membership one step at a time**, and not before the new leader has
-   committed in its term.
-8. **PreVote and CheckQuorum keep a flaky node from causing elections.** etcd's
-   server enables PreVote; the library's zero-value config leaves both off.
-9. **Paxos and Raft make the same safety argument.** The difference is how much
-   they specify; Multi-Paxos leaves the practical parts to each implementation.
-10. **Reads are where consistency is lost.** ReadIndex costs one round trip,
-    leases cost a clock assumption, and serializable reads can be stale; a
-    paused leader returned stale serializable reads five times out of five.
+1. **Copies of data drift apart unless the servers share an order.** A log of numbered commands, applied by a deterministic state machine on every server, gives them one, and the algorithm only has to decide what goes in each slot.
+2. **A slot is settled when a majority has stored it, because any two majorities overlap.** That overlap carries every committed decision into every later vote. An even size adds cost and no tolerance, and `2f + 1` servers survive `f` failures.
+3. **Safety never depends on timing; liveness always does.** FLP rules out both in a fully asynchronous system, so a lone node that can't reach a majority waits instead of guessing, as `e1` did in the experiment.
+4. **Raft elects a leader per term, with randomized timeouts.** A follower waits one to two election timeouts in etcd. In five failovers of a default-configured cluster the median outage was 1.54 s, and the election itself took about 15 ms.
+5. **Only up-to-date servers can win.** The election restriction means a new leader already has every committed entry, so data flows one way.
+6. **The leader copies its log with `AppendEntries`, and the commit index is the largest index a majority has reached.** A follower accepts an entry only if the entry before it matches.
+7. **Leaders commit only entries from their own term by counting.** Figure 8 shows an older entry on a majority being erased, and the no-op a leader appends on election is what commits the old ones.
+8. **Change membership one step at a time**, and not before the new leader has committed in its term.
+9. **PreVote and CheckQuorum keep a flaky node from causing elections.** etcd's server enables PreVote; the library's zero-value config leaves both off.
+10. **Paxos and Raft make the same safety argument.** The difference is how much they specify; Multi-Paxos leaves the practical parts to each implementation.
+11. **Reads are where consistency is lost.** ReadIndex costs one round trip, leases cost a clock assumption, and serializable reads can be stale; a paused leader returned stale serializable reads five times out of five.
 
-<SectionHeading n="14" id="build">Build this</SectionHeading>
+<SectionHeading n="15" id="build">Build this</SectionHeading>
 
-**Break a three-node etcd cluster on purpose, and measure each break.**
+**Break a three-node etcd cluster on purpose, and watch each break.**
 
 - Start three members on one machine with separate data directories. Run a
   writer that records the gap between successful puts, and `kill -9` the
   leader ten times. Plot the gaps against the `[1 s, 2 s)` window, then halve
   `--election-timeout` and `--heartbeat-interval` and do it again.
-- Reproduce the paused-leader stale read in section 10.4 with `SIGSTOP`. Then
+- Reproduce the paused-leader stale read in section 11.4 with `SIGSTOP`. Then
   try the same read with `--consistency=l` and record every error the client
   sees. Your retry logic has to handle all of them.
 - In throwaway VMs or network namespaces, run all members with
@@ -1320,7 +1473,7 @@ too close to the real round trip.
 - Stretch goal: implement Raft against the MIT 6.5840 test harness until the
   Figure 8 tests pass.
 
-<SectionHeading n="15" id="interview">Interview questions</SectionHeading>
+<SectionHeading n="16" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="Why do consensus clusters have an odd number of members?">
 A cluster of `2f + 1` tolerates `f` failures, because any majority of it still
@@ -1366,17 +1519,17 @@ contiguous. And Raft specifies membership, snapshots and client interaction,
 which Multi-Paxos leaves to each implementation.
 </QA>
 
-<QA level="deep" q="A service uses an etcd lease as a lock around writes to S3. How can two writers still interleave, and what fixes it?">
+<QA level="deep" q="A service uses an etcd lease as a lock around writes to Amazon S3. How can two writers still interleave, and what fixes it?">
 The lock holder can pause (GC, VM migration) after checking it holds the lock
 and before the write lands. The lease expires, another client acquires the
-lock, and both writes reach S3. Jepsen found etcd locks unsafe this way, even
+lock, and both writes reach the bucket. Jepsen found etcd locks unsafe this way, even
 in healthy clusters. The fix is a fencing token: send the lock key's revision
 with every write and have the store reject writes with an older revision than
 it has already seen. If the store can't check tokens, the lock can't give you
 mutual exclusion.
 </QA>
 
-<SectionHeading n="16" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="17" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
   <Q q="Five voters report match indexes 9, 7, 7, 5 and 3, all in the leader's term. What's the commit index?">
@@ -1423,7 +1576,7 @@ mutual exclusion.
   </WildCard>
 </CardGrid>
 
-<SectionHeading n="17" id="related">Related chapters</SectionHeading>
+<SectionHeading n="18" id="related">Related chapters</SectionHeading>
 
 <CardGrid>
   <WildCard name="Time, Clocks & Ordering">

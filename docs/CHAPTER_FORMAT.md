@@ -17,8 +17,9 @@ every process and a table for every comparison.
 frontmatter   title, dek (1–2 sentences: what you'll learn), readingTime, level
               (Beginner | Intermediate | Advanced), versions, prereqs (short, plain:
               "syscalls, TCP basics"), updated
-intro         2–3 short paragraphs, no heading: where the reader meets this topic,
-              why it matters, what the chapter will do. No anecdote, no benchmark.
+intro         No heading. Start from something the reader can picture (a running
+              example used for the whole chapter), raise the chapter's one question,
+              and say in a sentence where the chapter goes.
 01..N         Numbered sections by TOPIC, in teaching order, simple → deep.
               <SectionHeading n="01" id="kebab-id">Title</SectionHeading>
               Each has 1–6 <Sub n="1.1" title="…"> subsections.
@@ -33,7 +34,9 @@ Every `<Sub>` number must match its section (`2.1` under `02`).
 
 ## Teaching rules
 
-- **Short paragraphs.** 1–3 sentences, one idea each. Split anything longer.
+- **Connected paragraphs.** A paragraph is a chain of reasoning (because, so, but,
+  which means). Length follows the thought; never chop an explanation into
+  fragments. Each section ends on the question the next one answers.
 - **Answer the next question.** Use `<Why>Why …?</Why>` subheads for the
   question a learner would ask at that point, and answer it directly in the
   paragraph below. 3–8 per chapter.
@@ -55,10 +58,11 @@ Every `<Sub>` number must match its section (`2.1` under `02`).
   `label="Common mistake"` for a frequent error. 2–5 per chapter.
 - **Predict before revealing.** At least one `<Predict q options answer>`
   explanation `</Predict>` at a point where the reader can reason it out.
-- **Voice.** Plain, direct, second person, contractions. Real systems named
-  (Postgres, Kubernetes, Redis, nginx, the JVM…). First person only for
-  "in a test on …" measurements, and keep those to supporting evidence, never
-  the story of the chapter.
+- **Voice.** A person talking: "we" while designing, "you" for the reader,
+  contractions. Real systems named (Postgres, Kubernetes, Redis, nginx, the JVM…).
+  Never narrate the writer's own process: no "measured on my M4", "I verified",
+  "my first attempt". Numbers are stated as facts about the system, rounded and
+  given a sense of scale. `toolchain` on TryIt is for maintainers and isn't shown.
 
 ## What to keep from the old chapters
 
