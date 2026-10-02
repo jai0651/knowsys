@@ -1,31 +1,32 @@
 ---
 title: "Object Storage: S3 Internals"
-dek: "How S3 turns millions of slow hard drives into a store that keeps eleven nines of durability and answers every read with the latest write. You'll start by using an S3-compatible API against a local emulator, then learn how the keymap, erasure coding, the consistency fix of 2020, multipart uploads and storage classes work, and what each means for the code you write against it."
-readingTime: "~32 min"
+dek: "Follow one log file from the PUT that stores it to the GET that reads it back: why S3 has no rename or append, how a pile of failing hard drives keeps the file for years, what a reader sees right after a write, and why the bill can surprise you."
+readingTime: "~42 min"
 level: "Beginner"
-versions: "Amazon S3 as documented September 2026 · prices us-east-1 from the AWS Price List API, published 2026-09-26 · models run on Apple M4, Python 3.14 · boto3 1.43 and moto 5.2.3 for the first experiment"
+versions: "Amazon S3 as documented September 2026 · prices us-east-1 from the AWS Price List API, published 2026-09-26 · Python 3.14, boto3 1.43 and moto 5.2.3 for the experiments"
 prereqs: "a terminal and Python; HTTP, hashing, hard drives vs SSDs help"
-updated: "2026-09-30"
+updated: "2026-10-02"
 ---
 
-A coat check gives you a numbered ticket when you hand over your coat. Later you hand back the ticket and get the same coat. You can't ask the attendant to sew a button on while it's on the rack: you'd take the coat out, fix it, and hand in the whole coat again under the same ticket. And the sign "Winter coats, Rack B" is only a label on some tickets, since there are no real racks, just tickets and coats.
+Your service writes its log to a file called `app.log`. Disks fail and servers get thrown away, so you want a copy somewhere that outlives all of that. With a few lines of code you hand the file to Amazon S3, the object storage service of Amazon Web Services, under the name `logs/2026/09/30/app.log`. A week later, from a different machine, you ask S3 for that name and get the same bytes back.
 
-Object storage works like that. You store a whole blob under a key, fetch the whole blob by key, and replace it as a whole. The folders you see in a console are prefixes of keys. This shapes how you build on S3, and you can try the whole API without an AWS account.
+It's natural to picture S3 as a huge network drive with folders in it, and that picture breaks quickly. You can't add a line to the end of the stored file, you can't rename it, and you can't change one byte in the middle. The folder called `logs` doesn't exist either. Underneath, the storage is ordinary hard drives, which fail at around 1.36% a year, and yet S3 promises to keep your file with a loss rate so low that section 2 has to work out how it's possible.
 
-<Callout label="How this chapter was built" kind="note">
-S3's internals are proprietary. Everything here about how S3 works inside comes
-from AWS's own papers, documentation and engineering posts, each linked where
-it's used. The erasure coding, ETag and durability code in this chapter ran on
-an Apple M4 with Python 3.14; it models the mechanisms and doesn't measure S3.
-The first experiment runs against `moto`, a local S3 emulator, so it shows the
-shape of the API and not how S3 behaves inside.
-</Callout>
+Something has to turn one cheap request into that promise. A front-end service takes your request, a storage fleet holds the bytes, and an index called the **keymap** remembers where everything is. This chapter follows `app.log` through all of it, asking one question the whole way: when we hand S3 a file, what happens to it, and why can we trust it to be there, unchanged, years later? We start by using the API and noticing what it leaves out, then build up the machinery that makes those omissions make sense.
 
-<SectionHeading n="01" id="use-the-api">Use the S3 API against a local emulator</SectionHeading>
+<SectionHeading n="01" id="use-the-api">Using S3 from code</SectionHeading>
 
-Install `boto3` and `moto[server]` in a Python environment, and start the emulator with `moto_server -p 5055`. The script writes an object, writes it again, and lists keys with a prefix.
+<Sub n="1.1" title="Objects, keys and buckets">
 
-<Sub n="1.1" title="Put, replace, list">
+Let's start with what we hand over. S3 stores **objects**: a blob of bytes together with a little information about it, such as its size and when it was stored. Each object has a name that we choose, called its **key**, and ours is `logs/2026/09/30/app.log`. Objects live in a **bucket**, a named container that you create once and then fill. S3's own documentation describes the whole arrangement as "a basic data map between 'bucket + key + version' and the object itself" ([What is Amazon S3?](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html)). We'll meet the version part in section 7.
+
+There are four basic requests, all sent over HTTP. `PUT` stores an object, `GET` fetches all of it or just a range of its bytes, `DELETE` removes it, and `LIST` returns keys in alphabetical order. That's the whole vocabulary, so let's try it before asking why it looks like this.
+
+</Sub>
+
+<Sub n="1.2" title="Trying it on your own machine">
+
+You don't need an AWS account to see how the API behaves. `moto` is an open-source program that imitates S3 on your own computer, and `boto3` is AWS's Python library (its SDK, meaning a library for calling the service) for talking to S3. Install both with `pip install boto3 "moto[server]"` and start the imitation S3 with `moto_server -p 5055`. The script below stores `app.log`, stores it again with a second line, then adds three more keys and lists the ones under a prefix. A **prefix** is a string that keys must start with, and `Delimiter="/"` asks S3 to group the matching keys by the next slash after the prefix.
 
 <TryIt what="Put an object, replace it, then list keys with a prefix and a delimiter" lang="python" toolchain="Python 3.14, boto3 1.43, moto 5.2.3 (local S3 emulator), macOS 26.5.1">
 ```python
@@ -62,198 +63,398 @@ list prefix logs/2026/09/ with delimiter '/':
 </Output>
 </TryIt>
 
-Adding a second line meant writing the whole object again, and the ETag, a fingerprint of the contents, changed. The "folders" in the listing are just the parts of the keys between the prefix and the next `/`. Nothing named `logs/2026/09/29/` exists as a thing on its own.
+Look at the first two lines. The second `put_object` had to send the whole file again, `line 1` plus `line 2`, and S3 replaced the old object with it. There was no way to say "append". The **ETag**, S3's fingerprint of an object's contents, changed too, because the bytes changed. For a plain upload like this one the ETag is the MD5 hash of the bytes (a hash function squeezes any amount of data into a short fixed-size fingerprint), a detail that matters again in section 6.2.
+
+The listing shows the second surprise. We asked for keys under `logs/2026/09/` and got back two "folders", `logs/2026/09/29/` and `logs/2026/09/30/`. S3 built them on the spot from the stretch of each key between the prefix and the next `/`, and they come back under the name `CommonPrefixes`. Nothing called `logs/2026/09/29/` exists as a thing of its own. The last line lists every key in the bucket, and the "folders" are only shared beginnings of those keys.
 
 </Sub>
 
-<Sub n="1.2" title="What that means">
+<Sub n="1.3" title="What S3 leaves out">
 
-There's no append and no edit in place, only put and replace, so a growing log file becomes many small objects or a multipart upload. There are no directories, so renaming a "folder" means copying and deleting every key beneath it, and listing walks keys in order.
-
-The API is simple on purpose, and simple APIs hide a lot of engineering underneath. The chapter builds S3 from its design problem: a key-value store over millions of hard drives that must never lose a byte. It follows a PUT and a GET through the system and explains the index, the erasure coding and the 2020 change to strong consistency.
-
-</Sub>
-
-<SectionHeading n="02" id="what-it-is">What an object store is</SectionHeading>
-
-An object store keeps **objects**: a blob of bytes plus a little metadata,
-stored under a **key** in a **bucket**. S3's own docs describe it as "a basic
-data map between 'bucket + key + version' and the object itself"
-([What is Amazon S3?](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html)).
-
-<Sub n="2.1" title="A smaller API than a filesystem">
-
-The core API is four verbs: `PUT` a whole object, `GET` all or a byte range of
-one, `DELETE` it, and `LIST` keys in order. What's missing matters as much as
-what's there.
+A filesystem would let us do much more. The table compares S3's ordinary "general purpose" buckets, the kind we've been using, with **POSIX**, the standard file interface that Linux and macOS give every program (`open`, `pwrite`, `rename` and friends, the same calls chapter 08 follows through the kernel).
 
 | Operation | POSIX filesystem | S3 general purpose bucket |
 |---|---|---|
 | **Write part of a file** | `pwrite()` at any offset | No. You replace the whole object |
 | **Append** | `O_APPEND` | No |
-| **Rename** | `rename()`, atomic, O(1) | No. Copy then delete, O(size) and not atomic |
-| **Directories** | Real inodes | None. `/` is just a character in the key |
+| **Rename** | `rename()`, instant and all at once | No. Copy then delete: the time grows with the size, and readers can see it half done |
+| **Directories** | Real directories | None. `/` is just a character in the key |
 | **List a directory** | `readdir()` | `LIST` with a prefix and a delimiter, 1,000 keys per page |
-| **Locking** | `flock()`, `fcntl()` | None. Conditional writes (section 6.4) |
-| **Scale** | One machine or cluster | [More than 500 trillion objects](https://aws.amazon.com/blogs/aws/twenty-years-of-amazon-s3-and-building-whats-next/), 200 million requests a second |
+| **Locking** | `flock()`, `fcntl()` | None. Conditional writes (section 5.4) |
+| **Scale** | One machine or cluster | [More than 500 trillion objects](https://aws.amazon.com/blogs/aws/twenty-years-of-amazon-s3-and-building-whats-next/), over 200 million requests a second |
+
+Because the folders don't exist, "renaming a folder" has no single operation behind it. S3 has to copy every object under the prefix to a new key and then delete the old ones.
+
+<Callout label="Common mistake" kind="warn">
+"Renaming a folder" in S3. With a million objects under the prefix, that's a million `CopyObject` calls and a million `DeleteObject` calls, billed individually, and a window during which readers see some objects under each name. Design key layouts so you never need to rename, for example by writing to a new prefix and switching a pointer object.
+</Callout>
 
 <Why>Why give up rename and partial writes?</Why>
 
-Because every one of them would force coordination on the hot path. An
-object that can only be replaced whole can be written anywhere, checksummed
-once, erasure-coded once, and then never modified again. Immutable blobs are
-what let S3 spread each object across many drives without locking any of them.
+Because every one of them would force the drives that hold an object to coordinate. Suppose S3 let you overwrite bytes 100 to 200 of an object whose pieces live on many drives. All those drives would have to apply the change in the same order, even when two clients write at the same moment, and a crash halfway through would leave pieces of two different versions that don't fit together. If an object can only be replaced whole, every version is complete and never changes after it's written, so it can be stored on many drives without any of them asking permission from the others. Section 2 shows what that buys.
 
-One exception shows the cost. S3 Express One Zone, the single-zone class,
-added an atomic `RenameObject` in
-[June 2025](https://aws.amazon.com/about-aws/whats-new/2025/06/amazon-s3-express-one-zone-atomic-renaming-objects-api),
-only for its directory buckets. General purpose buckets still don't have one.
+There's one exception, and it shows the price. S3 Express One Zone, a faster class that keeps an object in a single availability zone (a data centre, or group of nearby ones, with its own power and network), added an atomic `RenameObject` in [June 2025](https://aws.amazon.com/about-aws/whats-new/2025/06/amazon-s3-express-one-zone-atomic-renaming-objects-api), only for its directory buckets, the kind of bucket that class uses. General purpose buckets still don't have one.
+
+These omissions all follow from one decision: an object is written whole and never changed. To see why that decision is worth so much, we have to look at what S3 is up against underneath, which is hardware that breaks.
 
 </Sub>
 
-<Sub n="2.2" title="Folders are an illusion">
+<SectionHeading n="02" id="erasure-coding">Keeping app.log alive</SectionHeading>
 
-When the console shows you a folder called `logs/2026/09/`, there's no folder.
-There are keys that happen to start with that string. `LIST` with
-`prefix=logs/2026/` and `delimiter=/` asks S3 to group keys by the next `/`, and
-the groups come back as `CommonPrefixes`, which the console draws as folders.
+S3's internals are proprietary. Everything this chapter says about how S3 works inside comes from AWS's own papers, documentation and engineering posts, each linked where it's used. The code models the mechanisms and doesn't measure S3, and AWS hasn't published every parameter, which we'll point out when it matters.
 
-<Callout label="Common mistake" kind="warn">
-"Renaming a folder" in S3. With a million objects under the prefix, that's a
-million `CopyObject` calls and a million `DeleteObject` calls, billed
-individually, and a window during which readers see some objects under each
-name. Design key layouts so you never need to rename, for example by writing to
-a new prefix and switching a pointer object.
+<Sub n="2.1" title="Drives fail">
+
+S3 keeps bytes on hard drives, spinning magnetic disks read by a moving arm, and hard drives die. Backblaze, a storage company that publishes failure data for its own fleet, reported an annual failure rate of 1.36% across all its drives in its [2025 drive stats](https://www.backblaze.com/blog/backblaze-drive-stats-for-2025/). If one drive held the only copy of `app.log`, the chance of losing it in a year would be about one in seventy-five. A fleet of a million drives at that rate sees about 13,600 failures a year, roughly 37 every day, so failure is an ordinary event that the design has to treat as routine.
+
+Against that, S3 Standard is "designed for" 99.999999999% durability, written as eleven nines, across at least three availability zones ([storage classes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html)). **Durability** is the chance that a stored object is still intact after a year, so eleven nines means a loss chance of about one in a hundred billion per object per year. An **availability zone** is one or more data centres with their own power and networking, separate enough that a fire or power failure in one is unlikely to touch the others.
+
+The gap between 1.36% and one in a hundred billion is closed by redundancy, which means keeping extra information so that losses can be survived, and by repair, which means replacing what was lost before more is. Let's build the redundancy first.
+
+</Sub>
+
+<Sub n="2.2" title="Copies">
+
+The obvious way to survive a failed drive is to keep three complete copies of `app.log` on three different drives. This is **replication**. Any two drives can die and the file survives, and repairing a lost copy means reading one of the others. The cost is that every byte takes three bytes of disk. S3 holds more than 500 trillion objects ([twenty years of S3](https://aws.amazon.com/blogs/aws/twenty-years-of-amazon-s3-and-building-whats-next/)), and at that scale three times the disk is an enormous bill. Can we survive failures with less than that?
+
+</Sub>
+
+<Sub n="2.3" title="Parity: surviving a loss for half the space">
+
+Here's a trick on a tiny scale. Cut `app.log` into two halves, A and B, and compute a third piece, P, by combining the two halves with **XOR**, an operation on bits that gives 1 where the two bits differ and 0 where they match. XOR has a handy property: combining any two of the three pieces gives you the third. A XOR P gives back B, B XOR P gives back A, and A XOR B gives P. Store A, B and P on three different drives. If any one drive dies, XOR the other two and the lost piece is back. We've survived one failure for 1.5 times the space, where two full copies would cost twice.
+
+Each of these pieces is called a **shard**. Surviving more than one failure needs more than XOR. **Erasure coding** is the general idea: split an object into k data shards and compute m extra parity shards from them, so that any k of the k+m shards are enough to rebuild the object. A standard construction is the **Reed-Solomon** code. Andy Warfield, an engineer on S3, describes S3's version this way: "we use an algorithm, such as Reed-Solomon, and split our object into a set of k 'identity' shards. Then we generate an additional set of m parity shards. As long as k of the (k+m) total shards remain available, we can read the object" ([Building and operating a pretty big storage system called S3](https://www.allthingsdistributed.com/2023/07/building-and-operating-a-pretty-big-storage-system.html), 2023). The identity shards are plain pieces of the object, and the parity shards are computed from them.
+
+AWS doesn't publish S3's k and m, so we'll use k = 10 and m = 4, the code Facebook's f4 storage system used. That makes 14 shards, any 10 of which are enough, and we'll write the scheme as RS(10,4). Here's `app.log` going through it, losing four drives, and being repaired:
+
+<Scene
+  title="app.log as 10 data shards and 4 parity shards, then four drives die"
+  regions={[
+    { id: "front", label: "Front end", sub: "cuts the object into shards", col: 0, row: 0, span: 3 },
+    { id: "fleet", label: "Storage nodes", sub: "14 drives, in at least 3 zones", col: 0, row: 1, span: 3 },
+  ]}
+  itemWidth={68}
+  frames={[
+    { caption: "`app.log` reaches S3's front end as one object. First it gets cut into ten equal pieces.",
+      items: [
+        { id: "obj", at: "front", label: "app.log", sub: "1 object", tone: "new" },
+      ],
+      focus: ["front"] },
+    { caption: "Ten **data shards**, d1 to d10. Put together they are the object itself.",
+      remove: ["obj"],
+      add: [
+        { id: "d1", at: "front", label: "d1", tone: "new" }, { id: "d2", at: "front", label: "d2", tone: "new" },
+        { id: "d3", at: "front", label: "d3", tone: "new" }, { id: "d4", at: "front", label: "d4", tone: "new" },
+        { id: "d5", at: "front", label: "d5", tone: "new" }, { id: "d6", at: "front", label: "d6", tone: "new" },
+        { id: "d7", at: "front", label: "d7", tone: "new" }, { id: "d8", at: "front", label: "d8", tone: "new" },
+        { id: "d9", at: "front", label: "d9", tone: "new" }, { id: "d10", at: "front", label: "d10", tone: "new" },
+      ],
+      focus: ["front"] },
+    { caption: "Four **parity shards**, p1 to p4, are computed from the ten. Each one is a different weighted sum of all ten data shards.",
+      add: [
+        { id: "p1", at: "front", label: "p1", tone: "accent" }, { id: "p2", at: "front", label: "p2", tone: "accent" },
+        { id: "p3", at: "front", label: "p3", tone: "accent" }, { id: "p4", at: "front", label: "p4", tone: "accent" },
+      ],
+      focus: ["front"] },
+    { caption: "Each of the 14 shards goes to a different drive. The object now takes 14 shards of space instead of 10: **1.4 times its size**, where three copies would take 3 times.",
+      change: [
+        { id: "d1", at: "fleet", tone: "default" }, { id: "d2", at: "fleet", tone: "default" },
+        { id: "d3", at: "fleet", tone: "default" }, { id: "d4", at: "fleet", tone: "default" },
+        { id: "d5", at: "fleet", tone: "default" }, { id: "d6", at: "fleet", tone: "default" },
+        { id: "d7", at: "fleet", tone: "default" }, { id: "d8", at: "fleet", tone: "default" },
+        { id: "d9", at: "fleet", tone: "default" }, { id: "d10", at: "fleet", tone: "default" },
+        { id: "p1", at: "fleet", tone: "default" }, { id: "p2", at: "fleet", tone: "default" },
+        { id: "p3", at: "fleet", tone: "default" }, { id: "p4", at: "fleet", tone: "default" },
+      ],
+      focus: ["fleet"], arrow: { from: "front", to: "fleet", label: "14 shards" } },
+    { caption: "Four drives die at once, the ones holding d2, d5, d9 and p2. Ten shards survive, which is exactly enough: **any 10 of the 14 can rebuild the object**.",
+      change: [
+        { id: "d2", tone: "bad", sub: "lost" }, { id: "d5", tone: "bad", sub: "lost" },
+        { id: "d9", tone: "bad", sub: "lost" }, { id: "p2", tone: "bad", sub: "lost" },
+      ],
+      focus: ["fleet"] },
+    { caption: "A reader asking for `app.log` makes the front end read ten survivors, and the object comes back. Notice the price: to get at data after a loss we read ten shards from ten different drives.",
+      add: [{ id: "obj", at: "front", label: "app.log", sub: "rebuilt", tone: "ok" }],
+      focus: ["front"], arrow: { from: "fleet", to: "front", label: "read 10 survivors" } },
+    { caption: "Repair rebuilds the four lost shards onto healthy drives. Until it finishes, the object has less margin against further failures, which is why repair speed matters in section 2.5.",
+      change: [
+        { id: "d2", tone: "ok", sub: "new drive" }, { id: "d5", tone: "ok", sub: "new drive" },
+        { id: "d9", tone: "ok", sub: "new drive" }, { id: "p2", tone: "ok", sub: "new drive" },
+      ],
+      focus: ["fleet"], arrow: { from: "front", to: "fleet", label: "write 4 new shards" } },
+  ]}
+/>
+
+The table puts this scheme next to the others. LRC is Azure's Local Reconstruction Code, which section 2.4 explains, and "Rebuild one lost shard by reading" is the repair cost we'll come back to there.
+
+| Scheme | Survives | Space | Rebuild one lost shard by reading |
+|---|---|---|---|
+| **3 replicas** | Any 2 failures | 3.00× | 1 shard |
+| **RS(10,4)** (Facebook f4, [OSDI 2014](https://www.usenix.org/conference/osdi14/technical-sessions/presentation/muralidhar)) | Any 4 | 1.40× | 10 shards |
+| **RS(17,3)** (Backblaze Vaults, [blog](https://www.backblaze.com/blog/vault-cloud-storage-architecture/)) | Any 3 | 1.18× | 17 shards |
+| **LRC(12,2,2)** (Azure, [ATC 2012](https://www.usenix.org/conference/atc12/technical-sessions/presentation/huang)) | Any 3, and many 4-failure patterns | 1.33× | 6 shards |
+
+<Why>How can 14 shards survive any 4 losses?</Why>
+
+Think of the ten data shards as ten unknown numbers, and of each stored shard as one equation that says "this shard equals a particular weighted sum of the unknowns". Any ten independent equations are enough to pin down ten unknowns. The XOR trick from the start of this section is the simplest such sum, with every weight equal to 1. Reed-Solomon does the arithmetic in a finite field, a small set of numbers (here 0 to 255, so each one fits in a byte) in which you can add, multiply and divide and never leave the set, and it picks the weights so that any ten of the fourteen equations are independent. So from any ten shards you can solve for the original ten data shards. The script below checks that property directly with a small Reed-Solomon implementation over GF(2⁸), the finite field of 256 numbers. It builds the fourteen shards of a 1 MiB random object, loses four chosen at random, rebuilds the object from ten survivors, and then tries every one of the 1,001 ways of losing four shards out of fourteen. It needs only Python's standard library.
+
+<TryIt what="RS(10,4) over GF(2^8): encode 1 MiB, lose any four shards, rebuild" lang="python" toolchain="Python 3.14.6">
+```python
+import itertools, os, random, time
+
+# GF(2^8): addition is XOR; multiplication uses log/exp tables (polynomial 0x11d)
+EXP, LOG = [0] * 512, [0] * 256
+x = 1
+for i in range(255):
+    EXP[i], LOG[x] = x, i
+    x <<= 1
+    if x & 0x100:
+        x ^= 0x11D
+for i in range(255, 512):
+    EXP[i] = EXP[i - 255]
+
+def mul(a, b): return 0 if a == 0 or b == 0 else EXP[LOG[a] + LOG[b]]
+def inv(a): return EXP[255 - LOG[a]]
+MULT = [bytes(mul(c, v) for v in range(256)) for c in range(256)]   # MULT[c][v] = c * v
+
+def xor(a, b): return (int.from_bytes(a, "little") ^ int.from_bytes(b, "little")).to_bytes(len(a), "little")
+
+def apply(rows, shards):
+    """each output shard = a weighted sum (in GF(2^8)) of the input shards"""
+    out = []
+    for row in rows:
+        acc = bytes(len(shards[0]))
+        for c, s in zip(row, shards):
+            if c: acc = xor(acc, s.translate(MULT[c]))
+        out.append(acc)
+    return out
+
+def invert(M):
+    n = len(M)
+    A = [row[:] + [1 if i == j else 0 for j in range(n)] for i, row in enumerate(M)]
+    for col in range(n):
+        piv = next(r for r in range(col, n) if A[r][col])
+        A[col], A[piv] = A[piv], A[col]
+        p = inv(A[col][col])
+        A[col] = [mul(p, v) for v in A[col]]
+        for r in range(n):
+            if r != col and A[r][col]:
+                f = A[r][col]
+                A[r] = [v ^ mul(f, w) for v, w in zip(A[r], A[col])]
+    return [row[n:] for row in A]
+
+k, m = 10, 4
+obj = random.Random(7).randbytes(1 << 20)                 # a 1 MiB object
+size = -(-len(obj) // k)
+padded = obj.ljust(size * k, b"\0")
+data = [padded[i * size:(i + 1) * size] for i in range(k)]            # ten shards
+E = [[1 if i == j else 0 for j in range(k)] for i in range(k)]        # data rows
+E += [[inv((k + i) ^ j) for j in range(k)] for i in range(m)]         # Cauchy parity rows
+
+t = time.perf_counter()
+shards = data + apply(E[k:], data)                                    # 14 shards
+enc = time.perf_counter() - t
+print(f"RS({k},{m}): {k + m} shards of {size:,} B, stored {(k + m) * size / len(obj):.2f}x, encode {enc * 1000:.0f} ms")
+
+lost = sorted(random.Random(3).sample(range(k + m), m))               # four drives die
+alive = [i for i in range(k + m) if i not in lost][:k]
+t = time.perf_counter()
+rebuilt = apply(invert([E[i] for i in alive]), [shards[i] for i in alive])
+dec = time.perf_counter() - t
+ok = b"".join(rebuilt)[:len(obj)] == obj
+print(f"lost shards {lost}, read 10 survivors {alive}, decode {dec * 1000:.0f} ms, object intact: {ok}")
+
+bad = 0
+for lost in itertools.combinations(range(k + m), m):                  # every way to lose four
+    try: invert([E[i] for i in range(k + m) if i not in lost][:k])
+    except StopIteration: bad += 1
+print(f"{len(list(itertools.combinations(range(k + m), m)))} loss patterns of {m} shards checked, unrecoverable: {bad}")
+```
+<Output>
+```text
+RS(10,4): 14 shards of 104,858 B, stored 1.40x, encode 96 ms
+lost shards [2, 3, 8, 9], read 10 survivors [0, 1, 4, 5, 6, 7, 10, 11, 12, 13], decode 94 ms, object intact: True
+1001 loss patterns of 4 shards checked, unrecoverable: 0
+```
+</Output>
+</TryIt>
+
+The object takes 1.4 times its size in storage, and every possible combination of four lost shards could be rebuilt. The first ten shards are the data itself, which Warfield calls the "identity" shards, so a healthy read needs no decoding at all. The timings vary from run to run and come from pure Python; production coders use SIMD libraries (libraries that use the CPU's vector instructions) such as Intel's ISA-L and run far faster.
+
+This also explains the missing partial writes of section 1.3. Changing one byte in the middle of an erasure-coded object means changing the data shard that holds it and all four parity shards, on five different drives, in step with each other, and a crash halfway would leave shards from two versions that can't be combined. An object that's written once and never modified needs its parity computed only once.
+
+</Sub>
+
+<Sub n="2.4" title="The price is paid at repair time">
+
+Erasure coding makes storage cheap and repair expensive. Rebuilding one lost shard of RS(10,4) means reading ten others from ten drives, so one dead 26 TB drive turns into hundreds of terabytes of repair reads spread across the fleet. The more shards a repair has to read, the more likely it is to hit a drive that's busy or slow, and the whole repair waits for the slowest one.
+
+That's the argument behind Azure's choice of a code that survives fewer failures. Its paper says that with RS(12,4), reconstruction "would need to read from a set of 12 fragments", which "greatly increases the chance of hitting a hot storage node". Local Reconstruction Codes add a parity shard for each group of six data shards, so a single failure is rebuilt from the six shards of its own group, at 1.33× overhead.
+
+A second thing helps. In Warfield's words, "individual objects may be encoded across tens of drives, we intentionally put different objects onto different sets of drives." The shards lost with one dead drive therefore belong to many objects whose other shards are scattered across thousands of drives, which means the repair work is shared by all of them instead of hammering a few.
+
+<Predict
+  q="An object is stored as RS(10,4). One drive dies. How many shards must be read to rebuild the shard it held?"
+  options={[
+    "1: only the lost shard's copy, as with replication",
+    "4: the parity shards, which hold the redundancy",
+    "10: any ten of the surviving shards",
+    "14: every shard, to be sure the result is right",
+  ]}
+  answer={2}
+>
+Ten, taken from any of the thirteen survivors. Each stored shard is one equation, and it takes ten of them to solve for the ten unknowns. Replication needs to read one copy, which is why erasure coding trades 1.4× storage for a repair that reads ten times more data.
+</Predict>
+
+</Sub>
+
+<Sub n="2.5" title="Where eleven nines comes from">
+
+Durability depends on three things: how many failures a scheme tolerates, how fast it repairs, and whether failures are independent. A toy model makes the first two concrete. It assumes independent failures at Backblaze's 1.36% annual rate, and counts an object as lost if, after one shard fails, m more of its shards fail before the repair finishes. The script prints each scheme's yearly loss probability with a repair window of one day and of one week, and counts the nines.
+
+<TryIt what="A durability model: redundancy scheme × repair time" lang="python" toolchain="Python 3.14.6">
+```python
+from math import comb, log10
+
+AFR = 0.0136                                  # Backblaze 2025, all drives
+def annual_loss(n, m, T_hours):
+    p = AFR * T_hours / 8760                  # a given drive fails within one repair window
+    tail = sum(comb(n-1, j) * p**j * (1-p)**(n-1-j) for j in range(m, n))
+    return n * AFR * tail                     # first failures per year × P(m more in the window)
+
+for name, n, m in (("3 replicas", 3, 2), ("RS(10,4)", 14, 4), ("RS(17,3)", 20, 3)):   # n shards, survives m losses
+    for T in (24, 168):
+        loss = annual_loss(n, m, T)
+        print(f"{name:<11} overhead {(n / (n - m)):.2f}x  repair {T:>3} h  P(loss)/yr {loss:.1e}  {int(-log10(loss))} nines")
+```
+<Output>
+```text
+3 replicas  overhead 3.00x  repair  24 h  P(loss)/yr 5.7e-11  10 nines
+3 replicas  overhead 3.00x  repair 168 h  P(loss)/yr 2.8e-09  8 nines
+RS(10,4)    overhead 1.40x  repair  24 h  P(loss)/yr 2.6e-16  15 nines
+RS(10,4)    overhead 1.40x  repair 168 h  P(loss)/yr 6.3e-13  12 nines
+RS(17,3)    overhead 1.18x  repair  24 h  P(loss)/yr 1.4e-11  10 nines
+RS(17,3)    overhead 1.18x  repair 168 h  P(loss)/yr 4.7e-09  8 nines
+```
+</Output>
+</TryIt>
+
+Two things fall out. RS(10,4) beats triple replication on durability and uses less than half the space: at a one-day repair its loss probability is 2.6e-16 against 5.7e-11. And repair time matters as much as the code. Stretching repair from a day to a week makes loss about 50 times more likely for triple replication, about 340 times for RS(17,3) and about 2,400 times for RS(10,4), because a longer window gives more of the other shards time to fail too.
+
+<Why>Then why isn't the answer fifteen nines?</Why>
+
+Because the model's biggest assumption is wrong on purpose. Real failures are correlated: a bad batch of drives, a firmware bug, a rack losing power, a building flooding, an operator deleting the wrong thing. That's why S3 spreads shards across availability zones, and why Warfield's post spends as much time on durability reviews and threat models as on codes. It's best to treat "eleven nines" as a design target for hardware loss, and not as a promise about everything that can destroy data.
+
+<Callout label="Design implication">
+S3's durability protects you from S3's hardware, and does nothing about your own code. A buggy job that overwrites a million objects does so perfectly durably. Versioning, Object Lock (a setting that makes objects undeletable for a set period) and replication to another account are the defences against the failures that lose customer data.
 </Callout>
 
+So `app.log` is now fourteen shards on fourteen drives, safe against any four of them breaking. There's a catch we've been ignoring. Fourteen shards are no use unless S3 can find them again when you ask for `logs/2026/09/30/app.log`, and that's the next job.
+
 </Sub>
 
-<SectionHeading n="03" id="architecture">The pieces behind the API</SectionHeading>
+<SectionHeading n="03" id="put-and-get">One PUT and one GET, from start to finish</SectionHeading>
 
-Andy Warfield, an engineer on S3, describes it at the highest level as "a
-frontend fleet with a REST API, a namespace service, a storage fleet that's
-full of hard disks, and a fleet that does background operations"
-([Building and operating a pretty big storage system called S3](https://www.allthingsdistributed.com/2023/07/building-and-operating-a-pretty-big-storage-system.html),
-2023).
+<Sub n="3.1" title="The pieces">
 
-This chapter calls the namespace service the **keymap**: the index that maps
-bucket + key to where the bytes live. AWS's own papers call it the index or
-the metadata subsystem.
+Warfield describes S3 at the highest level as "a frontend fleet with a REST API, a namespace service, a storage fleet that's full of hard disks, and a fleet that does background operations". The **front end** is the set of servers that answer your HTTPS request. The **storage fleet** is the drives and the machines attached to them, which we've just seen holding shards. The background fleet does chores such as repair and cleanup. The namespace service is the one we've been missing. It's the index that maps a bucket and key to the shards that hold the bytes, and this chapter calls it the **keymap**. AWS's own papers call it the index or the metadata subsystem.
 
-<Sub n="3.1" title="One PUT, step by step">
+</Sub>
 
-<Steps
-  title="One PutObject, from the client to the disks"
-  lanes={[
-    { t: "Client", s: "SDK · HTTPS", icon: "◉" },
-    { t: "Front end", s: "auth · routing", icon: "⇅" },
-    { t: "Erasure coder", s: "k + m shards", icon: "▦" },
-    { t: "Storage nodes", s: "ShardStore · HDD", icon: "▤" },
-    { t: "Keymap", s: "key → shard IDs", icon: "⌗" },
+<Sub n="3.2" title="Following one PUT">
+
+With those pieces in hand, we can follow `app.log` on its way in. AWS doesn't publish the exact sequence, but its documented guarantees force the order you'll see here.
+
+<Scene
+  title="One PUT of app.log, from your app to the disks"
+  regions={[
+    { id: "client", label: "Your app", sub: "SDK · HTTPS", col: 0, row: 0 },
+    { id: "front", label: "Front end", sub: "auth · checksum · split", col: 1, row: 0 },
+    { id: "keymap", label: "Keymap", sub: "key → shards", col: 2, row: 0 },
+    { id: "nodes", label: "Storage nodes", sub: "drives in at least 3 zones", col: 0, row: 1, span: 3 },
   ]}
-  steps={[
-    [0, "The SDK computes a checksum (CRC64NVME by default) and sends `PUT /bucket/key` over HTTPS."],
-    [1, "A front-end server authenticates the request, checks IAM and bucket policy, and verifies the checksum as the bytes stream in."],
-    [2, "The object is split into **k data shards** and **m parity shards**, so any k of them can rebuild it."],
-    [3, "The shards go to different storage nodes and drives, spread across at least three availability zones. Each node's **ShardStore** writes its shard to disk."],
-    [4, "Once the shards are durable, the **keymap** records the new version: this key now points at these shard IDs. That record is what makes the object visible."],
-    [0, "The client gets `200 OK` with an ETag. From this moment, any `GET` or `LIST` anywhere in the region returns the new object."],
+  itemWidth={124}
+  frames={[
+    { caption: "Your app calls `PUT` for `logs/2026/09/30/app.log`. The SDK computes a checksum of the bytes (which algorithm depends on the SDK version) and sends it with them over HTTPS.",
+      items: [{ id: "obj", at: "client", label: "app.log", sub: "your bytes", tone: "new" }],
+      focus: ["client"], arrow: { from: "client", to: "front", label: "PUT" } },
+    { caption: "A front-end server checks who you are and whether the bucket's policy lets you write. This is **IAM**, AWS's permission system. It also recomputes the checksum as the bytes stream in, and a mismatch rejects the request.",
+      change: [{ id: "obj", at: "front" }], focus: ["front"] },
+    { caption: "The front end cuts the object into 10 data shards and computes 4 parity shards, as in section 2.3.",
+      remove: ["obj"], add: [{ id: "sh", at: "front", label: "14 shards", sub: "10 data + 4 parity", tone: "new" }],
+      focus: ["front"] },
+    { caption: "The shards go to 14 different drives, spread across at least three availability zones. Each node writes its shard to disk before it answers. The object isn't visible yet, because no key points at these shards.",
+      change: [{ id: "sh", at: "nodes", tone: "accent", sub: "being written" }],
+      focus: ["nodes"], arrow: { from: "front", to: "nodes", label: "write shards" } },
+    { caption: "Suppose the front end crashes right here. The shards are safe on disk but nothing points at them, so a `GET` still returns the old version of the key, and a background job can later reclaim the unreferenced shards.",
+      change: [{ id: "sh", tone: "ok", sub: "durable, not visible" }],
+      focus: ["nodes"] },
+    { caption: "Only now, with every shard safely stored, does the front end tell the keymap that this key points at these shards. That single record is what makes the object visible.",
+      add: [{ id: "km", at: "keymap", label: "app.log", sub: "→ these 14 shards", tone: "new" }],
+      focus: ["keymap"], arrow: { from: "front", to: "keymap", label: "record key → shards" } },
+    { caption: "The client gets `200 OK` with an ETag. From this moment any `GET` or `LIST` in the region sees the new object. Answering any earlier could send a reader to shards that aren't all stored yet.",
+      change: [{ id: "km", tone: "ok" }, { id: "sh", sub: "durable and visible" }],
+      focus: ["client"], arrow: { from: "front", to: "client", label: "200 OK + ETag" } },
   ]}
 />
 
 <Why>Why must the data be durable before the index changes?</Why>
 
-AWS doesn't publish the exact sequence, but its documented guarantees force this order. A `GET` racing a `PUT` returns "either the old data or the new data, but never partial or corrupt data", and a successful `PUT` means "your data is safely stored".
-
-Both only hold if the key switches to the new version in one step, after all of its bytes are safe.
-
-A crash before that step leaves unreferenced shards, which a background process can reclaim; that's the kind of job Warfield's "background operations" fleet exists for.
+Because of what AWS promises. A `GET` racing a `PUT` returns "either the old data or the new data, but never partial or corrupt data", and a successful `PUT` means "your data is safely stored". Both only hold if the key switches to the new version in one step, after all of its bytes are safe. If the keymap changed first, a reader could be sent to shards that don't exist yet. A crash before the switch leaves unreferenced shards, which a background process can reclaim, and that's the kind of job the background-operations fleet exists for.
 
 </Sub>
 
-<Sub n="3.2" title="ShardStore, the layer on each disk">
+<Sub n="3.3" title="The GET">
 
-Every storage node runs a key-value store whose keys are shard IDs and whose
-values are shards. S3 rewrote it from scratch in Rust as **ShardStore**, and
-published how they checked it
-([Bornholt et al., SOSP 2021](https://www.amazon.science/publications/using-lightweight-formal-methods-to-validate-a-key-value-storage-node-in-amazon-s3)):
+A `GET` runs the other way. The front end looks the key up in the keymap, learns which drives hold the shards, and reads them. Since the first ten shards are the object's own bytes, a healthy read has nothing to decode, and when a drive is dead or slow, any other ten shards will do, as the scene in section 2.3 showed.
 
-- It's a **log-structured merge tree** that holds shard *locations*, with the
-  shard data stored outside the tree to reduce write amplification, the
-  same idea as WiscKey.
-- Data lives in **extents**, "contiguous regions of physical storage on a disk;
-  a typical disk has tens of thousands of extents", written sequentially and
-  reclaimed by garbage collection.
-- The implementation was "over 40,000 lines of Rust code", checked against
-  executable reference models, and the paper reports the approach "prevented 16
-  issues from reaching production, including subtle crash consistency and
-  concurrency problems".
+</Sub>
+
+<Sub n="3.4" title="One drive's view: ShardStore">
+
+Now zoom in on a single drive. Every storage node runs a key-value store whose keys are shard IDs and whose values are shards. S3 rewrote it from scratch in Rust, calls it **ShardStore**, and published how they checked it ([Bornholt et al., SOSP 2021](https://www.amazon.science/publications/using-lightweight-formal-methods-to-validate-a-key-value-storage-node-in-amazon-s3)). Three things stand out:
+
+- It's a **log-structured merge tree**, a structure that collects changes in memory and writes them out in large sorted batches. Here it holds shard *locations*, with the shard data stored outside the tree to reduce **write amplification**, the extra bytes a drive has to write beyond the bytes you meant to store. This is the same idea as WiscKey, a research key-value store.
+- Data lives in **extents**, "contiguous regions of physical storage on a disk; a typical disk has tens of thousands of extents", written sequentially and reclaimed by garbage collection, which frees the space held by shards nothing refers to any more.
+- The implementation was "over 40,000 lines of Rust code", checked against executable reference models, and the paper reports the approach "prevented 16 issues from reaching production, including subtle crash consistency and concurrency problems".
 
 <Why>Why append-only extents on a hard drive?</Why>
 
-Because random I/O is the scarce resource. Warfield puts a number on it: doing
-random reads and writes "as fast as you possibly can, you can expect about 120
-operations per second", roughly the same as in 2006, while capacity has grown
-many times over. Sequential writes into extents turn many small writes into
-few large ones.
+Because random I/O is the scarce resource. A hard drive reads and writes at a scattered location by physically moving its arm there and waiting for the platter to turn, and Warfield puts a number on what that allows: doing random reads and writes "as fast as you possibly can, you can expect about 120 operations per second", roughly the same as in 2006, while capacity has grown many times over. Sequential writes into an extent avoid the moving arm and turn many small writes into few large ones.
 
 </Sub>
 
-<Sub n="3.3" title="Heat: the problem hiding under capacity">
+<Sub n="3.5" title="Heat: the problem hiding under capacity">
 
-That 120-operations number drives the whole design. Drives keep getting bigger
-and no faster, so the I/O available per stored byte keeps falling. Warfield's
-projection: with 200 TB drives, "we will be allowed to do 1 I/O per second per
-2TB of data on disk."
+That 120-operations number drives the whole design. Drives keep getting bigger and no faster, so the I/O available per stored byte keeps falling. Warfield's projection is that with 200 TB drives, "we will be allowed to do 1 I/O per second per 2TB of data on disk."
 
-S3 calls the resulting problem **heat**: how many requests land on one disk at
-once. Its answer is to spread widely. "Individual objects may be encoded
-across tens of drives," and different objects go to different sets of drives,
-so any one customer's burst is served by a huge number of disks. His
-example is one bucket whose burst "can be served by over a million individual
-disks".
+S3 calls the resulting problem **heat**: how many requests land on one disk at once. Its answer is to spread widely. "Individual objects may be encoded across tens of drives," and different objects go to different sets of drives, so any one customer's burst is served by a huge number of disks. His example is a single bucket whose burst "can be served by over a million individual disks".
 
 <Callout label="Design implication">
-S3 is built for throughput across many objects, not latency on one. The
-[performance guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html)
-quotes "roughly 100–200 milliseconds" for small objects. If you need a few
-milliseconds, put a cache in front, or use S3 Express One Zone, which is
-designed for "single-digit millisecond" access in one zone.
+S3 is built for throughput across many objects, and offers little for latency on one. The [performance guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html) quotes "roughly 100–200 milliseconds" for small objects. If you need a few milliseconds, put a cache in front, or use S3 Express One Zone, which is designed for "single-digit millisecond" access in one zone.
 </Callout>
+
+Every `PUT` and every `GET` passed through the keymap, so it's worth a closer look. It holds an entry for every object in the region, hundreds of trillions of them, and each request consults it.
 
 </Sub>
 
-<SectionHeading n="04" id="keymap">The keymap</SectionHeading>
-
-This index holds an entry for every object in the region, hundreds of
-trillions of them, and it's consulted on every request. No single machine can
-hold it, so it's split into partitions.
+<SectionHeading n="04" id="keymap">The keymap at scale</SectionHeading>
 
 <Sub n="4.1" title="A sorted index, split by key range">
 
-S3 lists keys in lexicographic (UTF-8 binary) order, and `LIST` takes a
-`prefix` and a `start-after` key. That's the interface of a sorted index split
-by key range, and it's what AWS's guidance implies: request limits apply "per
-partitioned Amazon S3 prefix".
+No single machine can hold hundreds of trillions of entries, so the keymap is split into **partitions**, slices of the index that each live on their own machines. The next question is how to decide which key goes in which slice. S3 lists keys in lexicographic order, meaning dictionary order on the key's UTF-8 bytes, and `LIST` takes a `prefix` and a `start-after` key. That's the interface of a sorted index split by key range, and it's what AWS's guidance implies: request limits apply "per partitioned Amazon S3 prefix".
 
 <Why>Why sorted, and not hashed?</Why>
 
-Because `LIST` is a range query. With a hashed index, listing `logs/2026/09/`
-would mean asking every partition. With a sorted one it's a scan of one or a
-few adjacent partitions, starting at the prefix. The cost is that
-lexicographically adjacent keys land together, which makes hot spots possible.
+Because `LIST` is a range query. With a hashed index, listing `logs/2026/09/` would mean asking every partition. With a sorted one it's a scan of one or a few adjacent partitions, starting at the prefix. The cost is that lexicographically adjacent keys land together, which makes hot spots possible.
 
 </Sub>
 
 <Sub n="4.2" title="Request limits per prefix">
 
-AWS documents the numbers: "at least 3,500 PUT/COPY/POST/DELETE or 5,500
-GET/HEAD requests per second per partitioned Amazon S3 prefix. There are no
-limits to the number of prefixes in a bucket."
+If neighbouring keys share a partition, one busy prefix can overload it, so there have to be limits. AWS documents the numbers: "at least 3,500 PUT/COPY/POST/DELETE or 5,500 GET/HEAD requests per second per partitioned Amazon S3 prefix. There are no limits to the number of prefixes in a bucket."
 
-Partitions split as load grows, and "the scaling ... happens gradually and is
-not instantaneous". While it's happening, you "may see some 503 (Slow Down)
-errors".
+Partitions split as load grows, and "the scaling ... happens gradually and is not instantaneous". While it's happening, you "may see some 503 (Slow Down) errors".
 
 <Predict
   q="A new service writes 20,000 small objects a second, every key starting with uploads/2026-09-27/. Nothing was written under that prefix before. What happens in the first few minutes?"
@@ -265,29 +466,16 @@ errors".
   ]}
   answer={1}
 >
-The whole burst lands on one key range, and one partition starts at about
-3,500 writes a second. S3 splits the partition as it sees the load, but not
-instantly, so for a while some requests get `503 Slow Down`. SDKs retry these
-with backoff. The fix is to spread writes over several prefixes from the start,
-for example `uploads/<shard 00-15>/2026-09-27/...`.
+The whole burst lands on one key range, and one partition starts at about 3,500 writes a second. S3 splits the partition as it sees the load, but not instantly, so for a while some requests get `503 Slow Down`. SDKs retry these with backoff, which means waiting longer after each failure. The fix is to spread writes over several prefixes from the start, for example `uploads/<shard 00-15>/2026-09-27/...`.
 </Predict>
 
-<Why>Didn't AWS say to stop randomising prefixes?</Why>
-
-In [July 2018](https://aws.amazon.com/about-aws/whats-new/2018/07/amazon-s3-announces-increased-request-rate-performance/)
-it raised the limits to today's numbers and said this "removes any previous
-guidance to randomize object prefixes". That's about steady state: you don't
-need random hashes in key names for S3 to scale. It doesn't remove the per-prefix
-limit, or the ramp-up while a partition splits. A predictable spread over a
-few prefixes is still how you get more than 3,500 writes a second on day one.
+You may remember advice to randomise key prefixes. In [July 2018](https://aws.amazon.com/about-aws/whats-new/2018/07/amazon-s3-announces-increased-request-rate-performance/) AWS raised the limits to today's numbers and said this "removes any previous guidance to randomize object prefixes". That applies to steady state: you don't need random hashes in key names for S3 to scale. It doesn't remove the per-prefix limit, or the ramp-up while a partition splits, so a predictable spread over a few prefixes is still how you get more than 3,500 writes a second on day one.
 
 </Sub>
 
 <Sub n="4.3" title="What LIST costs">
 
-`ListObjectsV2` returns at most 1,000 keys per call. Listing a prefix of 100
-million objects is 100,000 sequential round trips, and each is billed as a
-request.
+`ListObjectsV2` returns at most 1,000 keys per call. Listing a prefix of 100 million objects takes 100,000 sequential round trips, and each one is billed as a request. When the question is "which objects arrived yesterday?", `LIST` is rarely the best tool:
 
 | Approach | Cost to find "all objects from yesterday" | When to use |
 |---|---|---|
@@ -296,211 +484,75 @@ request.
 | **S3 Metadata** tables | Query object metadata with SQL | Discovery over very large buckets |
 | **Event notifications** | Record keys as they're written | Pipelines that need every new object |
 
-<Callout label="Common mistake" kind="warn">
-Using `LIST` as a database query, such as a job that lists a whole bucket every
-five minutes to find new files. It's slow, it's billed per page, and it gets
-worse every day as the bucket grows. Record what you write, in an event queue
-or a table, and list only to reconcile.
-</Callout>
+A job that lists a whole bucket every five minutes to find new files gets slower and costlier every day as the bucket grows. Record what you write, in an event queue or a table, and list only to reconcile.
+
+All of this has assumed one client at a time. The next question comes up as soon as two clients exist: a `PUT` has just returned, and a different machine asks for the key a moment later. Which version does it get?
 
 </Sub>
 
-<SectionHeading n="05" id="erasure-coding">Erasure coding and durability</SectionHeading>
+<SectionHeading n="05" id="consistency">What a reader sees right after a write</SectionHeading>
 
-S3 Standard is "designed for" 99.999999999% durability, eleven nines, across
-at least three availability zones
-([storage classes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html)).
-Hard drives fail at around 1.36% a year, according to Backblaze's
-[2025 drive stats](https://www.backblaze.com/blog/backblaze-drive-stats-for-2025/).
-The gap between those two numbers is closed by redundancy and repair.
+For its first fourteen years, S3 gave a careful answer to that question. Since [1 December 2020](https://aws.amazon.com/about-aws/whats-new/2020/12/amazon-s3-now-delivers-strong-read-after-write-consistency-automatically-for-all-applications) the answer has been simple: it's the new version, at no extra cost and with no change to the API. A store that behaves this way is **strongly consistent**, which means every read that starts after a successful write sees that write.
 
-<Sub n="5.1" title="Replication or erasure coding">
+<Sub n="5.1" title="The eventual years">
 
-Simplest is **replication**: three full copies on three drives.
-It survives two failures and costs 3× the space. At S3's scale, that's
-an enormous amount of disk.
+Under the old model S3 was **eventually consistent** for overwrites, deletes and listings, meaning readers might briefly see old data but would all agree after a short while. A new object was usually readable straight after `PUT`, but an overwrite could briefly return the old data, a delete could briefly still return the object, and a `LIST` could miss a key you'd just written.
 
-**Erasure coding** does better. Warfield describes S3's approach: "we use an
-algorithm, such as Reed-Solomon, and split our object into a set of k
-'identity' shards. Then we generate an additional set of m parity shards. As
-long as k of the (k+m) total shards remain available, we can read the object."
-
-| Scheme | Survives | Space | Rebuild one lost shard by reading |
-|---|---|---|---|
-| **3 replicas** | Any 2 failures | 3.00× | 1 shard |
-| **RS(10,4)** (Facebook f4, [OSDI 2014](https://www.usenix.org/conference/osdi14/technical-sessions/presentation/muralidhar)) | Any 4 | 1.40× | 10 shards |
-| **RS(17,3)** (Backblaze Vaults, [blog](https://www.backblaze.com/blog/vault-cloud-storage-architecture/)) | Any 3 | 1.18× | 17 shards |
-| **LRC(12,2,2)** (Azure, [ATC 2012](https://www.usenix.org/conference/atc12/technical-sessions/presentation/huang)) | Any 3, and many 4-failure patterns | 1.33× | 6 shards |
-
-<Why>How can 14 shards survive any 4 losses?</Why>
-
-Each parity shard is a different weighted sum of all the data shards, in a
-finite field where every non-zero value has an inverse. With the right choice of
-weights, any k of the k+m rows form an invertible matrix. So from any k shards
-you can solve for the original k data shards. Here's that property checked
-directly, in a small Reed-Solomon implementation over GF(2⁸):
-
-<TryIt what="RS(10,4) over GF(2^8): encode 1 MiB, lose any four shards, rebuild" lang="python" toolchain="Python 3.14.6, Apple M4">
-```python
-k, m = 10, 4
-obj = os.urandom(1 << 20)                        # a 1 MiB object
-data = split_into(obj, k)                        # ten 104,858-byte shards
-E = [[1 if i == j else 0 for j in range(k)] for i in range(k)]   # data rows
-E += [[inv((k + i) ^ j) for j in range(k)] for i in range(m)]    # Cauchy parity rows
-shards = data + apply(E[k:], data)               # 14 shards
-
-lost = random.sample(range(k + m), m)            # four drives die
-alive = [i for i in range(k + m) if i not in lost][:k]
-rebuilt = apply(invert([E[i] for i in alive]), [shards[i] for i in alive])
-assert join(rebuilt) == obj
-
-# every one of the C(14,4) = 1001 ways to lose four shards is recoverable
-for lost in itertools.combinations(range(k + m), m): invert(rows_not_in(lost))
-```
-
-<Output>
-```text
-RS(10,4): 14 shards of 104,858 B, stored 1.40x, encode 154 ms
-lost shards [1, 2, 4, 9], read 10 survivors [0, 3, 5, 6, 7, 8, 10, 11, 12, 13], decode 172 ms, object intact: True
-1001 loss patterns of 4 shards checked, unrecoverable: 0
-```
-
-1.4× the storage, and every possible combination of four lost shards could be
-rebuilt. The first ten shards are the data itself (the "identity" shards in
-Warfield's description), so a healthy read needs no decoding at all. Those timings are pure Python; production coders use SIMD libraries such as Intel's
-ISA-L and run far faster.
-</Output>
-</TryIt>
-
-</Sub>
-
-<Sub n="5.2" title="The price is paid at repair time">
-
-Erasure coding makes storage cheap and repair expensive. Rebuilding one lost
-shard of RS(10,4) means reading ten others from ten drives, so one dead 26 TB
-drive becomes hundreds of terabytes of repair reads spread across the fleet.
-
-<Why>Why does Azure use a code that survives fewer failures?</Why>
-
-Because repair reads, and the slowest drive among them, dominate. Azure's
-paper says that with RS(12,4), reconstruction "would need to read from a set of
-12 fragments", which "greatly increases the chance of hitting a hot storage
-node". Local Reconstruction Codes add a parity per group of six data shards,
-so a single failure is rebuilt from its local group, at 1.33× overhead.
-
-This is also where Warfield's heat and durability meet. Spreading an object's
-shards over tens of drives, and objects over millions, means a failed drive's
-repair work is shared by thousands of others instead of hammering a few.
-
-</Sub>
-
-<Sub n="5.3" title="Where eleven nines comes from">
-
-Durability depends on three things: how many failures a scheme tolerates, how
-fast you repair, and whether failures are independent. A toy model makes the
-first two concrete. It assumes independent failures at Backblaze's 1.36% AFR,
-and counts an object lost if, after one shard fails, m more of its shards fail
-before repair finishes:
-
-<TryIt what="A durability model: redundancy scheme × repair time" lang="python" toolchain="Python 3.14.6, Apple M4">
-```python
-AFR = 0.0136                                  # Backblaze 2025, all drives
-def annual_loss(n, m, T_hours):
-    p = AFR * T_hours / 8760                  # a given drive fails within one repair window
-    tail = sum(comb(n-1, j) * p**j * (1-p)**(n-1-j) for j in range(m, n))
-    return n * AFR * tail                     # first failures per year × P(m more in the window)
-```
-
-<Output>
-```text
-3 replicas  overhead 3.00x  repair  24 h  P(loss)/yr 5.7e-11  ~10 nines
-3 replicas  overhead 3.00x  repair 168 h  P(loss)/yr 2.8e-09  ~9 nines
-RS(10,4)    overhead 1.40x  repair  24 h  P(loss)/yr 2.6e-16  ~16 nines
-RS(10,4)    overhead 1.40x  repair 168 h  P(loss)/yr 6.3e-13  ~12 nines
-RS(17,3)    overhead 1.18x  repair  24 h  P(loss)/yr 1.4e-11  ~11 nines
-RS(17,3)    overhead 1.18x  repair 168 h  P(loss)/yr 4.7e-09  ~8 nines
-```
-</Output>
-</TryIt>
-
-Two things fall out. RS(10,4) beats triple replication on durability *and*
-uses less than half the space. And a week of repair costs every scheme three
-to four nines: repair speed matters about as much as the code.
-
-<Why>Then why isn't the answer sixteen nines?</Why>
-
-Because the model's biggest assumption is wrong on purpose. Real failures are
-correlated: a bad batch of drives, a firmware bug, a rack losing power, a
-building flooding, an operator deleting the wrong thing. That's why S3 spreads
-shards across availability zones, and why Warfield's post spends as much
-time on durability reviews and threat models as on codes. It's probably best to treat "eleven nines" as a design target about hardware loss, not a promise about everything that can
-destroy data.
-
-<Callout label="Design implication">
-S3's durability protects you from S3's hardware, not from your own code. A
-buggy job that overwrites a million objects is perfectly durable. Versioning,
-Object Lock and replication to another account are the defences against the
-failures that lose customer data.
-</Callout>
-
-</Sub>
-
-<SectionHeading n="06" id="consistency">Strong consistency</SectionHeading>
-
-For its first fourteen years, S3 was eventually consistent for overwrites,
-deletes and listings. Since
-[1 December 2020](https://aws.amazon.com/about-aws/whats-new/2020/12/amazon-s3-now-delivers-strong-read-after-write-consistency-automatically-for-all-applications)
-it's been strongly consistent, at no extra cost and with no change to the API.
-
-<Sub n="6.1" title="The eventual years">
-
-Under the old model, a new object was usually readable straight after `PUT`,
-but an overwrite could briefly return the old data, a delete could briefly
-still return the object, and a `LIST` could miss a key you'd just written.
-
-For analytics that was a real problem. A Spark job writes 1,000 output files, the
-next stage lists the directory and sees 997, and computes a wrong answer with
-no error. Its workarounds were whole systems: Hadoop's
-[S3Guard](https://hadoop.apache.org/docs/r3.3.6/hadoop-aws/tools/hadoop-aws/s3guard.html)
-and EMRFS's consistent view both kept a second copy of the listing in
-DynamoDB.
+For analytics that was a real problem. A Spark job (Spark is a data-processing engine) writes 1,000 output files, the next stage lists the directory and sees 997, and computes a wrong answer with no error. The workarounds were whole systems: Hadoop's [S3Guard](https://hadoop.apache.org/docs/r3.3.6/hadoop-aws/tools/hadoop-aws/s3guard.html) and EMRFS's consistent view, two add-ons for analytics clusters, both kept a second copy of the listing in DynamoDB, AWS's key-value database.
 
 <Why>Where did the inconsistency come from?</Why>
 
-From a cache. Werner Vogels's
-[Diving Deep on S3 Consistency](https://www.allthingsdistributed.com/2021/04/s3-strong-consistency.html)
-explains that the metadata subsystem sat behind a highly available caching
-layer, and "on rare occasions, writes might flow through one part of cache
-infrastructure while reads end up querying another."
+From a cache, which is a fast copy of data kept near the readers so that most lookups don't have to go to the slower original. Werner Vogels's [Diving Deep on S3 Consistency](https://www.allthingsdistributed.com/2021/04/s3-strong-consistency.html) explains that the keymap sat behind a highly available caching layer, and "on rare occasions, writes might flow through one part of cache infrastructure while reads end up querying another." A reader could hit a cache node that still held the old version.
 
 </Sub>
 
-<Sub n="6.2" title="How the fix works">
+<Sub n="5.2" title="The witness">
 
-Removing the cache would have cost performance. Instead, S3 made the cache
-able to tell when it's stale.
+Removing the cache would have cost performance. Instead, S3 made the cache able to tell when it's stale. The scene follows an overwrite of `app.log` and a read that lands on a cache node holding the old version.
 
-<StepSequence
+<Scene
   title="A read after an overwrite, with the witness"
-  actors={["Writer", "Keymap cache", "Witness", "Keymap storage"]}
-  messages={[
-    { from: 0, to: 3, label: "PUT k (v2)", note: "An overwrite commits version 2 of the key in the persistent keymap. Per-object ordering gives every change to `k` a place in a sequence." },
-    { from: 3, to: 2, label: "k changed", note: "The **witness** is notified of every change to every object. It holds very little: enough to know the latest position for each key." },
-    { from: 1, to: 1, label: "still holds v1", note: "A cache node elsewhere still has version 1 of `k`. Under the old design, it would have served it." },
-    { from: 1, to: 2, label: "is my v1 current?", note: "On a read, the cache consults the witness first. Vogels calls this a **read barrier**." },
-    { from: 2, to: 1, label: "no, stale", note: "The witness knows `k` has moved on, so the cache invalidates its entry." },
-    { from: 1, to: 3, label: "reload k", note: "The cache reloads from persistent storage and returns **version 2**. The reader never sees v1 after the PUT was acknowledged." },
+  regions={[
+    { id: "clients", label: "Writers and readers", col: 0, row: 0 },
+    { id: "cache", label: "Keymap cache node", sub: "fast, may hold old copies", col: 1, row: 0 },
+    { id: "witness", label: "Witness", sub: "knows the latest version", col: 2, row: 0 },
+    { id: "store", label: "Keymap storage", sub: "the source of truth", col: 0, row: 1, span: 3 },
+  ]}
+  itemWidth={112}
+  frames={[
+    { caption: "Before the overwrite: keymap storage and one cache node both hold version 1 of `app.log`. The cache exists so that most lookups don't have to ask storage.",
+      items: [
+        { id: "st", at: "store", label: "app.log", sub: "version 1" },
+        { id: "cc", at: "cache", label: "app.log", sub: "version 1", tone: "ok" },
+      ],
+      focus: ["store", "cache"] },
+    { caption: "A writer replaces `app.log`. Version 2 is committed in keymap storage. The cache node, elsewhere, still holds version 1, and the old design would have served it.",
+      change: [{ id: "st", sub: "version 2", tone: "new" }, { id: "cc", tone: "bad", sub: "v1, now stale" }],
+      focus: ["store"], arrow: { from: "clients", to: "store", label: "PUT v2" } },
+    { caption: "In the same step the **witness** is told that `app.log` changed. It holds very little: just enough to know the latest version of every key.",
+      add: [{ id: "wi", at: "witness", label: "app.log", sub: "latest: v2", tone: "new" }],
+      focus: ["witness"], arrow: { from: "store", to: "witness", label: "app.log changed" } },
+    { caption: "A reader asks the cache node for `app.log`. Before answering from its entry, the cache asks the witness whether version 1 is still current. This check is the **read barrier**.",
+      focus: ["cache", "witness"], arrow: { from: "cache", to: "witness", label: "is v1 current?" } },
+    { caption: "The witness says no. The cache drops its stale entry.",
+      change: [{ id: "cc", tone: "dim", sub: "dropped" }],
+      focus: ["cache"], arrow: { from: "witness", to: "cache", label: "no, v2 exists" } },
+    { caption: "The cache reloads the key from keymap storage and now holds version 2.",
+      change: [{ id: "cc", tone: "ok", sub: "version 2" }],
+      focus: ["cache"], arrow: { from: "store", to: "cache", label: "reload" } },
+    { caption: "The reader gets **version 2**. Any read that starts after the `PUT` was acknowledged sees it, whichever cache node it reaches.",
+      change: [{ id: "st", tone: "ok" }, { id: "wi", tone: "ok" }],
+      focus: ["clients"], arrow: { from: "cache", to: "clients", label: "v2" } },
   ]}
 />
 
-Vogels also describes how they checked it: integration testing, "deductive
-proofs of our proposed cache coherence algorithm", and model checking,
-including on "actual runnable code". Verifying it, he writes, was "more
-work, in fact, than the actual implementation itself."
+Vogels also describes giving every change to an object a place in a per-object sequence, so the witness can know the latest position for each key. And he describes how they checked the design: integration testing, "deductive proofs of our proposed cache coherence algorithm", and model checking, including on "actual runnable code". Checking it, he writes, was "more work, in fact, than the actual implementation itself."
 
 </Sub>
 
-<Sub n="6.3" title="What's guaranteed, and what isn't">
+<Sub n="5.3" title="What the guarantee covers">
+
+Strong consistency settles what a read returns. The table shows what it covers and what it leaves open. All quotes are from the [consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel) docs.
 
 | Guaranteed | Not guaranteed |
 |---|---|
@@ -508,27 +560,26 @@ work, in fact, than the actual implementation itself."
 | A `GET` racing a `PUT` returns old or new data, "never partial or corrupt data" | Any atomic update across two keys |
 | Tags, ACLs and object metadata reads are strongly consistent | Bucket configuration: a deleted bucket may still be listed, and after enabling versioning AWS recommends waiting 15 minutes before writing |
 
-All quotes are from the
-[consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel)
-docs.
+The first row of the right-hand column is the one that catches people. Try reasoning it out.
 
-<Callout label="Common mistake" kind="warn">
-Reading "strongly consistent" as "safe for concurrent writers". Two services
-doing read-modify-write on the same `state.json` will lose updates: both read
-v1, both write their v2, last writer wins. Strong consistency tells you what a
-read returns; it doesn't serialise writers. For that, you need conditional
-writes.
-</Callout>
+<Predict
+  q="Two services each read state.json (version 1), change it, and PUT it back a moment apart. S3 is strongly consistent. What does the object contain afterwards?"
+  options={[
+    "Both changes: S3 merges the two writes",
+    "Only the later service's version: its write replaced the whole object, and the earlier change is lost",
+    "The earlier service's version, because it arrived first and the second write is rejected",
+    "An error state: S3 marks the object as conflicted",
+  ]}
+  answer={1}
+>
+Both services read version 1 and each wrote a complete replacement, so the later write replaced the earlier one. Strong consistency tells you what a read returns after a write, and it doesn't make writers take turns. Two services doing read-modify-write on the same `state.json` lose updates this way. To serialise them you need conditional writes.
+</Predict>
 
 </Sub>
 
-<Sub n="6.4" title="Conditional writes">
+<Sub n="5.4" title="Conditional writes">
 
-In 2024 S3 added the two headers that turn it into something you can
-coordinate on. `If-None-Match: *` (August 2024) writes only if the key doesn't
-exist. `If-Match: <etag>` (November 2024) writes only if the object is still
-the version you read
-([conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)).
+In 2024 S3 added two request headers that make it something you can coordinate on. `If-None-Match: *` (August 2024) writes only if the key doesn't exist yet. `If-Match: <etag>` (November 2024) writes only if the object is still the version you read ([conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)). The idea is called compare-and-swap: change the value only if it still equals what you last saw. Here are two writers racing on `state.json`:
 
 <StepSequence
   title="Two writers, one compare-and-swap"
@@ -543,70 +594,82 @@ the version you read
   ]}
 />
 
-AWS's docs spell out the edge cases. If several conditional writes race, "the
-first write operation to finish succeeds" and the rest get `412`. A concurrent
-delete can produce `409 Conflict`. And conditional writes "do not consider any
-in-progress multipart uploads", so a multipart upload that started first can
-still fail at `CompleteMultipartUpload`.
+AWS's docs spell out the edge cases. If several conditional writes race, "the first write operation to finish succeeds" and the rest get `412`. A concurrent delete can produce `409 Conflict`. And conditional writes "do not consider any in-progress multipart uploads", so a multipart upload that started first can still fail at `CompleteMultipartUpload`, a call we'll meet in the next section.
 
-<Why>What does this let you build?</Why>
+What does this let you build? A write-once commit log. Delta Lake, a table format for analytics, keeps a transaction log as numbered files, and its log, for example, needs exactly one writer to create `_delta_log/00000000000000000042.json`. On S3 that used to take a separate DynamoDB-backed log store to arbitrate. With `If-None-Match: *` on that key, S3 itself picks the winner.
 
-A write-once commit log. Delta Lake's transaction log, for example, needs exactly one writer to create `_delta_log/00000000000000000042.json`. On S3 that used to take a separate DynamoDB-backed log store to arbitrate. With `If-None-Match: *` on that key, S3 itself picks the winner.
+So far `app.log` has been a few bytes. Real log archives grow to gigabytes, and sending one of those in a single request is where the next problem starts.
 
 </Sub>
 
-<SectionHeading n="07" id="multipart">Multipart uploads</SectionHeading>
+<SectionHeading n="06" id="multipart">Big objects: multipart uploads</SectionHeading>
 
-A single `PUT` can carry up to 5 GB. Beyond that, and well before it in
-practice, you upload an object in **parts**.
+<Sub n="6.1" title="Uploading in parts">
 
-<Sub n="7.1" title="The protocol">
+Suppose `app.log` has grown to 20 MiB. A single `PUT` can carry up to 5 GB, and well before that limit it becomes awkward. A connection that drops at 90% forces us to start again from byte zero, and one connection moves bytes only as fast as one connection can. So S3 lets us upload an object in **parts**, which can travel in parallel, be retried one at a time, and be stitched together at the end. Here's `app.log` going up as four parts of 5 MiB:
 
-<StepSequence
-  title="A three-part multipart upload"
-  actors={["Client", "S3"]}
-  messages={[
-    { from: 0, to: 1, label: "CreateMultipartUpload", note: "Start an upload for a key. S3 returns an **UploadId**. No object exists yet; readers still see the old version, or nothing." },
-    { from: 1, to: 0, label: "UploadId", note: "Every later call names this upload." },
-    { from: 0, to: 1, label: "UploadPart 1, 2, 3", note: "Upload parts **in parallel**, over separate connections, in any order. Each part is stored durably and returns its own ETag." },
-    { from: 0, to: 1, label: "UploadPart 2 (retry)", note: "A part that fails is retried alone. Nothing else is re-sent." },
-    { from: 0, to: 1, label: "CompleteMultipartUpload", note: "Send the ordered list of part numbers and ETags. S3 stitches them into one object by writing the keymap entry. **This is the atomic commit.**" },
-    { from: 1, to: 0, label: "200 OK, ETag \"…-3\"", note: "The object appears all at once. Until now it was invisible; until you complete or abort, the parts are billed as storage." },
+<Scene
+  title="A four-part multipart upload of app.log"
+  regions={[
+    { id: "client", label: "Your app", sub: "app.log, 20 MiB", col: 0, row: 0 },
+    { id: "stage", label: "S3 storage", sub: "parts stored, invisible to readers", col: 1, row: 0, span: 2 },
+    { id: "keymap", label: "Keymap", sub: "what readers can see", col: 0, row: 1, span: 3 },
+  ]}
+  itemWidth={100}
+  frames={[
+    { caption: "`app.log` is 20 MiB, so we'll send it as four parts of 5 MiB. Readers asking for the key still get the earlier version.",
+      items: [
+        { id: "p1", at: "client", label: "part 1", sub: "5 MiB" }, { id: "p2", at: "client", label: "part 2", sub: "5 MiB" },
+        { id: "p3", at: "client", label: "part 3", sub: "5 MiB" }, { id: "p4", at: "client", label: "part 4", sub: "5 MiB" },
+        { id: "old", at: "keymap", label: "app.log", sub: "earlier version" },
+      ],
+      focus: ["client"] },
+    { caption: "`CreateMultipartUpload` starts an upload for the key. S3 returns an **UploadId**, and every later call names it. No new object exists yet.",
+      add: [{ id: "up", at: "stage", label: "UploadId", sub: "upload started", tone: "new" }],
+      focus: ["stage"], arrow: { from: "client", to: "stage", label: "CreateMultipartUpload" } },
+    { caption: "`UploadPart` sends the parts in parallel over separate connections, in any order. Each part that arrives is stored durably and returns its own ETag. Part 3's connection drops.",
+      change: [
+        { id: "p1", at: "stage", tone: "ok", sub: "stored · ETag" },
+        { id: "p2", at: "stage", tone: "ok", sub: "stored · ETag" },
+        { id: "p4", at: "stage", tone: "ok", sub: "stored · ETag" },
+        { id: "p3", tone: "bad", sub: "failed" },
+      ],
+      focus: ["stage"], arrow: { from: "client", to: "stage", label: "UploadPart × 4" } },
+    { caption: "Only part 3 is sent again. Nothing else has to be re-uploaded.",
+      change: [{ id: "p3", at: "stage", tone: "ok", sub: "stored · ETag" }],
+      focus: ["stage"], arrow: { from: "client", to: "stage", label: "UploadPart 3 (retry)" } },
+    { caption: "All four parts are stored, and for readers nothing has changed: a `GET` still returns the earlier version. Until we complete or abort the upload, the parts sit invisible in storage, and we're billed for them.",
+      focus: ["keymap"] },
+    { caption: "`CompleteMultipartUpload` sends the ordered list of part numbers and ETags. S3 writes one keymap entry that points at the four parts. **This is the atomic commit**: the new object appears all at once.",
+      remove: ["old"], add: [{ id: "new", at: "keymap", label: "app.log", sub: "20 MiB · ETag …-4", tone: "ok" }],
+      focus: ["keymap"], arrow: { from: "client", to: "keymap", label: "CompleteMultipartUpload" } },
   ]}
 />
 
-The limits, from the
-[multipart limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html)
-page:
+The limits, from the [multipart limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html) page:
 
 | Item | Limit |
 |---|---|
-| Maximum object size | 48.8 TiB (50 TB; raised from 5 TB, per the [20th-anniversary post](https://aws.amazon.com/blogs/aws/twenty-years-of-amazon-s3-and-building-whats-next/)) |
+| Maximum object size | 48.8 TiB, which is 10,000 parts of 5 GiB each. AWS's [twenty-year post](https://aws.amazon.com/blogs/aws/twenty-years-of-amazon-s3-and-building-whats-next/) rounds it to "50 TB" and says the maximum has grown from 5 GB at launch |
 | Parts per upload | 10,000 |
 | Part size | 5 MiB to 5 GiB; the last part can be smaller |
 | When to use it | AWS suggests considering it from 100 MB |
 
-<Why>Why is the minimum part 5 MiB?</Why>
-
-AWS doesn't say. It's probably about per-part overhead: each part is stored, checksummed and tracked on its own until the upload completes, and tiny parts would multiply that bookkeeping.
-
-Whatever the reason, the limits mean `10,000 × part size` sets
-your maximum object size: with 5 MiB parts you top out near 48.8 GiB. Pick
-the part size from the largest object you'll upload, not the smallest.
+AWS doesn't say why the minimum part is 5 MiB. It's probably about per-part overhead: each part is stored, checksummed and tracked on its own until the upload completes, and tiny parts would multiply that bookkeeping. Whatever the reason, the limits mean `10,000 × part size` sets your maximum object size: with 5 MiB parts you top out near 48.8 GiB. Pick the part size from the largest object you'll upload, and not from the smallest.
 
 </Sub>
 
-<Sub n="7.2" title="The ETag that isn't an MD5">
+<Sub n="6.2" title="The ETag that isn't an MD5">
 
-For a single `PUT` with SSE-S3 or no encryption, the ETag is the MD5 of the
-object. For a multipart upload it isn't. The
-[integrity docs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html)
-describe the calculation: MD5 each part, "concatenate the bytes for the MD5
-digests together and then calculate the MD5 digest of these concatenated
-values", then add "a dash with the total number of parts".
+Back in section 1.2 we said the ETag of a plain upload is the MD5 of the object. For a multipart upload it isn't. The [integrity docs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html) describe the calculation: MD5 each part, "concatenate the bytes for the MD5 digests together and then calculate the MD5 digest of these concatenated values", then add "a dash with the total number of parts". Since the part boundaries are part of the recipe, the same bytes uploaded with different part sizes should produce different ETags. The script below checks that on 20 MiB of bytes by computing the ETag as a single `PUT` and as multipart uploads with 5, 8 and 16 MiB parts.
 
-<TryIt what="The same 20 MiB of bytes, uploaded four ways" lang="python" toolchain="Python 3.14.6, Apple M4">
+<TryIt what="The same 20 MiB of bytes, uploaded four ways" lang="python" toolchain="Python 3.14.6">
 ```python
+import hashlib, random
+
+MiB = 1 << 20
+obj = random.Random(1).randbytes(20 * MiB)         # 20 MiB of bytes
+
 def multipart_etag(data, part_size):
     parts = [data[i:i+part_size] for i in range(0, len(data), part_size)]
     digests = b''.join(hashlib.md5(p).digest() for p in parts)
@@ -616,39 +679,29 @@ print("single PUT        ", f'"{hashlib.md5(obj).hexdigest()}"')
 for ps in (5, 8, 16):
     print(f"multipart {ps:>2} MiB  ", multipart_etag(obj, ps * MiB))
 ```
-
 <Output>
 ```text
-single PUT         "8686e501a7c97d828f46082615c27470"
-multipart  5 MiB   "c6758912b4cc12d11f57a60b8efb2078-4"
-multipart  8 MiB   "3763820c07a62437aff0124f34324a25-3"
-multipart 16 MiB   "1012e81656bc4afd29a548769033d7bb-2"
+single PUT         "1d2b576ca73525cf7bd96f059c1108b4"
+multipart  5 MiB   "706c32c7a258757a71946b19b0a2dd38-4"
+multipart  8 MiB   "2cd9cf8a134aaaf20630724453b53d8e-3"
+multipart 16 MiB   "8429eed32760bbb2d41a4d2fbdaed3bc-2"
 ```
-
-Identical bytes, four different ETags. The ETag depends on how the object was
-uploaded, and the AWS CLI and each SDK pick their own default part size.
 </Output>
 </TryIt>
 
+Identical bytes, four different ETags. The ETag depends on how the object was uploaded, and the AWS CLI and each SDK pick their own default part size. The number after the dash is the part count: 20 MiB in 5 MiB parts makes 4, in 8 MiB parts makes 3 (8, 8 and 4), and in 16 MiB parts makes 2.
+
 <Callout label="Common mistake" kind="warn">
-Using the ETag to check whether a local file matches an object, or to dedupe
-objects. Upload the same file with two tools and the ETags differ. Use a
-checksum S3 stores for you instead: new uploads get a full-object
-`CRC64NVME` by default, and CRC checksums "can linearize into a full object
-checksum", so the value doesn't depend on part boundaries.
+Using the ETag to check whether a local file matches an object, or to dedupe objects. Upload the same file with two tools and the ETags differ. Use a checksum S3 stores for you instead: when an upload carries no checksum, S3 attaches a full-object `CRC64NVME` by default, and CRC checksums "can linearize into a full object checksum", so the value doesn't depend on part boundaries.
 </Callout>
 
 </Sub>
 
-<Sub n="7.3" title="The parts you forgot">
+<Sub n="6.3" title="The parts you forgot">
 
-An upload that's started and never completed or aborted leaves its parts
-stored and billed, and they don't show up in a normal `LIST` of the bucket.
-A client that crashes mid-upload in a retry loop can leave terabytes behind.
+An upload that's started and never completed or aborted leaves its parts stored and billed, and they don't show up in a normal `LIST` of the bucket. A client that crashes mid-upload in a retry loop can leave terabytes behind.
 
-You fix it with one lifecycle rule, and AWS's docs recommend it: an
-`AbortIncompleteMultipartUpload` action that cleans up any upload older than a
-few days.
+You fix it with a **lifecycle rule**, a bucket setting that tells S3 to act on objects automatically after a number of days: move them to another class, delete them, or, as here, clean up stale uploads. AWS's docs recommend an `AbortIncompleteMultipartUpload` action that cleans up any upload older than a few days.
 
 ```json
 {
@@ -661,17 +714,17 @@ few days.
 }
 ```
 
+Storing `app.log` correctly is one question, and what it costs to keep it for years is another, and lifecycle rules turn out to matter for that one too.
+
 </Sub>
 
-<SectionHeading n="08" id="storage-classes">Storage classes</SectionHeading>
+<SectionHeading n="07" id="storage-classes">Storage classes and the bill</SectionHeading>
 
-Every object has a storage class. Classes trade storage price against
-access cost, latency, and how long you must keep the data.
+<Sub n="7.1" title="The classes side by side">
 
-<Sub n="8.1" title="The classes side by side">
+The log from September will probably be read once, by an auditor, if ever. Paying for S3 Standard, the default class that `app.log` got when we uploaded it, would be wasteful, so S3 sells the same storage at lower prices to objects you tell it you'll rarely read. Every object has a **storage class**, and classes trade the price per gigabyte against three other things: what it costs to read the object back, how quickly it can be read, and how long you must keep it. The cheaper classes add two rules to the bill. A **minimum duration** means an object deleted early is charged as if it had stayed, and a **minimum billable size** means a small object is charged as if it were bigger.
 
-Prices are us-east-1, per GB-month for the first 50 TB, from the AWS Price List
-API (published 2026-09-26). Durability is eleven nines for all of them.
+Prices are us-east-1, per GB-month (the price of keeping one gigabyte for one month) for the first 50 TB, from the AWS Price List API (published 2026-09-26). All of these classes are designed for eleven nines of durability, though the one-zone classes keep that figure only as long as their one zone survives.
 
 | Class | $/GB-month | Zones | Minimum duration | Minimum billable size | Access |
 |---|---|---|---|---|---|
@@ -684,20 +737,17 @@ API (published 2026-09-26). Durability is eleven nines for all of them.
 | **Glacier Flexible Retrieval** | 0.0036 | ≥ 3 | 90 days | 40 KB overhead per object | Minutes to hours, after a restore |
 | **Glacier Deep Archive** | 0.00099 | ≥ 3 | 180 days | 40 KB overhead per object | Hours, after a restore |
 
-Requests cost too: on Standard, $0.005 per 1,000 `PUT`, `COPY`, `POST` or
-`LIST` requests and $0.0004 per 1,000 `GET`s.
+Requests cost too: on Standard, $0.005 per 1,000 `PUT`, `COPY`, `POST` or `LIST` requests and $0.0004 per 1,000 `GET`s.
 
 <Why>How can Deep Archive be 23× cheaper than Standard?</Why>
 
-Because it gives up the thing that's expensive: random I/O on demand. Data in the archive classes is "not available for real-time access"; you `RestoreObject` first and wait hours. AWS doesn't say what hardware backs it, but a class that never has to answer a read immediately doesn't need to reserve any of section 3.3's scarce I/O for it, and can schedule its reads whenever the fleet has spare capacity.
+Because it gives up the thing that's expensive: random I/O on demand. Data in the archive classes is "not available for real-time access", so you `RestoreObject` first and wait hours. AWS doesn't say what hardware backs it, but a class that never has to answer a read immediately doesn't need to reserve any of section 3.5's scarce I/O for it, and can schedule its reads whenever the fleet has spare capacity.
 
 </Sub>
 
-<Sub n="8.2" title="How a lifecycle rule makes the bill bigger">
+<Sub n="7.2" title="How a lifecycle rule makes the bill bigger">
 
-Minimum sizes and minimum durations catch people moving small or short-lived
-objects to a colder class. Take ten million 16 KB thumbnails, 160 GB in
-all, moved from Standard to Standard-IA:
+Minimum sizes and minimum durations catch people who move small or short-lived objects to a colder class. A lifecycle rule (section 6.3) can also move objects to a colder class after a number of days. Take ten million 16 KB thumbnails, 160 GB in all, moved from Standard to Standard-IA:
 
 <Estimate
   rows={[
@@ -708,26 +758,17 @@ all, moved from Standard to Standard-IA:
   result={{ label: "The \"cheaper\" class, for these objects", value: "≈ 4× the monthly bill" }}
 />
 
-The same trap has two more forms: Glacier's 40 KB of per-object metadata
-("32 KB ... charged at the S3 Glacier Flexible Retrieval rate" and "8 KB ...
-at the S3 Standard rate"), and minimum durations, where an object deleted
-early is charged for the full 30, 90 or 180 days anyway.
+The same trap has two more forms: Glacier's 40 KB of per-object metadata ("32 KB ... charged at the S3 Glacier Flexible Retrieval rate" and "8 KB ... at the S3 Standard rate"), and minimum durations, where an object deleted early is charged for the full 30, 90 or 180 days anyway.
 
 <Callout label="Design implication">
-Lifecycle transitions pay off for large objects that stay put. For many small
-objects, either bundle them into larger archives first (tar, Parquet) or use
-Intelligent-Tiering, which skips objects under 128 KB instead of billing them
-as 128 KB. S3 Storage Lens and Storage Class Analysis show your object-size
-distribution before you commit to a rule.
+Lifecycle transitions pay off for large objects that stay put. For many small objects, either bundle them into larger archives first (tar, or Parquet, a columnar file format) or use Intelligent-Tiering, which skips objects under 128 KB instead of billing them as 128 KB. S3 Storage Lens and Storage Class Analysis show your object-size distribution before you commit to a rule.
 </Callout>
 
 </Sub>
 
-<Sub n="8.3" title="Versioning and the delete that isn't">
+<Sub n="7.3" title="Versioning and the delete that isn't">
 
-With versioning on, `DELETE` without a version ID doesn't delete anything. It
-adds a **delete marker** as the newest version, so `GET` returns 404 while every
-old version stays stored and billed.
+One more setting changes what a delete means. With **versioning** on, S3 keeps every version of a key instead of replacing it, and `DELETE` without a version ID doesn't delete anything. It adds a **delete marker** as the newest version, so `GET` returns 404 while every old version stays stored and billed.
 
 | You did | What's stored | What you pay for |
 |---|---|---|
@@ -736,38 +777,63 @@ old version stays stored and billed.
 | `DELETE` with `versionId` | One fewer version | The rest |
 | Lifecycle `NoncurrentVersionExpiration: 30 days` | Current version, plus 30 days of history | What you meant to pay for |
 
-Versioning is the best protection against the buggy job from section 5.3. Just
-pair it with a noncurrent-version expiration rule, or the bucket grows forever.
+Versioning is the best protection against the buggy job from section 2.5. Just pair it with a noncurrent-version expiration rule, or the bucket grows forever.
+
+We now have the whole story of `app.log`, from the PUT to the bill. The last question is how to watch all of it on a real bucket.
 
 </Sub>
 
-<SectionHeading n="09" id="operating">Running it</SectionHeading>
+<SectionHeading n="08" id="operating">Operating a bucket</SectionHeading>
 
-<Sub n="9.1" title="What to check on Monday">
+<Sub n="8.1" title="What to check on Monday">
+
+Each question the chapter raised has a command that answers it on a real bucket.
 
 ```shell
-# Incomplete multipart uploads you're paying for
+# Are there incomplete multipart uploads I'm paying for? (section 6.3)
 aws s3api list-multipart-uploads --bucket my-bucket \
   --query 'Uploads[].[Key,Initiated]' --output text
 
-# Lifecycle rules actually in force
+# Which lifecycle rules are actually in force? (sections 6.3 and 7.2)
 aws s3api get-bucket-lifecycle-configuration --bucket my-bucket
 
-# Is versioning on, and is anything expiring old versions?
+# Is versioning on, and is anything expiring old versions? (section 7.3)
 aws s3api get-bucket-versioning --bucket my-bucket
 
-# The checksum S3 stores, which doesn't depend on part size
+# What checksum does S3 store, one that doesn't depend on part size? (section 6.2)
 aws s3api head-object --bucket my-bucket --key big.bin --checksum-mode ENABLED
 ```
 
-In CloudWatch, request metrics (opt-in per bucket) give you `5xxErrors`,
-`FirstByteLatency` and request counts per prefix filter. A rising 503 rate on
-one prefix means the partition behind it is still splitting, or your keys all
-share one hot range.
+In CloudWatch, AWS's metrics service, request metrics (opt-in per bucket) give you `5xxErrors`, `FirstByteLatency` and request counts per prefix filter. A rising 503 rate on one prefix means the partition behind it is still splitting, or your keys all share one hot range (section 4.2).
 
 </Sub>
 
-<Sub n="9.2" title="Symptom, cause, fix">
+<Sub n="8.2" title="Rules that hold up">
+
+1. **Design keys so you never rename.** There's no rename, only copy and delete, so write to a new prefix and switch a pointer object instead.
+2. **Spread a new heavy write load over several prefixes** from the start, and let the SDK back off and retry on `503`.
+3. **Record what you write, and list only to reconcile.** Use an event queue, a table, S3 Inventory or S3 Metadata tables to find objects.
+4. **Use `If-Match` and `If-None-Match` whenever two writers can touch one key.** Strong consistency doesn't make them take turns.
+5. **Compare stored checksums, not ETags,** and don't dedupe on an ETag.
+6. **Add `AbortIncompleteMultipartUpload` and `NoncurrentVersionExpiration` rules** to every bucket that takes uploads or has versioning on.
+7. **Put a cache in front of S3 when you need a few milliseconds,** or use Express One Zone.
+
+</Sub>
+
+<Sub n="8.3" title="What you trade for what">
+
+| You get | You pay | When the bill arrives |
+|---|---|---|
+| Whole-object writes, so shards never change after they're stored | No append, no rename, no partial writes | When your design wants a growing file or a renamed folder |
+| Eleven nines against hardware loss at 1.4× the space | Nothing protects you from your own deletes and overwrites | When a job overwrites a million objects, perfectly durably |
+| Throughput from spreading an object over many drives | 100 to 200 ms for a small object | When a request path needs a few milliseconds |
+| Strong consistency on reads | No ordering between concurrent writers | As lost updates on a shared `state.json` |
+| Parallel, retryable uploads | An ETag that depends on part size, and hidden parts that cost money | In mismatched hashes and a storage bill higher than `LIST` suggests |
+| Cheaper cold classes | Minimum sizes, per-object overhead and minimum durations | As a bill that went up after a lifecycle rule |
+
+</Sub>
+
+<Sub n="8.4" title="Symptom, cause, fix">
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -777,120 +843,68 @@ share one hot range.
 | ETags don't match local MD5s | Object was uploaded in parts | Compare `CRC64NVME` or SHA-256 checksums instead |
 | Two writers lose each other's updates | Last writer wins on concurrent `PUT` | `If-Match` with the ETag you read, retry on `412` |
 | A job takes hours just to find its input | Listing huge prefixes page by page | Inventory, S3 Metadata tables, or event notifications |
-| p99 GET latency in the hundreds of milliseconds | S3 Standard's normal latency for small objects | Cache in front, or Express One Zone |
+| p99 GET latency (the time 99% of requests beat) in the hundreds of milliseconds | S3 Standard's normal latency for small objects | Cache in front, or Express One Zone |
 
 </Sub>
 
-<SectionHeading n="10" id="summary">Summary</SectionHeading>
+<SectionHeading n="09" id="summary">Summary</SectionHeading>
 
-1. **S3 is a key-value store, not a filesystem.** No rename, no append, no
-   partial writes; folders are key prefixes.
-2. **Data is written before the index.** A `PUT` commits when the keymap
-   records the new shards, so readers see old or new, never half.
-3. **The keymap is sorted and range-partitioned.** `LIST` is a range scan, and
-   limits of 3,500 writes and 5,500 reads a second apply per partitioned prefix.
-4. **Hard drives set the design.** About 120 random I/Os a second per drive,
-   flat since 2006, is why S3 spreads every object and every customer widely.
-5. **Erasure coding buys durability for less space.** RS(10,4) survives any
-   four losses at 1.4×, against three replicas' two losses at 3×.
-6. **Repair speed matters as much as the code.** In the model, a week of repair
-   cost three to four nines, and correlated failures matter more than either.
-7. **S3 has been strongly consistent since December 2020.** A witness acts as a
-   read barrier for the metadata cache.
-8. **Strong consistency doesn't serialise writers.** Use `If-Match` and
-   `If-None-Match` for compare-and-swap and write-once keys.
-9. **A multipart ETag depends on the part size.** Compare stored checksums,
-   and abort incomplete uploads with a lifecycle rule.
-10. **Cold storage classes punish small, short-lived objects.** Minimum sizes,
-    per-object overhead and minimum durations can make "cheaper" cost more.
+1. **S3 is a key-value store of whole objects.** There's no rename, no append and no partial write, and folders are only key prefixes (section 1).
+2. **Drives fail all the time, so durability is built from redundancy and repair.** Eleven nines is a design target for hardware loss, against a drive failure rate near 1.36% a year (section 2).
+3. **Erasure coding buys durability for less space.** RS(10,4) survives any four losses at 1.4×, against three replicas' two losses at 3×, and objects that never change keep the parity simple (section 2.3).
+4. **Repair speed matters as much as the code.** In the model, a week of repair instead of a day made losses 50 to 2,400 times more likely, and correlated failures matter more than either (section 2.5).
+5. **Data is written before the index.** A `PUT` commits when the keymap records the new shards, so readers see old or new, never half (section 3.2).
+6. **Hard drives set the design.** About 120 random I/Os a second per drive, flat since 2006, is why S3 spreads every object and every customer widely and writes sequentially (section 3.4).
+7. **The keymap is sorted and range-partitioned.** `LIST` is a range scan, and limits of 3,500 writes and 5,500 reads a second apply per partitioned prefix (section 4).
+8. **S3 has been strongly consistent since December 2020.** A witness acts as a read barrier for the keymap's cache (section 5.2).
+9. **Strong consistency doesn't serialise writers.** Use `If-Match` and `If-None-Match` for compare-and-swap and write-once keys (section 5.4).
+10. **A multipart upload commits with one keymap update, and its ETag depends on the part size.** Compare stored checksums, and abort incomplete uploads with a lifecycle rule (section 6).
+11. **Cold storage classes punish small, short-lived objects.** Minimum sizes, per-object overhead and minimum durations can make "cheaper" cost more (section 7).
 
-<SectionHeading n="11" id="build">Build this</SectionHeading>
+<SectionHeading n="10" id="build">Build this</SectionHeading>
 
 **A tiny object store with the same shape.**
 
-- Three processes, each a "storage node" that writes shards as append-only
-  files. A front end splits each `PUT` into RS(4,2) shards (reuse the Python
-  from section 5.1), writes them to different nodes, and only then records the
-  key in a SQLite keymap.
-- Kill a node and show `GET` still works from the other shards. Write a repair
-  job that rebuilds the missing shards onto a new node, and count the bytes it
-  reads.
-- Add `If-Match` on `PUT` by storing an ETag per key and checking it in the same
-  SQLite transaction as the keymap update. Run two writers doing
-  read-modify-write on one key and show no update is lost.
-- Implement multipart upload: parts as separate shard sets, completed by one
-  keymap update. Crash the client mid-upload and write the garbage collector
-  that finds orphaned parts.
+- Make three processes, each a "storage node" that writes shards as append-only files. A front end splits each `PUT` into RS(4,2) shards (reuse the Python from section 2.3), writes them to different nodes, and only then records the key in a SQLite keymap.
+- Kill a node and show that `GET` still works from the other shards. Write a repair job that rebuilds the missing shards onto a new node, and count the bytes it reads.
+- Add `If-Match` on `PUT` by storing an ETag per key and checking it in the same SQLite transaction as the keymap update. Run two writers doing read-modify-write on one key and show that no update is lost.
+- Implement multipart upload: parts as separate shard sets, completed by one keymap update. Crash the client mid-upload and write the garbage collector that finds orphaned parts.
 
-<SectionHeading n="12" id="interview">Interview questions</SectionHeading>
+<SectionHeading n="11" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="Why doesn't S3 have a rename operation?">
-Objects are immutable blobs, located through an index entry and erasure-coded
-across many drives. A general purpose bucket's "rename" is a copy of every byte
-to a new key and a delete of the old one: O(size), billed per request, and not
-atomic. S3 Express One Zone added an atomic `RenameObject` for directory buckets
-in 2025, but general purpose buckets still don't have one, so design key layouts
-that never need renaming.
+Objects are whole blobs that never change after they're stored, located through a keymap entry and erasure-coded across many drives. A general purpose bucket's "rename" is a copy of every byte to a new key and a delete of the old one: O(size), billed per request, and not atomic. S3 Express One Zone added an atomic `RenameObject` for directory buckets in 2025, but general purpose buckets still don't have one, so design key layouts that never need renaming.
 </QA>
 
 <QA level="beginner" q="What's a multipart upload and when should you use one?">
-A way to upload one object as up to 10,000 parts of 5 MiB to 5 GiB each, in
-parallel and in any order, retrying failed parts alone. `CompleteMultipartUpload`
-stitches them together atomically. AWS suggests considering it from 100 MB, and
-it's required above 5 GB. Add a lifecycle rule to abort incomplete uploads,
-because their parts are billed but invisible.
+A way to upload one object as up to 10,000 parts of 5 MiB to 5 GiB each, in parallel and in any order, retrying failed parts alone. `CompleteMultipartUpload` stitches them together atomically by writing one keymap entry. AWS suggests considering it from 100 MB, and it's required above 5 GB. Add a lifecycle rule to abort incomplete uploads, because their parts are billed but invisible.
 </QA>
 
 <QA level="intermediate" q="What does it mean that S3 is strongly consistent, and what doesn't it cover?">
-Since December 2020, after a successful `PUT` or `DELETE` is acknowledged, every
-later `GET`, `HEAD` and `LIST` reflects it. It doesn't cover concurrent writers
-(last writer wins), updates across keys (never atomic), or bucket configuration
-(eventually consistent). For safe read-modify-write, use `If-Match` with the
-ETag you read and retry on `412 Precondition Failed`.
+Since December 2020, after a successful `PUT` or `DELETE` is acknowledged, every later `GET`, `HEAD` and `LIST` reflects it. It doesn't cover concurrent writers (the latest write wins), updates across keys (never atomic), or bucket configuration (eventually consistent). For a safe read-modify-write, use `If-Match` with the ETag you read and retry on `412 Precondition Failed`.
 </QA>
 
 <QA level="intermediate" q="Why would you see 503 Slow Down from S3, and what do you do?">
-Each partitioned prefix supports at least 3,500 writes and 5,500 reads a
-second, and partitions split as load grows, gradually. A burst on a new or
-narrow key range gets 503s until the split. The SDK retries with backoff; the
-design fix is to spread keys across several prefixes so the load starts out
-across several partitions.
+Each partitioned prefix supports at least 3,500 writes and 5,500 reads a second, and partitions split as load grows, gradually. A burst on a new or narrow key range gets 503s until the split. The SDK retries with backoff, and the design fix is to spread keys across several prefixes so the load starts out across several partitions.
 </QA>
 
 <QA level="intermediate" q="Replication or erasure coding: what's the trade?">
-Replication (3 copies) costs 3× and survives two failures, and a repair reads
-one copy. Reed-Solomon RS(k,m) survives any m failures at (k+m)/k overhead,
-1.4× for RS(10,4), but a repair reads k shards from k drives, so repair
-bandwidth and stragglers become the cost. Local Reconstruction Codes, as in
-Azure, add local parities so a single failure is rebuilt from a small group.
+Replication (3 copies) costs 3× and survives two failures, and a repair reads one copy. Reed-Solomon RS(k,m) survives any m failures at (k+m)/k overhead, 1.4× for RS(10,4), but a repair reads k shards from k drives, so repair bandwidth and stragglers become the cost. Local Reconstruction Codes, as in Azure, add local parities so a single failure is rebuilt from a small group.
 </QA>
 
 <QA level="deep" q="How did S3 go from eventually to strongly consistent without making reads slower?">
-The inconsistency came from a metadata cache where writes and reads could hit
-different cache nodes. S3 kept the cache but added per-object ordering in its
-replication logic and a witness that's notified of every object change. On a
-read, the cache checks the witness as a read barrier; if its entry is stale, it
-invalidates and reloads from persistent storage. It was checked with proofs and model checking, which Vogels says took more work than the code.
+The inconsistency came from a metadata cache where writes and reads could hit different cache nodes. S3 kept the cache but added per-object ordering in its replication logic and a witness that's notified of every object change. On a read, the cache checks the witness as a read barrier, and if its entry is stale, it invalidates it and reloads from persistent storage. The design was checked with proofs and model checking, which Vogels says took more work than the code.
 </QA>
 
 <QA level="deep" q="Eleven nines means you'll never lose data, right?">
-It's a design target for losing objects to hardware failure, and it assumes
-S3's repair keeps up and failures are mostly independent. Your biggest risks
-aren't covered: a bug overwriting objects, an accidental delete, a compromised
-credential, a lifecycle rule expiring the wrong prefix. Those are perfectly
-durable mistakes. Versioning, Object Lock, and replication to a separate
-account are the defences for them.
+It's a design target for losing objects to hardware failure, and it assumes S3's repair keeps up and failures are mostly independent. Your biggest risks aren't covered: a bug overwriting objects, an accidental delete, a compromised credential, a lifecycle rule expiring the wrong prefix. Those are all durable mistakes. Versioning, Object Lock, and replication to a separate account are the defences for them.
 </QA>
 
 <QA level="deep" q="How would you build a single-writer commit log on S3?">
-Name each commit by a monotonically increasing number, and write it with
-`If-None-Match: *`. If two writers race for commit 42, S3 lets the first to
-finish win and returns `412` to the other, which re-reads the log and tries 43.
-Before August 2024 that took an external arbiter, such as the DynamoDB log store Delta Lake used on S3. Watch the edge cases: multipart completions aren't checked against
-in-progress uploads, and a concurrent delete can return `409`.
+Name each commit by a monotonically increasing number, and write it with `If-None-Match: *`. If two writers race for commit 42, S3 lets the first to finish win and returns `412` to the other, which re-reads the log and tries 43. Before August 2024 that took an external arbiter, such as the DynamoDB log store Delta Lake used on S3. Watch the edge cases: multipart completions aren't checked against in-progress uploads, and a concurrent delete can return `409`.
 </QA>
 
-<SectionHeading n="13" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="12" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
   <Q q="A 20 MiB file uploaded with 5 MiB parts has an ETag ending in what?">
@@ -912,6 +926,11 @@ in-progress uploads, and a concurrent delete can return `409`.
 </Quiz>
 
 <CardGrid>
+  <WildCard name="Operating Systems: Three Easy Pieces, chapters 37 and 38">
+    Hard disk drives and why random access is slow, then RAID, which uses the
+    same parity trick as section 2.3 inside one machine. Free online at
+    ostep.org.
+  </WildCard>
   <WildCard name="Warfield: Building and operating a pretty big storage system called S3">
     The FAST '23 keynote as an essay: hard drive physics, heat, erasure coding,
     ShardStore and how the organisation runs it.
@@ -919,7 +938,7 @@ in-progress uploads, and a concurrent delete can return `409`.
   </WildCard>
   <WildCard name="Vogels: Diving Deep on S3 Consistency">
     How the witness and the read barrier made the cache coherent, and how it was
-    verified. [All Things Distributed](https://www.allthingsdistributed.com/2021/04/s3-strong-consistency.html).
+    checked. [All Things Distributed](https://www.allthingsdistributed.com/2021/04/s3-strong-consistency.html).
   </WildCard>
   <WildCard name="Bornholt et al., ShardStore (SOSP 2021)">
     The per-disk key-value store, its LSM tree and extents, and the lightweight
@@ -942,7 +961,7 @@ in-progress uploads, and a concurrent delete can return `409`.
   </WildCard>
 </CardGrid>
 
-<SectionHeading n="14" id="related">Related chapters</SectionHeading>
+<SectionHeading n="13" id="related">Related chapters</SectionHeading>
 
 <CardGrid>
   <WildCard name="Block Devices & SSDs">

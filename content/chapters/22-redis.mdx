@@ -1,24 +1,87 @@
 ---
 title: Redis Internals
-dek: "How one thread, one event loop and a hash table that rehashes a bucket at a time add up to Redis, and why almost everything surprising about it follows from those three facts: the memory bill, the stalls, and the write that vanishes in a failover. You'll start by running a server and making one slow command stall another client."
-readingTime: "~30 min"
+dek: "Follow one login session into Redis: why a single thread can serve thousands of clients, what the session costs in memory, when it gets thrown away, and how a write you were told succeeded can vanish when the server dies."
+readingTime: "~40 min"
 level: "Beginner"
-versions: "Measured on Redis 8.10.2, macOS 15, Apple M4 · source refs at tag 7.2.4"
-prereqs: "a terminal and Redis installed; hash tables, event loops and fork() help"
-updated: "2026-09-30"
+versions: "Redis 8.10.2 for the examples · source references at tag 7.2.4"
+prereqs: "a terminal and Redis installed; chapters 04 (virtual memory), 07 (syscalls) and 13 (locks) help"
+updated: "2026-10-02"
 ---
 
-A small, very fast shop has one till. The cashier serves customers strictly one at a time and never puts anyone on hold. Each sale takes seconds, so nobody notices the queue. Then one customer asks for a complicated custom order that takes two minutes, and everyone behind them waits two minutes, however simple their purchase.
+A user logs in to your website. Your app server creates a session for them, a few bytes saying who they are and what they're allowed to do, and stores it in Redis under the name `session:42`. Redis answers `OK`. For the next half hour, any of your app servers might receive this user's next click, and each one asks Redis for `session:42` and gets the same few bytes back, usually in well under a millisecond.
 
-Redis is that shop. It runs your commands on one thread, in the order they arrive, and each one is so quick that a single thread serves thousands of clients. Most of what's surprising about Redis comes from that choice, and you can feel it in a minute.
+Hardly any of the machinery behind that is what you'd guess. A busy server is normally built with many threads, one per client, and Redis runs every command on a single thread. An `OK` normally means the data is safe, and by default Redis says it before a second copy exists. One client's slow request is normally its own problem, and in Redis it stalls everyone.
 
-<SectionHeading n="01" id="feel-the-single-thread">Make one command stall another</SectionHeading>
+What does the work is a small program, `redis-server`, that keeps every key and value in memory, in one big table indexed by name, and answers commands over the network. This chapter follows `session:42` through it with one question in mind: where does the session live, how can that be so fast for so many clients, and is it still there if the server dies? We start with the design brief and a slow command that stalls a second client, then go down through the event loop, the layout in memory, what happens when memory fills or a key expires, and finally what happens when the process dies.
 
-You need Redis installed (`brew install redis` on a Mac). The commands start a throwaway server on port 6399, run a few ordinary commands, then run one deliberately slow one.
+<SectionHeading n="01" id="one-thread">Why one thread runs every command</SectionHeading>
 
-<Sub n="1.1" title="Fast commands, then a slow one">
+<Sub n="1.1" title="The brief">
 
-<TryIt what="Start Redis, run ordinary commands, then run a 2-second command and time a PING from another client" lang="shell" toolchain="Redis 8.10.2, macOS 26.5.1, Apple M4">
+Your app servers need somewhere to keep small pieces of shared state: sessions, a counter per client, the result of an expensive query. A database can hold all of that, but a database query takes milliseconds, and this store has to answer in well under one. Speed rules out waiting for a disk on the normal path, so the data lives in RAM.
+
+Finding a value by its name is what a **hash table** is for. It's an array of slots called buckets. A function of the key, the hash, turns a name like `session:42` into a number that picks the bucket where its value is kept. Finding a key means computing one number and looking in one place, however many keys the table holds. Redis keeps all of its keys in one big hash table.
+
+Storing and fetching one session is the easy part. The hard part is that dozens of app servers, with thousands of connections between them, are sending commands at the same moment.
+
+</Sub>
+
+<Sub n="1.2" title="The textbook answer and what it costs">
+
+A textbook design gives every client connection its own thread and puts a lock around the table, so that two threads never change it at once. Chapter 13 showed why the lock is needed: two threads doing `count++` at the same moment can both read the same old value and write back the same new one, so one increment is lost. Chapters 13 and 17 also showed what locks cost once many threads fight over them. In a store where each operation is a single lookup, the lock becomes the busiest thing in the program.
+
+Redis takes the opposite route. One thread runs every command, one at a time, each to completion before the next one starts.
+
+</Sub>
+
+<Sub n="1.3" title="One thread, one command at a time">
+
+Think about what that gives you. While a command runs, nothing else is running, so nothing else can see the table half-changed. A command like this is **atomic**: it happens all at once, with no state in the middle that another client could observe. The lost update from chapter 13 can't happen, because `INCR`, which adds one to a number stored under a key, is a single command. Nobody can slip in between its read and its write, and there isn't a lock anywhere to make that true.
+
+That comes at a price, the other side of the same rule. If a command takes a long time, every command behind it waits. Here's `session:42` being fetched, then a slow command arriving, then a `PING` (the simplest command there is, which just answers `PONG`) stuck in line behind it:
+
+<Scene
+  title="One thread: a GET, then a slow command that holds up a PING"
+  regions={[
+    { id: "clients", label: "Clients", sub: "your app servers", col: 0, row: 0 },
+    { id: "line", label: "Waiting", sub: "in arrival order", col: 1, row: 0 },
+    { id: "thread", label: "The one thread", sub: "runs one command at a time", col: 2, row: 0 },
+    { id: "keys", label: "Keyspace", sub: "every key and its value, in RAM", col: 0, row: 1, span: 3 },
+  ]}
+  itemWidth={108}
+  frames={[
+    { caption: "App server A needs the session and sends `GET session:42`. All of Redis's keys and values sit in one table in memory, which we'll call the **keyspace**. Nothing else is running, so the command goes straight to the one thread.",
+      items: [
+        { id: "get", at: "clients", label: "GET session:42", sub: "from A", tone: "new" },
+        { id: "s42", at: "keys", label: "session:42", sub: "uid 42" },
+        { id: "s7", at: "keys", label: "session:7", tone: "dim" },
+        { id: "hits", at: "keys", label: "hits", sub: "2", tone: "dim" },
+      ],
+      focus: ["clients"], arrow: { from: "clients", to: "thread", label: "GET" } },
+    { caption: "The thread looks `session:42` up in the keyspace and builds the reply. That takes well under a millisecond, and no other command can run in the middle of it.",
+      change: [{ id: "get", at: "thread", tone: "accent" }], focus: ["thread", "keys"], arrow: { from: "thread", to: "keys", label: "lookup" } },
+    { caption: "A has its answer, and the thread is free for the next command.",
+      remove: ["get"], add: [{ id: "reply", at: "clients", label: "reply", sub: "uid 42", tone: "ok" }], focus: ["clients"], arrow: { from: "thread", to: "clients", label: "reply" } },
+    { caption: "Now another client sends a slow command. We'll use `DEBUG SLEEP 2`, which keeps the thread busy for two seconds. A real one might be `KEYS *` over millions of keys. The thread starts it and can't do anything else until it's done.",
+      remove: ["reply"], add: [{ id: "slow", at: "thread", label: "DEBUG SLEEP 2", sub: "takes 2 seconds", tone: "accent" }], focus: ["thread"] },
+    { caption: "0.3 seconds later client B sends `PING`. The thread is busy, so `PING` joins the line. There is no lock to wait for. It has to wait for its turn.",
+      add: [{ id: "ping", at: "line", label: "PING", sub: "from B", tone: "dirty" }], focus: ["line"] },
+    { caption: "1.7 seconds after that, the slow command finishes and the thread takes `PING`.",
+      remove: ["slow"], change: [{ id: "ping", at: "thread", tone: "accent" }], focus: ["thread"] },
+    { caption: "`PING` does almost no work, and B still waited 1.7 seconds for the answer. In Redis, how long a command takes to answer depends on what ran just before it.",
+      change: [{ id: "ping", sub: "answered after 1.7 s", tone: "ok" }], focus: ["clients"] },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="1.4" title="Trying it: one slow command, one stalled PING">
+
+Here's the same thing on a real server. `redis-server --port 6399` starts a throwaway server on its own port, so it can't disturb a Redis you already run. `--save ""` turns off snapshots to disk (section 8 explains them), `--enable-debug-command yes` switches on the `DEBUG` commands, which are off by default, and `--daemonize yes` runs the server in the background. After that, `redis-cli -p 6399 COMMAND` sends one command and prints the reply.
+
+First come ordinary commands. `SET` stores a value, `GET` reads it back, and `INCR` adds one to a number, creating it first if it isn't there. `EXPIRE greeting 60` gives the key a **TTL**, a time to live: after 60 seconds Redis deletes it, and `TTL` asks how many seconds are left. Then `DEBUG SLEEP 2` plays the slow command. The `&` at the end of its line runs it in the background so the shell can move on, `sleep 0.3` waits a third of a second, and `time` reports how long the `PING` takes.
+
+<TryIt what="Start Redis, run ordinary commands, then run a 2-second command and time a PING from another client" lang="shell" toolchain="Redis 8.10.2, macOS 26.5.1">
 ```shell
 redis-server --port 6399 --save "" --enable-debug-command yes --daemonize yes
 redis-cli -p 6399 SET greeting hello
@@ -49,92 +112,78 @@ sys	0m0.006s
 </Output>
 </TryIt>
 
-The ordinary commands return immediately: a value stored and fetched, a counter incremented twice, a 60-second expiry set. The `PING` at the end is the simplest command Redis has, and it took 1.7 seconds to answer.
+Those ordinary commands answer at once: the value is stored and read back, the counter goes to 1 and then 2, `EXPIRE` answers `1` to say it set a timeout, and `TTL` reports 60 seconds left. The second `OK` is `DEBUG SLEEP` finishing, two seconds after it started. `PONG` follows immediately, because that's the moment the thread is free to take the `PING`. Look at the `real` line. The `PING` was sent 0.3 seconds into a 2-second sleep, so it waited about 1.7 seconds for its turn, which matches the time reported.
+
+Nothing was wrong with `PING`, and no lock was involved. That's the trade Redis makes: no locking, no coordination between threads, a very fast common case, and in exchange a stall whenever one command is expensive. It leaves a question open, though. The `PING` waited because the thread was busy running a command. It must never also wait on a client's network connection, or one client that goes quiet would freeze everyone just the same. How does one thread keep thousands of connections going without waiting on any of them?
 
 </Sub>
 
-<Sub n="1.2" title="Why PING waited">
+<SectionHeading n="02" id="event-loop">Following one GET through the event loop</SectionHeading>
 
-`DEBUG SLEEP 2` occupied the one thread for two seconds. The `PING` arrived 0.3 seconds into that, so it waited about 1.7 seconds for its turn. Nothing was wrong with `PING`, and no lock was involved. Only one command runs at a time, so a slow one delays everyone.
+<Sub n="2.1" title="Never wait on one client">
 
-That's the trade Redis makes: no locking, no thread coordination and a very fast common case, in exchange for stalls when one command is expensive. The chapter starts from the brief that led to that design, follows one command through the event loop, and then covers the memory layout, durability and what to check when it's slow.
+A naive server would loop over its connections: read from the first client, run the command, reply, read from the second. A read blocks until bytes arrive, though, so one client that connects and says nothing would hold up the whole loop.
 
-</Sub>
-
-<SectionHeading n="02" id="design">Designing Redis from the brief</SectionHeading>
-
-The brief is simple. Build a shared store that dozens of application servers
-can reach over the network, for things that have to be fast: a cache, sessions,
-a counter per client. A database query takes milliseconds. This should
-take well under one.
-
-<Sub n="2.1" title="Data in RAM, in one hash table">
-
-Speed rules out the disk on the normal path, so the data lives in RAM. The
-simplest structure that gives you a value by name is one big hash table from
-key to value.
-
-That part's easy. The interesting decision is concurrency, because thousands of
-clients will be sending commands at once.
+Each client is connected through a **socket**, the kernel's endpoint for a network connection, and a socket is *readable* when bytes have arrived on it that nobody has read yet. Chapter 07 showed a system call, `epoll`, that fixes the problem. You hand `epoll` all your sockets at once, and it returns only the ones that are ready, sleeping inside the kernel if none are. So the server can ask the kernel which sockets have a request waiting, handle exactly those, and ask again. This loop is the **event loop**. No thread ever waits on a slow client, because the loop only touches sockets that the kernel has already said are ready, and at any instant most of ten thousand connections are idle, waiting for their app server to send something.
 
 </Sub>
 
-<Sub n="2.2" title="One thread runs every command">
+<Sub n="2.2" title="One GET, step by step">
 
-A textbook design gives each client a thread and puts locks around the table.
-Chapters 13 and 17 showed what that costs once the locks get busy.
+Now we can follow one command all the way through. First, some vocabulary. Redis clients speak a simple text protocol called **RESP**, in which a request is a few lines of text naming the command and its arguments. Redis keeps two chunks of memory for each client. The **query buffer** holds bytes read from the client's socket that haven't been parsed yet, and the **output buffer** holds replies waiting to be sent back. This is one trip around the loop for `GET session:42`, with the name of the function that does each step:
 
-Redis makes the opposite choice. One thread runs every command, one at a time,
-each to completion.
+<Scene
+  title="One GET through the Redis event loop"
+  regions={[
+    { id: "client", label: "Client A", sub: "an app server", col: 0, row: 0 },
+    { id: "inbuf", label: "Query buffer", sub: "bytes read, not yet parsed", col: 1, row: 0 },
+    { id: "outbuf", label: "Output buffer", sub: "replies waiting to be sent", col: 2, row: 0 },
+    { id: "dict", label: "Keyspace", sub: "the only step that touches your data", col: 0, row: 1, span: 3 },
+  ]}
+  itemWidth={116}
+  frames={[
+    { caption: "The loop is asleep inside `epoll_wait()`, called from `aeMain()` in `ae.c`. Client A sends its request. The kernel sees bytes arrive on A's socket and wakes the loop, reporting that this socket is readable.",
+      items: [
+        { id: "req", at: "client", label: "GET session:42", sub: "RESP bytes", tone: "new" },
+        { id: "s42", at: "dict", label: "session:42", sub: "uid 42" },
+        { id: "s7", at: "dict", label: "session:7", tone: "dim" },
+      ],
+      focus: ["client"] },
+    { caption: "`readQueryFromClient()` in `networking.c` reads the bytes from the socket into A's query buffer.",
+      change: [{ id: "req", at: "inbuf", sub: "raw bytes", tone: "accent" }], focus: ["inbuf"], arrow: { from: "client", to: "inbuf", label: "read()" } },
+    { caption: "`processInputBuffer()` parses the RESP text and fills in `argv`, the list holding the command name and its arguments.",
+      change: [{ id: "req", label: "argv", sub: "GET · session:42" }], focus: ["inbuf"] },
+    { caption: "`processCommand()` in `server.c` looks the command up and runs its checks: is the client logged in and allowed to run it, does the memory limit (section 7) allow it, and, when Redis runs as a cluster of servers, does this server hold the key. Then `call()` runs `getCommand()`, which does one lookup in the keyspace. Nothing else runs while it does.",
+      change: [{ id: "s42", tone: "accent" }], focus: ["dict"], arrow: { from: "inbuf", to: "dict", label: "lookup" } },
+    { caption: "`addReply()` appends the value to A's output buffer. No system call happens yet.",
+      remove: ["req"], change: [{ id: "s42", tone: "default" }], add: [{ id: "rep", at: "outbuf", label: "reply", sub: "uid 42", tone: "new" }], focus: ["outbuf"], arrow: { from: "dict", to: "outbuf", label: "value" } },
+    { caption: "Before sleeping again, `beforeSleep()` goes through every client's output buffer and sends each one with a single `write()`. Then the loop goes back to `epoll_wait()`.",
+      change: [{ id: "rep", at: "client", tone: "ok" }], focus: ["client"], arrow: { from: "outbuf", to: "client", label: "write()" } },
+  ]}
+/>
 
-<Why>What does one thread buy you?</Why>
-
-Atomicity without a single lock. Remember the lost update from chapter 13, two
-threads doing `count++` at once? It can't happen here. `INCR` on a key is one
-command, nothing else runs during it, and so it's atomic.
-
-<Why>How does one thread keep up with ten thousand connections?</Why>
-
-With an **event loop**. It asks the kernel which sockets have data ready (the
-`epoll` from chapter 07), handles those, and asks again. No thread ever waits
-on a slow client, because the loop only touches sockets that are ready.
-
-The price is exactly what you'd guess. One slow command, say `KEYS *` over ten
-million keys, and every other client waits behind it.
-
-</Sub>
-
-<Sub n="2.3" title="Three more problems the design has to solve">
-
-That single thread shapes the rest of the design:
-
-| Problem | What Redis does | Section |
-|---|---|---|
-| A general hash table spends pointers and bookkeeping that dwarf a small value | Stores small hashes, lists and sets as compact flat arrays (**listpacks**) until they pass a size threshold | 4 |
-| Rehashing ten million keys at once would freeze the only thread | Keeps the old and new tables side by side and moves one bucket at a time | 5 |
-| RAM is gone when the process dies | Snapshots to disk from a `fork()`ed child, an append-only log, and replicas | 7 |
-
-That last row carries the surprise. By default a replica copies the primary's
-writes *after* the primary has told the client "OK", so a write you were told
-succeeded can be lost in a failover.
+Only the fourth step touches your data. Everything around it moves bytes between the socket and the two buffers.
 
 </Sub>
 
-<SectionHeading n="03" id="guarantees">What Redis guarantees, and what it doesn't</SectionHeading>
+<Sub n="2.3" title="Why the reply waits">
 
-Redis promises you one thing, and people often hear a different one. The
-promise is **command atomicity**: while a command runs, no other command runs.
+In the fifth step nothing is sent. Replies pile up in the client's output buffer and go out together in `beforeSleep()`, once per trip around the loop. That has a consequence for a client that sends many commands without waiting for each answer, which is called **pipelining**:
 
-There's no partial state for another client to observe, no isolation level to
-pick, and no read that catches a hash halfway through an update.
+<Predict
+  q="A client pipelines 100 GET commands in one packet. Roughly how many write() syscalls does Redis make to answer them?"
+  options={["100", "About 50", "1", "0: the kernel sends replies on its own"]}
+  answer={2}
+>
+One. Each `GET` appends to the same output buffer, and `beforeSleep()` flushes
+it with a single `write`. Pipelining saves the syscalls as well as the network
+round trips, and at a few hundred nanoseconds each on a modern kernel, a hundred
+avoided syscalls is real.
+</Predict>
 
-<Sub n="3.1" title="The guarantees">
+<Why>Why is a client that stops reading dangerous?</Why>
 
-| Guarantee | What it means in practice |
-|---|---|
-| **Atomicity per command** | Every command, including multi-key ones like `MSET` and scripts, runs to completion before the next one starts |
-| **Ordering per connection** | Commands from one client execute in the order they were sent. Across clients, there's no ordering beyond serialisation |
-| **`MULTI`/`EXEC` without interleaving** | Nothing else runs between the queued commands |
+Because its output buffer keeps growing inside your Redis process. If a client sends requests but never reads the replies, the replies pile up in memory, and nothing else limits them. The setting `client-output-buffer-limit` decides whether Redis disconnects such a client or lets it eat your memory.
 
 <Callout label="Common mistake" kind="warn">
 Saying "Redis is single-threaded." It hasn't been true since Redis 6, which
@@ -145,16 +194,54 @@ rests on. Parsing and syscalls parallelise; the `dict` lookup doesn't.
 
 </Sub>
 
+<Sub n="2.4" title="Commands that block everything">
+
+Because execution is serialised, any slow command is a stall for every other client, exactly as in section 1. The slow ones are the commands whose cost grows with the amount of data they touch, which programmers write as **O(N)**, where N is the number of keys or members involved. A Lua script, in the last row, is a small program written in the Lua language that you send to Redis to run on the server as a single command. The usual suspects, and what to use instead:
+
+| Command | Why it blocks | What to use |
+|---|---|---|
+| `KEYS pattern` | Scans the entire keyspace | `SCAN` with a cursor: each call returns a small batch of keys plus a cursor to pass to the next call, so other clients get a turn in between |
+| `SMEMBERS` on a huge set | Returns, and so serialises, every member | `SSCAN` |
+| `DEL` on a 10M-element hash | Frees every entry inline | `UNLINK` (removes the key at once and frees the memory in a background thread) |
+| `FLUSHALL` (deletes every key) | Synchronous by default | `FLUSHALL ASYNC` |
+| A long Lua script | Atomic by design, so nothing preempts it | Split it, or use functions with smaller units |
+
+<Callout label="Design implication">
+In Redis, the latency of every command is the latency of the slowest command
+running near it. Treat any O(N) command on a big key as a production change,
+and prefer the cursor and async variants by default.
+</Callout>
+
+Since every command runs alone and to completion, we can say exactly what Redis promises, and just as important, what it leaves out.
+
+</Sub>
+
+<SectionHeading n="03" id="guarantees">What one thread guarantees, and what it doesn't</SectionHeading>
+
+Redis promises you one thing, and people often hear a different one. The promise is **command atomicity**: while a command runs, no other command runs. There's no partial state for another client to observe, no weaker or stronger setting to choose, and no read that catches a hash halfway through an update.
+
+<Sub n="3.1" title="The guarantees">
+
+| Guarantee | What it means in practice |
+|---|---|
+| **Atomicity per command** | Every command, including multi-key ones like `MSET` and scripts, runs to completion before the next one starts |
+| **Ordering per connection** | Commands from one client execute in the order they were sent. Across clients, there's no ordering beyond serialisation |
+| **`MULTI`/`EXEC` without interleaving** | `MULTI` starts queueing commands and `EXEC` runs the queue. Nothing else runs between the queued commands |
+
+</Sub>
+
 <Sub n="3.2" title="What it explicitly does not promise">
 
-This is the half that causes incidents.
+This is the half that causes incidents. One of the rows talks about copies of the data on other servers, so first the vocabulary. Redis can keep a second copy of your data on another machine. That machine is a **replica**, the original is the **primary**, and the primary sends each write to its replicas over the network. If the primary dies, one replica can be promoted to take its place, which is called a **failover**.
 
 | Not promised | What happens |
 |---|---|
 | **Rollback** | If a command inside `MULTI` fails at runtime, the other commands still apply. Redis reports the error and moves on |
-| **Durability by default** | Replication is asynchronous. `WAIT numreplicas timeout` blocks until replicas have *acknowledged*, which isn't the same as having *fsynced* |
-| **Expired keys leaving memory promptly** | An expired key is never returned to a client, but it can sit in the keyspace for a while (section 9.2) |
+| **Durability by default** | Replication is asynchronous. `WAIT numreplicas timeout` blocks until replicas have *acknowledged*, which isn't the same as having *fsynced* (forced the data onto its disk, as in chapter 08) |
+| **Expired keys leaving memory promptly** | An expired key is never returned to a client, but it can sit in the keyspace for a while (section 7.2) |
 | **Isolation between a script and the world** | A Lua script blocks the server for its whole duration. That's atomicity working as designed, and it's also how people take an outage |
+
+People who know transactions from SQL are surprised by the first row, so try to predict it before reading on.
 
 <Predict
   q="Inside MULTI you queue SET a 1, then INCR on a key holding the string hello, then SET b 2. You call EXEC. What's in a and b afterwards?"
@@ -171,98 +258,21 @@ fails at runtime on a string that isn't a number, Redis reports the error in
 that slot of the reply, and the other two commands still apply.
 </Predict>
 
+The second row raises a question that matters for failover.
+
 <Why>Why is the acknowledgement allowed to come before replication?</Why>
 
-Because that's what makes it fast. It isn't a bug and it isn't hidden: the
-primary replies as soon as the write is in its own memory, and section 8.1
-shows what that costs in a failover.
+Because that's what makes it fast. It isn't a bug and it isn't hidden: the primary replies as soon as the write is in its own memory, without waiting for a round trip to another machine, and section 8.1 shows what that costs in a failover.
+
+Two of these rows depend on memory and on what happens to it, and we haven't yet looked at how `session:42` sits in memory at all. We'll do that now, because the layout decides what a key costs and what a TTL does.
 
 </Sub>
 
-<SectionHeading n="04" id="event-loop">Following one GET through the event loop</SectionHeading>
+<SectionHeading n="04" id="value-layout">How session:42 is stored</SectionHeading>
 
-For a `GET`, the whole trip is a loop, a parse, a table lookup and a buffered
-write. Each step lives in a specific source file.
+<Sub n="4.1" title="Two hash tables per database">
 
-<Sub n="4.1" title="One iteration, step by step">
-
-<Steps
-  title="One GET through the Redis event loop"
-  lanes={[
-    { t: "aeMain", s: "epoll_wait · ae.c", icon: "◷" },
-    { t: "Read", s: "networking.c", icon: "⇣" },
-    { t: "Parse RESP", s: "networking.c", icon: "≡" },
-    { t: "processCommand", s: "server.c", icon: "✓" },
-    { t: "getCommand", s: "dict lookup", icon: "⌗" },
-    { t: "Reply", s: "addReply · beforeSleep", icon: "⇡" },
-  ]}
-  steps={[
-    [0, "`aeMain()` blocks in `epoll_wait`, waiting for any client socket to become readable."],
-    [1, "`readQueryFromClient()` reads the bytes into that client's **query buffer**."],
-    [2, "`processInputBuffer()` parses RESP and fills `c->argv` with the command and its arguments."],
-    [3, "`processCommand()` looks the command up, then checks auth, ACLs, `maxmemory` and cluster slot ownership."],
-    [4, "`call()` invokes `cmd->proc`, which for `GET` is `getCommand()`: one lookup in the keyspace `dict`. **Nothing else runs while it does.**"],
-    [5, "`addReply()` appends the value to the client's **output buffer**. No syscall yet."],
-    [5, "`beforeSleep()` flushes every output buffer, one `write()` per client, and the loop blocks in `epoll_wait` again."],
-  ]}
-/>
-
-Step 5 is the only one that touches your data. Everything around it is moving
-bytes in and out of buffers.
-
-</Sub>
-
-<Sub n="4.2" title="Why the reply isn't sent immediately">
-
-Step 6 doesn't call `write()`. Replies accumulate in a per-client buffer and go
-out in `beforeSleep()`, once, just before the loop blocks again.
-
-<Predict
-  q="A client pipelines 100 GET commands in one packet. Roughly how many write() syscalls does Redis make to answer them?"
-  options={["100", "About 50", "1", "0: the kernel sends replies on its own"]}
-  answer={2}
->
-One. Each `GET` appends to the same output buffer, and `beforeSleep()` flushes
-it with a single `write`. Pipelining saves the syscalls as well as the network
-round trips, and at a few hundred nanoseconds each on a modern kernel, a hundred
-avoided syscalls is real.
-</Predict>
-
-<Why>Why is a client that stops reading dangerous?</Why>
-
-Because its output buffer grows inside your Redis process.
-`client-output-buffer-limit` is the setting that decides whether Redis kills
-the client or lets it eat your memory.
-
-</Sub>
-
-<Sub n="4.3" title="Commands that block everything">
-
-Because execution is serialised, any slow command is an outage for every other
-client. The usual suspects:
-
-| Command | Why it blocks | What to use |
-|---|---|---|
-| `KEYS pattern` | Scans the entire keyspace | `SCAN` with a cursor |
-| `SMEMBERS` on a huge set | Serialises every member | `SSCAN` |
-| `DEL` on a 10M-element hash | Frees every entry inline | `UNLINK` (frees in a background thread) |
-| `FLUSHALL` | Synchronous by default | `FLUSHALL ASYNC` |
-| A long Lua script | Atomic by design, so nothing preempts it | Split it, or use functions with smaller units |
-
-<Callout label="Design implication">
-In Redis, the latency of every command is the latency of the slowest command
-running near it. Treat any O(N) command on a big key as a production change,
-and prefer the cursor and async variants by default.
-</Callout>
-
-</Sub>
-
-<SectionHeading n="05" id="memory-layout">How Redis stores a value</SectionHeading>
-
-A Redis database is two hash tables, and every value in them sits behind a
-16-byte header. The header decides how the value is laid out.
-
-<Sub n="5.1" title="Two hash tables per database">
+Redis's data is kept in a structure called a database, and each database holds two hash tables. This is the real definition from the source, trimmed to the part we need:
 
 ```c
 typedef struct redisDb {
@@ -272,21 +282,13 @@ typedef struct redisDb {
 } redisDb;
 ```
 
-Keys live in `dict`. TTLs live in a *separate* `dict` holding only the keys that
-have one.
-
-<Why>Why does a TTL cost memory?</Why>
-
-Because setting one adds an entry to the `expires` dict. Removing the TTL gives
-that memory back. The split also matters for eviction: the `volatile-*`
-policies only look at `expires` (section 9.1).
+Keys live in `dict`, the keyspace from section 1, and map each name to a value object. TTLs live in a separate `dict` holding only the keys that have one. So `session:42` has an entry in the keyspace, and once you give it a 30-minute TTL with `EXPIRE session:42 1800` it gets a second entry in `expires`. That's why a TTL costs memory, and removing the TTL gives it back. The split matters again in section 7, because some of Redis's eviction policies only look at `expires`.
 
 </Sub>
 
-<Sub n="5.2" title="The object header">
+<Sub n="4.2" title="The object header">
 
-Every value is a `robj`: a small header saying what the value is and how it's
-currently laid out.
+Every value in the keyspace is wrapped in a small header called an `robj`, which says what kind of value it is and how it's currently laid out in memory.
 
 <SourceRead
   file="src/server.h"
@@ -318,20 +320,17 @@ typedef struct redisObject {
 />
 </Figure>
 
-Two four-bit fields, a 24-bit clock, a refcount and a pointer. On x86-64 that
-packs into 16 bytes, and you pay those 16 bytes for every value you store.
+Two four-bit fields, a 24-bit clock, a refcount (how many places are using the object) and a pointer. On x86-64 that packs into 16 bytes, and you pay those 16 bytes for every value you store. The `lru` field is used by the eviction policies in section 7.
 
-**The type is what you asked for; the encoding is what Redis decided to give
-you.** A hash with six small fields isn't a hash table at all. It's a flat,
-cache-friendly array of length-prefixed entries called a
-<em className="term">listpack</em>, scanned linearly.
+**The type is what you asked for; the encoding is what Redis decided to give you.** Your session might be stored as a string, whose type is "string" and whose encoding could be one of three. A string that is a whole number, like `12345`, gets the `int` encoding. A short string gets `embstr`, where the header and the bytes sit together in one block of memory. A long string gets `raw`, where the header and the bytes are two separate blocks. The cutoff is 44 bytes, and section 6 shows where that number comes from.
 
 </Sub>
 
-<Sub n="5.3" title="Encodings, and the thresholds that trigger them">
+<Sub n="4.3" title="Small collections are flat arrays">
 
-Redis promotes a compact encoding to a real data structure only when it
-outgrows a threshold:
+Suppose you store the session as a hash instead, with one field per fact: `HSET session:42 uid 42 role member`. A general hash table has a lot of overhead for three small fields: an array of buckets, a node per entry, and pointers between them, which can easily outweigh the data. So Redis starts a small hash as a **listpack**, a single flat block of memory holding the entries one after another, each prefixed with its length. Looking up a field means scanning along the block. For three fields that scan is quick, and it saves the pointers.
+
+Redis switches to a real hash table only when the collection outgrows a threshold. Each type has its own:
 
 <Compare
   cols={["Type", "Compact form", "Promotes to", "Threshold on Redis 8.10"]}
@@ -344,83 +343,69 @@ outgrows a threshold:
   ]}
 />
 
-<Callout label="Common mistake" kind="warn">
-Quoting 128 as the hash threshold. It's the ziplist-era default that every blog
-post repeats, and this chapter's own first draft had it. On Redis 8.10.2 a hash
-holds 512 entries before it promotes, four times as many, which is four times
-the memory in the range where the compact encoding still applies. Ask your own
-build with `CONFIG GET`.
-</Callout>
+The compact forms not yet mentioned are the `intset`, a sorted array of integers, while a `skiplist` and a `quicklist` are the full-size structures that sorted sets and lists switch to. Lists count differently from the rest. `list-max-listpack-size` defaults to `-2`, which isn't an entry count: negative values select a byte budget per node, and `-2` means 8 KB. A thousand short strings in a list stay a listpack, and eighty hundred-byte strings don't.
 
-Lists are odd in a different way. `list-max-listpack-size` defaults to
-`-2`, and that's not an entry count. Negative values select a *byte* budget per
-node, `-2` meaning 8 KB. A thousand short strings in a list stay a listpack;
-eighty hundred-byte strings don't.
+A few notes keep you from quoting the wrong number. Blog posts often say 128 for hashes, and 128 is the sorted-set threshold, so check which type a post means. Listpack replaced the older ziplist in Redis 7.0, so a post that says ziplist predates that, and the config names it quotes no longer exist. And `CONFIG GET` reports your *running* value, which your distro may have overridden in `redis.conf`, so ask your own server.
 
-Two smaller notes. **Listpack replaced ziplist** in Redis 7.0, so a post that
-says ziplist predates that, and the config names it quotes no longer exist. And
-`CONFIG GET` reports your *running* value, which your distro may have
-overridden in `redis.conf`. The values here were checked against a server
-started with no config file at all.
+This experiment builds a hash and watches its encoding as it grows. `OBJECT ENCODING` reports how a key is laid out right now, and `HLEN` counts a hash's fields. `CONFIG GET` prints the setting's name and then its value, so `tail -1` keeps just the value. The loops add fields one command at a time, and the last step deletes 520 of them. It assumes the server from section 1 is still running on port 6399.
 
-<TryIt what="Watch a hash change its own data structure" lang="shell" toolchain="redis 8.10.2, macOS 15">
+<TryIt what="Watch a hash change its own data structure" lang="shell" toolchain="Redis 8.10.2, macOS 26.5.1">
 ```shell
-# Ask your build what the threshold is. Do not trust a blog post. Including this one.
-redis-cli CONFIG GET hash-max-listpack-entries | tail -1   # 512
+redis-cli -p 6399 CONFIG GET hash-max-listpack-entries | tail -1
 
-redis-cli DEL h > /dev/null
-redis-cli HSET h a 1 b 2 c 3 > /dev/null
-redis-cli OBJECT ENCODING h        # listpack
+redis-cli -p 6399 DEL h > /dev/null
+redis-cli -p 6399 HSET h a 1 b 2 c 3 > /dev/null
+redis-cli -p 6399 OBJECT ENCODING h
 
-# Cross the number everyone quotes. Nothing happens.
-for i in $(seq 1 130); do redis-cli HSET h "f$i" "$i" > /dev/null; done
-redis-cli HLEN h                   # 133
-redis-cli OBJECT ENCODING h        # listpack
+for i in $(seq 1 130); do redis-cli -p 6399 HSET h "f$i" "$i" > /dev/null; done
+redis-cli -p 6399 HLEN h
+redis-cli -p 6399 OBJECT ENCODING h
 
-# Cross the real one.
-for i in $(seq 131 520); do redis-cli HSET h "f$i" "$i" > /dev/null; done
-redis-cli HLEN h                   # 523
-redis-cli OBJECT ENCODING h        # hashtable
+for i in $(seq 131 520); do redis-cli -p 6399 HSET h "f$i" "$i" > /dev/null; done
+redis-cli -p 6399 HLEN h
+redis-cli -p 6399 OBJECT ENCODING h
 
-# Now shrink it back down to three fields.
-redis-cli HDEL h $(seq -f "f%g" 1 520 | tr '\n' ' ') > /dev/null
-redis-cli HLEN h                   # 3
-redis-cli OBJECT ENCODING h        # hashtable
+redis-cli -p 6399 HDEL h $(seq -f "f%g" 1 520 | tr '\n' ' ') > /dev/null
+redis-cli -p 6399 HLEN h
+redis-cli -p 6399 OBJECT ENCODING h
 ```
-
 <Output>
-A 133-field hash is still a flat array being scanned linearly, and on this
-build that's the right call. The listpack stays competitive far longer than the
-folk number suggests.
-
-**The conversion only goes one way.** Once a hash is promoted it stays promoted
-for the life of the key, however small it shrinks. Three fields, full hash
-table overhead.
+```
+512
+listpack
+133
+listpack
+523
+hashtable
+3
+hashtable
+```
 </Output>
 </TryIt>
 
+Read the output in pairs. This build's threshold is 512. A hash with three fields is a listpack, as we expected. After 130 more fields it holds 133, past the 128 that so many blog posts quote, and it's still a listpack: a flat array being scanned linearly is the right call at that size, and it stays competitive far longer than the folk number suggests. After 390 more it holds 523 fields and has become a `hashtable`. The last pair is the surprise: after 520 deletions the hash is back to three fields, and it's still a `hashtable`. **The conversion only goes one way.** Once a hash is promoted it stays promoted for the life of the key, however small it shrinks, so three fields now carry the full overhead of a hash table.
+
 <Why>Why doesn't a shrunk hash go back to a listpack?</Why>
 
-Because the thresholds are checked on insert, never on delete. Build a hash by
-inserting 600 fields and deleting 597 and you keep paying. If that matters,
-rebuild the key: `HGETALL` into a new key and `RENAME` over the old one.
+Because the thresholds are checked on insert, never on delete. Build a hash by inserting 600 fields and deleting 597 and you keep paying. If that matters, rebuild the key: `HGETALL` into a new key and `RENAME` over the old one.
 
-Why 512 for hashes when sorted sets and sets sit at 128? The linear scan is over
-the same listpack layout in each case. A plausible reason is that hashes are
-the type people push hardest for object storage, so the memory win was judged
-worth more scanning. That's a guess; I couldn't find it written down.
+You might wonder why hashes get 512 while sorted sets and sets get 128, when the scan runs over the same listpack layout in each case. Nothing in the default config file says. A plausible reason is that hashes are the type people push hardest for object storage, so the memory saving was judged worth more scanning. That's a guess.
+
+A hash table that holds every key has to grow as keys arrive. In a server with one thread, growing it is dangerous, and that's the next problem.
 
 </Sub>
 
-<SectionHeading n="06" id="rehashing">Growing the table without stopping</SectionHeading>
+<SectionHeading n="05" id="rehashing">Growing the table without stopping</SectionHeading>
 
-A hash table has to grow as keys arrive. The normal way is to allocate a bigger
-array and move every entry. With one thread and fifty million keys, that move
-would freeze the server.
+<Sub n="5.1" title="The obvious resize would freeze the server">
 
-<Sub n="6.1" title="Two tables and a cursor">
+A hash table with too many entries per bucket gets slow, so it has to grow. The normal way is to allocate a bigger array of buckets and move every entry into it. With one thread and fifty million keys, that move would freeze the server, and since command execution is serialised, *blocking the loop is blocking the database*. A stop-the-world rehash of a 50-million-key table would stall every client for seconds.
 
-A `dict` holds *two* hash tables, not one.
+</Sub>
+
+<Sub n="5.2" title="Two tables and a cursor">
+
+So Redis moves the entries a little at a time. A `dict` holds *two* hash tables, the old one and the new one, plus one number saying how far the move has got. This is the definition, trimmed:
 
 ```c
 typedef struct dict {
@@ -431,6 +416,45 @@ typedef struct dict {
     /* ... */
 } dict;
 ```
+
+Here is a tiny table growing, with `session:42` in one of the buckets. The move is called **rehashing**, and `rehashidx` is the number of the next bucket to move:
+
+<Scene
+  title="Growing a hash table one bucket at a time"
+  regions={[
+    { id: "old", label: "ht_table[0]", sub: "old table · 4 buckets", col: 0, row: 0, span: 2 },
+    { id: "new", label: "ht_table[1]", sub: "new table · twice the size", col: 2, row: 0 },
+    { id: "ctl", label: "Bookkeeping", sub: "rehashidx: the next bucket to move", col: 0, row: 1, span: 3 },
+  ]}
+  itemWidth={100}
+  frames={[
+    { caption: "A table with four buckets now holds five entries, one of them `session:42`, so some buckets hold more than one entry and the table is due to grow. The obvious way is to build a bigger table and move all five entries right now. With fifty million entries, that would freeze the only thread.",
+      items: [
+        { id: "k1", at: "old", label: "k1", sub: "bucket 0" },
+        { id: "k2", at: "old", label: "k2", sub: "bucket 0" },
+        { id: "s42", at: "old", label: "session:42", sub: "bucket 2", tone: "accent" },
+        { id: "k4", at: "old", label: "k4", sub: "bucket 3" },
+        { id: "k5", at: "old", label: "k5", sub: "bucket 3" },
+        { id: "idx", at: "ctl", label: "rehashidx = -1", sub: "not resizing" },
+      ],
+      focus: ["old"] },
+    { caption: "Redis allocates `ht_table[1]` at twice the size and sets `rehashidx` to 0. It moves nothing yet. From now on, a lookup has to check both tables, because a key may be in either.",
+      change: [{ id: "idx", label: "rehashidx = 0", sub: "resizing", tone: "new" }], focus: ["new", "ctl"] },
+    { caption: "The next command to arrive is a `SET`. Before running it, Redis moves **one bucket**, bucket 0 with `k1` and `k2`, into the new table and advances `rehashidx` to 1.",
+      change: [{ id: "k1", at: "new", sub: "moved", tone: "ok" }, { id: "k2", at: "new", sub: "moved", tone: "ok" }, { id: "idx", label: "rehashidx = 1" }],
+      focus: ["old", "new"], arrow: { from: "old", to: "new", label: "move bucket 0" } },
+    { caption: "Then `GET session:42` arrives. Again Redis moves one bucket before the lookup. Bucket 1 is empty and is skipped, so bucket 2 moves, taking `session:42` with it, and `rehashidx` becomes 3. The lookup checks the old table, then the new one, and finds the session there.",
+      change: [{ id: "s42", at: "new", sub: "moved", tone: "ok" }, { id: "idx", label: "rehashidx = 3" }],
+      focus: ["old", "new"], arrow: { from: "old", to: "new", label: "move bucket 2" } },
+    { caption: "Suppose no commands arrive for a while. A background timer inside the server, the **cron**, moves a few more buckets, so a quiet table still finishes. Bucket 3, with `k4` and `k5`, goes across.",
+      change: [{ id: "k4", at: "new", sub: "moved", tone: "ok" }, { id: "k5", at: "new", sub: "moved", tone: "ok" }, { id: "idx", label: "rehashidx = 4" }],
+      focus: ["old", "new"], arrow: { from: "old", to: "new", label: "move bucket 3" } },
+    { caption: "The old table is empty. Redis frees it, the new table becomes *the* table, and `rehashidx` goes back to -1. The resize cost a few small moves, each one done alongside a command that was running anyway.",
+      change: [{ id: "idx", label: "rehashidx = -1", sub: "done", tone: "ok" }], focus: ["new"] },
+  ]}
+/>
+
+Frozen in the middle and drawn the way the `dict` holds it, looks like this:
 
 <Figure caption="rehashidx is the only state. Buckets left of it have moved; buckets right of it haven't. Every lookup while this is in flight checks both tables.">
 <Cells
@@ -443,51 +467,21 @@ typedef struct dict {
 />
 </Figure>
 
-</Sub>
-
-<Sub n="6.2" title="One resize, a bucket at a time">
-
-<Steps
-  title="Incremental rehashing in a Redis dict"
-  lanes={[
-    { t: "Grow", s: "table too full", icon: "↗" },
-    { t: "ht_table[1]", s: "new, empty", icon: "▦" },
-    { t: "Each operation", s: "lookup · insert · delete", icon: "⇄" },
-    { t: "Background cron", s: "a few more buckets", icon: "◷" },
-    { t: "Done", s: "one table again", icon: "✓" },
-  ]}
-  steps={[
-    [0, "The table needs to grow. Redis **doesn't move any entries yet**."],
-    [1, "It allocates `ht_table[1]` at the new size and sets `rehashidx` to 0."],
-    [2, "Every lookup, insert or delete also migrates **one bucket** from table 0 to table 1 and bumps `rehashidx`."],
-    [2, "While `rehashidx >= 0`, a lookup has to check **both tables**, because a key may not have moved yet."],
-    [3, "A background cron moves a few more buckets, so an idle table still finishes."],
-    [4, "When table 0 is empty, the new table is the only one and `rehashidx` goes back to -1."],
-  ]}
-/>
-
 <Why>Why not rehash everything at once?</Why>
 
-Because a stop-the-world rehash of a 50-million-key table would block the event
-loop for seconds. Since command execution is serialised, *blocking the loop is
-blocking the database*. Spreading the work one bucket at a time keeps the worst
-case bounded.
+Because the loop is the whole database. Spreading the work one bucket at a time keeps the worst case bounded: each command carries a tiny share of the move, and no client ever sees a multi-second stall.
 
-<Callout label="Design implication">
-You pay for it on every read: while a resize is in flight, each lookup checks
-two tables. Redis trades a small continuous penalty for never having a
-multi-second stall. For a system selling predictable latency, that's the right
-way round. Section 7.2 shows a resize caught in the middle.
-</Callout>
+You do pay for it on every read. While a resize is in flight, each lookup checks two tables. Redis trades a small continuous penalty for never having a long stall. For a system whose selling point is predictable latency, that's the right way round. Section 6.2 shows a resize caught in the middle, in a memory reading.
+
+Growing tables are one reason a key's memory cost isn't a fixed number. The next question is how much memory one key takes.
 
 </Sub>
 
-<SectionHeading n="07" id="cost">What a key costs</SectionHeading>
+<SectionHeading n="06" id="key-cost">What one key costs</SectionHeading>
 
-Memory is where Redis estimates go wrong most often. The fixed costs are small
-but paid per key, and the table itself adds a share that moves as it grows.
+Memory is where Redis estimates go wrong most often. The fixed costs per key are small, but you pay them for every key, and the hash table adds a share that moves as it grows.
 
-<Sub n="7.1" title="The fixed costs">
+<Sub n="6.1" title="The fixed costs">
 
 <Cost items={[
   { what: "Hash table lookup, amortised", value: "O(1)", source: "dict.c: two tables while rehashing" },
@@ -496,137 +490,156 @@ but paid per key, and the table itself adds a share that moves as it grows.
   { what: "Hash slots in Cluster", value: "16384", source: "CLUSTER_SLOTS, cluster.h" },
 ]} />
 
+An *amortised* O(1) lookup means that the average cost doesn't grow with the number of keys, even though one particular resize costs more. "Hash slots in Cluster" refers to Redis Cluster, the mode where several servers split the keyspace between them: each key belongs to one of 16384 slots, and each server owns a share of the slots.
+
 <Why>Why 44 bytes, and not a round number?</Why>
 
-An `robj` is 16 bytes and an `sdshdr8` header is 3 bytes plus a null
-terminator, so 16 + 3 + 44 + 1 = 64. That's exactly one cache line and exactly
-one jemalloc size class.
+An `robj` is 16 bytes, and the string's own header, called an `sdshdr8` (SDS is Redis's string type, which stores its length in front of the bytes), is 3 bytes plus a null terminator at the end of the text. So 16 + 3 + 44 + 1 = 64. That is one cache line, the chunk of memory a CPU typically loads at a time, and exactly one of the standard block sizes the memory allocator rounds requests up to (its size classes). Cross it by a byte and you get two allocations, two pointer chases, and a size class with slack in it.
 
-Cross it by a byte and you get two allocations, two pointer chases, and a size
-class with slack in it.
+You can see the boundary on a running server. A 44-byte string reports `embstr` and a 45-byte string reports `raw`.
 
 </Sub>
 
-<Sub n="7.2" title="Measuring your own per-key cost">
+<Sub n="6.2" title="Measuring your own per-key cost">
 
-Key length, value length, encoding and allocator version all move the per-key
-overhead, so a number from a blog post (this one included) won't fit your data.
-Measure your own shape:
+Key length, value length, encoding and allocator all move the per-key overhead, so a number from a blog post won't fit your data, and that includes the number below. Measure your own shape. The experiment loads 100,000 sessions that look like ours and divides the growth in memory by 100,000.
 
-<TryIt what="Measure the real per-key cost of your own data shape" lang="shell" toolchain="redis 8.10.2, macOS 15">
+A few of its pieces need explaining. `redis-cli --pipe` reads commands from standard input and sends them in bulk, much faster than one `redis-cli` call per key. `INFO memory` prints memory statistics, and `used_memory` is the number of bytes Redis has allocated, which `awk` pulls out before and after. The quotes matter: the JSON value goes in single quotes, because without them the inline protocol reads the first `"` as an opening quote and the whole pipe dies with "unbalanced quotes in request". `FLUSHALL` first empties the server, so the baseline is clean. `MEMORY USAGE` asks Redis what one key costs, and `STRLEN` gives the length of the value.
+
+<TryIt what="Measure the real per-key cost of your own data shape" lang="shell" toolchain="Redis 8.10.2, macOS 26.5.1">
 ```shell
 # Empty baseline
-redis-cli FLUSHALL > /dev/null
-BEFORE=$(redis-cli INFO memory | awk -F: '/^used_memory:/{print $2+0}')
+redis-cli -p 6399 FLUSHALL > /dev/null
+BEFORE=$(redis-cli -p 6399 INFO memory | awk -F: '/^used_memory:/{print $2+0}')
 
 # 100k keys in the shape you actually store. Note the single quotes around the
 # JSON — without them the inline protocol reads the first " as an opening quote
 # and the whole pipe dies with "unbalanced quotes in request".
 for i in $(seq 1 100000); do
   printf "SET session:%s '{\"uid\":%s,\"role\":\"member\"}'\n" "$i" "$i"
-done | redis-cli --pipe
+done | redis-cli -p 6399 --pipe
 
-AFTER=$(redis-cli INFO memory | awk -F: '/^used_memory:/{print $2+0}')
+AFTER=$(redis-cli -p 6399 INFO memory | awk -F: '/^used_memory:/{print $2+0}')
 echo "bytes per key: $(( (AFTER - BEFORE) / 100000 ))"
-redis-cli MEMORY USAGE session:1
-redis-cli STRLEN session:1
+redis-cli -p 6399 MEMORY USAGE session:1
+redis-cli -p 6399 STRLEN session:1
 ```
-
 <Output>
 ```
+All data transferred. Waiting for the last reply...
+Last reply received from server.
 errors: 0, replies: 100000
-bytes per key: 93
+bytes per key: 94
 64
 25
 ```
-
-A 9-byte key and a 25-byte value. That's 34 bytes of data in 93 bytes of RAM,
-about 2.7×, and none of it is waste you can configure away. It's the `robj`
-header, the `dictEntry`, the SDS length prefix, and jemalloc rounding each of
-those up to a size class.
 </Output>
 </TryIt>
 
+Our key `session:1` is 9 bytes and its value is 25, so each entry carries 34 bytes of data and takes about 94 bytes of RAM, a little under three times as much. The figure moves by a byte or two from run to run, depending on the state the table was left in. None of that is waste you can configure away. It's the `robj` header, the `dictEntry` that links the key into the table, the SDS length prefix, and the allocator rounding each of those up to a size class. The exact figure depends on the allocator your build uses.
+
 <Why>Why do MEMORY USAGE and the subtraction disagree?</Why>
 
-`MEMORY USAGE` says 64: one key, its `dictEntry`, its allocator rounding. The
-subtraction says 93, because it also carries this key's share of the bucket
-array. **Use the subtraction.** The single-key number is honest about the key
-and silent about the table.
+`MEMORY USAGE` says 64: one key, its `dictEntry` and its allocator rounding. The subtraction says 94, because it also carries this key's share of the bucket array. **Use the subtraction.** The single-key number is honest about the key and silent about the table.
 
-That share moves with how many keys you have, and not monotonically. Same
-measurement at three sizes:
+That share changes with how many keys you have, and not smoothly. The same measurement at three sizes:
 
 | Keys | Bytes per key |
 |---|---|
 | 70,000 | 105 |
-| 100,000 | 93 |
+| 100,000 | 94 |
 | 131,000 | 92 |
 
-The obvious guess for 70k is an oversized, half-empty table. That's wrong, and
-`DEBUG HTSTATS` shows why (you need `--enable-debug-command local` to run it;
-it's off by default since Redis 7):
+You might guess that 70,000 keys means a table that's oversized and half empty. That guess is wrong, and `DEBUG HTSTATS` shows why. It prints the state of the hash tables of one database, and it needs the server started with `--enable-debug-command`, because it has been off by default since Redis 7. Taken right after loading 70,000 keys, it looks like this. The `[Expires HT]` heading is the second hash table from section 4.1, and it's empty here because none of these keys has a TTL:
 
 ```
+[Dictionary HT]
 Hash table 0 stats (main hash table):
  table size: 65536
- number of elements: 58460
+ number of elements: 58570
 Hash table 1 stats (rehashing target):
  table size: 131072
- number of elements: 11540
+ number of elements: 11430
+[Expires HT]
 ```
 
-At 70k the resize from section 6.2 is still *in flight*. Both arrays exist,
-196,608 buckets for 70,000 keys, until the incremental rehash drains table 0. At
-100k it has finished: one table, 131,072 buckets, all 100,000 elements. That
-12-byte difference is a rehash caught in the middle.
+Two tables exist, so the resize from section 5 is still in flight. There are 196,608 buckets for 70,000 keys (65,536 plus 131,072) until the incremental rehash drains table 0. At 100,000 keys it has finished: one table, 131,072 buckets, all 100,000 elements. That extra 11 bytes per key is a rehash caught in the middle. The exact split between the two tables varies from run to run, because it depends on how far the rehash has got.
+
+So a memory reading taken on a keyspace that's still growing measures a transient, and it can be about 12% off while looking perfectly stable. Take your measurement when the table isn't resizing.
+
+Now we know what a key costs. A server has only so much RAM, though, and sessions are meant to disappear, so Redis needs rules for what leaves.
+
+</Sub>
+
+<SectionHeading n="07" id="eviction-expiry">When memory fills and when keys expire</SectionHeading>
+
+A cache has to get rid of data in two ways: when memory runs out, and when a key's TTL passes. Neither works the way most people assume.
+
+<Sub n="7.1" title="Choosing an eviction policy">
+
+`maxmemory` is a setting that puts a ceiling on how much memory Redis may use for data. When a write would take it past the ceiling, Redis has to decide what to do, and `maxmemory-policy` says which. It's the setting most often left at its default, and the default is `noeviction`, which means writes start failing when you hit the ceiling. For a cache that's almost never what you want. The alternative is **eviction**: Redis throws out existing keys to make room.
+
+Which keys should go? Two plain ideas. **LRU**, least recently used, evicts the key that has gone longest without being touched. **LFU**, least frequently used, evicts the key that has been touched the fewest times. Think of sessions: the user who clicks every few seconds has a hot session under either rule. The trouble starts with a nightly job that reads every session exactly once.
+
+| Policy | How it picks a victim | Breaks when | Best for |
+|---|---|---|---|
+| **`allkeys-lru`** | Samples `maxmemory-samples` keys (5 by default) and evicts the least recently used | A batch job touching every key evicts your hot set; recency is a weak signal under a scan | A pure cache with a stable working set and no periodic sweeps |
+| **`allkeys-lfu`** | Evicts by access *frequency*, from an 8-bit counter in the `robj`'s `lru` field | A key that was hot last week resists eviction today; decay is set by `lfu-decay-time`, which people rarely tune | Caches with a long-lived hot set and periodic scans, the usual production shape |
+| **`volatile-ttl`** | Among keys with a TTL, evicts the one expiring soonest | Keys without a TTL are never candidates | A keyspace where every key has a deliberate TTL |
+
+Under LRU, the nightly job makes every session it touches the most recently used key in the cache, and the hot set gets evicted to make room for keys nobody will read again. Under LFU, a key the job touched once has a counter near 1, while a key served a thousand times a minute sits far higher, so the scan evicts itself.
+
+<Why>Why sample instead of tracking exact LRU?</Why>
+
+Real LRU would need a linked list threaded through every object, and every read would have to move its object to the front of the list. Sampling five keys gets close enough, most of the time, for a fraction of the memory.
+
+LFU's counter uses a similar trick to fit into eight bits. Increments get logarithmically less likely as the counter rises, so a counter of 255 represents roughly a million accesses. That frequency is what makes LFU scan-resistant.
 
 <Callout label="Common mistake" kind="warn">
-Benchmarking memory on a keyspace that's actively growing. A reading taken
-during a resize measures a transient, and it can be 13% off while looking
-perfectly stable.
+`volatile-lru` on a keyspace where only some keys have TTLs. It hits
+`maxmemory`, finds no eligible victim, and returns `OOM command not allowed when
+used memory > 'maxmemory'`, while `INFO` reports gigabytes of evictable-looking
+data. None of it is *eligible*: every `volatile-*` policy only considers the
+`expires` dict from section 4.1. Check `db0:keys=N,expires=M` in `INFO keyspace`; if `M` is much
+smaller than `N`, this is your bug.
 </Callout>
 
 </Sub>
 
-<Sub n="7.3" title="Sizing an instance">
+<Sub n="7.2" title="How expiry runs">
 
-Once you have a measured figure, the arithmetic is simple. Add margin, then the
-buffers and the fork headroom from section 8.2:
+Eviction frees memory when it's short. **Expiry** is the other path: a key reaches the end of its TTL, like `session:42` after its 30 minutes, and must stop being served. Redis uses two mechanisms, and neither is a guarantee of prompt memory.
 
-<Estimate
-  rows={[
-    { label: "Keys", math: "peak sessions × 1.3 headroom", value: "10,000,000" },
-    { label: "Bytes per key", math: "measured above", value: "93 B" },
-    { label: "Dataset", math: "10M × 93 B", value: "0.93 GB" },
-    { label: "Replication buffer", math: "client-output-buffer-limit slave", value: "0.26 GB" },
-    { label: "COW headroom for BGSAVE", math: "write rate × dump duration", value: "0.40 GB" },
-  ]}
-  result={{ label: "maxmemory, before you round up to an instance size", value: "≈ 1.6 GB" }}
-/>
+| Mechanism | When it runs | What it does |
+|---|---|---|
+| **Lazy** | On every lookup | Checks the `expires` dict first. An expired key is deleted and the lookup reports a miss, so a client never sees stale data |
+| **Active** | `hz` times a second (10 by default), in `activeExpireCycle()` | Samples 20 keys from `expires`, deletes the expired ones, and repeats while more than 10% of the sample was expired |
+
+Lazy expiry keeps the promise to clients: the moment the 30 minutes are up, a `GET session:42` returns nothing. Active expiry gives the memory back for keys that nobody asks about. Its sampling stops as soon as at most one key in ten of the sample turns out to be expired, and each cycle is also capped to a share of the CPU time (in the 7.2.4 source, 25% of one `hz` period), so the loop doesn't take over the server. Older documentation, and many blog posts, quote 25% as the repeat threshold; in the 7.2.4 source that number is the CPU cap, and the threshold is 10%.
+
+So memory for expired keys is reclaimed *eventually*. A key that nothing reads, in a database where few keys are expiring, can linger well past its TTL, because the sampling only digs deeper when it keeps finding expired keys. If you're sizing memory against a TTL, size against the lingering.
+
+Eviction and expiry throw data away on purpose. Everything we've covered so far also lives in RAM, so the harder question remains: what happens to `session:42` when the process itself dies?
 
 </Sub>
 
-<SectionHeading n="08" id="durability">Durability: replication and fork()</SectionHeading>
+<SectionHeading n="08" id="durability">When the process dies</SectionHeading>
 
-RAM is gone when the process dies. Redis has three answers: replicas that copy
-the primary's writes, RDB snapshots written by a forked child, and an
-append-only file. Each has a gap you should know about.
+RAM is gone when the process dies. Redis has three answers: replicas that copy the primary's writes, RDB snapshots written by a forked child process, and an append-only file. Each has a gap you should know about, and the first one carries the biggest surprise.
 
 <Sub n="8.1" title="The acknowledged write that vanishes">
 
-Replication is asynchronous. The primary replies `OK` to your client and
-*then* streams the write to replicas.
+Replication is asynchronous. The primary replies `OK` to your client and *then* streams the write to its replicas. Walk `SET session:42` through a failure that lands between those two moments:
 
 <StepSequence
   title="An acknowledged write lost in a failover"
   actors={["Client", "Primary", "Replica"]}
   messages={[
-    { from: 0, to: 1, label: "SET k v", note: "The client writes a key. The primary applies it **in its own memory**." },
+    { from: 0, to: 1, label: "SET session:42", note: "The client writes the session. The primary applies it **in its own memory**." },
     { from: 1, to: 0, label: "+OK", note: "The primary acknowledges **before** replicating. From here until the replica has the write, it exists only in the primary's RAM." },
     { from: 1, to: 1, label: "primary dies", dashed: true, note: "The primary crashes before the write is streamed to the replica." },
-    { from: 2, to: 2, label: "promoted", note: "Failover promotes the replica. It never received `SET k v`." },
-    { from: 0, to: 2, label: "GET k", note: "The client reads the key it was told was written." },
+    { from: 2, to: 2, label: "promoted", note: "Failover promotes the replica. It never received `SET session:42`." },
+    { from: 0, to: 2, label: "GET session:42", note: "The client reads the key it was told was written." },
     { from: 2, to: 0, label: "(nil)", note: "The promoted replica **happily serves a read that doesn't include the write**. No error anywhere." },
   ]}
 />
@@ -638,44 +651,54 @@ min-replicas-to-write 1
 min-replicas-max-lag 10
 ```
 
-This makes the primary *refuse writes* when fewer than one replica has been seen
-within ten seconds. It shrinks the window.
+This makes the primary *refuse writes* when fewer than one replica has been seen within ten seconds. It shrinks the window.
 
-<Why>Why doesn't that close the window?</Why>
-
-Because "a replica was alive recently" and "this specific write reached a
-replica" are different claims. A write acknowledged one second before the
-primary dies can still be lost. `WAIT` narrows it further, but it counts
-replicas that acknowledged receipt, not ones that fsynced.
+It doesn't close it, because "a replica was alive recently" and "this specific write reached a replica" are different claims. A write acknowledged one second before the primary dies can still be lost. `WAIT` narrows it further: it blocks until a number of replicas have acknowledged a write. But it counts replicas that acknowledged receipt, not replicas that wrote the data to disk, so two replicas that both hold the write only in memory can lose it together in a correlated power failure.
 
 <Callout label="Design implication">
 Treat an acknowledged Redis write as "probably durable". If losing it would be
 an incident, the source of truth belongs in a database, and Redis holds a copy.
 </Callout>
 
+Replicas protect against a dead machine. What about restarting the same machine? For that Redis can write the dataset to disk.
+
 </Sub>
 
 <Sub n="8.2" title="Snapshots with fork()">
 
-`BGSAVE` and AOF rewrite both `fork()`. The child gets a copy-on-write view of
-memory (chapter 04) and writes it out while the parent keeps serving.
+An **RDB snapshot** is a copy of the whole dataset written to a file (by default `dump.rdb`). `BGSAVE` takes one without stopping the server, and the trick is `fork()`. The kernel creates a child process that starts out sharing all of the parent's memory, and as chapter 04 showed, the sharing is copy-on-write: a page is copied only when one of the two processes writes to it. The child writes its frozen view of memory to disk while the parent keeps serving clients. Rewriting the append-only file, which section 8.3 covers, forks in the same way. Here's a snapshot with `session:42` in the middle of it:
 
-<Steps
+<Scene
   title="BGSAVE: a snapshot from a forked child"
-  lanes={[
-    { t: "Parent", s: "the event loop", icon: "◉" },
-    { t: "fork()", s: "copy page tables", icon: "⑂" },
-    { t: "Child", s: "writes the RDB file", icon: "⇣" },
-    { t: "Shared pages", s: "copy-on-write", icon: "▦" },
-    { t: "Memory", s: "RSS of both", icon: "▲" },
+  regions={[
+    { id: "parent", label: "Redis (parent)", sub: "the event loop", col: 0, row: 0 },
+    { id: "child", label: "Child process", sub: "writes the snapshot", col: 1, row: 0 },
+    { id: "disk", label: "Disk", sub: "survives a restart", col: 2, row: 0 },
+    { id: "ram", label: "Memory pages", sub: "shared until someone writes", col: 0, row: 1, span: 3 },
   ]}
-  steps={[
-    [0, "`BGSAVE` runs on the main thread, which calls `fork()`."],
-    [1, "`fork()` copies the **page tables**, and that time scales with the size of the address space. The event loop is stalled until it returns."],
-    [2, "The child walks the dataset and writes it to disk. It sees memory frozen at the moment of the fork."],
-    [3, "The parent keeps serving. The first write to any page makes the kernel **copy that page**, so the child's view stays intact."],
-    [4, "Extra memory grows with **how many pages the parent writes** during the dump, not with the dataset size."],
-    [2, "The child finishes and exits, and its copied pages are freed."],
+  itemWidth={112}
+  frames={[
+    { caption: "Redis keeps the dataset in memory pages, and the page holding `session:42` is page 2. `BGSAVE` asks for a snapshot of everything while Redis keeps serving clients. It runs on the main thread, which calls `fork()`.",
+      items: [
+        { id: "loop", at: "parent", label: "event loop", sub: "serving clients", tone: "ok" },
+        { id: "p1", at: "ram", label: "page 1" },
+        { id: "p2", at: "ram", label: "page 2", sub: "session:42" },
+        { id: "p3", at: "ram", label: "page 3" },
+      ],
+      focus: ["parent"] },
+    { caption: "`fork()` copies the **page tables** (the maps from addresses to pages) and not the pages themselves. Both processes now point at the same three pages. Copying page tables takes longer the bigger the address space is, and the event loop is stalled until `fork()` returns.",
+      add: [{ id: "pt", at: "child", label: "page table", sub: "copy of the parent's", tone: "new" }],
+      change: [{ id: "loop", sub: "stalled in fork()", tone: "bad" }], focus: ["parent", "child"], arrow: { from: "parent", to: "child", label: "fork()" } },
+    { caption: "The child walks the pages it shares and writes them to a file. It sees memory frozen at the moment of the fork. Meanwhile the parent is back to serving clients.",
+      change: [{ id: "loop", sub: "serving clients", tone: "ok" }, { id: "pt", label: "walking pages", sub: "reads page 1, 2, 3", tone: "accent" }],
+      add: [{ id: "rdb", at: "disk", label: "dump.rdb", sub: "being written", tone: "dirty" }],
+      focus: ["child", "disk"], arrow: { from: "child", to: "disk", label: "write" } },
+    { caption: "A client sends `SET session:42` with new data. The parent is about to write to page 2, which the child is still reading. The kernel **copies page 2 first**, hands the parent the copy, and lets the write go ahead on the copy. The child still sees the old page 2.",
+      change: [{ id: "p2", sub: "old session:42", tone: "dim" }],
+      add: [{ id: "p2c", at: "ram", label: "page 2 copy", sub: "new session:42", tone: "new" }],
+      focus: ["ram", "parent"] },
+    { caption: "The child finishes the file and exits, and the old page 2 is freed. The extra memory in this snapshot was one page. It grows with the number of pages the parent writes during the dump, not with the size of the dataset.",
+      remove: ["pt", "p2"], change: [{ id: "rdb", sub: "complete", tone: "ok" }], focus: ["disk"] },
   ]}
 />
 
@@ -683,75 +706,45 @@ Two failure modes come out of this:
 
 | Failure | Cause | What to do |
 |---|---|---|
-| **Memory doubling under write load** | COW copies every page the parent writes during the dump. Read-mostly instances probably never notice; one rewriting most of its keyspace can approach 2× | Budget COW headroom (section 7.3); set `vm.overcommit_memory=1` so the kernel doesn't refuse a fork it would never need to back |
+| **Memory doubling under write load** | COW copies every page the parent writes during the dump. Read-mostly instances probably never notice; one rewriting most of its keyspace can approach 2× | Budget COW headroom (section 9); set `vm.overcommit_memory=1` so the kernel doesn't refuse a fork it would never need to back (see below) |
 | **The fork stalls the loop** | Copying page tables for a large address space | Keep instances smaller, and schedule saves off-peak |
+
+`vm.overcommit_memory=1` is a Linux setting that stops the kernel from refusing the `fork()`. Left at its default, the kernel may add up the parent's and the child's memory as if both were private, find that it doesn't fit, and say no, although in practice the two share nearly all of it.
 
 <Why>Where did "disable transparent huge pages" come from?</Why>
 
-Before Linux 5.8, a COW fault on a huge page copied 2 MB instead of 4 KB, which
-made the aftermath of a fork far worse. Since
-[commit 3917c80280c9](https://github.com/torvalds/linux/commit/3917c80280c93a7123f1a3a6dcdb10a3ea19737d),
-whose message names Redis, the kernel splits the page and copies 4 KB.
+Transparent huge pages are a Linux feature that lets the kernel use 2 MB pages instead of 4 KB ones. Before Linux 5.8, a COW fault on a huge page copied 2 MB instead of 4 KB, which made the aftermath of a fork far worse. Since [commit 3917c80280c9](https://github.com/torvalds/linux/commit/3917c80280c93a7123f1a3a6dcdb10a3ea19737d), whose message names Redis, the kernel splits the page and copies 4 KB.
 
-Compaction stalls are still a reason to be careful, and Redis's startup warning
-now asks for `madvise` instead of `never`.
+Compaction stalls are still a reason to be careful, and Redis's startup warning now asks for `madvise` instead of `never`.
 
 </Sub>
 
-<SectionHeading n="09" id="eviction">Eviction and expiry</SectionHeading>
+<Sub n="8.3" title="The append-only file">
 
-A cache has to get rid of data two ways: when it's out of memory, and when a
-key's TTL passes. Neither works the way most people assume.
+A snapshot only holds the dataset as of the moment it was taken, so a crash loses everything written since. The **append-only file**, or AOF, closes most of that gap by recording every write command in a file that Redis replays on restart. Writing to a file is a `write()` call like any other, which brings back chapter 08: the bytes go into the page cache first and reach the disk only when `fsync` runs. How often Redis calls `fsync` on the AOF is a setting called `appendfsync`, and its default, `everysec`, flushes once a second, so a crash can lose up to about the last second of writes.
 
-<Sub n="9.1" title="Choosing an eviction policy">
-
-`maxmemory-policy` is the setting most often left at its default. The default is
-`noeviction`, which means writes start failing when you hit the ceiling. For a
-cache that's almost never what you want.
-
-| Policy | How it picks a victim | Breaks when | Best for |
-|---|---|---|---|
-| **`allkeys-lru`** | Samples `maxmemory-samples` keys (5 by default) and evicts the least recently used | A batch job touching every key evicts your hot set; recency is a weak signal under a scan | A pure cache with a stable working set and no periodic sweeps |
-| **`allkeys-lfu`** | Evicts by access *frequency*, from an 8-bit counter in the `robj`'s `lru` field | A key that was hot last week resists eviction today; decay is set by `lfu-decay-time`, which people rarely tune | Caches with a long-lived hot set and periodic scans, the usual production shape |
-| **`volatile-ttl`** | Among keys with a TTL, evicts the one expiring soonest | Keys without a TTL are never candidates | A keyspace where every key has a deliberate TTL |
-
-<Why>Why sample instead of tracking exact LRU?</Why>
-
-Real LRU would need a linked list threaded through every object. Sampling five
-keys gets close enough, most of the time, for a fraction of the memory.
-
-The LFU counter uses the same trick. Increments get logarithmically less likely
-as the counter rises, so a counter of 255 represents roughly a million accesses
-in eight bits. That frequency is what makes LFU scan-resistant.
-
-<Callout label="Common mistake" kind="warn">
-`volatile-lru` on a keyspace where only some keys have TTLs. It hits
-`maxmemory`, finds no eligible victim, and returns `OOM command not allowed when
-used memory > 'maxmemory'`, while `INFO` reports gigabytes of evictable-looking
-data. None of it is *eligible*: every `volatile-*` policy only considers the
-`expires` dict. Check `db0:keys=N,expires=M` in `INFO keyspace`; if `M` is much
-smaller than `N`, this is your bug.
-</Callout>
+That's a much smaller window than a snapshot leaves, though not an empty one. All three answers leave some gap, so a store that can lose the last acknowledged write is a cache with a good memory, not a system of record.
 
 </Sub>
 
-<Sub n="9.2" title="How expiry runs">
+<SectionHeading n="09" id="sizing">Sizing an instance</SectionHeading>
 
-Two mechanisms, and neither is a guarantee:
+<Sub n="9.1" title="Adding it up">
 
-| Mechanism | When it runs | What it does |
-|---|---|---|
-| **Lazy** | On every lookup | Checks the `expires` dict first. An expired key is deleted and the lookup reports a miss, so a client never sees stale data |
-| **Active** | 20 times a second, in `activeExpireCycle()` | Samples 20 keys from `expires`, deletes the expired ones, and repeats while more than 25% of the sample was expired |
+Now every cost has appeared, and the arithmetic is simple. Take your measured bytes per key, add margin for growth, and then add what the instance needs besides the data: a buffer for replication (section 8.1) and headroom for copy-on-write during `BGSAVE` (section 8.2). For ten million sessions:
 
-So memory for expired keys is reclaimed *eventually*. A key that nothing reads,
-in a database where few keys are expiring, can linger well past its TTL. If
-you're sizing memory against a TTL, size against the lingering.
+<Estimate
+  rows={[
+    { label: "Keys", math: "peak sessions × 1.3 headroom", value: "10,000,000" },
+    { label: "Bytes per key", math: "measured in section 6.2", value: "94 B" },
+    { label: "Dataset", math: "10M × 94 B", value: "0.94 GB" },
+    { label: "Replication buffer", math: "client-output-buffer-limit slave", value: "0.26 GB" },
+    { label: "COW headroom for BGSAVE", math: "write rate × dump duration", value: "0.40 GB" },
+  ]}
+  result={{ label: "maxmemory, before you round up to an instance size", value: "≈ 1.6 GB" }}
+/>
 
-Its tail is hard to model. The 25% rule makes it
-self-limiting in aggregate, but I've watched a staging instance hold a few
-thousand expired keys for several minutes with no read pressure, and couldn't
-reproduce it on demand.
+The replication buffer row uses the default limit for replica connections, 256 MB. The copy-on-write row is the one you have to estimate from your own write rate during a dump. Together they show why `maxmemory` can't be set to the size of your dataset: the dataset is only 0.94 GB of the 1.6.
 
 </Sub>
 
@@ -759,32 +752,37 @@ reproduce it on demand.
 
 <Sub n="10.1" title="What to look at when it's slow">
 
+Each question the chapter raised has a command that answers it on a live server.
+
 ```shell
+# Is the whole server slow, or one client? (section 1)
 redis-cli --latency-history          # round trip over time, cheap, run it first
+
+# Which commands were slow? (sections 1 and 2.4)
 redis-cli SLOWLOG GET 10             # commands over slowlog-log-slower-than
+
+# Which command type uses the most time in total? (section 2.4)
 redis-cli INFO commandstats          # calls, usec, usec_per_call, per command
+
+# Which keys are huge? (sections 2.4 and 4)
 redis-cli --bigkeys                  # SCAN-based, safe on production
-redis-cli INFO keyspace              # keys vs expires — see section 9.1
+
+# Do the keys have TTLs? (section 7.1)
+redis-cli INFO keyspace              # keys vs expires
 ```
 
-`INFO commandstats` is the one people skip, and it's usually the fastest route
-to an answer. It gives total microseconds per command type, so an `HGETALL`
-that's individually fast but called 400,000 times a second shows up as the
-largest number on the page.
+`INFO commandstats` is the one people skip, and it's usually the fastest route to an answer. It gives total microseconds per command type, so an `HGETALL` that's individually fast but called 400,000 times a second shows up as the largest number on the page.
 
 </Sub>
 
-<Sub n="10.2" title="Symptom, cause, fix">
+<Sub n="10.2" title="Rules that hold up">
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| Every client stalls at once, briefly | One slow command: `KEYS`, a big `DEL`, a long script | `SLOWLOG GET`, then `SCAN`, `UNLINK`, `FLUSHALL ASYNC` |
-| Memory far above the estimate | Per-key overhead, promoted encodings that never shrink, a resize in flight | Measure by subtraction; rebuild shrunk keys |
-| OOM errors with plenty of data | `volatile-*` policy, few keys with TTLs | Compare `keys` and `expires`; use `allkeys-lfu` |
-| Hit rate collapses after a nightly job | `allkeys-lru` evicting the hot set during a scan | Switch to `allkeys-lfu` |
-| Memory spikes during saves | COW during `BGSAVE` under write load | Budget headroom; `vm.overcommit_memory=1` |
-| A write is missing after failover | Asynchronous replication | `min-replicas-to-write`, `WAIT`, or keep the source of truth elsewhere |
-| Memory creeping on the server | A client not reading its replies | `client-output-buffer-limit` |
+1. **Treat any O(N) command on a big key as a production change.** Use `SCAN`, `SSCAN`, `UNLINK` and `FLUSHALL ASYNC` by default (section 2.4).
+2. **Choose the eviction policy on purpose.** `allkeys-lfu` is the usual choice for a cache, and a `volatile-*` policy only works when almost every key has a TTL (section 7.1).
+3. **Measure the per-key cost by subtraction, on your own data shape,** and not while the table is resizing (section 6.2).
+4. **Treat an acknowledged write as probably durable.** If losing it would be an incident, the source of truth belongs in a database (section 8.1).
+5. **Budget copy-on-write headroom for `BGSAVE`,** set `vm.overcommit_memory=1`, and keep instances small enough that `fork()` is quick (section 8.2).
+6. **Put a limit on client output buffers,** so a client that stops reading can't eat your memory (section 2.3).
 
 </Sub>
 
@@ -803,20 +801,35 @@ largest number on the page.
 
 </Sub>
 
-<Sub n="10.4" title="Where you meet this in the wild">
+<Sub n="10.4" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Every client stalls at once, briefly | One slow command: `KEYS`, a big `DEL`, a long script | `SLOWLOG GET`, then `SCAN`, `UNLINK`, `FLUSHALL ASYNC` |
+| Memory far above the estimate | Per-key overhead, promoted encodings that never shrink, a resize in flight | Measure by subtraction; rebuild shrunk keys |
+| OOM errors with plenty of data | `volatile-*` policy, few keys with TTLs | Compare `keys` and `expires`; use `allkeys-lfu` |
+| Hit rate collapses after a nightly job | `allkeys-lru` evicting the hot set during a scan | Switch to `allkeys-lfu` |
+| Memory spikes during saves | COW during `BGSAVE` under write load | Budget headroom; `vm.overcommit_memory=1` |
+| A write is missing after failover | Asynchronous replication | `min-replicas-to-write`, `WAIT`, or keep the source of truth elsewhere |
+| Memory creeping on the server | A client not reading its replies | `client-output-buffer-limit` |
+
+</Sub>
+
+<Sub n="10.5" title="Where you meet this in the wild">
 
 <CardGrid>
   <WildCard name="GitHub, 2018" verdict="The lesson generalises past Redis: a cache that a request path can't proceed without is a database, and it needs a database's availability plan.">
     A 43-second network partition during maintenance cascaded into 24 hours of
-    degraded service. The incident was not a Redis failure. The published analysis is the clearest public writing on how a replication topology with an
-    asynchronous loss window behaves when the network, not the process, is what
-    fails.
+    degraded service. The incident was not a Redis failure: it involved GitHub's
+    MySQL clusters. The published analysis is the clearest public writing on how
+    a replication topology with an asynchronous loss window behaves when the
+    network, not the process, is what fails.
   </WildCard>
   <WildCard name="Twemproxy and the sharding era" verdict="Worth knowing because plenty of production Redis still predates Cluster.">
-    Before Redis Cluster, sharding lived in a proxy. Twitter's twemproxy hashed
-    keys client-side and multiplexed connections. It also couldn't do
-    multi-key operations across shards, the same constraint Cluster inherited
-    and made explicit with `CROSSSLOT` errors.
+    Before Redis Cluster, sharding lived in a proxy. Twitter's twemproxy sat in
+    front of the servers, hashed each key to pick one, and multiplexed
+    connections. It also couldn't do multi-key operations across shards, the
+    same constraint Cluster inherited and made explicit with `CROSSSLOT` errors.
   </WildCard>
 </CardGrid>
 
@@ -824,47 +837,27 @@ largest number on the page.
 
 <SectionHeading n="11" id="summary">Summary</SectionHeading>
 
-1. **One thread executes every command.** That's where atomicity without locks
-   comes from, and why one slow command stalls every client.
-2. **"Single-threaded" is out of date.** Since Redis 6, I/O threads parallelise
-   socket reads and writes; execution stays serialised.
-3. **`MULTI`/`EXEC` doesn't roll back.** A failing command reports an error and
-   the rest still apply.
-4. **Replies are buffered and flushed once per loop.** A hundred pipelined
-   commands cost one `write`.
-5. **The type is what you asked for; the encoding is what you got.** Small
-   hashes are listpacks until 512 entries on Redis 8.10, not the 128 blogs quote.
-6. **Promotion is one-way.** A hash that grew and shrank keeps hash-table
-   overhead until you rebuild it.
-7. **Resizing happens a bucket at a time.** Lookups check two tables during a
-   resize, and memory readings taken then are transient.
-8. **Measure per-key cost by subtraction.** 34 bytes of data cost 93 bytes of RAM
-   in the test here.
-9. **An acknowledged write can vanish in a failover.** Replication is
-   asynchronous, and `min-replicas-to-write` only narrows the window.
-10. **`BGSAVE` memory grows with the write rate**, and `volatile-*` policies
-    only see keys with a TTL.
+1. **One thread executes every command.** That's where atomicity without locks comes from, and why one slow command stalls every client, the `PING` that waited 1.7 seconds.
+2. **An event loop lets that one thread serve thousands of sockets.** It only touches the sockets the kernel says are ready, so it never waits on a quiet client.
+3. **"Single-threaded" is out of date.** Since Redis 6, I/O threads parallelise socket reads and writes; execution stays serialised.
+4. **Replies are buffered and flushed once per loop,** so a hundred pipelined commands cost one `write`.
+5. **`MULTI`/`EXEC` doesn't roll back.** A failing command reports an error and the rest still apply.
+6. **The type is what you asked for; the encoding is what you got.** Small hashes are listpacks until 512 entries on Redis 8.10, and the 128 that blogs quote is the sorted-set number.
+7. **Promotion is one-way.** A hash that grew and shrank keeps hash-table overhead until you rebuild it.
+8. **Resizing happens a bucket at a time.** Lookups check two tables during a resize, and memory readings taken then are transient.
+9. **Measure per-key cost by subtraction.** 34 bytes of data cost about 94 bytes of RAM in the experiment above.
+10. **Eviction and expiry both work by sampling.** `volatile-*` policies only see keys with a TTL, and expired keys can outlive their TTL in memory.
+11. **An acknowledged write can vanish in a failover.** Replication is asynchronous, `min-replicas-to-write` only narrows the window, and `BGSAVE` memory grows with the write rate.
 
 <SectionHeading n="12" id="build">Build this</SectionHeading>
 
-**Implement the listpack-to-hashtable promotion yourself.** Not the whole of
-Redis: one type, one threshold, in about 200 lines of C++.
+**Implement the listpack-to-hashtable promotion yourself.** Not the whole of Redis: one type, one threshold, in about 200 lines of C++.
 
-- A `Hash` class with two representations behind one interface: a
-  `std::vector<std::pair<std::string,std::string>>` scanned linearly, and a
-  `std::unordered_map`.
-- Promote when entry count crosses 512 *or* any value exceeds 64 bytes, or
-  whatever your own `CONFIG GET hash-max-listpack-entries` says, so the numbers
-  are comparable to your build.
+- A `Hash` class with two representations behind one interface: a `std::vector<std::pair<std::string,std::string>>` scanned linearly, and a `std::unordered_map`.
+- Promote when the entry count crosses 512 *or* any value exceeds 64 bytes, or whatever your own `CONFIG GET hash-max-listpack-entries` says, so the numbers are comparable to your build.
 - Benchmark `HGET` at 4, 16, 64, 256, 511 and 513 entries. Plot it.
 
-What you're looking for is the crossover: the point where a linear scan of a
-contiguous array stops beating a hash lookup with a pointer chase. Redis picked
-512 for hashes and 128 for sorted sets, over what looks like the same listpack
-layout, and the reasoning isn't written down anywhere I could find. If your
-crossover lands nowhere near either number (and on a machine with a 128-byte
-cache line it might not), working out *why* will teach you more than this
-chapter did.
+What you're looking for is the crossover: the point where a linear scan of a contiguous array stops beating a hash lookup with a pointer chase. Redis uses 512 for hashes and 128 for sorted sets over what looks like the same listpack layout, and its default config doesn't explain the difference. If your crossover lands nowhere near either number (and on a machine with a 128-byte cache line it might not), working out *why* will teach you more than this chapter did.
 
 <SectionHeading n="13" id="interview">Interview questions</SectionHeading>
 
@@ -878,11 +871,11 @@ serialised execution that gives you atomicity for free.
 
 <QA level="intermediate" q="You set a TTL on a key. When is the memory freed?">
 On whichever comes first: the next access to that key, or the active expiry
-cycle sampling it. Redis samples 20 keys from the `expires` dict twenty times a
-second, deletes the expired ones, and repeats while more than a quarter of the
-sample was expired. Neither path is a guarantee, so a key past its TTL can hold
-memory for a while. It's never *returned* to a client, though: the lazy check
-happens on every read.
+cycle sampling it. Redis runs that cycle `hz` times a second (10 by default),
+samples 20 keys from the `expires` dict, deletes the expired ones, and repeats
+while more than a tenth of the sample was expired. Neither path is a
+guarantee, so a key past its TTL can hold memory for a while. It's never
+*returned* to a client, though: the lazy check happens on every read.
 </QA>
 
 <QA level="intermediate" q="Why is pipelining faster than sending commands one at a time?">
@@ -926,7 +919,7 @@ moves a few more. It exists because a stop-the-world rehash of a large table
 would block the event loop for seconds, and since execution is serialised,
 blocking the loop is blocking the database.
 
-The cost is that while `rehashidx >= 0` every lookup checks both tables, so
+What it costs is that while `rehashidx >= 0` every lookup checks both tables, so
 reads are measurably slower for the duration. You're trading a small continuous
 penalty for the elimination of a multi-second stall. For a system selling
 predictable latency, that's the right way round.
@@ -942,11 +935,11 @@ predictable latency, that's the right way round.
     insert, never on delete. Two keys, identical contents, and the second costs
     you full hash table overhead for three fields until you rebuild it. If you
     answered `hashtable` for both, you're carrying the 128 from an old blog post,
-    which is exactly the mistake this chapter shipped with.
+    and that number belongs to sorted sets.
   </Q>
   <Q q="Why is the embstr threshold 44 bytes and not a round number?">
     16 bytes of `robj` + 3 bytes of `sdshdr8` header + 44 bytes of payload + 1
-    null terminator = 64 bytes. One cache line, one jemalloc size class.
+    null terminator = 64 bytes. One cache line, one allocator size class.
   </Q>
   <Q q="You run `WAIT 2 1000` and it returns 2. Is your write durable?">
     No. `WAIT` counts replicas that *acknowledged receipt*, not replicas that
@@ -961,6 +954,10 @@ predictable latency, that's the right way round.
 </Quiz>
 
 <CardGrid>
+  <WildCard name="Operating Systems: Three Easy Pieces, chapters 5 and 33">
+    The process API, which is where `fork()` is explained, and event-based
+    concurrency, the model Redis's event loop follows. Free online at ostep.org.
+  </WildCard>
   <WildCard name="redis/redis: src/dict.c">
     Incremental rehashing in about 200 readable lines. The clearest example in
     any production codebase of resizing a hash table without a pause.
@@ -993,6 +990,10 @@ predictable latency, that's the right way round.
   <WildCard name="Virtual Memory & Page Tables">
     Copy-on-write, page tables and huge pages, the mechanics behind `BGSAVE`.
     [Chapter 04](/topics/04-virtual-memory).
+  </WildCard>
+  <WildCard name="Filesystems & the Page Cache">
+    Why a written byte isn't on the disk until `fsync`, which is what limits the
+    append-only file. [Chapter 08](/topics/08-filesystems).
   </WildCard>
   <WildCard name="Concurrent Data Structures">
     The locked and lock-free hash tables Redis chose not to build.

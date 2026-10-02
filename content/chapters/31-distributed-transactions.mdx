@@ -1,22 +1,39 @@
 ---
 title: Distributed Transactions
-dek: "What to do when one action has to change two systems that can fail independently. You'll start by crashing a checkout between two writes and finding a charge with no order, then see how two-phase commit works and why it blocks, how sagas, the outbox and idempotency keys replace it in most services, and what Kafka's \"exactly-once\" promises."
-readingTime: "~34 min"
+dek: "Follow one online checkout, a charge in the payments system and an order in the orders system, through every way it can half-happen. You'll crash it between two writes, make two databases commit together with two-phase commit and see why it blocks, then learn what services use instead (sagas, the outbox and idempotency keys) and what Kafka's \"exactly-once\" really promises."
+readingTime: "~40 min"
 level: "Beginner"
-versions: "PostgreSQL 16.15 source at REL_16_4 · Kafka clients at 3.7.0 · measured on linuxkit 6.10.14 aarch64 · Python 3.14 and SQLite 3.53.3 for the first experiment"
+versions: "PostgreSQL 16.15 source at REL_16_4 · Kafka clients at 3.7.0 · linuxkit 6.10.14 aarch64 · Python 3.14 and SQLite 3.53.3 for the first experiment"
 prereqs: "a terminal and Python; ACID transactions, write-ahead logs, retries and timeouts help"
-updated: "2026-09-30"
+updated: "2026-10-02"
 ---
 
-You're buying a coat in a shop where payment and stock are handled at two separate counters. You pay at the first, and as you walk to the second to collect the coat, the shop's power fails. The first counter has your money and the second has no record of the sale. Nobody made a mistake. The two counters just can't commit together.
+You're buying a pair of headphones for $49.99. You press Pay, and behind the button the shop's code has two jobs to do. It has to charge your card, which the **payments** system takes care of, and it has to record order number 2, which the **orders** system takes care of. If both jobs finish, the headphones arrive at your door.
 
-Software does this all the time: charge a card in one system, save an order in another; write a row to a database, publish an event to a queue. Inside one database a transaction makes both changes atomic. Across two systems there's nothing to make them atomic. You can produce the failure in a short script.
+The two systems are separate programs with separate databases, and that's where it gets hard. A database can make several changes happen all together or not at all by wrapping them in a **transaction**: you start one, make the changes, and then either commit them or roll them back, and the database never lets anyone see a half-finished result. But a transaction belongs to one database. Nothing covers the payments database and the orders database together, so if the shop's server loses power after the charge and before the order is saved, you've paid for headphones that, as far as the shop's records go, you never ordered.
 
-<SectionHeading n="01" id="crash-between-writes">Crash a checkout between two writes</SectionHeading>
+The question for this chapter is how two systems that fail independently can agree on whether order 2 happened. We'll follow that one checkout the whole way. First we'll crash it halfway and look at the damage. Then we'll make two databases commit together with two-phase commit and watch where that breaks down, and after that we'll look at what real services use instead: sagas, the outbox and idempotency keys. The chapter ends with a careful look at what Kafka means when it says "exactly-once".
 
-Save this as `dual.py`. It uses two separate in-memory SQLite databases to stand in for two independent systems, an order store and a payment service. The second checkout crashes after charging the card and before saving the order.
+<SectionHeading n="01" id="crash-between-writes">One checkout, two systems</SectionHeading>
 
 <Sub n="1.1" title="A charge with no order">
+
+We can reproduce the failure in a short script. It uses two separate in-memory SQLite databases (SQLite is a small database that runs inside your own program) as stand-ins for the two systems, one for orders and one for payments. The function `checkout` does what the shop's code does: charge the card first, then save the order. Python's `with connection:` block runs its contents as one transaction and commits when the block ends, so each write below is a properly committed transaction in its own database. Checkout 1 runs normally. Checkout 2 is told to crash in between, after the charge has committed and before the order is written, which stands in for a power cut or a killed process.
+
+<Predict
+  q="Checkout 2 crashes after charging the card and before saving the order. What will the two databases hold afterwards?"
+  options={[
+    "Nothing for order 2 in either database: the crash undoes the charge",
+    "A charge for order 2, but no order",
+    "An order for order 2, but no charge",
+    "Both a charge and an order, because the script is retried on restart",
+  ]}
+  answer={1}
+>
+The charge was committed before the crash, and a commit survives whatever the process does afterwards. Nothing connects the payments database to the order that was supposed to follow, so nothing undoes the charge. The order was never written, because the script died before reaching that line.
+</Predict>
+
+Save the script as `dual.py` and run it.
 
 <TryIt what="Run two checkouts against two independent databases, crashing the second between its writes" lang="python" toolchain="Python 3.14, SQLite 3.53.3, macOS 26.5.1">
 ```python
@@ -51,27 +68,47 @@ charges : [(1,), (2,)]
 </Output>
 </TryIt>
 
-There are two charges and one order. Customer 2 has been billed for something that was never recorded.
+Read the last two lines. `orders` has one row, for order 1. `charges` has two rows, for orders 1 and 2. The amount in the script is 4999, the price in cents, so customer 2 has been billed $49.99 for an order the shop has no record of. Here is the same run drawn out, with the two systems as separate places:
+
+<Scene
+  title="Checkout 2, crashed between its two writes"
+  regions={[
+    { id: "app", label: "Checkout code", sub: "one process", col: 0, row: 0, span: 2 },
+    { id: "pay", label: "Payments database", sub: "commits on its own", col: 0, row: 1 },
+    { id: "ord", label: "Orders database", sub: "commits on its own", col: 1, row: 1 },
+  ]}
+  itemWidth={108}
+  frames={[
+    { caption: "Checkout 2 starts. Payments and Orders are separate databases, and each holds what checkout 1 left behind: one charge and one order, both for order 1.",
+      items: [
+        { id: "me", at: "app", label: "checkout 2", sub: "$49.99 headphones", tone: "accent" },
+        { id: "c1", at: "pay", label: "charge · 1", tone: "ok" },
+        { id: "o1", at: "ord", label: "order · 1", tone: "ok" },
+      ] },
+    { caption: "Step one: charge the card. The Payments database commits the charge for order 2. A commit is final, so nothing can take this charge back later.",
+      add: [{ id: "c2", at: "pay", label: "charge · 2", sub: "committed", tone: "new" }], focus: ["pay"], arrow: { from: "app", to: "pay", label: "charge" } },
+    { caption: "Before step two, the process crashes.",
+      change: [{ id: "me", sub: "crashed", tone: "bad" }], focus: ["app"] },
+    { caption: "Step two never runs. Orders has no row for order 2, and nothing tells Payments to undo the charge. The customer has paid for an order the shop doesn't know about.",
+      add: [{ id: "o2", at: "ord", label: "order · 2", sub: "never written", tone: "bad" }], change: [{ id: "c2", tone: "bad" }], focus: ["ord", "pay"] },
+  ]}
+/>
 
 </Sub>
 
 <Sub n="1.2" title="Why a transaction doesn't save you">
 
-Each `with` block is a proper transaction, atomic within its own database. The trouble is that there are two databases, and no single commit covers both. Reordering the writes only moves the failure: save the order first and a crash leaves an order nobody paid for.
+Each `with` block did its job, because each one was atomic inside its own database. The trouble is that no single commit covers both. To see why, look at what a commit physically is. Every database keeps a **log**, a file it only ever appends to, and a transaction commits at the moment one record saying "this transaction committed" is safely on disk in that log. One record in one log is what the whole guarantee rests on. It can cover everything in that database and nothing outside it: no record in the payments log can say "and the orders database has this too".
 
-The chapter starts from this failure and builds the classic fix, two-phase commit, then shows where it hurts using a real stuck transaction in Postgres. After that it covers what most services use instead: sagas, the transactional outbox and idempotency keys.
+Could we reorder the writes, saving the order first and charging second? That only moves the failure: a crash between the two now leaves an order nobody paid for. The same shape appears wherever code changes a database and then tells another system, and the next section shows another case, with a second and subtler failure hiding behind it.
 
 </Sub>
 
-<SectionHeading n="02" id="dual-write">One action, two systems</SectionHeading>
-
-Start with the simplest version of the problem. A checkout handler has to do
-two things: insert an order into Postgres, and publish `OrderPlaced` to Kafka
-so the warehouse starts picking.
+<SectionHeading n="02" id="dual-write">Why retrying doesn't fix it</SectionHeading>
 
 <Sub n="2.1" title="The dual write">
 
-Most first versions write to one, then the other:
+The checkout has this problem in a second place. After the order is saved, the warehouse has to hear about it so that someone starts packing the headphones. The shop does that by publishing an `OrderPlaced` message to **Kafka**, a system that stores streams of messages in order. Each stream is called a **topic**, and other services read it at their own pace. Most first versions write to one system and then the other (the order goes into Postgres, a popular open-source database, in this example):
 
 ```python
 with db.transaction():
@@ -79,9 +116,7 @@ with db.transaction():
 kafka.send("orders", order_placed_event)   # a second, separate write
 ```
 
-This is called a **dual write**. Each write is atomic on its own, but nothing
-ties them together. There are four ways it can end, and only one of them is
-correct.
+This is called a **dual write**: two writes to two systems, each atomic on its own, with nothing tying them together. There are four ways it can end, and only one of them is correct.
 
 | Postgres | Kafka | Result |
 |---|---|---|
@@ -92,26 +127,21 @@ correct.
 
 <Why>Why not just swap the order, or retry until it works?</Why>
 
-Swapping the order swaps which row of the table you get, not whether you get
-one. And retrying doesn't cover the case where the process itself dies between
-the two writes: there's nobody left to retry.
+Swapping the order swaps which row of the table you get, and doesn't change whether you get one. Retrying doesn't cover the case where the process itself dies between the two writes, because then nobody is left to retry. And as section 1.2 said, each system has its own log, and a commit is a single record in one of them, so there's no record Postgres could write that says "and Kafka also has this".
 
-Underneath, each system has its own log, and a commit is a
-single record in *one* log. No record in Postgres's WAL can say "and Kafka also
-has this".
+The third row of that table needs a closer look, because it hides a different kind of problem.
 
 </Sub>
 
 <Sub n="2.2" title="The ambiguous timeout">
 
-There's a second, subtler failure hiding in the third row. When a network call
-times out, you don't know whether it happened.
+When a call across a network **times out**, meaning no answer came back within the time you were willing to wait, you don't know whether the call happened. Here is the payment call for order 2, with the answer lost on the way back.
 
 <StepSequence
   title="A payment call that times out"
   actors={["Your service", "Network", "Payment provider"]}
   messages={[
-    { from: 0, to: 2, label: "POST /charges", note: "You ask the provider to charge the customer $50." },
+    { from: 0, to: 2, label: "POST /charges", note: "You ask the provider to charge the customer $49.99." },
     { from: 2, to: 2, label: "charge applied", note: "The provider charges the card and commits the charge in **its** database." },
     { from: 2, to: 1, label: "200 OK", dashed: true, note: "The response is lost: a dropped connection, a load balancer restart, a client timeout that fired a moment too early." },
     { from: 0, to: 0, label: "timeout", note: "You see a timeout. **You can't tell this apart from a request that never arrived.**" },
@@ -119,41 +149,28 @@ times out, you don't know whether it happened.
   ]}
 />
 
-A timeout has three possible meanings: the request never arrived, it arrived
-and failed, or it arrived and succeeded. From the client's side all three look the same. Every technique in this chapter is, in the end, a way of making that
-ambiguity safe.
-
-<Callout label="Design implication">
-Any call that crosses a network and changes state needs an answer to "what if
-this times out?" before it ships. It's almost always one of three things: a
-coordinator that can find out (2PC), a way to undo it (a saga), or a way to
-repeat it safely (idempotency).
-</Callout>
+A timeout has three possible meanings: the request never arrived, it arrived and failed, or it arrived and succeeded. From the client's side all three look the same. Every technique in this chapter is a way of making that ambiguity safe, and there are only three ways to do it: have a coordinator that can find out what happened, have a way to undo it, or have a way to repeat it harmlessly. We'll build them in that order, starting with the one that sounds most natural, which is to get both systems to commit together.
 
 </Sub>
 
-<SectionHeading n="03" id="two-phase-commit">Two-phase commit</SectionHeading>
-
-If you want real atomicity across two databases, you need someone to make one
-decision and everyone to follow it. That's **two-phase commit** (2PC), described
-by Jim Gray in his 1978 [Notes on Data Base Operating Systems](https://jimgray.azurewebsites.net/papers/dbos.pdf)
-and still the protocol under every "distributed transaction" feature you'll
-meet.
+<SectionHeading n="03" id="two-phase-commit">Making two systems commit together</SectionHeading>
 
 <Sub n="3.1" title="The protocol">
 
-There are two roles. The **coordinator** runs the transaction; the
-**participants** are the databases that hold the data. Its trick is to split commit into a promise and a decision.
+If we want real atomicity across two databases, we need one party to make a single decision and every database to follow it. That protocol is **two-phase commit**, usually shortened to 2PC. Jim Gray described it in his 1978 [Notes on Data Base Operating Systems](https://jimgray.azurewebsites.net/papers/dbos.pdf), and it sits under most of the "distributed transaction" features you'll meet. It has two roles. The **coordinator** runs the transaction and makes the decision. The **participants** are the databases that hold the data, which for order 2 are Orders and Payments. The trick is to split "commit" into a promise and a decision.
+
+Three words first, because the protocol leans on them. A **lock** is how a database stops anyone else from changing a row while a transaction is working on it, held until that transaction commits or rolls back. **Durable** means written to disk, so that it survives a crash and a restart. And to **abort** a transaction is to roll it back.
 
 <StepSequence
-  title="Two-phase commit: moving $30 from bank A to bank B"
-  actors={["Coordinator", "Participant A", "Participant B"]}
+  title="Two-phase commit for order 2"
+  actors={["Coordinator", "Orders", "Payments"]}
   messages={[
-    { from: 0, to: 1, label: "debit $30", note: "The coordinator runs the work on each participant as an ordinary transaction. Rows are locked as usual." },
-    { from: 0, to: 2, label: "credit $30", note: "Nothing is committed yet. Either side can still abort for any reason." },
+    { from: 0, to: 2, label: "charge $49.99", note: "The coordinator runs the work on each participant as an ordinary transaction. Rows are locked as usual." },
+    { from: 0, to: 1, label: "insert order 2", note: "Nothing is committed yet. Either side can still abort for any reason." },
     { from: 0, to: 1, label: "PREPARE", note: "Phase one. Each participant writes everything it needs to commit **to durable storage**, keeps its locks, and promises it will commit if told to." },
-    { from: 1, to: 0, label: "yes", note: "A **yes** vote is binding. From here A can no longer abort on its own, even if it crashes and restarts." },
-    { from: 2, to: 0, label: "yes", note: "B votes yes too. Any **no** vote, or silence past a timeout, and the coordinator would decide abort." },
+    { from: 0, to: 2, label: "PREPARE", note: "Payments does the same. Its change and its locks are now safe from a crash." },
+    { from: 1, to: 0, label: "yes", note: "A **yes** vote is binding. From here Orders can no longer abort on its own, even if it crashes and restarts." },
+    { from: 2, to: 0, label: "yes", note: "Payments votes yes too. Any **no** vote, or silence past a timeout, and the coordinator would decide abort." },
     { from: 0, to: 0, label: "log COMMIT", note: "Phase two begins with the **decision**: the coordinator writes commit to its own durable log. This one record is the moment the transaction commits." },
     { from: 0, to: 1, label: "COMMIT", note: "The coordinator tells each participant. They commit, release their locks, and acknowledge." },
     { from: 0, to: 2, label: "COMMIT", note: "If a participant is down, the coordinator keeps retrying. The decision is already made; delivery just has to finish." },
@@ -162,33 +179,21 @@ There are two roles. The **coordinator** runs the transaction; the
 
 <Why>Why does it need two phases?</Why>
 
-Because a participant might be unable to commit: a constraint fails, it runs
-out of disk, it crashes. Phase one finds out while it's still safe to abort
-everywhere. Once every participant has promised, nothing but the coordinator's
-decision stands between the transaction and commit.
+Because a participant might be unable to commit: a constraint fails, it runs out of disk, it crashes. Phase one finds that out while it's still safe to abort everywhere. Once every participant has promised, nothing but the coordinator's decision stands between the transaction and commit.
 
-Everything hinges on the prepared state. A prepared participant has given up
-its right to decide. It must survive a crash still holding the transaction,
-still holding its locks, and wait to be told.
+Everything hinges on the prepared state. A prepared participant has given up its right to decide. It must survive a crash still holding the transaction, still holding its locks, and wait to be told. Whether real databases can do that is easy to check, because Postgres exposes the participant half of 2PC as ordinary SQL.
 
 </Sub>
 
 <Sub n="3.2" title="Prepared transactions in Postgres">
 
-Postgres exposes the participant half of 2PC as SQL. You run a transaction as
-normal, then end it with `PREPARE TRANSACTION 'gid'` instead of `COMMIT`. Later,
-from any session, `COMMIT PREPARED 'gid'` or `ROLLBACK PREPARED 'gid'` finishes
-it.
+Postgres lets us play the participant's part ourselves. You run a transaction as normal, then end it with `PREPARE TRANSACTION 'gid'` instead of `COMMIT`, where the **gid** is a name you choose for the transaction (a global transaction identifier). Later, from any **session** (one connection to the database), `COMMIT PREPARED 'gid'` or `ROLLBACK PREPARED 'gid'` finishes it.
 
-It's off by default: `max_prepared_transactions` is 0, and the
-[documentation](https://www.postgresql.org/docs/16/sql-prepare-transaction.html)
-recommends leaving it there unless an external transaction manager is tracking
-every prepared transaction.
+It's off by default: `max_prepared_transactions` is 0, and the [documentation](https://www.postgresql.org/docs/16/sql-prepare-transaction.html) recommends leaving it there unless an external transaction manager, a program that plays the coordinator, is tracking every prepared transaction.
 
 <Why>How does a prepared transaction survive a crash?</Why>
 
-Postgres keeps a dummy process entry per prepared transaction so the
-rest of the system still sees it as running, and writes its state to the WAL:
+Postgres records every change in its **write-ahead log**, or **WAL**, the append-only log from section 1.2, and flushes it to disk before a commit returns. A prepared transaction's state goes into the WAL too. Every Postgres transaction also gets a number, its **XID**, and Postgres keeps a dummy process entry for each prepared transaction so that its XID still counts as running. The header comment of the source file says it directly:
 
 <SourceRead
   file="src/backend/access/transam/twophase.c"
@@ -222,12 +227,9 @@ rest of the system still sees it as running, and writes its state to the WAL:
 ```
 </SourceRead>
 
-"Keeps the XID considered running" is the sentence to remember. As far as the
-rest of the database is concerned, a prepared transaction is a transaction that
-hasn't finished, with no client attached.
+"Keeps the XID considered running" is the sentence to remember. As far as the rest of the database is concerned, a prepared transaction is a transaction that hasn't finished and has no client attached. We'll see in section 3.3 what that costs.
 
-You can see the two durable steps in the WAL. Here's one 2PC transaction
-followed by one ordinary transaction, dumped with `pg_waldump`:
+The two durable steps show up in the WAL. The next experiment runs one 2PC transaction and then one ordinary transaction, and `pg_waldump`, a tool that prints a WAL's records, shows what each one wrote. In its output, `rmgr` names the part of Postgres that wrote the record, `len (rec/tot)` is the record's size in bytes, `tx` is the XID, and `desc` says what the record is.
 
 <TryIt what="One prepared transaction and one plain one, as WAL records" lang="shell" toolchain="PostgreSQL 16.15, linuxkit 6.10.14 aarch64">
 ```sql
@@ -244,40 +246,63 @@ rmgr: Transaction len (rec/tot):  42/  42, tx:      0, desc: COMMIT_PREPARED 135
 rmgr: Heap        len (rec/tot):  71/  71, tx: 135416, desc: HOT_UPDATE ...
 rmgr: Transaction len (rec/tot):  34/  34, tx: 135416, desc: COMMIT 2026-09-27 04:06:29.061850 UTC
 ```
-
-(The `lsn` and `prev` columns and the tail of each heap record are trimmed.)
-The plain transaction ends in one 34-byte `COMMIT` record. A 2PC transaction needs a 293-byte `PREPARE` record (the locks and state to rebuild it after a crash)
-and then a separate `COMMIT_PREPARED`. Each is flushed to disk before the
-command returns.
 </Output>
 </TryIt>
+
+The `lsn` and `prev` columns and the tail of each heap record are trimmed from this output. The `Heap` lines are the row updates themselves, one per transaction. The plain transaction (XID 135416) ends in one 34-byte `COMMIT` record. The 2PC transaction (XID 135415) needs a 293-byte `PREPARE` record, which holds the locks and state needed to rebuild it after a crash, and then a separate 42-byte `COMMIT_PREPARED`. Each of those records is flushed to disk before its command returns, so one commit has become two flushes, a cost we'll price in section 3.4.
 
 </Sub>
 
 <Sub n="3.3" title="The blocking problem">
 
-Now the failure 2PC is known for. Suppose the coordinator crashes after the
-participants vote yes but before it tells them the outcome.
+Now the failure that 2PC is known for. The coordinator has collected yes votes from Orders and Payments, and then it crashes before it tells either of them the outcome.
 
 <Predict
-  q="Participant A has prepared a transaction that debits account 1. The coordinator crashes before sending COMMIT or ROLLBACK, and A restarts. What happens to the prepared transaction and its row lock?"
+  q="Payments has prepared a transaction that debits an account. The coordinator crashes before sending COMMIT or ROLLBACK, and Payments restarts. What happens to the prepared transaction and its row lock?"
   options={[
-    "A rolls it back on restart, because the client is gone",
-    "A commits it on restart, because it voted yes",
+    "Payments rolls it back on restart, because the client is gone",
+    "Payments commits it on restart, because it voted yes",
     "It stays prepared, holding the lock, until someone decides",
-    "A asks participant B what to do and follows B",
+    "Payments asks Orders what to do and follows Orders",
   ]}
   answer={2}
 >
-It stays. A promised to do whatever the coordinator decides, and it doesn't
-know the decision. The coordinator may have logged commit and told B already,
-so rolling back would be wrong; it may have decided abort, so committing would
-be wrong. Asking B only helps if B heard the outcome. If B is also merely
-prepared, nobody knows.
+It stays. Payments promised to do whatever the coordinator decides, and it doesn't know the decision. The coordinator may have logged commit and told Orders already, so rolling back would be wrong. It may have decided abort, so committing would be wrong. Asking Orders only helps if Orders heard the outcome. If Orders is also merely prepared, nobody knows.
 </Predict>
 
-Here's that exact situation on a real Postgres. The participant prepares, the
-server is killed with `-m immediate` (no clean shutdown), and restarts:
+Here is that run for order 2, drawn as state. Watch what each database is stuck holding.
+
+<Scene
+  title="The coordinator crashes after the votes"
+  regions={[
+    { id: "co", label: "Coordinator", sub: "makes the decision", col: 0, row: 0, span: 2 },
+    { id: "ord", label: "Orders database", sub: "prepared", col: 0, row: 1 },
+    { id: "pay", label: "Payments database", sub: "prepared", col: 1, row: 1 },
+  ]}
+  itemWidth={124}
+  frames={[
+    { caption: "Order 2 in the middle of 2PC. Orders and Payments both received PREPARE and voted yes. Each has written its change to its own log and keeps its locks, and neither may commit or abort on its own now. The coordinator hasn't logged a decision yet.",
+      items: [
+        { id: "cd", at: "co", label: "decision", sub: "not logged yet", tone: "dim" },
+        { id: "po", at: "ord", label: "order · 2", sub: "prepared", tone: "dirty" },
+        { id: "pp", at: "pay", label: "charge · 2", sub: "prepared", tone: "dirty" },
+        { id: "pl", at: "pay", label: "account row", sub: "locked", tone: "dirty" },
+      ], focus: ["ord", "pay"] },
+    { caption: "The coordinator crashes before it tells anyone anything. Nobody has been told to commit, and nobody has been told to abort.",
+      change: [{ id: "cd", label: "coordinator", sub: "crashed", tone: "bad" }], focus: ["co"] },
+    { caption: "Orders and Payments can't guess what the coordinator would have decided, so both wait. Restarting a database doesn't change that: a prepared transaction is rebuilt from its log, locks included.",
+      change: [{ id: "po", sub: "waiting" }, { id: "pp", sub: "waiting" }], focus: ["ord", "pay"] },
+    { caption: "Meanwhile another request wants to change the same account row. It queues behind the lock and keeps waiting.",
+      add: [{ id: "w", at: "pay", label: "other update", sub: "blocked", tone: "bad" }], focus: ["pay"] },
+    { caption: "The coordinator restarts and reads its own log. It finds no COMMIT record for order 2, so it can't have told anyone to commit, and it decides **abort**. (Had the record been there, it would commit.)",
+      change: [{ id: "cd", label: "decision", sub: "abort", tone: "accent" }], focus: ["co"] },
+    { caption: "It tells both participants. They roll back and release their locks, the blocked update finally runs, and order 2 never happened anywhere. Until this moment the locks were held, and nobody could shorten the wait.",
+      change: [{ id: "po", sub: "rolled back", tone: "dim" }, { id: "pp", sub: "rolled back", tone: "dim" }, { id: "pl", sub: "released", tone: "ok" }, { id: "w", sub: "runs now", tone: "ok" }, { id: "cd", tone: "ok" }],
+      focus: ["ord", "pay"], arrow: { from: "co", to: "pay", label: "ROLLBACK" } },
+  ]}
+/>
+
+We can watch a real Postgres do this. The next experiment plays Payments' part with a plain `accounts` table, where the work inside the transaction is subtracting 30 from account 1. It prepares the transaction, kills the server with `pg_ctl stop -m immediate` (an immediate stop with no clean shutdown, like a power cut) and starts it again. Then it looks at `pg_prepared_xacts`, the list of prepared transactions, and from another session tries to update the same row. `lock_timeout` makes a statement that has to wait for a lock give up after two seconds, where it would otherwise wait for ever. Finally `pg_locks` lists the locks that are currently held.
 
 <TryIt what="A prepared transaction outlives a crash and keeps its lock" lang="shell" toolchain="PostgreSQL 16.15, linuxkit 6.10.14 aarch64">
 ```sql
@@ -313,57 +338,37 @@ CONTEXT:  while updating tuple (0,1) in relation "accounts"
  transactionid | ExclusiveLock    | t       | -1/731             |
  relation      | RowExclusiveLock | t       | -1/731             |
 ```
-
-It survived the crash with its locks, and the lock holder has no
-`pid`: there's no backend to cancel and no connection to kill.
-`pg_terminate_backend` can't help you here.
 </Output>
 </TryIt>
 
-Those locks are the visible half. What you can't see is that the prepared
-transaction's XID counts as running, so `VACUUM` can't remove anything that
-became dead after it started. In the same test, updating 100,000 rows of an
-unrelated table and vacuuming it printed:
+The first table shows `xfer-42` still prepared after the crash and restart. The other session's update waited its full 2,001 ms and then gave up with a lock timeout, which means the row is still locked by a transaction nobody is running. The last table shows who holds the locks, and it's the dummy entry from section 3.2: its `virtualtransaction` is `-1/731` and its `pid` is empty. There's no backend (the server process Postgres runs for each connection) to cancel and no connection to kill, so `pg_terminate_backend` can't help you here.
+
+Those locks are the visible half of the damage. The hidden half comes from `VACUUM`, the Postgres job that cleans up dead row versions, the old copies left behind whenever a row is updated or deleted. `VACUUM` can only remove a dead version if no running transaction could still need to see it, and a prepared transaction's XID counts as running. In the same test, updating 100,000 rows of an unrelated table and then vacuuming it printed:
 
 ```text
 tuples: 0 removed, 200000 remain, 100000 are dead but not yet removable
 removable cutoff: 731, which was 5 XIDs old when operation ended
 ```
 
-Cutoff 731 is the prepared transaction's XID. After `COMMIT PREPARED 'xfer-42'`,
-the same `VACUUM` reported `100000 removed`. Left for weeks, a forgotten
-prepared transaction bloats every table in the database and, as the docs warn,
-can eventually force a shutdown to prevent transaction ID wraparound.
+Cutoff 731 is the prepared transaction's XID. After `COMMIT PREPARED 'xfer-42'`, the same `VACUUM` reported `100000 removed`. Left for weeks, a forgotten prepared transaction bloats every table in the database and, as the docs warn, can eventually force a shutdown to prevent transaction ID wraparound, which is what happens when Postgres's transaction counter gets too far ahead of its oldest unfinished transaction.
 
 <Callout label="Common mistake" kind="warn">
-Resolving an orphaned prepared transaction by guessing. `ROLLBACK PREPARED` on
-a transaction the coordinator had already committed elsewhere leaves the two
-databases disagreeing, which is the one thing 2PC exists to prevent. Find the
-coordinator's log (the transaction manager's recovery log, or your own
-`transfers` table) and apply its decision. If there's no decision recorded,
-the coordinator never committed, and rolling back is safe.
+Resolving an orphaned prepared transaction by guessing. `ROLLBACK PREPARED` on a transaction the coordinator had already committed elsewhere leaves the two databases disagreeing, which is the one thing 2PC exists to prevent. Find the coordinator's log (the transaction manager's recovery log, or your own `transfers` table) and apply its decision. If there's no decision recorded, the coordinator never committed, and rolling back is safe.
 </Callout>
 
 <Why>Why does the coordinator's log make "no decision" mean abort?</Why>
 
-Because commit happens at exactly one point: the coordinator durably writing
-its decision. If recovery finds no commit record for a transaction, it can't
-have told anyone to commit, so aborting is always consistent. This convention
-is called **presumed abort**, from IBM's R* system
-([Mohan, Lindsay and Obermarck, 1986](https://dl.acm.org/doi/10.1145/7239.7266)),
-and it's what lets the coordinator skip logging aborts entirely.
+Because commit happens at exactly one point: the coordinator durably writing its decision. If recovery finds no commit record for a transaction, the coordinator can't have told anyone to commit, so aborting is always consistent. This convention is called **presumed abort**, from IBM's R* system ([Mohan, Lindsay and Obermarck, 1986](https://dl.acm.org/doi/10.1145/7239.7266)), and it's what lets the coordinator skip the durable log write for aborts. The last frame of the diagram above is this rule at work.
+
+Blocking is what happens when the coordinator fails. Even when nothing fails, 2PC isn't free.
 
 </Sub>
 
 <Sub n="3.4" title="What 2PC costs">
 
-Every participant has to flush a prepare record, the coordinator has to flush a
-decision, and then every participant flushes a commit. Locks are held across
-all of it, including the network round trips.
+Every step of the protocol that has to survive a crash is a disk flush. A plain commit needs one, for its commit record. In 2PC every participant flushes a prepare record, then the coordinator flushes its decision, then every participant flushes a commit record, one after another with a network round trip between the phases. Through all of it, the participants hold their locks.
 
-On one Postgres, with the coordinator in the same place as the participant, a
-one-row update through `PREPARE TRANSACTION` + `COMMIT PREPARED` against a
-plain `COMMIT`, using pgbench with one client for 10 seconds, three runs:
+Here's the flush count on one Postgres, with the coordinator and the participant in the same place so that there's no network at all. The test commits a one-row update with a plain `COMMIT`, and then the same update with `PREPARE TRANSACTION` followed by `COMMIT PREPARED`, using `pgbench` (Postgres's benchmark tool) with one client for 10 seconds, three runs each:
 
 <Compare
   cols={["Commit path", "Median latency", "Runs", "WAL flushes"]}
@@ -373,24 +378,28 @@ plain `COMMIT`, using pgbench with one client for 10 seconds, three runs:
   ]}
 />
 
-That's roughly 2.5× on one node, before any network. (Shared 4-CPU container,
-linuxkit 6.10; the virtual disk's `fdatasync` measured roughly 0.37 ms with
-`pg_test_fsync`, far faster than a cloud volume.) Across real machines, add roughly a round trip per phase, and add the time locks are held while you wait for the
-slowest participant.
+That's roughly 2.5 times the commit latency on one node, before any network. The virtual disk in this test flushed in about 0.37 ms according to `pg_test_fsync`, far faster than a cloud volume, so on real storage every extra flush costs more. Across real machines, add roughly one network round trip per phase, and add the time the locks are held while the coordinator waits for the slowest participant.
 
-Google's Spanner paper gives the one large-scale public measurement. Running
-2PC over Paxos groups across three zones, it
-[reports](https://research.google/pubs/spanner-googles-globally-distributed-database-2/)
-a mean commit latency of 14.6 ms with one participant, 20.7 ms with two, 33.8 ms
-with 50, and 122.5 ms with 200. Its authors call 50 participants "reasonable"
-and note latency "start[s] to rise noticeably at 100".
+Google's Spanner, a globally distributed database, gives the one large-scale public measurement. Its paper reports 2PC running over groups of replicated machines across three zones (a zone is one data centre location), with a mean commit latency of 17.0 ms with one participant, 24.5 ms with two, 42.7 ms with 50, and 150.5 ms with 200. Those are means over ten runs. The authors call scaling to 50 participants "reasonable" and note that latency starts to rise noticeably at 100.
+
+Those latencies matter because of the locks. If every commit touches the same row and holds its lock for the whole commit, a row can only commit about once per commit latency:
+
+<Estimate
+  rows={[
+    { label: "1 participant, 17.0 ms per commit", math: "1,000 ms ÷ 17.0 ms", value: "≈ 59 per second" },
+    { label: "50 participants, 42.7 ms", math: "1,000 ms ÷ 42.7 ms", value: "≈ 23 per second" },
+    { label: "200 participants, 150.5 ms", math: "1,000 ms ÷ 150.5 ms", value: "≈ 7 per second" },
+  ]}
+  result={{ label: "most commits a single hot row can take, as participants are added", value: "59 → 7 / s" }}
+/>
+
+This is an upper bound under a simple assumption, not a measurement, but it shows why a transaction that touches many participants and a popular row is the one that hurts. The cost is the price when everything works. The harder question is whether we can keep 2PC's atomicity and remove the blocking.
 
 </Sub>
 
 <Sub n="3.5" title="Making 2PC non-blocking">
 
-2PC blocks because the decision lives in one place, the coordinator, and that
-place can fail. There are two ways out.
+2PC blocks because the decision lives in one place, the coordinator, and that place can fail. Before we look at the fixes we need one more idea. A **consensus group** is a small set of machines, usually three or five, that run a protocol such as Paxos or Raft to agree on one ordered log, so that the log survives the loss of any minority of them. Chapter 27 builds one. With that in hand, there are three ideas on the table.
 
 | Approach | Idea | Used by |
 |---|---|---|
@@ -400,15 +409,9 @@ place can fail. There are two ways out.
 
 <Why>Why does replicating the coordinator fix blocking?</Why>
 
-Because now "the coordinator crashed" means "the leader of a Paxos or Raft
-group crashed", and the group elects a new leader that can read the decision
-from the replicated log. Spanner is explicit about it: each participant is a
-Paxos group, and "running two-phase commit over Paxos mitigates the
-availability problems". Section 3.4's latencies are what that costs.
+Because now "the coordinator crashed" means "the leader of a Paxos or Raft group crashed", and the group elects a new leader that can read the decision from the replicated log. Spanner is explicit about it: each participant is a Paxos group, and "running two-phase commit over Paxos mitigates the availability problems". The latencies in section 3.4 are what that costs.
 
-Spanner's authors also make the argument for offering transactions at all:
-"We believe it is better to have application programmers deal with
-performance problems due to overuse of transactions as bottlenecks arise", instead of making everyone code around their absence.
+Spanner's authors also make the argument for offering transactions at all: "We believe it is better to have application programmers deal with performance problems due to overuse of transactions as bottlenecks arise", instead of making everyone code around their absence.
 
 </Sub>
 
@@ -422,98 +425,83 @@ performance problems due to overuse of transactions as bottlenecks arise", inste
 | **DynamoDB `TransactWriteItems`** | Up to 100 items across tables, atomically ([API reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html)) | One region, one service; not across DynamoDB and anything else |
 | **Kafka transactions** | Atomic writes to many partitions plus consumer offsets | Only covers Kafka (section 7) |
 
-Notice the pattern in that table: 2PC works well *inside* one system, where the same
-team owns the coordinator, the participants and the recovery code. It works
-badly *between* systems owned by different teams, where nobody owns the
-recovery.
+Notice the pattern in that table: 2PC works well inside one system, where the same team owns the coordinator, the participants and the recovery code. It works badly between systems owned by different teams, where nobody owns the recovery.
 
 <Callout label="Design implication">
-If a single database can hold both sides of the invariant, put them there and
-use a local transaction. Many "distributed transaction" problems are probably schema-placement problems in disguise. When they aren't, prefer a database that does 2PC
-internally over running XA between services.
+If a single database can hold both sides of the invariant, put them there and use a local transaction. Many "distributed transaction" problems are probably schema-placement problems in disguise. When they aren't, prefer a database that does 2PC internally over running XA between services.
 </Callout>
+
+That advice covers the case where you own both sides. For order 2, one side is a payment provider, and it won't be a participant in anybody's transaction.
 
 </Sub>
 
-<SectionHeading n="04" id="sagas">Sagas: a sequence of local transactions</SectionHeading>
+<SectionHeading n="04" id="sagas">Undoing instead of rolling back</SectionHeading>
 
-Most services can't use 2PC. The payment provider won't join your XA
-transaction, and holding locks across a third party's latency is a bad idea
-anyway. What you do instead is give up atomicity and replace it with
-**compensation**.
+<Sub n="4.1" title="Sagas">
 
-<Sub n="4.1" title="The idea">
+Most real checkouts can't use 2PC. The payment provider is another company's **service**, a program with its own database and its own team, reached over the network, and it won't join your XA transaction. Even if it would, holding locks across a third party's latency is a bad idea, as the numbers in section 3.4 show. So we give up atomicity and replace it with **compensation**.
 
-A **saga** is a sequence of local transactions, each committed on its own. If a
-later step fails, you run **compensating** transactions that semantically undo
-the earlier steps, in reverse order. It comes from Hector Garcia-Molina and
-Kenneth Salem's [Sagas](https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf)
-(SIGMOD 1987), written for long-lived transactions inside one database, and it
-maps directly onto services.
+A **saga** is a sequence of local transactions, each committed on its own. If a later step fails, we run **compensating** transactions that semantically undo the earlier steps, in reverse order. The idea comes from Hector Garcia-Molina and Kenneth Salem's [Sagas](https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf) (SIGMOD 1987), written for long-lived transactions inside one database, and it maps directly onto services. Here's order 2 as a saga in which shipping fails. Each service has its own place, and a log underneath records which steps are done.
 
-<Steps
+<Scene
   title="A checkout saga where shipping fails"
-  lanes={[
-    { t: "Orders", s: "create · cancel", icon: "▤" },
-    { t: "Inventory", s: "reserve · release", icon: "▦" },
-    { t: "Payments", s: "charge · refund", icon: "$" },
-    { t: "Shipping", s: "book courier", icon: "⇆" },
-    { t: "Saga log", s: "state per step", icon: "≡" },
+  regions={[
+    { id: "ord", label: "Orders", sub: "create · cancel", col: 0, row: 0 },
+    { id: "inv", label: "Inventory", sub: "reserve · release", col: 1, row: 0 },
+    { id: "pay", label: "Payments", sub: "charge · refund", col: 2, row: 0 },
+    { id: "shp", label: "Shipping", sub: "book courier", col: 3, row: 0 },
+    { id: "log", label: "Saga log", sub: "one entry per step", col: 0, row: 1, span: 4 },
   ]}
-  steps={[
-    [0, "**T1**: Orders inserts the order with status `PENDING` and commits. Other readers can already see it."],
-    [1, "**T2**: Inventory reserves two units and commits. Stock looks lower to everyone from this moment."],
-    [2, "**T3**: Payments charges the card and commits. The money has moved."],
-    [3, "**T4**: Shipping can't book a courier for that postcode and fails. There's no rollback: T1–T3 are already committed."],
-    [2, "**C3**: refund the charge. A compensation isn't an undo; the customer's statement shows a charge and a refund."],
-    [1, "**C2**: release the reservation. If someone bought the last unit in between, releasing just puts it back."],
-    [0, "**C1**: mark the order `CANCELLED`, not deleted. Compensations append history; they don't erase it."],
-    [4, "The saga log records every step and compensation, so a crashed orchestrator can resume where it stopped instead of starting over."],
+  itemWidth={88}
+  frames={[
+    { caption: "Order 2 needs four steps in four services: create the order, reserve the stock, charge the card, book a courier. Each service commits on its own. Underneath, a log records which steps are done.",
+      items: [{ id: "lg", at: "log", label: "log", sub: "empty", tone: "dim" }] },
+    { caption: "**T1:** Orders inserts order 2 with status `PENDING` and commits. Other readers can already see it.",
+      remove: ["lg"], add: [{ id: "o", at: "ord", label: "order 2", sub: "PENDING", tone: "ok" }, { id: "l1", at: "log", label: "T1", sub: "done", tone: "ok" }], focus: ["ord"] },
+    { caption: "**T2:** Inventory reserves two units and commits. Stock looks lower to everyone from this moment.",
+      add: [{ id: "s", at: "inv", label: "2 units", sub: "reserved", tone: "ok" }, { id: "l2", at: "log", label: "T2", sub: "done", tone: "ok" }], focus: ["inv"] },
+    { caption: "**T3:** Payments charges the card and commits. The money has moved.",
+      add: [{ id: "p", at: "pay", label: "charge", sub: "$49.99", tone: "ok" }, { id: "l3", at: "log", label: "T3", sub: "done", tone: "ok" }], focus: ["pay"] },
+    { caption: "**T4:** Shipping can't book a courier for that postcode and fails. There's no rollback, because T1 to T3 are already committed. The only way back is to run new transactions that undo them.",
+      add: [{ id: "c", at: "shp", label: "courier", sub: "no route", tone: "bad" }, { id: "l4", at: "log", label: "T4", sub: "failed", tone: "bad" }], focus: ["shp"] },
+    { caption: "**C3:** refund the charge. A compensation isn't an undo: the customer's statement now shows a charge and a refund.",
+      change: [{ id: "p", sub: "refunded", tone: "new" }], add: [{ id: "l5", at: "log", label: "C3", sub: "refund", tone: "new" }], focus: ["pay"], arrow: { from: "log", to: "pay", label: "refund" } },
+    { caption: "**C2:** release the reservation. If someone bought the last unit in between, releasing just puts the stock back.",
+      change: [{ id: "s", sub: "released", tone: "new" }], add: [{ id: "l6", at: "log", label: "C2", sub: "release", tone: "new" }], focus: ["inv"], arrow: { from: "log", to: "inv", label: "release" } },
+    { caption: "**C1:** mark the order `CANCELLED`, not deleted. Compensations add history and don't erase it. The books balance again, though for a while other readers saw an order, reserved stock and a charge that all came to nothing.",
+      change: [{ id: "o", sub: "CANCELLED", tone: "default" }], add: [{ id: "l7", at: "log", label: "C1", sub: "cancel", tone: "new" }], focus: ["ord"], arrow: { from: "log", to: "ord", label: "cancel" } },
   ]}
 />
 
+The log matters. A crashed orchestrator can read it on restart and resume where it stopped, rather than starting over.
+
 <Why>Why is a compensation not the same as a rollback?</Why>
 
-A rollback makes it as if the transaction never happened. A compensation is a
-new transaction that happens *after*, and everyone may have seen the original
-in between. An email already went out; a refund takes days to reach the card.
-Some actions can't be compensated at all: you can't unsend a notification or
-unship a parcel.
+A rollback makes it as if the transaction never happened. A compensation is a new transaction that happens after the original, and everyone may have seen the original in between. An email already went out, and a refund takes days to reach the card. Some actions can't be compensated at all: you can't unsend a notification or unship a parcel.
 
-That's why the order of steps matters. Put the steps that can't be undone
-last. Chris Richardson's *Microservices Patterns* (Manning, 2018) calls the
-step after which the saga can only go forward the **pivot transaction**: before
-it, failures compensate; after it, failures retry until they succeed.
+That's why the order of steps matters. Put the steps that can't be undone last. Chris Richardson's *Microservices Patterns* (Manning, 2018) calls the step after which the saga can only go forward the **pivot transaction**: before it, failures compensate, and after it, failures retry until they succeed.
 
 </Sub>
 
 <Sub n="4.2" title="Orchestration or choreography">
 
-Someone has to run the saga. There are two shapes:
+Someone has to run the saga. There are two shapes, and they differ in who knows what comes next. In the picture above, the saga log belongs to a single **orchestrator**, one piece of code that calls each step and decides what happens next. The alternative is **choreography**, where there's no central code: each service listens for an **event**, a message announcing that something happened such as `OrderPlaced`, does its own step, and publishes the next event.
 
 | | Orchestration | Choreography |
 |---|---|---|
 | **Who drives** | One orchestrator calls each step and decides what's next | Each service reacts to the previous service's event |
 | **Where the state lives** | The orchestrator's saga log | Spread across every service's events |
 | **Good for** | Many steps, branching, compensations that must run in order | Two or three steps with a simple chain |
-| **Hard part** | The orchestrator is a service you must make durable | Nobody can answer "what state is order 81 in?" |
+| **Hard part** | The orchestrator is a service you must make durable | Nobody can answer "what state is order 2 in?" |
 | **Tools** | Temporal, AWS Step Functions, Camunda, a table and a worker | Kafka topics plus the outbox (section 5) |
 
-<Why>Why do teams end up with orchestration?</Why>
-
-Because with choreography, the saga's logic lives nowhere in particular. Adding
-a step means changing which events three services listen to, and debugging a
-stuck order means reading four services' logs. An orchestrator makes the flow
-a piece of code you can read, and its log answers the "what state is it in"
-question directly.
+Which should you pick? Teams usually end up with orchestration, because with choreography the saga's logic lives nowhere in particular. Adding a step means changing which events three services listen to, and debugging a stuck order means reading four services' logs. An orchestrator makes the flow a piece of code you can read, and its log answers "what state is it in" directly.
 
 </Sub>
 
 <Sub n="4.3" title="What you give up: isolation">
 
-A saga is atomic in the end (every step completes or is compensated) but it
-isn't isolated. Between T1 and C1, the rest of the world sees the in-between
-states.
+A saga is atomic in the end, since every step completes or is compensated. It isn't **isolated**, which means other readers can see its in-between states. Between T1 and C1 in the picture, the rest of the world could see a `PENDING` order for something that was about to be cancelled. These are the same kinds of anomaly that database isolation levels exist to prevent (chapter 19), and a saga has to handle them in application code:
 
 | Anomaly | Example | Countermeasure |
 |---|---|---|
@@ -523,69 +511,85 @@ states.
 | **Compensation of a changed thing** | C3 refunds a charge that support already refunded by hand | Make compensations idempotent, and check current state first |
 
 <Callout label="Common mistake" kind="warn">
-Writing a compensation as "restore the value I saw before". Another saga may
-have changed it since. Compensations should be relative (`+2`, not `= 17`) or
-check that the current state is still the one they're undoing.
+Writing a compensation as "restore the value I saw before". Another saga may have changed it since. Compensations should be relative (`+2`, not `= 17`) or check that the current state is still the one they're undoing.
 </Callout>
 
-Every step and every compensation also has to be safe to repeat. The
-orchestrator will crash between sending a request and recording the reply,
-and on restart it will send it again. That's the ambiguous timeout from
-section 2.2, and section 6 is how you make repeats safe.
+Look at what a saga asks of every step. A step has to commit its own change and then get the next step started, which is a change to a database plus a message to someone, and that's the dual write from section 2 all over again. And the orchestrator will crash between sending a request and recording the reply, so on restart it sends the request again, which is the ambiguous timeout of section 2.2. We'll fix the first problem first.
 
 </Sub>
 
 <SectionHeading n="05" id="outbox">The transactional outbox</SectionHeading>
 
-Back to the dual write from section 2.1. You need a database row and a message
-to happen together, and 2PC between Postgres and Kafka isn't on offer. The
-**outbox** turns the two writes into one.
-
 <Sub n="5.1" title="Write the message as a row">
 
-Instead of sending the event, insert it into an `outbox` table in the same
-local transaction as the business change:
+We need a database row and a message to happen together, and 2PC between Postgres and Kafka isn't on offer. The way out is to turn the two writes into one. Instead of sending the event, the checkout inserts it into an `outbox` table, in the same local transaction as the business change:
 
 ```sql
 BEGIN;
-INSERT INTO orders (id, customer_id, total) VALUES (81, 7, 5000);
+INSERT INTO orders (id, customer_id, total) VALUES (2, 7, 4999);
 INSERT INTO outbox (aggregate_id, topic, payload)
-  VALUES (81, 'orders', '{"type":"OrderPlaced","order_id":81}');
+  VALUES (2, 'orders', '{"type":"OrderPlaced","order_id":2}');
 COMMIT;
 ```
 
-Now there's one commit record in one log. Either the order and its event both
-exist, or neither does. A separate process, the **relay**, reads the outbox and
-publishes each row to Kafka. Chris Richardson writes the pattern up on
-[microservices.io](https://microservices.io/patterns/data/transactional-outbox.html).
+Now there's one commit record in one log. Either the order and its event both exist, or neither does. A separate process, the **relay**, reads the outbox table and publishes each row to Kafka. Chris Richardson writes the pattern up on [microservices.io](https://microservices.io/patterns/data/transactional-outbox.html). Here's order 2 going through it, including the failure that gives the pattern its limit:
 
-<Steps
+<Scene
   title="One event through the outbox"
-  lanes={[
-    { t: "Handler", s: "one local txn", icon: "◉" },
-    { t: "Postgres", s: "orders + outbox", icon: "▤" },
-    { t: "Relay", s: "poll or CDC", icon: "⟳" },
-    { t: "Kafka", s: "orders topic", icon: "≡" },
-    { t: "Consumer", s: "dedupe by id", icon: "✓" },
+  regions={[
+    { id: "pg", label: "Orders database", sub: "one local transaction", col: 0, row: 0, span: 2 },
+    { id: "rl", label: "Relay", sub: "separate process", col: 2, row: 0 },
+    { id: "kf", label: "Kafka topic", sub: "orders", col: 0, row: 1, span: 2 },
+    { id: "wh", label: "Warehouse", sub: "reads the topic", col: 2, row: 1 },
   ]}
-  steps={[
-    [0, "The handler inserts the order and the outbox row in **one transaction** and commits. This is the only write the request path makes."],
-    [1, "Both rows are durable together. If the process dies now, the event isn't lost: it's a row waiting to be read."],
-    [2, "The relay picks up unsent rows, either by polling the table or by reading the WAL through logical decoding."],
-    [3, "It publishes each event and waits for Kafka's ack. **Then** it marks the row sent. If it crashes in between, it will publish the row again."],
-    [4, "So the consumer sees each event **at least once**, and must ignore a repeat by recording the event IDs it has already applied."],
+  itemWidth={112}
+  frames={[
+    { caption: "The checkout is about to place order 2 and tell the warehouse. The orders table and the outbox table are empty, and the topic holds an older event.",
+      items: [{ id: "k0", at: "kf", label: "older event", tone: "dim" }] },
+    { caption: "The checkout inserts the order and an outbox row describing the `OrderPlaced` event, in **one transaction**, and commits. This is the only write the request makes.",
+      add: [{ id: "or", at: "pg", label: "order · 2", sub: "row", tone: "new" }, { id: "ob", at: "pg", label: "outbox row", sub: "OrderPlaced", tone: "new" }], focus: ["pg"] },
+    { caption: "Both rows are durable together. If the process dies now, nothing is lost and nothing is inconsistent: the event is a row waiting to be read. There's no moment where the order exists and the event is gone.",
+      change: [{ id: "or", tone: "ok" }, { id: "ob", sub: "unsent", tone: "ok" }], focus: ["pg"] },
+    { caption: "The relay picks up unsent rows from the outbox table.",
+      add: [{ id: "ev", at: "rl", label: "OrderPlaced", sub: "unsent", tone: "accent" }], focus: ["rl"], arrow: { from: "pg", to: "rl", label: "read unsent" } },
+    { caption: "The relay publishes the event and waits for Kafka to confirm it stored it. **Only then** does it mark the outbox row as sent.",
+      add: [{ id: "k1", at: "kf", label: "OrderPlaced", sub: "stored", tone: "new" }], focus: ["kf"], arrow: { from: "rl", to: "kf", label: "publish" } },
+    { caption: "Suppose the relay crashes right here, after Kafka confirmed but before it marked the row. The outbox row still says unsent.",
+      change: [{ id: "ev", sub: "crashed", tone: "bad" }, { id: "ob", sub: "still unsent", tone: "dirty" }], focus: ["rl"] },
+    { caption: "After a restart the relay finds the row still unsent and publishes it again. Kafka now holds two copies of the event, and the row is finally marked sent.",
+      change: [{ id: "ev", sub: "retry", tone: "accent" }, { id: "ob", sub: "sent", tone: "ok" }], add: [{ id: "k2", at: "kf", label: "OrderPlaced", sub: "duplicate", tone: "bad" }], focus: ["kf"], arrow: { from: "rl", to: "kf", label: "publish again" } },
+    { caption: "The warehouse reads the topic and sees order 2's event twice. The outbox never loses an event, but it can deliver one more than once, which is called **at least once** delivery. The receiver has to make the second copy harmless.",
+      add: [{ id: "w1", at: "wh", label: "OrderPlaced", sub: "first copy", tone: "ok" }, { id: "w2", at: "wh", label: "OrderPlaced", sub: "again", tone: "bad" }], focus: ["wh"], arrow: { from: "kf", to: "wh", label: "read" } },
   ]}
 />
 
 <Why>Why doesn't the outbox give exactly-once delivery?</Why>
 
-Because the relay has its own dual write: publish to Kafka, then mark the row
-sent. It's the same problem, moved to a place where it's harmless. But it always publishes *before* marking, so a crash produces a duplicate, never a
-loss, and duplicates are something a consumer can detect.
+Because the relay has its own dual write: publish to Kafka, then mark the row sent. It's the same problem, moved to a place where it does little harm. The relay always publishes before marking, so a crash produces a duplicate and never a loss, and a duplicate is something a receiver can detect.
 
 </Sub>
 
-<Sub n="5.2" title="Polling relay or change data capture">
+<Sub n="5.2" title="The consumer's half: the inbox">
+
+Detecting the duplicate is the job of the **consumer**, the service that reads the messages, here the warehouse. A robust design mirrors the outbox. The consumer records each event's ID in a table in its own database, in the same local transaction as the effect of handling the event. This table is called the **inbox**.
+
+```sql
+BEGIN;
+INSERT INTO processed_events (event_id) VALUES ($1)
+  ON CONFLICT DO NOTHING
+  RETURNING event_id;               -- no row back? we've done this one; stop
+-- only if the insert returned a row:
+UPDATE stock SET reserved = reserved + 2 WHERE sku = 'A-17';
+COMMIT;
+```
+
+When the second copy of the `OrderPlaced` event arrives, the insert finds the ID already there, does nothing and returns no row, so the application skips the update. Because the ID and the stock change commit together, a crash between them is impossible: either both happened or neither did. This is the same trick Kafka's own docs recommend for external systems (section 7.3): store "what I've processed" in the same place, and the same transaction, as the output.
+
+</Sub>
+
+<Sub n="5.3" title="Polling relay or change data capture">
+
+How does the relay find unsent rows? There are two common ways, and both leave a different thing to watch. **Change data capture**, or **CDC**, means reading the database's own log of changes (its WAL in Postgres) instead of querying its tables. Postgres offers this through **logical decoding**, which turns the WAL into a stream of row-level changes that a program can follow.
 
 | | Polling relay | Change data capture (CDC) |
 |---|---|---|
@@ -598,6 +602,7 @@ loss, and duplicates are something a consumer can detect.
 A polling relay that several workers can run at once looks like this:
 
 ```sql
+BEGIN;
 WITH batch AS (
   SELECT id FROM outbox
   WHERE sent_at IS NULL
@@ -611,58 +616,25 @@ UPDATE outbox SET sent_at = now() WHERE id = ANY($1);
 COMMIT;
 ```
 
+The `BEGIN` matters, because the row locks that `FOR UPDATE` takes last only until the transaction ends.
+
 <Why>Why SKIP LOCKED?</Why>
 
-Without it, a second relay's `FOR UPDATE` waits on the first relay's rows and
-the relays run one at a time. With it, each relay takes whatever rows nobody
-else holds. The cost is ordering: two relays can publish neighbouring events
-out of order. If per-order ordering matters, give each relay a partition of
-`aggregate_id` instead.
+Without it, a second relay's `FOR UPDATE` waits on the first relay's rows and the relays run one at a time. With it, each relay takes whatever rows nobody else holds. The cost is ordering: two relays can publish neighbouring events out of order. If per-order ordering matters, give each relay a partition of `aggregate_id` instead.
 
-<Callout label="Common mistake" kind="warn">
-Using logical decoding for the relay and forgetting the replication slot. If
-the CDC connector stops, Postgres keeps every WAL segment the slot hasn't
-confirmed, and the primary's disk fills. Alert on
-`pg_replication_slots` lag, and set `max_slot_wal_keep_size` so a dead
-connector costs you the slot instead of the database.
-</Callout>
+With CDC the thing to remember is the **replication slot**, Postgres's bookmark for a reader of the WAL. If the CDC connector stops, Postgres keeps every WAL segment the slot hasn't confirmed, and the primary's disk fills. Alert on `pg_replication_slots` lag, and set `max_slot_wal_keep_size` so that a dead connector costs you the slot instead of the database.
 
-</Sub>
-
-<Sub n="5.3" title="The consumer's half: the inbox">
-
-At-least-once delivery means the consumer has to deduplicate. A robust design mirrors the outbox: record the event ID in the same local transaction as the
-effect.
-
-```sql
-BEGIN;
-INSERT INTO processed_events (event_id) VALUES ($1)
-  ON CONFLICT DO NOTHING;           -- 0 rows? we've done this one; stop
--- only if the insert returned a row:
-UPDATE stock SET reserved = reserved + 2 WHERE sku = 'A-17';
-COMMIT;
-```
-
-This is the same trick Kafka's own docs recommend for external systems (section 7.3): store "what I've processed" in the same place, and the same transaction,
-as the output.
+The outbox and inbox keep messages between your own services from being lost or doubled. Requests that arrive from outside, from a browser or a partner's server, have the same problem at the front door.
 
 </Sub>
 
 <SectionHeading n="06" id="idempotency">Idempotency keys</SectionHeading>
 
-Outbox and inbox handle messages between your own services. For requests
-into an API, especially one that moves money, the tool is an **idempotency
-key**: a unique value the client generates once per logical operation and
-sends with every retry of it.
-
 <Sub n="6.1" title="How the server uses the key">
 
-Stripe's is the design most people copy. Its
-[API reference](https://docs.stripe.com/api/idempotent_requests) says it
-works "by saving the resulting status code and body of the first request made
-for any given idempotency key, regardless of whether it succeeds or fails.
-Subsequent requests with the same key return the same result, including `500`
-errors."
+When a client's call to your API times out, it retries, and from section 2.2 you know it can't tell whether the first attempt landed. The answer is to make repeating the call harmless. An operation is **idempotent** if doing it twice has the same effect as doing it once. A charge isn't idempotent by nature, so we make it so with an **idempotency key**: a unique value the client generates once per logical operation and sends with every retry of it. The server remembers which keys it has seen. The inbox of section 5.2 is the same idea applied to messages.
+
+Stripe's is the design most people copy. Its [API reference](https://docs.stripe.com/api/idempotent_requests) says it works "by saving the resulting status code and body of the first request made for any given idempotency key, regardless of whether it succeeds or fails. Subsequent requests with the same key return the same result, including `500` errors."
 
 Four decisions go into a design like that:
 
@@ -673,30 +645,19 @@ Four decisions go into a design like that:
 | **How long it's kept** | Keys can be pruned once they're at least 24 hours old | Retries happen in seconds or minutes; storage isn't free |
 | **What's stored** | The status and body, once the endpoint starts executing | A retry must get the *same* answer, not a fresh one |
 
-DynamoDB makes different choices for the same problem. A `ClientRequestToken`
-on `TransactWriteItems` is valid for 10 minutes after the first request
-completes, and a reuse with different parameters returns
-`IdempotentParameterMismatch`
-([API reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html)).
+DynamoDB makes different choices for the same problem. A `ClientRequestToken` on `TransactWriteItems` is valid for 10 minutes after the first request completes, and a reuse with different parameters returns `IdempotentParameterMismatch` ([API reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html)).
 
 <Why>Why generate the key on the client and not the server?</Why>
 
-Because the server can't tell a retry from a second purchase. Two identical
-`POST /charges` for $50 might be one customer clicking twice or one request
-retried after a timeout. The client knows which it meant, so the client names
-the operation, generates the key before the first attempt, and reuses it for
-every retry of that attempt.
+Because the server can't tell a retry from a second purchase. Two identical `POST /charges` for $49.99 might be one customer clicking twice, or one request retried after a timeout. The client knows which it meant, so the client names the operation, generates the key before the first attempt, and reuses it for every retry of that attempt.
 
 </Sub>
 
 <Sub n="6.2" title="Two retries at once">
 
-Harder than a retry after the first request finished is a retry
-that arrives *while the first is still running*, because the client's timeout
-fired early. Both requests look up the key and find nothing.
+Harder than a retry after the first request finished is a retry that arrives while the first is still running, because the client's timeout fired early. Both requests look up the key and find nothing, and both go ahead and charge. So we make "claim this key" an atomic insert, which lets the database decide the race.
 
-So make "claim this key" an atomic insert, so the database decides
-the race. Here, two requests with the same key start 200 ms apart:
+The next experiment sends two requests with the same key, started about 200 ms apart. The table uses the key as its primary key, so Postgres refuses to store a second row with the same key. `on conflict (key) do nothing` turns that refusal into "insert nothing", and `returning 'inserted'` prints a row only when an insert happened. `pg_sleep(1)` stands in for a second of real work, such as calling the card network. In the output each line is prefixed with the request that printed it, `A` or `B`, and the two timestamps per request are `start` and `after_insert`. The blank rows that `pg_sleep` prints have been removed.
 
 <TryIt what="Two concurrent requests with one idempotency key" lang="shell" toolchain="PostgreSQL 16.15, linuxkit 6.10.14 aarch64">
 ```sql
@@ -734,67 +695,34 @@ B: INSERT 0 0
 B: 04:06:40.967
 B: COMMIT
 ```
-
-Each line is prefixed with the request that printed it; the two timestamps per
-request are `start` and `after_insert`, and blank `pg_sleep` rows are removed.
-B's insert **waited roughly 810 ms**, on A's uncommitted row in the primary key
-index, until A committed. Then it inserted nothing. B knows it doesn't own the
-key, so it doesn't charge the card; it returns A's saved response, or a `409`
-telling the client to retry shortly if A hasn't finished.
 </Output>
 </TryIt>
 
+A's insert took 3 ms (39.959 to 39.962) and printed `inserted`, so A owns the key and goes on to do the work. B started 198 ms later, and its insert **waited roughly 810 ms** (40.157 to 40.967) on A's uncommitted row in the primary key index, until A committed. Then it inserted nothing (`INSERT 0 0`). B knows it doesn't own the key, so it doesn't charge the card. It returns A's saved response, or a `409` telling the client to retry shortly if A hasn't finished.
+
 <Callout label="Design implication">
-The key table must live in the same database, and ideally the same
-transaction, as the effect it protects. A key in Redis and a charge in
-Postgres is a dual write again: the process can die after one and before the
-other.
+The key table must live in the same database, and ideally the same transaction, as the effect it protects. A key in Redis and a charge in Postgres is a dual write again: the process can die after one and before the other.
 </Callout>
 
 </Sub>
 
 <Sub n="6.3" title="When the work calls someone else">
 
-That works when all the work is one local transaction. It gets harder when the
-handler itself calls a third party: create the charge row, call the card
-network, send a receipt email.
+That works when all the work is one local transaction. It gets harder when the handler itself calls a third party: create the charge row, call the card network, send a receipt email. Why not hold one database transaction across the whole request? Because the external call can take seconds, and the transaction would hold its locks the whole time. Worse, if the call succeeds and your commit fails, you've charged the card with no record of it.
 
-Brandur Leach's [Implementing Stripe-like Idempotency Keys in
-Postgres](https://brandur.org/idempotency-keys) solves it with **recovery
-points**. Each key's row records how far the request got (`started`,
-`charge_created`, `stripe_charge_made`, `finished`), each local step commits
-and advances the recovery point atomically, and a retry resumes from the last
-recorded point. Each foreign call must itself be idempotent, which usually
-means passing *your* idempotency key through to the provider.
+Brandur Leach's [Implementing Stripe-like Idempotency Keys in Postgres](https://brandur.org/idempotency-keys) solves it with **recovery points**. Each key's row records how far the request got. In his ride-sharing example the points are `started`, `ride_created`, `charge_created` and `finished`. Each local step commits and advances the recovery point atomically, and a retry resumes from the last recorded point. Committing a recovery point before each external call means there's always a durable note saying "this might have happened; check before redoing it". Each foreign call must itself be idempotent, which usually means passing your own idempotency key through to the provider. It's a small saga, with the key's row as its log.
 
-It's a small saga, with the key's row as its log.
-
-<Why>Why not hold one database transaction across the whole request?</Why>
-
-Because the external call can take seconds, and your transaction would hold
-its locks the whole time. Worse, if the call succeeds and your commit fails,
-you've charged the card with no record of it. Committing a recovery point
-before each external call means there's always a durable note saying "this
-might have happened; check before redoing it".
+We've now built every piece: outbox and inbox for messages, keys for requests. They all rest on the same bargain of at-least-once delivery plus duplicate detection. That bargain is what messaging systems advertise as "exactly-once", and it deserves a careful reading.
 
 </Sub>
 
-<SectionHeading n="07" id="exactly-once">"Exactly-once", read carefully</SectionHeading>
-
-Every messaging system eventually advertises exactly-once. It's worth being
-precise about what that can mean, because the precise version is true and the
-marketing version is impossible.
+<SectionHeading n="07" id="exactly-once">What "exactly-once" can mean</SectionHeading>
 
 <Sub n="7.1" title="Delivery versus processing">
 
-A message crossing a network can be delivered **at most once** (send, never
-retry; you may lose it) or **at least once** (retry until acked; you may
-duplicate it). The ambiguous timeout from section 2.2 means there's no third
-option at the delivery layer.
+A message crossing a network can be delivered **at most once**, where the sender never retries and so may lose the message, or **at least once**, where it retries until acknowledged and so may duplicate it. The ambiguous timeout from section 2.2 means there's no third option at the delivery layer.
 
-What systems can offer is **exactly-once effect**: every message is delivered at
-least once, and duplicates are detected and discarded before they change
-anything. That's what the outbox-plus-inbox and idempotency keys already built.
+What systems can offer is **exactly-once effect**: every message is delivered at least once, and duplicates are detected and discarded before they change anything. That's what the outbox with an inbox, and idempotency keys, already built. The same three choices show up in how a consumer commits its position in a stream. Kafka splits each topic into **partitions**, each an append-only log of messages in which a message's position is its **offset**. A consumer reads messages in order and remembers how far it has got by committing an offset.
 
 | Guarantee | Mechanism | What can still go wrong |
 |---|---|---|
@@ -806,8 +734,7 @@ anything. That's what the outbox-plus-inbox and idempotency keys already built.
 
 <Sub n="7.2" title="What Kafka's exactly-once is">
 
-Kafka 0.11 (2017, [KIP-98](https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging))
-added two features, and since Kafka 3.0 the first is on by default:
+Kafka 0.11 (2017, [KIP-98](https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging)) added two features, and since Kafka 3.0 the first is on by default. The **producer** is the program that writes messages to Kafka, and the class's own header comment describes both:
 
 <SourceRead
   file="clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java"
@@ -833,13 +760,9 @@ added two features, and since Kafka 3.0 the first is on by default:
 ```
 </SourceRead>
 
-The **idempotent producer** is an idempotency key built into the protocol. Each producer gets an ID from the broker, the producer numbers its batches per
-partition, and the broker discards a batch whose sequence number it has already
-written. It fixes duplicates from the producer's *own* retries, within one
-producer session, and nothing else.
+The **idempotent producer** is an idempotency key built into the protocol. Each producer gets an ID from the **broker** (a Kafka server that stores partitions), the producer numbers its batches per partition, and the broker discards a batch whose sequence number it has already written. It fixes duplicates from the producer's own retries, within one producer session, and nothing else.
 
-The **transactional producer** is 2PC with Kafka as every participant, and it's
-what makes consume-transform-produce atomic:
+The **transactional producer** is 2PC with Kafka as every participant, and it's what makes consume-transform-produce atomic: read a batch of input, process it, write the output. One more problem has to be handled first. If a producer stalls and a replacement starts with the same `transactional.id`, the old instance may wake up and keep writing, which makes it a zombie. Kafka gives each start of that ID a higher **epoch** number and rejects writes that carry an older one, which is called **fencing**.
 
 <StepSequence
   title="One consume-transform-produce transaction in Kafka"
@@ -854,52 +777,31 @@ what makes consume-transform-produce atomic:
   ]}
 />
 
-<Why>Why do the offsets have to be in the transaction?</Why>
-
-Because "I've processed input up to offset 500" and "here's the output for
-it" are the two writes of a dual write. Kafka can make them atomic only
-because both are writes to Kafka. If the transaction aborts, the output is
-invisible to `read_committed` readers and the offset reverts, so the batch is
-processed again and produces the same output.
+Why do the offsets have to be in the transaction? Because "I've processed input up to offset 500" and "here's the output for it" are the two writes of a dual write. Kafka can make them atomic only because both are writes to Kafka. If the transaction aborts, the output is invisible to `read_committed` readers and the offset reverts, so the batch is processed again and produces the same output.
 
 </Sub>
 
 <Sub n="7.3" title="Where it stops">
 
-Once your processing touches anything outside Kafka (a database write,
-an HTTP call, an email), those effects aren't in the transaction. Kafka's own
-[design documentation](https://github.com/apache/kafka/blob/3.7.0/docs/design.html)
-says so directly:
+Once your processing touches anything outside Kafka (a database write, an HTTP call, an email), those effects aren't in the transaction. Kafka's own [design documentation](https://github.com/apache/kafka/blob/3.7.0/docs/design.html) says so directly.
 
-> "When writing to an external system, the limitation is in the need to
-> coordinate the consumer's position with what is actually stored as output.
-> The classic way of achieving this would be to introduce a two-phase commit
-> between the storage of the consumer position and the storage of the
-> consumers output. But this can be handled more simply and generally by
-> letting the consumer store its offset in the same place as its output."
+The limitation, it says, "is in the need to coordinate the consumer's position with what is ... stored as output". The classic way of achieving that "would be to introduce a two-phase commit between the storage of the consumer position and the storage of the consumers output", but this "can be handled ... by letting the consumer store its offset in the same place as its output."
 
-And: "Exactly-once delivery for other destination systems generally requires
-cooperation with such systems ... Otherwise, Kafka guarantees at-least-once
-delivery by default."
+And: "Exactly-once delivery for other destination systems generally requires cooperation with such systems ... Otherwise, Kafka guarantees at-least-once delivery by default."
 
 <Callout label="Common mistake" kind="warn">
-Turning on Kafka transactions and assuming the consumer that writes to Postgres
-is now exactly-once. It isn't. A crash after the Postgres commit and before
-the offset commit reprocesses the message. Store the offset (or the event ID)
-in Postgres, in the same transaction as the write.
+Turning on Kafka transactions and assuming the consumer that writes to Postgres is now exactly-once. It isn't. A crash after the Postgres commit and before the offset commit reprocesses the message. Store the offset (or the event ID) in Postgres, in the same transaction as the write, which is the inbox from section 5.2.
 </Callout>
 
-Pat Helland's [Life beyond Distributed Transactions](https://www.cidrdb.org/cidr2007/papers/cidr07p15.pdf)
-(CIDR 2007) is the long version of this section's argument. At scale, he
-writes, applications must assume messages are retried and reordered, keep
-each atomic unit to one "entity", and make every message handler idempotent.
-Twenty years later, it's probably still the design most large services end up with.
+Pat Helland's [Life beyond Distributed Transactions](https://www.cidrdb.org/cidr2007/papers/cidr07p15.pdf) (CIDR 2007) is the long version of this chapter's argument. At scale, he writes, applications must assume messages are retried and reordered, keep each atomic unit to one "entity", and make every message handler idempotent. Most of the patterns in this chapter are in that paper.
 
 </Sub>
 
 <SectionHeading n="08" id="operating">Choosing and operating</SectionHeading>
 
 <Sub n="8.1" title="Which tool for which problem">
+
+Each tool answers one of the failures from the checkout. Here they are as a decision table:
 
 | Situation | Reach for | Not |
 |---|---|---|
@@ -915,31 +817,53 @@ Twenty years later, it's probably still the design most large services end up wi
 
 <Sub n="8.2" title="What to watch">
 
-Every one of these patterns leaves a table that grows when something is stuck.
-Monitor those tables, not just error rates:
+Every one of these patterns leaves a table that grows when something is stuck. Monitor those tables, not just error rates:
 
 ```sql
--- Orphaned 2PC participants: anything prepared for more than a minute
+-- Is any 2PC participant orphaned? (section 3.3) Anything prepared for more than a minute.
 SELECT gid, prepared, now() - prepared AS age
 FROM pg_prepared_xacts WHERE prepared < now() - interval '1 minute';
 
--- Outbox lag: the oldest unsent event
-SELECT now() - min(created_at) AS oldest_unsent FROM outbox WHERE sent_at IS NULL;
-
--- CDC relay: WAL the slot is holding back
-SELECT slot_name, active,
-       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
-FROM pg_replication_slots;
-
--- Sagas stuck mid-flight
+-- Are sagas stuck mid-flight? (section 4)
 SELECT state, count(*) FROM sagas
 WHERE updated_at < now() - interval '15 minutes' AND state NOT IN ('DONE','COMPENSATED')
 GROUP BY state;
+
+-- Is the outbox draining? (section 5.1) The oldest unsent event.
+SELECT now() - min(created_at) AS oldest_unsent FROM outbox WHERE sent_at IS NULL;
+
+-- Is the CDC relay holding back WAL? (section 5.3)
+SELECT slot_name, active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM pg_replication_slots;
 ```
 
 </Sub>
 
-<Sub n="8.3" title="Symptom, cause, fix">
+<Sub n="8.3" title="Rules that hold up">
+
+1. **Keep both sides of an invariant in one database when you can.** A local transaction beats every pattern in this chapter.
+2. **Never write to two systems in one request path.** Write one row, and let a relay deliver the rest.
+3. **Assume every message arrives at least once.** Record the event ID in the same transaction as the effect.
+4. **Generate the idempotency key on the client, and store it next to the effect.** A key in a different system is a dual write.
+5. **Order saga steps so the ones that can't be undone come last,** and write compensations as relative changes that are safe to repeat.
+6. **Resolve an orphaned prepared transaction from the coordinator's log.** Don't guess.
+
+</Sub>
+
+<Sub n="8.4" title="What you trade for what">
+
+| You get | You pay | When the bill arrives |
+|---|---|---|
+| 2PC's atomic commit across databases | Extra flushes, locks held across round trips, blocking if the coordinator dies | As latency on hot rows, or an orphaned prepared transaction |
+| A saga's availability, with no locks across services | No isolation, and compensations that can't undo everything | As reports that show orders that were later cancelled |
+| The outbox's guarantee that an event follows its row | At-least-once delivery and a relay to run | As duplicates, an outbox that grows, or a stalled replication slot |
+| An idempotency key's safe retries | A key table in the same database, and a retention policy | As a double charge when the key lives somewhere else |
+| Kafka's exactly-once between topics | It stops at Kafka's edge | As duplicate side effects in whatever the consumer writes to |
+
+</Sub>
+
+<Sub n="8.5" title="Symptom, cause, fix">
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -955,117 +879,58 @@ GROUP BY state;
 
 <SectionHeading n="09" id="summary">Summary</SectionHeading>
 
-1. **A dual write has no atomic outcome.** Each system commits to its own log,
-   and the process can die between them.
-2. **A timeout doesn't tell you whether it happened.** Every technique here
-   makes that ambiguity safe: find out, undo, or repeat harmlessly.
-3. **2PC commits at one record: the coordinator's decision.** Participants
-   promise first, and that promise must survive a crash.
-4. **A prepared participant blocks until it hears the decision.** In Postgres
-   it keeps its locks with no backend attached and stops `VACUUM` at its XID.
-5. **2PC costs extra flushes and held locks.** About 2.5× commit latency on one
-   node here, and 14.6 to 33.8 ms at 1 to 50 participants in Spanner.
-6. **Replicating the coordinator removes blocking.** That's why Spanner and
-   CockroachDB run 2PC over consensus, and why 2PC works best inside one system.
-7. **A saga trades isolation for availability.** Compensations append new
-   history, must be idempotent, and can't undo everything.
-8. **The outbox turns two writes into one.** The relay delivers at least once,
-   so consumers deduplicate in the same transaction as their effect.
-9. **Idempotency keys are claimed with an atomic insert.** Store them next to
-   the effect they protect, not in a separate system.
-10. **"Exactly-once" means at-least-once plus deduplication.** Kafka's version
-    covers Kafka to Kafka; anything outside needs its own dedupe.
+1. **A dual write has no atomic outcome.** Each system commits to its own log, and the process can die between them, which is how order 2 was charged and never saved.
+2. **A timeout doesn't tell you whether it happened.** Every technique here makes that ambiguity safe: find out, undo, or repeat harmlessly.
+3. **2PC commits at one record: the coordinator's decision.** Participants promise first, and that promise must survive a crash.
+4. **A prepared participant blocks until it hears the decision.** In Postgres it keeps its locks with no backend attached and stops `VACUUM` at its XID.
+5. **2PC costs extra flushes and held locks.** About 2.5 times the commit latency on one node, and 17.0 to 42.7 ms at 1 to 50 participants in Spanner.
+6. **Replicating the coordinator removes blocking.** That's why Spanner and CockroachDB run 2PC over consensus, and why 2PC works best inside one system.
+7. **A saga trades isolation for availability.** Compensations add new history, must be idempotent, and can't undo everything.
+8. **The outbox turns two writes into one.** The relay delivers at least once, so consumers deduplicate in the same transaction as their effect.
+9. **Idempotency keys are claimed with an atomic insert.** Store them next to the effect they protect, not in a separate system.
+10. **"Exactly-once" means at-least-once plus deduplication.** Kafka's version covers Kafka to Kafka, and anything outside needs its own dedupe.
 
 <SectionHeading n="10" id="build">Build this</SectionHeading>
 
 **A checkout that survives being killed.**
 
-- Two Postgres instances on different ports: `orders` in one, `payments` in
-  the other. Write the naive dual write, then kill the process with `kill -9`
-  at random points in a loop and count mismatched rows.
-- Replace it with an outbox and a polling relay using `SKIP LOCKED`, and a
-  consumer with an inbox table. Run the same kill loop against the handler, the
-  relay and the consumer. The mismatch count should be zero, and the consumer
-  should log the duplicates it discarded.
-- Add an idempotency-key table to the payments side. Fire each request twice,
-  50 ms apart, from different connections, and check that exactly one charge
-  row exists per key.
-- Finally, set `max_prepared_transactions`, do the transfer with
-  `PREPARE TRANSACTION`, kill the coordinator between phases, and write the
-  recovery script that reads your coordinator log and resolves every row in
-  `pg_prepared_xacts`.
+- Start two Postgres instances on different ports, `orders` in one and `payments` in the other. Write the naive dual write, then kill the process with `kill -9` at random points in a loop and count the mismatched rows.
+- Replace it with an outbox and a polling relay using `SKIP LOCKED`, and a consumer with an inbox table. Run the same kill loop against the handler, the relay and the consumer. The mismatch count should be zero, and the consumer should log the duplicates it discarded.
+- Add an idempotency-key table to the payments side. Fire each request twice, 50 ms apart, from different connections, and check that exactly one charge row exists per key.
+- Finally, set `max_prepared_transactions`, do the transfer with `PREPARE TRANSACTION`, kill the coordinator between phases, and write the recovery script that reads your coordinator log and resolves every row in `pg_prepared_xacts`.
 
 <SectionHeading n="11" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="What is the dual-write problem?">
-Writing to two systems (say, a database and a message broker) as two separate
-operations. Each is atomic on its own, but the process can crash, or one call
-can time out, between them. You end up with a row and no event, or an event
-and no row. Usually the fix is the transactional outbox: write the event as a
-row in the same local transaction, and publish it afterwards.
+Writing to two systems (say, a database and a message broker) as two separate operations. Each is atomic on its own, but the process can crash, or one call can time out, between them. You end up with a row and no event, or an event and no row. Usually the fix is the transactional outbox: write the event as a row in the same local transaction, and publish it afterwards.
 </QA>
 
 <QA level="beginner" q="What's an idempotency key, and who generates it?">
-A unique value naming one logical operation, sent with every retry of it. Your server stores it with the result, atomically with the effect, and returns the
-stored result for any repeat. The client generates it, because only the client
-knows whether two identical requests are a retry or two separate purchases.
-Stripe keeps keys for at least 24 hours and rejects a reused key with
-different parameters.
+A unique value naming one logical operation, sent with every retry of it. Your server stores it with the result, atomically with the effect, and returns the stored result for any repeat. The client generates it, because only the client knows whether two identical requests are a retry or two separate purchases. Stripe keeps keys for at least 24 hours and rejects a reused key with different parameters.
 </QA>
 
 <QA level="intermediate" q="Walk through two-phase commit. Where exactly does the transaction commit?">
-Phase one: the coordinator sends PREPARE; each participant makes its changes
-durable, keeps its locks and votes yes or no. A yes is a binding promise. If all
-vote yes, the coordinator durably logs COMMIT. That log record is the commit
-point. Phase two: it tells each participant, retrying until they all
-acknowledge. With presumed abort, a coordinator that finds no commit record on
-recovery aborts.
+Phase one: the coordinator sends PREPARE, and each participant makes its changes durable, keeps its locks and votes yes or no. A yes is a binding promise. If all vote yes, the coordinator durably logs COMMIT. That log record is the commit point. Phase two: it tells each participant, retrying until they all acknowledge. With presumed abort, a coordinator that finds no commit record on recovery aborts.
 </QA>
 
 <QA level="intermediate" q="Why is 2PC called a blocking protocol?">
-A participant that has voted yes can't decide on its own. If the coordinator
-fails before telling it the outcome, it must keep the transaction prepared,
-with its locks, until the coordinator recovers. In Postgres that's a row in
-`pg_prepared_xacts`, locks with no backend PID, and `VACUUM` unable to clean
-anything newer than its XID. Systems like Spanner avoid this by making the
-coordinator a Paxos group.
+A participant that has voted yes can't decide on its own. If the coordinator fails before telling it the outcome, it must keep the transaction prepared, with its locks, until the coordinator recovers. In Postgres that's a row in `pg_prepared_xacts`, locks with no backend PID, and `VACUUM` unable to clean anything newer than its XID. Systems like Spanner avoid this by making the coordinator a Paxos group.
 </QA>
 
 <QA level="intermediate" q="How is a saga different from a distributed transaction?">
-A saga is a series of local transactions that each commit immediately, with
-compensating transactions to semantically undo earlier steps if a later one
-fails. It never holds locks across services, so it's available and fast, but
-it isn't isolated: other readers see intermediate states. Compensations are
-new transactions, not rollbacks, and some actions (an email, a shipment) can't
-be compensated, so they go after the pivot step.
+A saga is a series of local transactions that each commit immediately, with compensating transactions to semantically undo earlier steps if a later one fails. It never holds locks across services, so it's available and fast, but it isn't isolated: other readers see intermediate states. Compensations are new transactions, not rollbacks, and some actions (an email, a shipment) can't be compensated, so they go after the pivot step.
 </QA>
 
 <QA level="deep" q="Kafka claims exactly-once semantics. What does it guarantee?">
-Two things. The idempotent producer (default since 3.0) uses a producer ID and
-per-partition sequence numbers so its own retries don't duplicate, within one
-session. Transactions let a consume-transform-produce app write output and
-input offsets atomically, with `read_committed` consumers seeing only committed
-data, and fence zombie instances by epoch. It covers Kafka to Kafka. Writes to
-a database or calls to an API are at-least-once unless you store offsets or
-event IDs with the output.
+Two things. The idempotent producer (default since 3.0) uses a producer ID and per-partition sequence numbers so its own retries don't duplicate, within one session. Transactions let a consume-transform-produce app write output and input offsets atomically, with `read_committed` consumers seeing only committed data, and fence zombie instances by epoch. It covers Kafka to Kafka. Writes to a database or calls to an API are at-least-once unless you store offsets or event IDs with the output.
 </QA>
 
 <QA level="deep" q="Two retries with the same idempotency key arrive at the same time. How do you stop both from charging?">
-Claim the key with an atomic insert on a unique index, such as `INSERT ... ON
-CONFLICT DO NOTHING RETURNING`, in the same database as the charge. The second
-insert blocks on the first's uncommitted index entry, then inserts nothing, so
-exactly one request owns the key. Whoever loses returns the saved response, or a
-409 asking the client to retry if the first is still running. A check-then-insert
-in application code, or a key stored in a different system, both race.
+Claim the key with an atomic insert on a unique index, such as `INSERT ... ON CONFLICT DO NOTHING RETURNING`, in the same database as the charge. The second insert blocks on the first's uncommitted index entry, then inserts nothing, so exactly one request owns the key. Whoever loses returns the saved response, or a 409 asking the client to retry if the first is still running. A check-then-insert in application code, or a key stored in a different system, both race.
 </QA>
 
 <QA level="deep" q="You find a prepared transaction in Postgres that's three days old. What do you do?">
-Don't guess. Find which coordinator created it (the GID usually encodes it)
-and look up its decision in that coordinator's log. If it logged commit, run
-`COMMIT PREPARED`; if there's no commit record, presumed abort says
-`ROLLBACK PREPARED` is safe. Then find out why recovery didn't resolve it
-automatically, add an alert on `pg_prepared_xacts` age, and check table bloat,
-since `VACUUM` couldn't remove anything newer than its XID for three days.
+Don't guess. Find which coordinator created it (the GID usually encodes it) and look up its decision in that coordinator's log. If it logged commit, run `COMMIT PREPARED`. If there's no commit record, presumed abort says `ROLLBACK PREPARED` is safe. Then find out why recovery didn't resolve it automatically, add an alert on `pg_prepared_xacts` age, and check table bloat, since `VACUUM` couldn't remove anything newer than its XID for three days.
 </QA>
 
 <SectionHeading n="12" id="resources">Go deeper</SectionHeading>
@@ -1090,6 +955,11 @@ since `VACUUM` couldn't remove anything newer than its XID for three days.
 </Quiz>
 
 <CardGrid>
+  <WildCard name="Operating Systems: Three Easy Pieces, the distributed systems and NFS chapters">
+    Lost messages, timeouts and retries, and why NFS is built from idempotent
+    operations so that a repeated request does no harm: the same problem as
+    section 2.2, from the operating system side. Free online at ostep.org.
+  </WildCard>
   <WildCard name="Garcia-Molina and Salem, Sagas (SIGMOD 1987)">
     The original paper: long-lived transactions as sequences with compensations.
     Short, and still the clearest statement of what you give up.

@@ -1,24 +1,43 @@
 ---
 title: Allocators & Memory Management
-dek: "malloc costs about nine nanoseconds and a bump allocator costs two tenths of one. You'll start by freeing half a gigabyte and watching the process keep all of it, then learn what fills that gap, how size classes and thread caches work, and why a service's memory can climb for hours without a leak."
-readingTime: "~26 min"
+dek: "Follow one small `malloc(40)` from your code down to the kernel and back: how an allocator carves memory into pieces, why `free` doesn't give memory back, and why a service's memory can climb for hours without a leak."
+readingTime: "~30 min"
 level: "Beginner"
-versions: "Measured on Apple M4 · libmalloc · clang 21 -O2"
-prereqs: "a terminal and a C compiler; virtual memory helps"
-updated: "2026-09-30"
+versions: "macOS 26.5.1 (libmalloc), clang 21 -O2 for the examples; glibc behaviour described where it differs"
+prereqs: "a terminal and a C compiler; chapter 04 (virtual memory) helps"
+updated: "2026-10-02"
 ---
 
-A car park attendant buys whole floors from the building's owner and hands out individual spaces to drivers. When a car leaves, the attendant marks the space free for the next driver. The floor stays with the attendant, because handing floors back and buying them again is slow and the next car is probably minutes away.
+You're building a linked list in C. Every time the program adds an item, it calls `malloc(40)`, which asks for 40 bytes of memory and returns the address of a fresh piece that nothing else is using. When the program is done with the item, it calls `free` on that address to hand the piece back. A million items later, you'd expect that after freeing all of them the program's memory use would fall back to where it started.
 
-`malloc` is that attendant. The kernel sells memory in big blocks called pages, the attendant cuts them into the small pieces your program asks for, and freed pieces go back on the attendant's list, not back to the kernel. That's why memory numbers for a running program can look wrong. Watch it happen.
+It doesn't. A program can free every piece it ever asked for and still sit on hundreds of megabytes, and nothing is broken. The reason is that `malloc` and `free` never talk to the operating system the way you'd imagine. A piece you free is not returned to anyone; it's kept somewhere, waiting for the next `malloc`.
+
+The somewhere is the **allocator**, the code behind `malloc` and `free` that every language runtime carries with it. This chapter asks one question and follows it all the way down: when I call `malloc(40)` and later free the piece, where does that memory come from, where does it go, and why doesn't it go back to the system? We'll watch the effect first, then build an allocator one problem at a time until it looks like the real ones, and finish with what each design choice costs and how to see it on a running program.
 
 <SectionHeading n="01" id="free-and-keep">Free everything and keep it all</SectionHeading>
 
-Save this as `rss.c`. It allocates half a million 1 KB blocks, frees most of them, then frees the rest, and prints the process's resident memory (RSS) at each step.
-
 <Sub n="1.1" title="Half a gigabyte, freed">
 
-<TryIt what="Allocate 500,000 blocks of 1 KB, free 90%, then free the rest, printing RSS each time" lang="c" toolchain="clang 21 -O2, Apple M4, macOS 26.5.1, libmalloc">
+Let's make the effect visible. The program below plays the part of the list-builder, with 1 KB nodes instead of 40-byte ones so the effect is big enough to see. It allocates half a million nodes, frees nine out of every ten, then frees the rest, and after each step it asks the operating system how much memory the process is using.
+
+That number needs a little background. The **kernel**, the core of the operating system that owns the hardware, gives memory to a program in fixed-size chunks called **pages**: 4 KB on most Linux machines and 16 KB on Apple Silicon Macs. A **process** is one running program, and the kernel keeps count of how many of a process's pages are sitting in RAM right now. That count is the process's **resident set size**, or **RSS**, and the `ps` command prints it in kilobytes. A fresh page only counts once the program has written something into it, which is why the program stores one byte into every node it allocates.
+
+The helper `rss_mb` runs `ps -o rss= -p <our own process id>` (the `=` after `rss` removes the column heading) and divides the kilobytes by 1,024 to get megabytes.
+
+<Predict
+  q="The program allocates 500,000 blocks of 1 KB (about half a gigabyte), frees 90% of them, and then frees the rest. After the very last free, roughly what does the process's RSS show?"
+  options={[
+    "About 1 MB, back to where it started",
+    "About 50 MB, a tenth of the peak",
+    "About 495 MB, where it peaked",
+    "The program crashes: freeing in that order is a bug",
+  ]}
+  answer={2}
+>
+Every block has been freed, and RSS is still at its peak. If you picked the first option, the output below will surprise you, and the rest of the chapter explains where the memory went.
+</Predict>
+
+<TryIt what="Allocate 500,000 blocks of 1 KB, free 90%, then free the rest, printing RSS each time" lang="c" toolchain="clang 21 -O2, macOS 26.5.1, libmalloc">
 ```c
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,110 +71,108 @@ after freeing the rest   :  495.7 MB
 </Output>
 </TryIt>
 
-After every block had been freed, the process still held 495.7 MB. On this machine `libmalloc` kept the pages.
+Read the four lines in order. The process starts at 1.3 MB. Half a million 1 KB nodes bring it to 495.4 MB, which is about what 500,000 kilobytes should add up to. Freeing 90% of the nodes changes nothing at all. Freeing the rest changes nothing either: with every node freed, the process still holds 495.7 MB, slightly more than before. On macOS, the allocator (`libmalloc`) kept the pages.
 
 </Sub>
 
 <Sub n="1.2" title="Why that isn't a leak">
 
-A leak is memory your program lost track of. Here the program freed everything, and the allocator knows exactly where it all is: on its free lists, ready for the next `malloc`. The kernel doesn't know or care, so RSS stays where it peaked.
+A **leak** is memory your program has lost track of: it still owns the piece but no pointer to it exists, so nobody can ever free it. A leaking program grows for as long as it runs. Here the program freed everything, and the code holding the 495 MB knows exactly where every piece is, because it keeps them for the next `malloc`.
 
-Which allocator you use, how it groups sizes, and whether it hands pages back all change what you see here. The rest of the chapter builds an allocator from the simplest version up, following each problem that makes the next piece necessary.
+That code is the allocator. The kernel only sees the pages it handed out, and as far as it can tell the process is still using every one of them, so RSS stays where it peaked. Which allocator you run, how it groups sizes, and how eagerly it hands pages back all change what you see in this experiment.
+
+To see why a layer like this exists at all, and why it behaves this way, we should start with what the kernel is willing to sell.
 
 </Sub>
 
 <SectionHeading n="02" id="why-an-allocator">Why programs need an allocator</SectionHeading>
 
-Chapter 04 ended with the kernel handing memory to a process in pages, 16 KB at
-a time on this machine, through calls like `mmap`. Your program doesn't think
-in pages, though.
-
 <Sub n="2.1" title="Pages are the wrong size">
 
-It asks for a 24-byte node, a 100-byte string, a 3 KB buffer, millions of times
-a second. Something has to sit between those requests and the kernel's pages.
+The kernel sells memory by the page, 4 KB or 16 KB at a time, through system calls such as `mmap`. A **system call**, or **syscall**, is a request from your program to the kernel: the CPU stops running your code, switches into the kernel, does the work, and switches back. `mmap` is the one that asks for fresh pages.
+
+Your program doesn't think in pages. It asks for a 40-byte node, a 100-byte string, a 3 KB buffer, millions of times a second. So why not call `mmap` for each of them?
 
 <Why>Why not ask the kernel for every object?</Why>
 
-Because both costs are absurd. Each request would be a syscall, which chapter
-07 measures at around 350 ns. And each 24-byte object would occupy a whole
-16 KB page.
+Because both costs are absurd. Each request would be a syscall, and the crossing alone costs about 350 nanoseconds (chapter 07 times it), which is far more than the work of handing out 40 bytes. And each 40-byte node would occupy a whole page, so a million nodes would take a million pages: 4 GB on a 4 KB-page machine, 16 GB with 16 KB pages, for 40 MB of data.
 
-So every language runtime puts a middleman in between: the **allocator**, the
-code behind `malloc`, `free`, `new` and `delete`. It asks the kernel for big
-chunks and cuts them up itself.
+The fix is a middleman. Think of a car park attendant who buys whole floors from the building's owner and hands out single spaces to drivers. When a car leaves, the attendant marks the space free for the next driver and keeps the floor, because buying and returning floors is slow and the next car is probably minutes away. The allocator is that attendant: it asks the kernel for big chunks of memory, cuts them into the pieces your program asks for, and keeps the freed pieces on hand. Its pool of memory is called its **heap**.
 
 </Sub>
 
 <Sub n="2.2" title="What malloc promises">
 
-`malloc(n)` promises a pointer to `n` usable bytes, suitably aligned, that no
-other live allocation overlaps. `free(p)` promises that memory becomes
-available again.
+Before building one, we should write down the contract. `malloc(n)` promises a pointer to `n` usable bytes that no other live allocation overlaps. The pointer is also **aligned**, meaning its address is a multiple of some number (16 on most 64-bit systems). Alignment matters because some CPU instructions run slower, or refuse to run, on values that straddle such a boundary, and `malloc` doesn't know what you'll store in the piece, so it lines every piece up for the strictest case. `free(p)` promises that the piece at `p` becomes available again.
 
-Read the list of things it doesn't promise, because every one of them is a
-production incident someone has had.
-
-| Not promised | What that means in practice |
-|---|---|
-| **A time bound** | A single `malloc` may take a lock, split a block, walk a free list, or ask the kernel for memory and take microseconds |
-| **Return to the OS** | Freed memory usually stays in the allocator's pools. Your RSS doesn't go down, and that isn't a leak |
-| **Locality** | Two sequential allocations may land anywhere. Chapter 02 explains why that matters more than the allocation cost |
-| **A bound on fragmentation** | Peak RSS can exceed peak live bytes by a lot, permanently |
-
-<Callout label="Design implication">
-An allocator spends most of its effort answering "which free block should I
-give you, and how do I find it again later". If your program knows the answer
-(all objects the same size, or all freed at once), you can skip nearly the
-whole mechanism. Section 6 measures that as a **42×** difference.
-</Callout>
+That's the entire contract. It says nothing about how fast `malloc` is, where the piece will be, or whether freed memory ever leaves the process. An allocator is free to choose any of those, and a surprising number of production incidents come from the choices. Those gaps are the room we have to design in, so let's start with the simplest allocator that keeps the contract.
 
 </Sub>
 
 <SectionHeading n="03" id="building-one">Building an allocator, one problem at a time</SectionHeading>
 
-Each version below fixes the one before it, and each fix brings a new problem.
-Real allocators are the sum of all four.
+Each version below fixes the one before it, and each fix creates a new problem. Real allocators are the sum of all four. We'll watch them hand out memory from a single fresh page.
 
 <Sub n="3.1" title="The bump allocator">
 
-The simplest allocator you could write takes one big chunk and keeps a pointer
-to the first unused byte. To allocate `n` bytes it returns the pointer and
-moves it forward by `n`.
+The simplest allocator takes one big chunk and keeps a pointer to the first unused byte. To allocate `n` bytes, it returns the pointer and moves it forward by `n`. That's a **bump allocator**, and it's close to the fastest allocator possible: a couple of instructions per call.
 
-That's a **bump allocator**, and it's probably impossible to beat: a couple of
-instructions per allocation.
+<Why>Why can't a bump allocator free?</Why>
 
-<Why>What's wrong with it?</Why>
-
-It can't free anything. Once the pointer has passed an object, that memory is
-gone until you throw the whole chunk away.
+Because the pointer only moves forward. Once it has passed a node, nothing records that the node's bytes are available again. The memory stays used until the whole chunk is thrown away, so a program that allocates and frees in a loop would eat through the chunk and then run out.
 
 </Sub>
 
 <Sub n="3.2" title="Free lists, and fragmentation">
 
-So the next step is to remember freed pieces. When a program frees a block, put
-it on a **free list**, and check that list before bumping the pointer.
+So the next step is to remember freed pieces. When a program frees a piece, the allocator links it into a **free list**, a list of pieces that are ready for reuse, and `malloc` checks that list before it bumps the pointer. Here is one page, first with the bump pointer alone and then with a free list added:
 
-Now memory gets reused, and a new problem shows up. Free a 24-byte object and
-then ask for 100 bytes, and the 24-byte hole is no use.
+<Scene
+  title="One page: bump pointer, then a free list, then a hole that's too small"
+  regions={[
+    { id: "prog", label: "Your program", sub: "live blocks", col: 0, row: 0 },
+    { id: "page", label: "The allocator's page", sub: "unused space, handed out from the front", col: 1, row: 0 },
+    { id: "lost", label: "Forgotten", sub: "freed, but nobody can find it", col: 0, row: 1 },
+    { id: "free", label: "Free list", sub: "freed blocks, ready for reuse", col: 1, row: 1 },
+  ]}
+  itemWidth={96}
+  frames={[
+    { caption: "The kernel has given the allocator one page. A pointer marks the front of the unused space. This is a **bump allocator**.",
+      items: [{ id: "un", at: "page", label: "unused", sub: "a whole page", tone: "dim" }],
+      focus: ["page"] },
+    { caption: "Your program calls `malloc(40)` for a list node. The allocator returns the pointer and bumps it forward by 40 bytes.",
+      add: [{ id: "a", at: "prog", label: "node a", sub: "40 B", tone: "new" }],
+      change: [{ id: "un", sub: "pointer moved on" }],
+      focus: ["prog"], arrow: { from: "page", to: "prog", label: "malloc(40)" } },
+    { caption: "Then `malloc(100)` for a string. Same move: return the pointer, bump it by 100.",
+      add: [{ id: "b", at: "prog", label: "string b", sub: "100 B", tone: "new" }],
+      change: [{ id: "a", tone: "default" }],
+      focus: ["prog"], arrow: { from: "page", to: "prog", label: "malloc(100)" } },
+    { caption: "The program calls `free(a)`. The bump pointer is already past node a and has no way to go back, so the 40 bytes are forgotten for good.",
+      change: [{ id: "b", tone: "default" }, { id: "a", at: "lost", tone: "bad", sub: "lost" }],
+      focus: ["lost"] },
+    { caption: "Add a **free list**. Now `free(a)` links the block into the list instead, and the allocator can find it again.",
+      change: [{ id: "a", at: "free", tone: "ok", sub: "40 B, free" }],
+      focus: ["free"] },
+    { caption: "The program calls `malloc(100)` again. The allocator checks the free list first, but the only free block is 40 bytes, too small. A new string is carved from the page instead, and the 40-byte block stays behind as a **hole**.",
+      add: [{ id: "c", at: "prog", label: "string c", sub: "100 B", tone: "new" }],
+      change: [{ id: "a", tone: "dim", sub: "40 B hole" }],
+      focus: ["free", "page"], arrow: { from: "page", to: "prog", label: "malloc(100)" } },
+    { caption: "Only a request that fits can use the hole. A later `malloc(40)` fits exactly, so block a is reused. Freed blocks get reused only when a request happens to match, which hints at the next fix: keep blocks of the same size together.",
+      change: [{ id: "a", at: "prog", label: "node a", sub: "40 B, reused", tone: "new" }, { id: "c", tone: "default" }],
+      focus: ["prog"], arrow: { from: "free", to: "prog", label: "malloc(40)" } },
+  ]}
+/>
 
-Do that for a few hours with mixed sizes and the heap can end up full of free
-pieces too small to reuse. That waste is **fragmentation**.
+Now memory gets reused, and a new problem appears, as frames 6 and 7 hint. Free a 40-byte node and then ask for 100 bytes, and the 40-byte hole is no use. Do that for a few hours with mixed sizes and the heap can end up full of free pieces that are each too small for what's being asked. That waste is **fragmentation**: plenty of free memory in total, none of it in a usable shape.
 
 </Sub>
 
 <Sub n="3.3" title="Size classes">
 
-Real allocators handle it with **size classes**. Every request is rounded up to
-one of a fixed set of sizes (say 16, 32, 48, 64 bytes, then coarser steps above
-that), and each class keeps its own free list.
+Real allocators avoid most of that with **size classes**. Every request is rounded up to one of a fixed set of sizes (say 8, 16, 32, 48, 64 bytes, then coarser steps above that), and each class keeps its own free list. A request for 40 bytes gets a 48-byte block.
 
-Any freed 48-byte block fits the next 48-byte request exactly. And "find a
-block that fits" turns into an array index.
-
-<Figure caption="A 40-byte request lands in the 48-byte class. Those 8 bytes are internal fragmentation: invisible to your program, real in your RSS, and typically a few percent overall.">
+<Figure caption="malloc(40) rounds up to the 48-byte class. The 8 spare bytes are internal fragmentation: waste inside a block, invisible to your program and real in your RSS. Averaged over a typical mix of sizes it's usually a few percent.">
 <Cells
   cellWidth={54}
   rows={[
@@ -164,29 +181,23 @@ block that fits" turns into an array index.
 />
 </Figure>
 
+Any freed 48-byte block now fits the next 48-byte request exactly, so the hole problem from 3.2 mostly disappears. And "find a block that fits" turns into an array index: the allocator computes the class number and looks at that class's list.
+
 <Why>What does rounding cost?</Why>
 
-Memory. Under classes of 16 and 32, a 17-byte request gets a 32-byte block, and
-nearly half of it is wasted. That sounds bad, but it's usually cheaper than the
-fragmentation it prevents.
-
-It also buys speed: allocation becomes a pop from a list, and freeing becomes a
-push. No search.
+Memory. With classes of 16 and 32, a 17-byte request gets a 32-byte block, and nearly half of it is wasted. That sounds bad, but it's usually cheaper than the fragmentation it prevents. It also buys speed: allocation becomes a pop from a list and freeing becomes a push, with no searching.
 
 </Sub>
 
 <Sub n="3.4" title="Threads, caches and arenas">
 
-Threads add one more problem. A single free list shared by every thread needs a
-lock, and on a busy server that lock can easily become the bottleneck. Chapter
-13 measured what that costs under contention.
+So far there has been one program doing one thing at a time. A real server runs many **threads**, separate lines of execution inside one process that can run on different CPU cores at the same moment, and every one of them calls `malloc`.
 
-So every modern allocator (tcmalloc, jemalloc, mimalloc, macOS libmalloc, and
-glibc's too) keeps a **per-thread cache** of small blocks. Some add several
-independent heaps called **arenas**.
+If all threads share one free list per size class, two of them could pop the same block at the same instant, so the list needs a **lock**: a guard that lets one thread in at a time while the others wait. On a busy server the waiting is the cost (chapter 13 measures what lock contention costs).
 
-Allocation from a thread cache needs no atomics at all. Only when the cache
-empties or overflows does the thread touch shared structures.
+So every modern allocator, including tcmalloc, jemalloc, mimalloc, macOS's libmalloc and glibc's `malloc`, gives each thread a **thread cache**: a small private stock of free blocks for each size class, touched only by that thread. (macOS's libmalloc keeps one stock per CPU core instead of per thread, which solves the same problem the same way.) Taking a block from it needs no lock and none of the slower **atomic operations**, the special CPU instructions threads use to coordinate. Only when the cache is empty does the thread go to the shared **central heap** behind it, and it takes a whole batch of blocks in one trip, so one lock acquisition pays for many later allocations. When the cache grows too big, the thread returns a batch.
+
+Some allocators go one step further and run several **arenas**: independent heaps, each with its own central lists and lock, so threads spread across them instead of queuing at one. (Section 7 uses the word arena for a different idea, so keep this meaning in mind: several heaps, side by side.)
 
 | Design | Fast path | What it costs |
 |---|---|---|
@@ -194,79 +205,124 @@ empties or overflows does the thread touch shared structures.
 | Per-thread cache | A list pop, no atomics | Blocks freed on one thread aren't available to others until a flush |
 | Several arenas | Threads spread over independent heaps | Freed memory can sit in one arena where the others can't reuse it |
 
-That's also why a long-running service's memory can climb without leaking.
-Freed memory sits in one thread's cache or one arena, where the others can't
-reuse it and the kernel never gets it back. `MALLOC_ARENA_MAX` exists because
-of this. So do the allocators people switch to: jemalloc, which Redis ships as
-its default on Linux, and Google's tcmalloc.
+Every row of the table buys speed by letting memory sit where one thread can't share it, and we'll see that bill come due in section 4.2. For now we have all the pieces: size classes, thread caches, a central heap behind them, and the kernel behind that. Let's follow one `malloc(40)` through all of it.
 
 </Sub>
 
 <SectionHeading n="04" id="malloc-path">One malloc call, step by step</SectionHeading>
 
-With size classes and thread caches in place, most calls finish in a few
-nanoseconds. The rest fall through a chain of slower paths.
-
 <Sub n="4.1" title="Fast path, then slow path">
 
-<Steps
-  title="malloc(40), from the size class to the kernel"
-  lanes={[
-    { t: "Your code", s: "malloc(40)", icon: "◉" },
-    { t: "Size class", s: "round up", icon: "▦" },
-    { t: "Thread cache", s: "no lock", icon: "⚡" },
-    { t: "Central heap", s: "shared, locked", icon: "≡" },
-    { t: "New span", s: "carve fresh blocks", icon: "▤" },
-    { t: "Kernel", s: "mmap, page faults", icon: "⌁" },
+With size classes and thread caches in place, most calls finish in a few nanoseconds, and a few fall through to slower paths. To watch both, suppose a thread has never asked for a 48-byte block, and follow its first `malloc(40)` and then its second. One new word first: a **span** is a run of pages the allocator has set aside to cut into blocks of one size.
+
+<Scene
+  title="malloc(40): the slow first call, then the fast ones"
+  regions={[
+    { id: "prog", label: "Your code", col: 0, row: 0 },
+    { id: "cache", label: "This thread's cache", sub: "no lock", col: 1, row: 0 },
+    { id: "central", label: "Central heap", sub: "shared, takes a lock", col: 0, row: 1 },
+    { id: "kernel", label: "Kernel", sub: "mmap: a syscall", col: 1, row: 1 },
   ]}
-  steps={[
-    [0, "Your code calls `malloc(40)`."],
-    [1, "The allocator rounds 40 up to the **48-byte class**. That's a computation, not a search."],
-    [2, "It pops a block off this thread's cache for class 48 and returns it. **No lock, no atomics, a few nanoseconds.** Most calls end here."],
-    [3, "If the thread's cache is empty, it refills a batch from the **central heap**. This is where threads can contend."],
-    [4, "If the central heap has nothing free in that class either, it carves a new **span** of memory into 48-byte blocks."],
-    [5, "If there's no memory left to carve, it asks the kernel with `mmap`: a syscall now, and a page fault on each page when it's first touched."],
+  itemWidth={112}
+  frames={[
+    { caption: "Your code calls `malloc(40)`. The allocator rounds 40 up to the **48-byte class**, a quick calculation with nothing to search, and looks in this thread's cache for a free 48-byte block. There is none: this thread has never needed one.",
+      items: [
+        { id: "req", at: "prog", label: "malloc(40)", sub: "→ 48 B class", tone: "accent" },
+        { id: "pages", at: "kernel", label: "fresh pages", sub: "not yet handed out", tone: "dim" },
+      ],
+      focus: ["cache"], arrow: { from: "prog", to: "cache", label: "malloc(40)" } },
+    { caption: "The empty cache refills from the **central heap**. That structure is shared by every thread, so the refill takes a lock, and this is where threads can end up waiting for each other. The central heap has no free 48-byte blocks either.",
+      focus: ["central"], arrow: { from: "cache", to: "central", label: "refill" } },
+    { caption: "So the central heap asks the kernel for memory with `mmap`. That is a syscall, about 350 ns just to cross into the kernel.",
+      change: [{ id: "pages", tone: "accent" }],
+      focus: ["kernel"], arrow: { from: "central", to: "kernel", label: "mmap" } },
+    { caption: "The pages arrive and become a **span** that the allocator will cut into 48-byte blocks.",
+      change: [{ id: "pages", at: "central", label: "span", sub: "to cut into 48 B", tone: "new" }],
+      focus: ["central"], arrow: { from: "kernel", to: "central", label: "pages" } },
+    { caption: "The central heap cuts the span into blocks and hands a whole **batch** to the thread's cache in one trip, so the next calls won't need to come back here.",
+      change: [{ id: "pages", label: "rest of span", sub: "still uncut", tone: "dim" }],
+      add: [
+        { id: "s1", at: "cache", label: "48 B block", sub: "free", tone: "new" },
+        { id: "s2", at: "cache", label: "48 B block", sub: "free", tone: "new" },
+        { id: "s3", at: "cache", label: "48 B block", sub: "free", tone: "new" },
+      ],
+      focus: ["cache"], arrow: { from: "central", to: "cache", label: "batch" } },
+    { caption: "The cache pops one block and `malloc` returns its address. The slow trip is over, and it was paid once for the whole batch.",
+      remove: ["req"],
+      change: [{ id: "s1", at: "prog", label: "your node", sub: "40 of 48 B used", tone: "accent" }, { id: "s2", tone: "default" }, { id: "s3", tone: "default" }],
+      focus: ["prog"], arrow: { from: "cache", to: "prog", label: "block" } },
+    { caption: "Later your code calls `free`. The block goes straight back on this thread's list for its class: no lock, no kernel, a few nanoseconds.",
+      change: [{ id: "s1", at: "cache", label: "48 B block", sub: "free", tone: "ok" }],
+      focus: ["cache"], arrow: { from: "prog", to: "cache", label: "free" } },
+    { caption: "The next `malloc(40)` pops the same block again, also without a lock or a syscall. Most calls in a running program look like this one.",
+      change: [{ id: "s1", at: "prog", label: "your node", sub: "40 of 48 B used", tone: "accent" }],
+      focus: ["prog"], arrow: { from: "cache", to: "prog", label: "malloc(40)" } },
   ]}
 />
 
-Notice that the fast path never enters the kernel and never takes a lock. The
-cost measured in section 6.1 is almost entirely step 3: a size-class
-computation, a list pop, and some bookkeeping.
+Notice the shape of the cost. The first call took every slow step, a lock and a syscall among them, and bought a whole batch of blocks. The calls after it took only the fast path, which never enters the kernel and never takes a lock. The nine or so nanoseconds per call that section 7.1 lists are almost entirely that fast path: a size-class computation, a list pop and some bookkeeping.
+
+`free` follows the same route in reverse, and it's quick when the block goes back to the cache it came from. That's not always where it ends up.
 
 </Sub>
 
 <Sub n="4.2" title="Freeing on another thread">
 
-`free` is the same path in reverse, and it's fast when the block goes back to
-the thread that allocated it. Cross-thread freeing is the slow path in most
-allocators. Step through a producer handing objects to a consumer:
+The thread that frees a block isn't always the one that allocated it. A common pattern in servers is a **producer** thread that allocates objects and hands them to a **consumer** thread through a queue, and the consumer is the one that frees them. Where do the blocks go? In most allocators `free` puts a block in the cache of the thread that calls it, wherever the block was allocated, and that turns out to be expensive for the producer. Here are three 48-byte blocks in the producer's cache, and two spares waiting in the central heap:
 
-<StepSequence
+<Scene
   title="Allocate on one thread, free on another"
-  actors={["Thread A", "Central heap", "Thread B"]}
-  messages={[
-    { from: 0, to: 2, label: "hand off objects", note: "Thread A, a producer, allocates from its own cache and passes the objects to thread B, a consumer, through a queue." },
-    { from: 2, to: 2, label: "free()", note: "B frees them. The blocks land in **B's** thread cache, not A's." },
-    { from: 0, to: 1, label: "refill", note: "A's cache runs dry, because nothing ever comes back to it. It refills from the shared central heap: the slow path." },
-    { from: 2, to: 1, label: "flush (eventually)", note: "B's cache holds blocks it never uses. Until it overflows and flushes, that memory is **stranded**: free, but not available to A." },
+  regions={[
+    { id: "a", label: "Thread A's cache", sub: "the producer", col: 0, row: 0 },
+    { id: "c", label: "Central heap", sub: "shared, takes a lock", col: 1, row: 0 },
+    { id: "b", label: "Thread B's cache", sub: "the consumer", col: 2, row: 0 },
+    { id: "use", label: "In use", sub: "nodes passed from A to B through a queue", col: 0, row: 1, span: 3 },
+  ]}
+  itemWidth={84}
+  frames={[
+    { caption: "Thread A builds nodes, and it has three free blocks in its own cache. Thread B only consumes: it will never call `malloc` for this size.",
+      items: [
+        { id: "b1", at: "a", label: "block 1" },
+        { id: "b2", at: "a", label: "block 2" },
+        { id: "b3", at: "a", label: "block 3" },
+        { id: "b7", at: "c", label: "block 7" },
+        { id: "b8", at: "c", label: "block 8" },
+      ],
+      focus: ["a"] },
+    { caption: "A allocates three nodes, fast, from its own cache, and hands them to B through a queue.",
+      change: [{ id: "b1", at: "use", tone: "accent" }, { id: "b2", at: "use", tone: "accent" }, { id: "b3", at: "use", tone: "accent" }],
+      focus: ["use"], arrow: { from: "a", to: "use", label: "malloc ×3" } },
+    { caption: "B finishes with the nodes and calls `free`. The blocks land in **B's** cache, not A's.",
+      change: [{ id: "b1", at: "b", tone: "ok" }, { id: "b2", at: "b", tone: "ok" }, { id: "b3", at: "b", tone: "ok" }],
+      focus: ["b"], arrow: { from: "use", to: "b", label: "free" } },
+    { caption: "A's cache is now empty, because nothing ever comes back to it. A has to refill from the central heap: the slow path, with its lock.",
+      change: [{ id: "b7", at: "a", tone: "new" }, { id: "b8", at: "a", tone: "new" }],
+      focus: ["c", "a"], arrow: { from: "c", to: "a", label: "refill" } },
+    { caption: "A uses blocks 7 and 8 for its next nodes, and B frees those into its own cache too. Every round goes the same way, so B's cache fills with blocks that B will never allocate from. They're free, and nobody else can use them: they're **stranded**.",
+      change: [{ id: "b7", at: "b", tone: "bad", sub: "stranded" }, { id: "b8", at: "b", tone: "bad", sub: "stranded" }, { id: "b1", tone: "bad", sub: "stranded" }, { id: "b2", tone: "bad", sub: "stranded" }, { id: "b3", tone: "bad", sub: "stranded" }],
+      focus: ["b"] },
+    { caption: "Only when B's cache overflows does it flush a batch back to the central heap, where A can use the blocks again. Until then the memory counts toward your RSS and does no work.",
+      change: [{ id: "b7", at: "c", tone: "ok", sub: "" }, { id: "b8", at: "c", tone: "ok", sub: "" }, { id: "b1", at: "c", tone: "ok", sub: "" }, { id: "b2", at: "c", tone: "ok", sub: "" }, { id: "b3", at: "c", tone: "ok", sub: "" }],
+      focus: ["c"], arrow: { from: "b", to: "c", label: "flush" } },
   ]}
 />
 
+The producer pays a refill, with its lock, on every round, and in some allocators (mimalloc is one) the consumer's `free` is slower too, because a block that belongs to another thread has to be sent back to its owner with an atomic operation. Meanwhile memory piles up. This is how a long-running service's memory can climb with no leak. Freed memory sits in one thread's cache or one arena, where the other threads can't reuse it and the kernel never gets it back. `MALLOC_ARENA_MAX`, a setting that caps how many arenas glibc creates, exists because of this. So do the replacement allocators that people switch to: jemalloc, which Redis ships as its default on Linux, and Google's tcmalloc.
+
 <Callout label="Design implication">
-Allocate and free on the same thread where you can. A pipeline that allocates
-on one stage and frees on another pays the slow path on both ends and strands
-memory in between.
+Allocate and free on the same thread where you can. A pipeline that allocates on one stage and frees on another pays the slow path on both ends and strands memory in between.
 </Callout>
+
+Everything so far has been about small blocks. A request for something big is handled differently.
 
 </Sub>
 
 <Sub n="4.3" title="Why big allocations behave differently">
 
-Past a threshold (128 KB in glibc by default), allocators stop using their heap
-and call `mmap` directly, returning the memory to the OS on `free`.
+Past a threshold (128 KB in glibc by default), allocators stop carving from their own heap and call `mmap` for that one block directly. When the block is freed, `munmap` returns it to the kernel. glibc also raises the threshold by itself after you free a big block, so the exact point moves, but the idea stays: big blocks bypass the size classes and the caches.
 
 <Predict
-  q="On this machine, malloc + free of 256 bytes costs 9.5 ns. Roughly what does 64 KB cost?"
+  q="On a fast laptop, malloc + free of 256 bytes costs about 9.5 ns. Roughly what does 64 KB cost?"
   options={[
     "About 10 ns: size barely matters",
     "About 15 ns",
@@ -275,101 +331,119 @@ and call `mmap` directly, returning the memory to the OS on `free`.
   ]}
   answer={2}
 >
-73.4 ns, nearly eight times the 256-byte cost. A 4 KB allocation was still
-15.1 ns. The jump is where the kernel starts getting involved: a syscall on
-allocation, `munmap` on free, and fresh pages that fault on first touch.
+About 73 ns, nearly eight times the 256-byte cost. A 4 KB allocation was still 15.1 ns. At 64 KB the allocator has left its small-block fast path for the code that handles big blocks, and that code does more work per call. The kernel isn't the cause of this jump, because a single syscall costs about 350 ns, which is already more than the whole 73. The cost also stays at about this level for much larger blocks, most likely because macOS's allocator keeps recently freed big blocks for reuse instead of returning them to the kernel each time.
 </Predict>
 
-You're paying for a syscall and, later, for a page fault on every page you
-touch (chapter 04's 686 ns each). A loop allocating and freeing megabyte
-buffers can spend most of its time in the kernel, and the fix is to reuse one
-buffer.
+That is one allocator's behaviour in a loop that allocates and frees a single size. A program that keeps asking for fresh big buffers can pay much more. Each allocation can be an `mmap` syscall and each free a `munmap`, the syscall that hands pages back. Then there are the pages themselves. Section 1.1 noted that a fresh page only counts once something is written into it, and that's because the kernel supplies the real memory at the moment of that first write. The CPU stops your program, the kernel finds and zeroes a page, and your program carries on. That interruption is a **page fault**, and a page fault on a first touch costs about 686 ns (chapter 04 measures it), once for every page of every new block. Such a loop can spend most of its time in the kernel, and the fix is to allocate one buffer and reuse it.
+
+So far we've been looking at how fast the allocator hands memory out. The other half of the story is the memory it keeps, and that explains the 495 MB from the start of the chapter.
 
 </Sub>
 
 <SectionHeading n="05" id="rss">Why RSS never comes down</SectionHeading>
 
-The allocator gets memory from the kernel in pages and hands it out in objects.
-Giving it back only works in pages, and that mismatch is behind the most common
-allocator complaint.
-
 <Sub n="5.1" title="One survivor pins a page">
 
-Free a million small objects scattered across thousands of pages, and the
-allocator can only return a page to the OS if **every** object on it is free.
+The allocator gets memory from the kernel in pages and hands it out in small blocks. Giving it back only works in whole pages, because the kernel sells and takes back nothing smaller. So an allocator can return a page only if **every** block on it is free. Here is a burst of 1 KB nodes like the ones in the opening program, drawn on a toy heap with 4 KB pages, four nodes to a page:
 
-<Steps
-  title="A burst that leaves RSS permanently high"
-  lanes={[
-    { t: "Burst", s: "many small objects", icon: "◉" },
-    { t: "Pages", s: "objects spread out", icon: "▦" },
-    { t: "Frees", s: "most objects die", icon: "✕" },
-    { t: "Survivors", s: "one per page", icon: "●" },
-    { t: "Kernel", s: "gets nothing back", icon: "⌁" },
+<Scene
+  title="A burst that leaves RSS high"
+  regions={[
+    { id: "p1", label: "Page 1", sub: "4 KB", col: 0, row: 0 },
+    { id: "p2", label: "Page 2", sub: "4 KB", col: 1, row: 0 },
+    { id: "p3", label: "Page 3", sub: "4 KB", col: 2, row: 0 },
+    { id: "kernel", label: "Back with the kernel", sub: "pages here no longer count in RSS", col: 0, row: 1, span: 3 },
   ]}
-  steps={[
-    [0, "A burst of traffic allocates a million small objects."],
-    [1, "They're spread across thousands of pages. RSS climbs to cover all of them."],
-    [2, "The burst ends and most objects are freed. The allocator puts them back on its free lists."],
-    [3, "A few long-lived objects survive, scattered one or two per page. **One survivor pins the whole page.**"],
-    [4, "The allocator can only return a page when every object on it is free, so almost nothing goes back. RSS stays at the burst's peak."],
+  itemWidth={64}
+  frames={[
+    { caption: "A burst of traffic allocates twelve 1 KB nodes. They fill three pages, so RSS has grown by 12 KB and every node is live.",
+      items: [
+        { id: "n1", at: "p1", label: "n1", tone: "accent" }, { id: "n2", at: "p1", label: "n2", tone: "accent" },
+        { id: "n3", at: "p1", label: "n3", tone: "accent" }, { id: "n4", at: "p1", label: "n4", tone: "accent" },
+        { id: "n5", at: "p2", label: "n5", tone: "accent" }, { id: "n6", at: "p2", label: "n6", tone: "accent" },
+        { id: "n7", at: "p2", label: "n7", tone: "accent" }, { id: "n8", at: "p2", label: "n8", tone: "accent" },
+        { id: "n9", at: "p3", label: "n9", tone: "accent" }, { id: "n10", at: "p3", label: "n10", tone: "accent" },
+        { id: "n11", at: "p3", label: "n11", tone: "accent" }, { id: "n12", at: "p3", label: "n12", tone: "accent" },
+      ] },
+    { caption: "The burst ends and the program frees ten of the twelve nodes. The allocator puts them on its free lists, shown dim. Two nodes live on: n2 on page 1 and n6 on page 2.",
+      change: [
+        { id: "n1", tone: "dim" }, { id: "n3", tone: "dim" }, { id: "n4", tone: "dim" },
+        { id: "n5", tone: "dim" }, { id: "n7", tone: "dim" }, { id: "n8", tone: "dim" },
+        { id: "n9", tone: "dim" }, { id: "n10", tone: "dim" }, { id: "n11", tone: "dim" }, { id: "n12", tone: "dim" },
+      ] },
+    { caption: "Page 3 has no live node left, so the allocator can give the whole page back, and RSS drops by 4 KB (if the allocator chooses to).",
+      change: [
+        { id: "n9", at: "kernel" }, { id: "n10", at: "kernel" }, { id: "n11", at: "kernel" }, { id: "n12", at: "kernel" },
+      ],
+      focus: ["kernel"] },
+    { caption: "Pages 1 and 2 can't go back. n2 and n6 are still in use, and the kernel takes whole pages only. RSS is 8 KB while the program is using 2 KB: **one survivor pins its page**.",
+      change: [{ id: "n2", tone: "bad" }, { id: "n6", tone: "bad" }],
+      focus: ["p1", "p2"] },
+    { caption: "The free blocks aren't wasted: new allocations reuse them. They just aren't available to the kernel or to any other program on the machine.",
+      remove: ["n1", "n3"],
+      add: [{ id: "n13", at: "p1", label: "n13", tone: "new" }, { id: "n14", at: "p1", label: "n14", tone: "new" }],
+      focus: ["p1"] },
   ]}
 />
 
-That's how a process reaches 4 GB RSS with 400 MB live and stays there. No
-leak, no allocator bug, and no statistic in your application will show it. The
-usual signature: memory climbs during a burst and never recovers.
+Now scale that up to the opening program. It allocated 1 KB nodes one after another, so consecutive nodes sit 1,024 bytes apart, and with 16 KB pages, as on Apple Silicon, that's 16 nodes to a page. It kept every tenth node alive, and any run of 16 consecutive nodes contains one of those survivors, so every page was pinned and none of the 495 MB could go back. After the final frees, every page was entirely free and could have gone back, but libmalloc kept them anyway. Returning memory costs a syscall, and the program will probably ask for memory again soon, so allocators keep a stock of free pages and give them back lazily, if at all.
+
+That's how a process reaches 4 GB of RSS with 400 MB of live data and stays there. There's no leak and no allocator bug, and no statistic inside your application shows it. The usual signature is memory that climbs during a burst of traffic and never recovers.
 
 <Callout label="Common mistake" kind="warn">
-Calling a flat, high RSS a leak. A leak keeps growing; fragmentation climbs
-during a burst and then holds. Compare RSS against the sum of live
-allocations: a large, stable gap is fragmentation.
+Calling a flat, high RSS a leak. A leak keeps growing. Fragmentation climbs during a burst and then holds. Compare RSS against the sum of live allocations: a large, stable gap is fragmentation.
 </Callout>
 
 <Why>What can you do about it?</Why>
 
-Mitigations, in rough order of practicality:
-
-1. Use an arena for the burst and drop it whole.
-2. Use `malloc_trim` if your allocator supports it.
-3. Restart the process. Less embarrassing than it sounds, and what many systems
-   do.
+Three things, in rough order of practicality. Put the burst's objects in their own arena and drop it whole when the burst ends (section 7.2 builds one). Call `malloc_trim` if your allocator has it: that's glibc's call that asks the allocator to hand back whatever pages it can. Or restart the process, which is less embarrassing than it sounds and is what many systems do.
 
 </Sub>
 
-<Sub n="5.2" title="Allocator-induced false sharing">
+<Sub n="5.2" title="What malloc doesn't promise">
 
-Two threads allocating small objects concurrently can receive adjacent
-addresses in one cache line. Neither thread shares data with the other, and
-they hit chapter 13's 55× penalty anyway.
+We've now met enough of the machinery to read the list of things `malloc` leaves out of its contract. Nearly every row is something we've already watched happen.
 
-Per-thread caches mostly prevent this, because each thread carves from its own
-span. Mostly. If you're padding for concurrency, pad the allocation, not just
-the struct.
+| Not promised | What that means in practice | Where we saw it |
+|---|---|---|
+| **A time bound** | A single `malloc` may take a lock, split a block, walk a free list, or ask the kernel for memory and take microseconds | Section 4.1, and `realloc` in 6.2 |
+| **Return to the OS** | Freed memory usually stays in the allocator's pools. Your RSS doesn't go down, and that isn't a leak | Sections 1 and 5.1 |
+| **Locality** | Two sequential allocations may land anywhere. Chapter 02 explains why that matters more than the allocation cost | Not yet: section 6.1 |
+| **A bound on fragmentation** | Peak RSS can exceed peak live bytes by a lot, permanently | Sections 3.2 and 5.1 |
 
-</Sub>
-
-<Sub n="5.3" title="Realloc in a loop">
-
-`realloc` may extend in place or may copy everything. Growing a buffer by a
-fixed increment in a loop is O(n²) in bytes copied and looks perfectly
-reasonable in the source.
-
-Growth by a constant *factor*, the doubling every `std::vector` does, is what
-makes it amortised O(n).
+Two rows still have a trap waiting in them. Nothing so far has asked where a block lands in memory, which is the locality row, and the time bound has a second, quieter way to bite besides the slow first call. The next section takes them in turn.
 
 </Sub>
 
-<SectionHeading n="06" id="cost">Nine nanoseconds, or two tenths</SectionHeading>
+<SectionHeading n="06" id="traps">Two more traps</SectionHeading>
 
-<Callout label="The machine" kind="note">
-Apple M4, macOS 26.5.1, clang 21 `-O2`, system libmalloc. Two million
-allocate-and-immediately-free pairs per size, warmed first. Immediate freeing
-keeps everything in the thread cache, so these are best-case numbers. A real
-workload holding thousands of live objects will do worse.
-</Callout>
+<Sub n="6.1" title="Allocator-induced false sharing">
 
-<Sub n="6.1" title="malloc by size">
+A CPU doesn't fetch memory a byte at a time. It moves it in **cache lines**, chunks of 64 bytes on most x86 machines and 128 bytes on Apple Silicon (chapter 02 explains why). When one core writes to a line, every other core's copy of that line is thrown away, so if two cores keep writing to the same line they pass it back and forth, and each write waits. Two threads that write to different variables sitting in the same line pay this price without sharing anything, and that is called **false sharing**.
+
+The allocator can cause it without your noticing. `malloc` promises nothing about where blocks land, so two threads that allocate small nodes at the same moment can receive neighbouring addresses, inside one cache line. Neither thread shares data with the other, and they pay chapter 13's penalty anyway: that chapter measures a slowdown of about 55× at eight threads.
+
+Per-thread caches prevent most of this, because each thread carves its blocks from its own span, so two threads' blocks rarely sit side by side. It can still happen where one thread's span ends and another's begins, and with allocators that don't have thread caches. If you're padding a struct for concurrency, pad the allocation, not just the struct.
+
+</Sub>
+
+<Sub n="6.2" title="Realloc in a loop">
+
+The time bound hides another trap. `realloc` resizes a block you already have, and it may extend the block in place if there's free room next to it, or it may allocate a bigger block and copy everything across. You can't tell which from the call.
+
+Suppose you grow a buffer by a fixed 1 KB each time round a loop, up to 1 MB. In the worst case every step copies the whole buffer so far: 1 KB, then 2 KB, then 3 KB, up to 1,024 KB. Those add up to about 525,000 KB, half a gigabyte of copying to build a 1 MB buffer. The source looks perfectly reasonable, and the copying grows with the square of the final size: double the target and you copy four times as much. Programmers write that growth as **O(n²)**, "order n squared".
+
+Grow by a constant *factor* instead and the copying collapses. Doubling from 1 KB, the copies are 1 KB, 2 KB, 4 KB, and so on up to 512 KB, about 1 MB in total, a single extra buffer's worth. That's what `std::vector` does when it doubles, and it's why appending to one is **amortised** O(1), a constant cost per append on average: the occasional expensive copy is spread over the many cheap appends that came before it.
+
+That's the cost of surprises. The next question is how much the ordinary path costs when nothing goes wrong, and whether we can skip it.
+
+</Sub>
+
+<SectionHeading n="07" id="cost">What allocation costs</SectionHeading>
+
+<Sub n="7.1" title="malloc by size">
+
+Here is what `malloc` followed by `free` costs for different sizes on a fast laptop. Each figure is an average over two million allocate-and-free pairs after a warm-up. Every block is freed immediately, so it comes straight back from the thread cache, which makes these best-case numbers. A real workload holding thousands of live objects will do worse.
 
 <Compare
   cols={["Size", "malloc + free", "What's happening"]}
@@ -378,21 +452,17 @@ workload holding thousands of live objects will do worse.
     ["64 B", "9.8 ns", "Same path"],
     ["256 B", "9.5 ns", "Same path; size barely matters here"],
     ["4 KB", "15.1 ns", "Larger class, more bookkeeping"],
-    ["64 KB", "73.4 ns", "Past the threshold, kernel involved"],
+    ["64 KB", "73.4 ns", "Big-block path, more work per call"],
   ]}
 />
 
-Flat from 16 to 256 bytes, then climbing. Under a few hundred bytes you're
-paying for the *mechanism*, not for the memory. So avoiding the mechanism pays
-very well.
+The time is flat from 16 to 256 bytes and then climbs. Under a few hundred bytes the time goes into the mechanism we followed in section 4.1 (the class lookup, the list pop, the bookkeeping), and the size of the block hardly matters. So if you want allocation to be cheaper, shrinking your objects won't help much. Skipping the mechanism would, and the next subsection shows how far that goes.
 
 </Sub>
 
-<Sub n="6.2" title="What you save by knowing the answer in advance">
+<Sub n="7.2" title="What you save by knowing the answer in advance">
 
-A bump allocator does one thing: return the current pointer and advance it.
-There's no free list, no size class, no thread cache, and no individual `free`.
-You drop the whole arena at once.
+Go back to the bump allocator from 3.1. Its flaw was that it can't free anything. For one situation that flaw doesn't matter: a batch of objects that all die at the same moment. Then there's nothing to free individually, and you drop the whole chunk at once. An allocator used this way is called an **arena** (or a region). It's the same word as the arenas of 3.4 but a different idea: a block of memory filled from the front and thrown away in one go. It has no free list, no size classes, no thread cache and no individual `free`, and a call does one thing: return the current pointer and advance it.
 
 <Cost items={[
   { what: "malloc + free, 16 bytes", value: "8.5 ns", source: "system libmalloc, 2M iterations" },
@@ -402,10 +472,7 @@ You drop the whole arena at once.
 
 <Why>Where does a 42× gap come from?</Why>
 
-It's the price of generality. `malloc` doesn't know your objects are all the
-same size, or that you'll free them together, or that no other thread will
-touch them. When you do know, an arena turns allocation into a pointer
-increment.
+It's the price of generality. `malloc` doesn't know that your objects are all the same size, or that you'll free them together, or that no other thread will touch them, so it has to be ready for every case. When you do know, an arena turns allocation into a pointer increment. Here's what that is worth for a parser that builds a tree of 50,000 nodes for each document:
 
 <Estimate
   rows={[
@@ -417,48 +484,54 @@ increment.
   result={{ label: "saved per request, before any other optimisation", value: "≈ 415 µs" }}
 />
 
-Request-scoped arenas are common in parsers, compilers and web servers for this
-reason. The allocation pattern (many small objects, all dead at the same
-moment) is exactly the case general allocators handle worst. A web server
-freeing every allocation at the end of a request doesn't need a free list at
-all, which is roughly why nginx gives each request its own pool.
+<Callout label="Design implication">
+An allocator spends most of its effort answering "which free block should I give you, and how will I find it again later". If your program already knows the answer (all objects the same size, or all freed together), you can skip nearly the whole mechanism, and that's where the 42× comes from.
+</Callout>
+
+Request-scoped arenas are common in parsers, compilers and web servers for this reason. Many small objects that all die at the same moment is exactly the pattern general allocators handle worst. A web server that frees every allocation at the end of a request doesn't need a free list at all, which is roughly why nginx gives each request its own pool.
+
+That leaves a practical question: how do you tell which of these problems a real program has, and which fix to reach for?
 
 </Sub>
 
-<SectionHeading n="07" id="choosing">Choosing an allocator</SectionHeading>
+<SectionHeading n="08" id="choosing">Choosing an allocator</SectionHeading>
 
-<Sub n="7.1" title="Seeing what the allocator is doing">
+<Sub n="8.1" title="Seeing what the allocator is doing">
+
+Each question the chapter raised has a tool that answers it on a running program. `perf` is Linux's profiler, and on macOS `leaks` and `heap` list the allocations a process is holding.
 
 ```shell
-# Which allocator, and is it the bottleneck?
+# Which allocator, and is it the bottleneck? (section 7)
 perf record -g ./app && perf report | grep -iE 'malloc|free|arena'
 
-# jemalloc's own statistics, if you link it
+# jemalloc's own statistics, if you link it (sections 3.4 and 5.1)
 MALLOC_CONF=stats_print:true ./app
 
-# glibc: arena count, in-use bytes, and what it will not return
-# (malloc_stats writes to stderr)
+# glibc: call malloc_stats() from inside the program; it prints each arena's
+# bytes from the kernel and bytes in use to stderr (sections 3.4 and 5.1)
 
-# macOS
-MallocStackLogging=1 ./app && leaks --outputGraph app
-heap $PID | head -40
+# macOS: list leaked blocks when the program exits, with allocation stacks
+MallocStackLogging=1 leaks --atExit -- ./app
+heap $PID | head -40          # what a running process holds, by size and type
 
-# Fragmentation, roughly: RSS against the sum of live allocations
+# Fragmentation, roughly: RSS against the sum of live allocations (section 5.1)
 ```
+
+The last line is the one that settles most arguments. Compare the process's RSS with the total of the bytes your program has allocated and not yet freed. If RSS keeps climbing along with the live total, that's a leak. If RSS sits far above it and holds steady, that's fragmentation, and no search for a missing `free` will find it.
 
 </Sub>
 
-<Sub n="7.2" title="The three options">
+<Sub n="8.2" title="The three options">
+
+When the profile does point at the allocator, there are three ways out, and they differ in what they cost you.
 
 <Approach
   n="1"
   name="The system allocator"
-  breaks="Multi-threaded allocation-heavy workloads, where glibc's arena handling is measurably behind."
+  breaks="Multi-threaded allocation-heavy workloads, where glibc's arena handling can fall measurably behind."
   bestFor="Almost everything. Change only when a profile names malloc."
 >
-Modern system allocators are good. Starting anywhere else is premature, and
-the measurement in 5.1 shows that under a few hundred bytes the cost is
-single-digit nanoseconds.
+Modern system allocators are good. Starting anywhere else is premature, and the measurement in 7.1 shows that under a few hundred bytes the cost is single-digit nanoseconds.
 </Approach>
 
 <Approach
@@ -467,36 +540,38 @@ single-digit nanoseconds.
   breaks="One more dependency, and different fragmentation behaviour that you will have to learn."
   bestFor="Long-running, heavily threaded services. A drop-in LD_PRELOAD makes it an afternoon experiment."
 >
-Better arena management, better fragmentation behaviour over long uptimes, and
-far better introspection. Often a double-digit percentage win on server
-workloads for no code change at all.
+Better arena management, better fragmentation behaviour over long uptimes, and far better introspection. `LD_PRELOAD` is a setting that makes the program loader pick your library's `malloc` before the system's (chapter 46). Some server workloads see a double-digit percentage win from the swap alone, with no code change.
 </Approach>
 
 <Approach
   n="3"
   name="An arena, scoped to a request"
-  breaks="You must be certain nothing outlives the arena. A single escaping pointer is a use-after-free."
+  breaks="You must be certain nothing outlives the arena. A single escaping pointer is a use-after-free: using memory after it has been given back."
   bestFor="Parsers, compilers, request handlers: anywhere a batch of objects all die together."
 >
-The 42× in 5.2. Allocation becomes a pointer bump and deallocation becomes
-resetting one offset.
+The 42× in 7.2. Allocation becomes a pointer bump and deallocation becomes resetting one offset.
 </Approach>
 
 <Why>Does swapping the allocator ever help?</Why>
 
-Sometimes it's the whole fix. Mozilla adopted jemalloc for Firefox largely to
-fight fragmentation in a long-running browser process, where RSS climbing over
-hours was the user-visible complaint, not allocation speed.
+Sometimes it's the whole fix. Mozilla adopted jemalloc for Firefox largely to fight fragmentation in a long-running browser process, where RSS climbing over hours was the user-visible complaint, not allocation speed.
 
-And sometimes the answer is to stop using a general allocator. Many compilers
-allocate AST and IR nodes in per-phase arenas and free each phase wholesale. No
-individual node is ever freed, and no free list is ever walked. If your objects
-have a common death date, a general allocator is solving a problem you don't
-have.
+And sometimes the answer is to stop using a general allocator. Many compilers allocate syntax-tree and intermediate-representation nodes in per-phase arenas and free each phase wholesale. No individual node is ever freed, and no free list is ever walked. If your objects have a common death date, a general allocator is solving a problem you don't have.
 
 </Sub>
 
-<Sub n="7.3" title="What you give up">
+<Sub n="8.3" title="Rules that hold up">
+
+1. **Compare RSS with live bytes before calling anything a leak.** A flat gap is fragmentation (section 5.1).
+2. **Allocate and free on the same thread** where you can, so blocks aren't stranded in another thread's cache (section 4.2).
+3. **Reuse one big buffer** instead of allocating and freeing megabyte buffers in a loop (section 4.3).
+4. **Grow buffers by a constant factor**, never by a fixed increment (section 6.2).
+5. **Give a burst of short-lived objects its own arena** when they all die together (sections 5.1 and 7.2).
+6. **Change the allocator only when a profile names it.** Then jemalloc or mimalloc is an afternoon experiment (section 8.2).
+
+</Sub>
+
+<Sub n="8.4" title="What you give up">
 
 | You get | You pay | When the bill arrives |
 |---|---|---|
@@ -508,7 +583,7 @@ have.
 
 </Sub>
 
-<Sub n="7.4" title="Symptom, cause, fix">
+<Sub n="8.5" title="Symptom, cause, fix">
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -521,115 +596,75 @@ have.
 
 </Sub>
 
-<SectionHeading n="08" id="summary">Summary</SectionHeading>
+<SectionHeading n="09" id="summary">Summary</SectionHeading>
 
-1. **The allocator is a middleman.** It gets big chunks from the kernel and
-   cuts them into objects, because a syscall per object would be absurd.
-2. **`malloc` promises very little.** No time bound, no return to the OS, no
-   locality, no bound on fragmentation.
-3. **A bump allocator is the fastest possible allocator** and can't free
-   anything; every later design pays to fix that.
-4. **Size classes trade memory for speed.** Rounding wastes a few percent and
-   turns allocation into a list pop.
-5. **Per-thread caches remove the lock from the fast path**, at the price of
-   memory stranded in other threads' caches.
-6. **Allocate and free on the same thread.** Cross-thread freeing is the slow
-   path in most allocators.
-7. **Big allocations go to `mmap`.** Past 128 KB in glibc you pay a syscall and
-   page faults; 64 KB cost 73.4 ns against 9.5 ns at 256 bytes here.
-8. **One live object pins a page.** That's how RSS stays high with no leak.
-9. **An arena was 42× faster than `malloc`** for 16-byte objects that die
-   together: 0.2 ns against 8.5 ns.
-10. **Change the allocator only when a profile names it.** Then jemalloc or
-    mimalloc is an afternoon `LD_PRELOAD` experiment.
+1. **Freeing doesn't shrink a process.** The program in section 1 freed all 500,000 nodes and still held 495.7 MB, because the allocator keeps what it frees.
+2. **The allocator is a middleman.** It gets big chunks from the kernel and cuts them into pieces, because a syscall and a whole page per object would be absurd.
+3. **`malloc` promises very little.** No time bound, no return to the OS, no locality, no bound on fragmentation.
+4. **A bump allocator is the fastest possible allocator** and can't free anything. A free list fixes that and creates fragmentation, because a hole of the wrong size is no use to the next request.
+5. **Size classes trade memory for speed.** Rounding 40 up to 48 wastes a few percent and turns allocation into a list pop.
+6. **Per-thread caches remove the lock from the fast path**, at the price of memory stranded in other threads' caches.
+7. **Allocate and free on the same thread.** Cross-thread freeing is the slow path in most allocators.
+8. **Big allocations bypass the caches.** 64 KB cost 73.4 ns against 9.5 ns at 256 bytes, and past 128 KB glibc goes to `mmap` with its syscall and page faults.
+9. **One live object pins a page.** That's how RSS stays high with no leak.
+10. **An arena was 42× faster than `malloc`** for 16-byte objects that die together: 0.2 ns against 8.5 ns.
+11. **Change the allocator only when a profile names it.** Then jemalloc or mimalloc is an afternoon `LD_PRELOAD` experiment.
 
-<SectionHeading n="09" id="build">Build this</SectionHeading>
+<SectionHeading n="10" id="build">Build this</SectionHeading>
 
 **Write an arena, then find where it stops winning.**
 
-- Fifty lines: a `char*` cursor over a large block, with alignment rounding and
-  a `reset()`. (Alignment is the part people get wrong. Round the cursor up
-  before you hand it out, not the size afterwards.)
-- Benchmark it against `malloc` for 16, 64, 256 and 4,096 byte objects. The
-  ratio should shrink as objects get bigger: the arena does roughly the same
-  work at every size, so there's less for it to beat.
-- Then make it realistic: keep 100,000 objects **live** instead of freeing each
-  immediately, and re-measure `malloc`. Its thread cache stops being a free
-  win and the gap widens.
-- Finally, measure peak RSS for both. The arena probably uses more memory (it
-  never reuses a freed slot, so its high-water mark is the sum of everything you
-  ever allocated), and seeing that trade in your own numbers is the point.
+- Fifty lines: a `char*` cursor over a large block, with alignment rounding and a `reset()`. (Alignment is the part people get wrong. Round the cursor up before you hand it out, not the size afterwards.)
+- Benchmark it against `malloc` for 16, 64, 256 and 4,096 byte objects. Write one byte into every object, or the compiler may delete the loop, and expect the arena's numbers to include that first touch. The ratio should shrink as objects get bigger: the arena does roughly the same work at every size, so there's less for it to beat.
+- Then make it realistic: keep 100,000 objects **live** instead of freeing each immediately, and re-measure `malloc`. Its thread cache stops being a free win and the gap widens.
+- Finally, measure peak RSS for both. The arena probably uses more memory, because it never reuses a freed slot and its high-water mark is the sum of everything you ever allocated. Seeing that trade in your own numbers is the point.
 
-<SectionHeading n="10" id="interview">Interview questions</SectionHeading>
+<SectionHeading n="11" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="Your service freed a lot of memory and RSS didn't drop. Is that a leak?">
-Probably not. Allocators keep freed memory in their own pools for reuse instead
-of returning it, and a page can only go back to the OS when every object on it
-is free. One live object pins a whole page.
+Probably not. Allocators keep freed memory in their own pools for reuse instead of returning it, and a page can only go back to the OS when every object on it is free. One live object pins a whole page.
 
-So a burst that scatters allocations across many pages can leave RSS
-permanently high with a small live set. Compare RSS against the sum of live
-allocations. A large, stable gap is fragmentation, not a leak.
+So a burst that scatters allocations across many pages can leave RSS permanently high with a small live set. Compare RSS against the sum of live allocations. A large, stable gap is fragmentation, and a leak would keep growing.
 </QA>
 
 <QA level="intermediate" q="Why do allocators use per-thread caches?">
-To avoid a lock on every allocation. A single global free list means every
-allocation contends, and chapter 13 measured what that costs. With a per-thread
-cache, the fast path is a list pop with no atomics at all, and shared
-structures are touched only on refill or overflow.
+To avoid a lock on every allocation. A single global free list means every allocation contends, and chapter 13 measures what that costs. With a per-thread cache, the fast path is a list pop with no atomics at all, and shared structures are touched only on refill or overflow.
 
-The cost is that memory freed on one thread sits in that thread's cache and
-isn't available elsewhere until a flush, so allocate and free on the same
-thread where you can.
+The cost is that memory freed on one thread sits in that thread's cache and isn't available elsewhere until a flush, so allocate and free on the same thread where you can.
 </QA>
 
 <QA level="intermediate" q="When is an arena the right choice, and what's the risk?">
-When a batch of objects share a lifetime: parse trees, per-request state, a
-compiler phase. Allocation becomes a pointer bump (I measured 0.2 ns against
-8.5 ns for malloc, about 42×) and deallocation is resetting one offset.
+When a batch of objects share a lifetime: parse trees, per-request state, a compiler phase. Allocation becomes a pointer bump, about 0.2 ns against 8.5 ns for `malloc`, roughly 42×, and deallocation is resetting one offset.
 
-The risk is a pointer escaping the arena's lifetime. There's no per-object
-free, so nothing catches it, and you get a use-after-free that reproduces
-rarely.
+The risk is a pointer escaping the arena's lifetime. There's no per-object free, so nothing catches it, and you get a use-after-free that reproduces rarely.
 </QA>
 
 <QA level="deep" q="Why does allocation cost jump at large sizes?">
-Past a threshold (128 KB in glibc by default) allocators bypass their heap
-and call `mmap` directly, so you pay a syscall on allocation and `munmap` on
-free. Worse, the returned pages are untouched, so you also pay a minor page
-fault on first write to each one: about 570 ns per page on the hardware in
-chapter 04.
+Past a threshold (128 KB in glibc by default) allocators bypass their heap and call `mmap` directly, so you pay a syscall on allocation and `munmap` on free. The returned pages are also untouched, so you pay a minor page fault on the first write to each one, about 686 ns per page for a first touch (chapter 04).
 
-I measured 9.5 ns for a 256-byte allocation and 73.4 ns at 64 KB. A loop
-allocating and freeing large buffers can spend most of its time in the kernel;
-reuse one buffer instead.
+On a fast laptop, `malloc` plus `free` is about 9.5 ns at 256 bytes and about 73 ns at 64 KB, where the allocator has moved off its small-block fast path. A loop that keeps allocating and freeing fresh large buffers can spend most of its time in the kernel, so reuse one buffer instead.
 </QA>
 
 <QA level="deep" q="Two threads allocate small objects and performance is worse than one. Neither shares data.">
-Likely false sharing introduced by the allocator. If both threads receive
-addresses in the same cache line, their independent writes invalidate each
-other's copy: chapter 13's 55× with no shared data and no lock.
+Likely false sharing introduced by the allocator. If both threads receive addresses in the same cache line, their independent writes invalidate each other's copy: chapter 13's 55× with no shared data and no lock.
 
-Per-thread caches usually prevent it by carving each thread's objects from its
-own span, but it still happens near span boundaries and with allocators that
-lack them. If a struct is written by exactly one thread and lives next to
-another's, pad the allocation to a cache line, not just the struct.
+Per-thread caches usually prevent it by carving each thread's objects from its own span, but it still happens near span boundaries and with allocators that lack them. If a struct is written by exactly one thread and lives next to another's, pad the allocation to a cache line, not just the struct.
 </QA>
 
-<SectionHeading n="11" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="12" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
   <Q q="Roughly what does a small malloc+free pair cost?">
-    Single-digit nanoseconds on a warm thread cache. I measured 8.5 ns at 16
-    bytes on an M4. Under a few hundred bytes the size barely matters.
+    Single-digit nanoseconds on a warm thread cache: about 8.5 ns at 16 bytes on
+    a fast laptop. Under a few hundred bytes the size barely matters.
   </Q>
   <Q q="Why can't the allocator return a mostly-free page to the OS?">
     Because one live object anywhere on it pins the whole page. Pages are the
     unit of return, objects are not.
   </Q>
   <Q q="Growing a buffer by a fixed 1 KB each time. What's the complexity?">
-    O(n²) in bytes copied. Grow by a constant factor instead. That's what makes vector's push_back
-    amortised O(1).
+    O(n²) in bytes copied. Grow by a constant factor instead. That's what makes
+    vector's push_back amortised O(1).
   </Q>
   <Q q="When does a bump allocator beat malloc by 40x?">
     When every object dies at the same time, so you never free individually.
@@ -638,6 +673,10 @@ another's, pad the allocation to a cache line, not just the struct.
 </Quiz>
 
 <CardGrid>
+  <WildCard name="Operating Systems: Three Easy Pieces, chapters 14 and 17">
+    The memory API and free-space management, which build free lists, splitting
+    and coalescing one step at a time. Free online at ostep.org.
+  </WildCard>
   <WildCard name="jemalloc: Jason Evans' original paper">
     Why per-thread arenas and size classes are shaped the way they are, from
     the person who built the allocator most servers end up using.
@@ -656,7 +695,7 @@ another's, pad the allocation to a cache line, not just the struct.
   </WildCard>
 </CardGrid>
 
-<SectionHeading n="12" id="related">Related chapters</SectionHeading>
+<SectionHeading n="13" id="related">Related chapters</SectionHeading>
 
 <CardGrid>
   <WildCard name="Virtual Memory & Page Tables">

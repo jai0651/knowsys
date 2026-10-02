@@ -1,22 +1,82 @@
 ---
 title: PostgreSQL Deep Dive
-dek: "How Postgres stores a row, why every UPDATE writes a new one, and what that single decision costs you: vacuum, bloat, the 32-bit transaction counter that can stop your database, TOAST for big values, and the write-ahead log that crash recovery and replication are built on. You'll start by updating one row three times and looking at what's on the page."
-readingTime: "~34 min"
+dek: "Follow one bank-account row through Postgres: why an UPDATE writes a new copy of it instead of changing it, who gets to see which copy, what vacuum has to clean up, why a 32-bit counter can stop the whole database, where big values go, and how the write-ahead log makes a commit survive a crash and feeds a replica."
+readingTime: "~46 min"
 level: "Intermediate"
-versions: "PostgreSQL 16.15 · source refs at tag REL_16_15 · measured in a shared 4-CPU container, linuxkit 6.10"
-prereqs: "a terminal and Docker; B-trees, transactions and fsync help"
-updated: "2026-09-30"
+versions: "PostgreSQL 16.15 · source refs at tag REL_16_15"
+prereqs: "a terminal and Docker; chapter 08 (fsync) helps"
+updated: "2026-10-02"
 ---
 
-An accountant keeps a ledger in ink. When a figure changes, they don't scrub out the old line. They draw a single stroke through it and write the new figure on the next line down. The old line stays, crossed out, and every entry is marked with who wrote it. From time to time a clerk goes through and cuts out the lines nobody can still need.
+Your database has a table of bank accounts, and one row says that account 1 holds a balance of 100. A purchase takes 10, so you run `UPDATE acct SET balance = 90 WHERE id = 1`. It's natural to picture Postgres finding the row in its file on disk and changing the 100 to a 90, the way you'd rub out a pencilled number and write the new one in its place.
 
-Postgres stores your rows like that ledger. An `UPDATE` never changes a row where it sits: it marks the old version as replaced and writes a new one. Almost everything odd about Postgres, from table bloat to `VACUUM`, follows from that one habit. You can see it with three statements.
+Postgres never does that. It leaves the 100 where it is, marks it as replaced, and writes a brand-new row that says 90 somewhere else. Update the balance once more and the file holds three rows for the one account, although a query only ever shows you one of them. An accountant keeps a ledger in ink the same way: a changed figure gets a line through it and a new line below, and every so often a clerk cuts out the lines nobody can still need.
 
-<SectionHeading n="01" id="update-three-times">Update one row three times</SectionHeading>
+That one habit explains most of what's odd about Postgres: why tables grow when you update them, why a background job called `VACUUM` has to exist, why a counter can stop your whole database, and why a replica is made by copying a log. This chapter follows account 1 through all of it, asking one question: when I update a row, what does Postgres do with it on disk, and what does that cost me? We'll start with the page the row lives on, watch three versions of it appear, and then follow the consequences one at a time.
 
-You need Docker. Start a throwaway Postgres 16 and open `psql` inside it.
+<SectionHeading n="01" id="where-a-row-lives">Where a row lives</SectionHeading>
 
-<Sub n="1.1" title="One row, three versions">
+<Sub n="1.1" title="A table is a file of pages">
+
+Before we can watch account 1 change, we need to know where it sits. Postgres keeps a table in a file and cuts the file into fixed-size chunks of 8 KB. Each chunk is a **page**, and Postgres reads and writes the file one page at a time. (These are Postgres's own pages. They aren't the 4 KB or 16 KB memory pages of chapters 04 and 08, and the 8 KB size is fixed when Postgres is compiled, in a setting called `BLCKSZ`.) New rows go on whichever page has room, in no particular order, so a table laid out like this is called a **heap**: an unordered pile of rows. Anything that needs sorted order, such as finding account 1 quickly by its id, uses a separate structure that points into the heap, and section 4 comes to it.
+
+Inside a page, a row needs somewhere to go and a way to be found again. Every page has the same layout. At the front is a small page header of bookkeeping, then an array of **line pointers**, then free space, and then the rows themselves, which fill the page from the back. Postgres calls the stored bytes of one row a **tuple**. This chapter also says *row version* for the same thing, for a reason the next section makes obvious. A line pointer is a 4-byte entry that records where one tuple starts, how long it is, and what state it's in.
+
+| Part | Where it sits | What it holds |
+|---|---|---|
+| **Page header** | First 24 bytes | Bookkeeping: where the free space starts and ends, some flags, and the position in the write-ahead log (section 8) of the last change to the page |
+| **Line pointers** | Growing forward from the header | 4 bytes each: offset, length and a 2-bit state for one tuple |
+| **Free space** | The gap in the middle | Room for more line pointers and tuples |
+| **Tuples** | Growing backward from the end | The row versions themselves |
+
+Two numbers in the page header, `lower` and `upper`, mark the two ends of the free space. `lower` is where the line pointers stop and `upper` is where the tuples start, and they move toward each other as the page fills. Every line pointer adds 4 to `lower`, so a page holding two tuples has `lower = 32`: 24 bytes of header plus two 4-byte pointers.
+
+Here is the line pointer in Postgres's source. Its three fields add up to 32 bits, which is the 4 bytes, and the two bits of `lp_flags` hold one of four states. `LP_NORMAL` means the pointer leads to a tuple and `LP_UNUSED` means the slot is free. `LP_DEAD` and `LP_REDIRECT` will matter in sections 4 and 5.
+
+<SourceRead
+  file="src/include/storage/itemid.h"
+  repo="postgres/postgres"
+  tag="REL_16_15"
+  href="https://github.com/postgres/postgres/blob/REL_16_15/src/include/storage/itemid.h#L25"
+>
+```c
+typedef struct ItemIdData
+{
+	unsigned	lp_off:15,		/* offset to tuple (from start of page) */
+				lp_flags:2,		/* state of line pointer, see below */
+				lp_len:15;		/* byte length of tuple */
+} ItemIdData;
+
+#define LP_UNUSED		0		/* unused (should always have lp_len=0) */
+#define LP_NORMAL		1		/* used (should always have lp_len>0) */
+#define LP_REDIRECT		2		/* HOT redirect (should have lp_len=0) */
+#define LP_DEAD			3		/* dead, may or may not have storage */
+```
+</SourceRead>
+
+</Sub>
+
+<Sub n="1.2" title="A row's address">
+
+A row's address is the pair (page number, line pointer number), called its **ctid**. Account 1 is the first row in page 0, so its ctid is `(0,1)`.
+
+<Why>Why the extra step through a line pointer?</Why>
+
+Because the address has to stay valid when the tuple moves. The lookup structures we'll meet in section 4, called indexes, store ctids. If the address were the tuple's byte offset, moving a tuple inside its page, to close a gap, would mean finding and fixing every index entry that points at it. With a line pointer in between, Postgres compacts the tuple to a new offset inside the page, changes the one offset in the line pointer, and `(0,1)` still leads to the same row.
+
+So account 1 sits at `(0,1)` with a balance of 100. Next we change the balance and watch what happens to that address.
+
+</Sub>
+
+<SectionHeading n="02" id="update-three-times">Updating one row three times</SectionHeading>
+
+<Sub n="2.1" title="Three updates, three addresses">
+
+You need Docker for this one. `docker run` starts a throwaway Postgres 16 in a container called `pgdemo`: `-d` runs it in the background and `-e POSTGRES_PASSWORD=x` sets the password the image insists on. `docker exec` then opens `psql`, Postgres's command-line client, inside that container as the user `postgres`, and `-it` connects it to your terminal.
+
+Postgres lets any query ask for a few hidden columns. We'll use three. `ctid` is the address we just met. `xmin` and `xmax` need one new idea: a **transaction** is a group of statements that take effect together or not at all. It ends with a *commit*, which makes its changes permanent, or an abort, which undoes them, and every statement outside an explicit `BEGIN` is a transaction of its own. Postgres numbers each transaction that changes data, counting upward. `xmin` is the number of the transaction that created this version of the row, and `xmax` is the number of the transaction that replaced or deleted it, with 0 meaning nobody has.
+
+We create the table, insert account 1 with a balance of 100, and update the balance to 90 and then to 80, printing the row each time. Last, we use `pageinspect`, an extension that shows the raw contents of a page. `get_raw_page('acct', 0)` fetches page 0 of the table's file, and `heap_page_items` lists every slot on it, with `lp` as the slot number and `t_xmin`, `t_xmax` and `t_ctid` as the same bookkeeping fields stored in each tuple. `t_ctid` is the tuple's own record of its address, or of the newer version that replaced it.
 
 <TryIt what="Update one row twice and look at its physical location and transaction ids each time, then read the page" lang="sql" toolchain="PostgreSQL 16.15 (postgres:16-alpine) on linuxkit 6.10.14 aarch64, pageinspect extension">
 ```shell
@@ -58,72 +118,15 @@ SELECT lp, t_xmin, t_xmax, t_ctid FROM heap_page_items(get_raw_page('acct', 0));
 </Output>
 </TryIt>
 
-The table holds one row, but each `UPDATE` moved it. `ctid` is the row's physical address, page 0 with a slot number, and it went from `(0,1)` to `(0,2)` to `(0,3)`. The `xmin` column is the id of the transaction that wrote that version, and it went 732, 733, 734.
+Read the first three tables top to bottom. The table holds one row, and every `UPDATE` gave it a new address: `(0,1)`, then `(0,2)`, then `(0,3)`. Its `xmin` went 732, 733, 734, so three different transactions wrote the three versions: the `INSERT` and the two `UPDATE`s.
+
+The last table shows why the address moved. All three versions are still on page 0, in slots 1, 2 and 3. Slots 1 and 2 have a non-zero `t_xmax`, 733 and 734, which are the transactions that replaced them, and each `t_ctid` points at its successor: slot 1 at `(0,2)` and slot 2 at `(0,3)`. Only slot 3, whose `t_xmax` is 0, is the live row. So an `UPDATE` is an insert of a new version plus a stamp on the old one, and a `DELETE` is just the stamp. Nothing is overwritten.
 
 </Sub>
 
-<Sub n="1.2" title="Reading the page">
+<Sub n="2.2" title="The header in front of every version">
 
-The last query reads page 0 of the table directly. It shows three row versions, not one. The first two have a non-zero `t_xmax`, the id of the transaction that replaced them, and each points at its successor through `t_ctid`. Only the third, with `t_xmax` of 0, is the live row.
-
-Those crossed-out versions are the price of the design. They're what makes it possible for a reader to keep seeing an old version while a writer creates a new one, and they're also what `VACUUM` exists to clean up. The chapter follows that decision through the heap, vacuum, transaction id wraparound, TOAST, the write-ahead log and replication.
-
-</Sub>
-
-<SectionHeading n="02" id="heap">The heap: pages, line pointers and tuples</SectionHeading>
-
-A Postgres table is called a **heap**: an unordered pile of rows, stored in a file
-of fixed-size pages. Indexes are separate files that point into it.
-
-<Sub n="2.1" title="An 8 KB page">
-
-Every table file is a sequence of 8 KB pages (the compile-time `BLCKSZ`). Each
-page has the same shape:
-
-| Part | Where it sits | What it holds |
-|---|---|---|
-| **Page header** | First 24 bytes | The LSN of the last WAL record that touched the page, free-space pointers, flags |
-| **Line pointers** | Growing forward from the header | 4 bytes each: offset, length and a 2-bit state for one tuple |
-| **Free space** | The gap in the middle | Room for more line pointers and tuples |
-| **Tuples** | Growing backward from the end | The row versions themselves |
-
-In the header, `lower` marks the end of the line-pointer array and `upper`
-marks the start of the tuples. In the test below, a page holding two tuples had
-`lower = 32`: the 24-byte header plus two 4-byte line pointers.
-
-<SourceRead
-  file="src/include/storage/itemid.h"
-  repo="postgres/postgres"
-  tag="REL_16_15"
-  href="https://github.com/postgres/postgres/blob/REL_16_15/src/include/storage/itemid.h#L25"
->
-```c
-typedef struct ItemIdData
-{
-	unsigned	lp_off:15,		/* offset to tuple (from start of page) */
-				lp_flags:2,		/* state of line pointer, see below */
-				lp_len:15;		/* byte length of tuple */
-} ItemIdData;
-
-#define LP_UNUSED		0		/* unused (should always have lp_len=0) */
-#define LP_NORMAL		1		/* used (should always have lp_len>0) */
-#define LP_REDIRECT		2		/* HOT redirect (should have lp_len=0) */
-#define LP_DEAD			3		/* dead, may or may not have storage */
-```
-</SourceRead>
-
-<Why>Why the indirection through line pointers?</Why>
-
-Because it lets Postgres move a tuple within its page without telling anyone. A
-row's address, its **ctid**, is `(page, line pointer)`, and every index entry
-stores a ctid. Postgres can compact the tuple to a new offset inside the page, and the
-line pointer is the only thing that changes.
-
-</Sub>
-
-<Sub n="2.2" title="The tuple header">
-
-Every row version starts with a 23-byte header. Its first two fields matter most.
+The fields that just did the work sit in a header at the front of every tuple. Postgres's source defines it like this, with `/* ... */` standing in for the parts left out:
 
 <SourceRead
   file="src/include/access/htup_details.h"
@@ -170,29 +173,104 @@ struct HeapTupleHeaderData
 | `t_xmin` | The transaction that created this version |
 | `t_xmax` | The transaction that deleted or replaced it; 0 while it's current |
 | `t_ctid` | Points at itself, or at the newer version that replaced it |
-| `t_infomask` | Hint bits: whether `xmin` and `xmax` are known committed, aborted or frozen |
+| `t_infomask` | Flag bits, among them the hint bits of section 3.2 and the frozen flag of section 6 |
 | `t_hoff` | Where the data starts, after the header, null bitmap and alignment padding |
 
-<Why>What does a small row cost?</Why>
+Every version of every row pays for this header. After alignment the 23 bytes become 24 (`t_hoff = 24` in the page we read). A row of two integers and the word `hello` took **38 bytes** in the heap: 24 of header and 14 of data. Add the 4-byte line pointer and it's 42 bytes of page for 14 bytes of payload, so for narrow tables the header is most of the table.
 
-After alignment, the 23-byte header becomes 24 (`t_hoff = 24` in the test). A row
-of two integers and the word `hello` took **38 bytes** in the heap: 24 of header,
-14 of data. Add the 4-byte line pointer and it's 42 bytes of page for 14 bytes of
-payload. For narrow tables, the header is most of the table.
+Keeping old versions costs a header and a slot each, and a pile of dead rows to clean up later. Postgres could have overwritten the balance and saved all of that, so why doesn't it? The answer appears the moment a second person looks at account 1 while we're changing it.
 
 </Sub>
 
-<SectionHeading n="03" id="mvcc">MVCC: every UPDATE writes a new row</SectionHeading>
+<SectionHeading n="03" id="mvcc">Who sees which version</SectionHeading>
 
-Postgres gives each transaction a consistent snapshot, so readers never block
-writers and writers never block readers. It does that by keeping old versions of
-rows around until nobody can see them. This is **multi-version concurrency
-control**.
+<Sub n="3.1" title="A reader and a writer at the same time">
 
-<Sub n="3.1" title="Watching an UPDATE happen">
+Suppose a report starts reading all the accounts right after the `INSERT`, when account 1 holds 100, and takes a while to finish. While it runs, your two updates set the balance to 90 and then 80, and each commits. What should the report see for account 1?
 
-With the `pageinspect` extension you can read a page directly. Insert one row, update
-it, and look:
+If Postgres overwrote the row, every answer would be bad. A report could read 100 for some accounts and 90 for others, a total that never existed at any single moment. Or one side would have to wait with a lock until the other finished. Keeping the old versions gives a third answer: the report keeps reading the version that was current when it began, a new query reads the newest one, and nobody waits. Postgres calls this **multi-version concurrency control**, or **MVCC**. Readers never block writers and writers never block readers, because each query is shown the database as of a single moment.
+
+Watch the page, and what each of the two readers gets from it.
+
+<Scene
+  title="Account 1 updated twice while a report is reading"
+  regions={[
+    { id: "page", label: "Page 0 of acct", sub: "slots hold row versions", col: 0, row: 0, span: 3 },
+    { id: "report", label: "Long report", sub: "started after txn 732", col: 0, row: 1 },
+    { id: "now", label: "A query started now", sub: "always sees the latest", col: 1, row: 1, span: 2 },
+  ]}
+  itemWidth={124}
+  frames={[
+    { caption: "Transaction 732 has committed: slot 1 holds balance 100. A long report starts. When it begins it takes a **snapshot**, a note of which transactions have committed so far. That includes 732.",
+      items: [
+        { id: "s1", at: "page", label: "slot 1", sub: "100 · xmin 732", tone: "ok" },
+        { id: "r", at: "report", label: "sees 100", sub: "slot 1", tone: "accent" },
+        { id: "q", at: "now", label: "sees 100", sub: "slot 1" },
+      ],
+      focus: ["report"] },
+    { caption: "Transaction 733 sets the balance to 90 and commits. Slot 1 is stamped `xmax 733` and the new version goes in slot 2. The report's snapshot was taken before 733 committed, so as far as the report is concerned 733 hasn't happened, and it keeps reading slot 1. A query that starts now reads slot 2.",
+      change: [{ id: "s1", sub: "100 · xmax 733", tone: "default" }, { id: "q", label: "sees 90", sub: "slot 2" }],
+      add: [{ id: "s2", at: "page", label: "slot 2", sub: "90 · xmin 733", tone: "new" }],
+      focus: ["page"] },
+    { caption: "Transaction 734 sets it to 80. Slot 3 is the newest version. Nobody's snapshot lies between 733 and 734, so no query will ever read slot 2.",
+      change: [{ id: "s2", sub: "90 · xmax 734", tone: "dim" }, { id: "q", label: "sees 80", sub: "slot 3" }],
+      add: [{ id: "s3", at: "page", label: "slot 3", sub: "80 · xmin 734", tone: "new" }],
+      focus: ["page"] },
+    { caption: "The report finishes. Now nobody can see slots 1 and 2, today or in the future. They are **dead**, and they sit in the page, taking space, until something removes them (section 5).",
+      remove: ["r"],
+      change: [{ id: "s1", sub: "100 · dead", tone: "dim" }, { id: "s2", sub: "90 · dead" }, { id: "s3", tone: "ok" }],
+      focus: ["page"] },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="3.2" title="How a query picks a version">
+
+A snapshot is a small record taken when a statement starts: the next transaction number to be handed out, and the list of transactions still in progress. (In the `REPEATABLE READ` isolation level, which chapter 19 covers, one snapshot lasts for the whole transaction.) A version is visible to you if the transaction that created it had committed before your snapshot and the transaction that replaced it hadn't. Four cases cover it:
+
+| `xmin` is… | `xmax` is… | Visible to your snapshot? |
+|---|---|---|
+| Committed before your snapshot | 0, or aborted | Yes |
+| Committed before your snapshot | Committed before your snapshot | No: it was deleted or replaced |
+| Committed before your snapshot | In progress, or committed after | Yes: the delete hasn't happened for you |
+| In progress, aborted, or after your snapshot | Anything | No |
+
+Apply it to the report in the diagram. Slot 1 has an `xmin` of 732, committed before the report's snapshot, and an `xmax` of 733, which hadn't committed when the snapshot was taken, so it falls in the third row and the report sees it. Slot 2 has an `xmin` of 733, which hadn't committed yet, so it falls in the fourth row and the report can't see it.
+
+Deciding whether 733 committed means looking it up in the commit log, `pg_xact`, a compact record of how every transaction ended. Doing that for every tuple of every query would be slow, so whichever reader finds out first writes the answer into the tuple's header as a **hint bit** (a flag in `t_infomask`), and later readers skip the lookup.
+
+<Why>Why does a SELECT sometimes write to disk?</Why>
+
+Because setting a hint bit changes the page, which makes it dirty. Your first read of freshly loaded data therefore writes more than you'd expect, and with checksums or `wal_log_hints` on, it can generate log records too. It happens once per tuple, and it surprises people who run benchmarks right after a bulk load.
+
+</Sub>
+
+<Sub n="3.3" title="Why not overwrite, like MySQL?">
+
+MySQL's InnoDB engine does overwrite the row in place. It keeps the old version in a separate undo log, which readers rebuild old values from. Postgres keeps the old versions in the table itself. That makes rollback free, because the versions of an aborted transaction are never visible to anyone, and it makes crash recovery simple. It also puts the cost of cleanup somewhere else, and that place is vacuum.
+
+This idea is older than Postgres's SQL. Michael Stonebraker's [The Design of the POSTGRES Storage System](https://dsf.berkeley.edu/papers/ERL-M87-06.pdf) (VLDB 1987) described a "no-overwrite" store that kept every version and needed no write-ahead log. Postgres kept the no-overwrite heap and added the log in [7.1](https://www.postgresql.org/docs/release/7.1.0/), in 2001.
+
+There's a catch we skipped over. Each new version has a new ctid, and the structures that find rows by address still hold the old one.
+
+</Sub>
+
+<SectionHeading n="04" id="hot">Indexes, and why HOT updates exist</SectionHeading>
+
+<Sub n="4.1" title="Every version has a new address">
+
+Finding account 1 by its `id` without reading the whole heap is the job of an **index**: a separate sorted structure (usually a B-tree, which chapter 18 covers) whose entries pair a column value with a ctid. Our index on `id` holds an entry that says "id 1 is at `(0,1)`". After our first `UPDATE` the live version is at `(0,2)`, and the index still says `(0,1)`.
+
+The most direct fix would be to add a new entry, "id 1 is at `(0,2)`", to every index on the table, on every update, even when no indexed column changed. That is the write amplification Uber described in 2016 when it [moved from Postgres to MySQL](https://www.uber.com/blog/postgres-to-mysql-migration/): "a small logical update (say, writing a few bytes) becomes a much larger, costly update when translated to the physical layer."
+
+</Sub>
+
+<Sub n="4.2" title="Heap-only tuples">
+
+**HOT** (heap-only tuples, added in [8.3](https://www.postgresql.org/docs/release/8.3.0/)) removes that cost in a common case. If no indexed column changed and the new version fits on the same page, Postgres writes the new version without touching any index. Postgres flags the new version *heap-only*, because no index points at it, and the old version *HOT-updated*. An index scan still arrives at the old slot through the stale ctid, and from there it follows the `t_ctid` pointers to the live version.
+
+This run shows those flags on a page. It uses a table with a third column, `note`, so run it in a fresh database (`CREATE DATABASE hot;` and then `\c hot`), because it creates its own `acct`. Its two `&` expressions test bits of `t_infomask2`: 16384 (`0x4000`) is the HOT-updated flag and 32768 (`0x8000`) is the heap-only flag.
 
 <TryIt what="Insert one row, update it, and read the page" lang="sql" toolchain="PostgreSQL 16.15, pageinspect">
 ```sql
@@ -221,91 +299,48 @@ still holds balance 100, with `xmax = 734` and a `t_ctid` pointing forward to
 </Output>
 </TryIt>
 
-So an `UPDATE` is an insert of a new version plus a mark on the old one. A
-`DELETE` is just the mark. Nothing is overwritten.
+Slot 1 is HOT-updated and slot 2 is heap-only, exactly the pair described above. Both tuples are 38 bytes (`lp_len`), the size we worked out in section 2.2. Because `balance` has no index, no index had to learn about slot 2.
 
-<Why>Why not update in place, like MySQL's InnoDB?</Why>
+Here is the same idea on account 1 with two indexes, one on `id` and one on `balance`, and a `note` column. We'll change an unindexed column first and then an indexed one.
 
-InnoDB overwrites the row and keeps the old version in a separate undo log, which
-readers reconstruct from. Postgres keeps old versions in the table itself. That
-makes rollback free (an aborted transaction's versions are never visible)
-and crash recovery simple, and it puts the cleanup cost somewhere else: vacuum.
-
-This idea is older than Postgres's SQL. Stonebraker's
-[The Design of the POSTGRES Storage System](https://dsf.berkeley.edu/papers/ERL-M87-06.pdf)
-(VLDB 1987) described a "no-overwrite" store that kept every version and needed
-no write-ahead log. Postgres kept the no-overwrite heap and added the log in
-[7.1](https://www.postgresql.org/docs/release/7.1.0/), in 2001.
-
-</Sub>
-
-<Sub n="3.2" title="Snapshots and visibility">
-
-A **snapshot** is a small record taken when a statement (or, in `REPEATABLE READ`,
-a transaction) starts: the next transaction ID, and the list of transactions still
-in progress. A tuple is visible to you if its creator had committed before your
-snapshot and its deleter hadn't.
-
-| `xmin` is… | `xmax` is… | Visible to your snapshot? |
-|---|---|---|
-| Committed before your snapshot | 0, or aborted | Yes |
-| Committed before your snapshot | Committed before your snapshot | No: it was deleted or replaced |
-| Committed before your snapshot | In progress, or committed after | Yes: the delete hasn't happened for you |
-| In progress, aborted, or after your snapshot | Anything | No |
-
-Checking whether a transaction committed means reading the commit log (`pg_xact`).
-Whichever reader finds out first sets a **hint bit** in `t_infomask` so later readers
-skip the lookup.
-
-<Why>Why does a SELECT sometimes write to disk?</Why>
-
-Because setting hint bits dirties the page. Your first read of freshly loaded data
-probably writes more than you'd expect, and with checksums or `wal_log_hints` on, it can also generate
-WAL. It's a one-time cost per tuple, and it surprises people running benchmarks
-right after a bulk load.
-
-</Sub>
-
-<Sub n="3.3" title="The index problem, and HOT">
-
-A new version means a new ctid. Every index on the table points at the *old*
-ctid. In the naive design, every update inserts a new entry into every index,
-even if no indexed column changed.
-
-This is the write amplification Uber described in 2016 when it
-[moved from Postgres to MySQL](https://www.uber.com/blog/postgres-to-mysql-migration/):
-"a small logical update (say, writing a few bytes) becomes a much larger, costly
-update when translated to the physical layer."
-
-**HOT** (heap-only tuples, added in
-[8.3](https://www.postgresql.org/docs/release/8.3.0/)) removes that cost for a
-common case. If no indexed column changed *and* the new version fits on the same
-page, Postgres writes the new version without touching any index. Index scans
-land on the old line pointer and follow the chain.
-
-<Steps
-  title="One UPDATE, HOT and not"
-  lanes={[
-    { t: "Executor", s: "UPDATE … WHERE id=1", icon: "◉" },
-    { t: "Old tuple", s: "page 0, lp 1", icon: "▤" },
-    { t: "Page free space", s: "fillfactor", icon: "▦" },
-    { t: "New tuple", s: "same page or another", icon: "▥" },
-    { t: "Indexes", s: "one entry per index", icon: "⌗" },
-    { t: "WAL", s: "HOT_UPDATE or UPDATE", icon: "≡" },
+<Scene
+  title="One HOT update, then one that can't be HOT"
+  regions={[
+    { id: "ix_id", label: "Index on id", sub: "value → ctid", col: 0, row: 0 },
+    { id: "ix_bal", label: "Index on balance", sub: "value → ctid", col: 1, row: 0, span: 2 },
+    { id: "page", label: "Page 0 of acct", sub: "slots hold row versions", col: 0, row: 1, span: 3 },
   ]}
-  steps={[
-    [0, "The executor finds the row through the primary-key index and locks the tuple."],
-    [1, "It stamps the old version's `xmax` with its transaction ID and points its `t_ctid` at the new version's slot."],
-    [2, "It checks two things: did any **indexed column** change, and is there **room on this page**?"],
-    [3, "If both pass, the new version goes on the same page, flagged **heap-only**. The old one is flagged **HOT-updated**."],
-    [4, "**HOT: no index is touched.** An index scan lands on lp 1 and follows the chain to lp 2. Otherwise, every index gets a new entry pointing at the new ctid."],
-    [5, "One WAL record describes the change: `HOT_UPDATE` for the first case, `UPDATE` plus index inserts for the second."],
+  itemWidth={124}
+  frames={[
+    { caption: "Account 1 is in slot 1 with balance 100 and note `hello`. Both indexes point at `(0,1)`.",
+      items: [
+        { id: "i1", at: "ix_id", label: "id 1", sub: "→ (0,1)" },
+        { id: "b1", at: "ix_bal", label: "balance 100", sub: "→ (0,1)" },
+        { id: "s1", at: "page", label: "slot 1", sub: "100 · hello", tone: "ok" },
+      ],
+      focus: ["page"] },
+    { caption: "`UPDATE acct SET note = 'paid'`. No indexed column changes and the page has room, so this is a **HOT** update. The new version goes in slot 2, flagged heap-only. Neither index is written.",
+      change: [{ id: "s1", sub: "HOT-updated", tone: "default" }],
+      add: [{ id: "s2", at: "page", label: "slot 2", sub: "heap-only · paid", tone: "new" }],
+      focus: ["page"] },
+    { caption: "A lookup by id. The index still says `(0,1)`, so the scan lands on slot 1, sees it was HOT-updated, and follows `t_ctid` to slot 2.",
+      change: [{ id: "s2", tone: "accent" }],
+      focus: ["ix_id", "page"], arrow: { from: "ix_id", to: "page", label: "(0,1) → follow chain" } },
+    { caption: "`UPDATE acct SET balance = 90`. The index on `balance` has to find the new version by its new value, so this can't be HOT. The new version goes in slot 3, and **every** index gets a new entry for it.",
+      change: [{ id: "s2", sub: "paid", tone: "default" }],
+      add: [
+        { id: "s3", at: "page", label: "slot 3", sub: "90 · paid", tone: "new" },
+        { id: "i3", at: "ix_id", label: "id 1", sub: "→ (0,3)", tone: "new" },
+        { id: "b3", at: "ix_bal", label: "balance 90", sub: "→ (0,3)", tone: "new" },
+      ],
+      focus: ["ix_id", "ix_bal", "page"] },
+    { caption: "Count the writes. The HOT update touched only the page. The second update wrote the page and one entry in each index, and with ten indexes it would have written ten. A single index on a column that changes often turns HOT off for the whole table.",
+      change: [{ id: "i3", tone: "default" }, { id: "b3", tone: "default" }, { id: "s3", tone: "ok" }],
+      focus: ["ix_id", "ix_bal"] },
   ]}
 />
 
-That "room on this page" check is why `fillfactor` exists. A table with
-`fillfactor = 90` leaves 10% of each page empty on insert, as landing space for
-future updates.
+The condition "fits on the same page" is why the setting `fillfactor` exists. A table with `fillfactor = 90` leaves 10% of every page empty when rows are first inserted, as landing space for new versions.
 
 <Predict
   q="A 100,000-row table has fillfactor 90 and no autovacuum. You run one UPDATE that changes a non-indexed column on every row. Roughly what fraction of those updates are HOT?"
@@ -323,8 +358,7 @@ rows' new versions go to new pages at the end of the table, and those updates
 must add index entries. In the run below it was 10,170 of 100,000.
 </Predict>
 
-Here's that run, and the same table under random single-row updates, the
-shape of an OLTP workload:
+Here is that run, and the same tables under random single-row updates, which is the pattern of a busy application where each transaction touches one row. `pgbench` is Postgres's own benchmarking tool. Its `-n` option skips the vacuum it would otherwise run first, `-f` names a file of SQL to repeat, and `-t 200000` makes the run 200,000 transactions.
 
 <TryIt what="HOT rate and table growth, bulk UPDATE versus random single-row updates" lang="shell" toolchain="PostgreSQL 16.15, pgbench, shared 4-CPU container, linuxkit 6.10">
 ```shell
@@ -352,63 +386,73 @@ at fillfactor 100.
 </Output>
 </TryIt>
 
+Bulk updates behave as the prediction says: with `fillfactor 100` none of the new versions fit on their page, with `fillfactor 90` about a tenth did, and either way the table's file roughly doubled, because the old versions are still sitting in it. Random updates tell a different story. They barely grew the table and almost all were HOT, even on pages with no spare room at the start.
+
 <Why>How can random updates be 98% HOT on a full page?</Why>
 
-Because of **page pruning**. When a query visits a page that's short on space,
-Postgres removes dead versions in HOT chains that no snapshot can see anymore,
-right then, without waiting for vacuum. The first update on a full page has to
-go elsewhere, but it frees space that the next updates on that page can use.
+Because of **page pruning**. When a query visits a page that's short on space, Postgres removes the dead versions in HOT chains that no snapshot can see any more, right then, without waiting for vacuum. The first update on a full page has to go elsewhere, but it frees space that the next updates on that page can use.
 
-My last experiment is the one the Uber post is about: an update that changes an
-indexed column. On a table with three indexes and fillfactor 90, 50,000 random
-updates to a non-indexed column were all HOT and wrote 425 bytes of WAL each.
-Changing the indexed `email` column instead gave zero HOT updates and 784 bytes of
-WAL each.
+An indexed column is the case that hurts. On a table with three indexes and `fillfactor 90`, 50,000 random updates to a column nobody had indexed were all HOT. Changing the indexed `email` column instead gave zero HOT updates, and section 8 shows how much extra work that is.
 
 <Callout label="Design implication">
-Every index is a tax on updates, not just on inserts, because it can stop an
-update being HOT. Check `n_tup_hot_upd` against `n_tup_upd` in
-`pg_stat_user_tables` for your busiest tables. If the ratio is low, the cause is probably an
-index on a column that changes often, like `updated_at`.
+Every index is a tax on updates, not just on inserts, because it can stop an update being HOT. Check `n_tup_hot_upd` against `n_tup_upd` in `pg_stat_user_tables` for your busiest tables. If the ratio is low, the cause is probably an index on a column that changes often, like `updated_at`.
 </Callout>
+
+Pruning cleans up inside one page when a query happens to visit it. Dead versions it doesn't reach, like the ones the bulk update left behind, stay in the file, and something has to go through the table and remove them.
 
 </Sub>
 
-<SectionHeading n="04" id="vacuum">Vacuum: taking out the old versions</SectionHeading>
+<SectionHeading n="05" id="vacuum">Vacuum: removing old versions</SectionHeading>
 
-Old versions have to go eventually, or the table grows forever. Removing them is
-vacuum's job, and it can only remove a version once no snapshot anywhere could
-still see it.
+<Sub n="5.1" title="What one vacuum pass does">
 
-<Sub n="4.1" title="What one vacuum pass does">
+A version is dead when no snapshot, now or later, can see it, like slots 1 and 2 at the end of the first diagram. Dead versions can go, and the job that removes them is **vacuum**. To know which versions are dead, vacuum first works out the **horizon**: the number of the oldest transaction that any snapshot still open in the database may need. Vacuum's own output calls it the *removable cutoff*. A version whose replacement committed before the horizon can't be seen by anyone, so it can be removed.
 
-<Steps
-  title="One VACUUM of one table"
-  lanes={[
-    { t: "Horizon", s: "oldest xmin", icon: "◷" },
-    { t: "Heap scan", s: "skip all-visible pages", icon: "▤" },
-    { t: "Dead TIDs", s: "in memory", icon: "≡" },
-    { t: "Indexes", s: "remove entries", icon: "⌗" },
-    { t: "Heap again", s: "free line pointers", icon: "▦" },
-    { t: "Maps", s: "FSM · VM · relfrozenxid", icon: "✓" },
+Vacuum then walks the table's pages. It skips any page that the **visibility map** marks as all-visible, a bitmap with one bit per page saying that every version on the page is visible to everyone, so there is nothing to clean. On every other page it removes dead versions. Here is the page from the last section, after the report is long gone and the horizon has moved past slots 1 and 2.
+
+<Scene
+  title="One vacuum of account 1's page"
+  regions={[
+    { id: "idx", label: "Indexes", sub: "entries point at ctids", col: 0, row: 0, span: 3 },
+    { id: "page", label: "Page 0 of acct", sub: "slots hold row versions", col: 0, row: 1, span: 2 },
+    { id: "fsm", label: "Free space map", sub: "room left in each page", col: 2, row: 1 },
   ]}
-  steps={[
-    [0, "Vacuum computes the **removable cutoff**: the oldest transaction any open snapshot, replication slot or prepared transaction still needs."],
-    [1, "It scans the heap, skipping pages the **visibility map** says are all-visible. On each page it prunes dead versions older than the cutoff."],
-    [2, "Dead tuples that indexes still point at become `LP_DEAD` stubs, and their TIDs are collected in memory (`maintenance_work_mem`)."],
-    [3, "It scans **every index** and removes entries pointing at those TIDs. On a table with several indexes, it's probably the slowest part."],
-    [4, "It goes back to the heap and marks those line pointers `LP_UNUSED`, so their slots can be reused."],
-    [5, "It updates the **free space map** so inserts can find the room, sets visibility-map bits, freezes old tuples (section 5), and advances `relfrozenxid`."],
+  itemWidth={124}
+  frames={[
+    { caption: "Before: slots 1 and 2 hold dead versions and slot 3 is live. Two index entries still point at dead slot 1.",
+      items: [
+        { id: "i1", at: "idx", label: "id 1", sub: "→ (0,1)", tone: "bad" },
+        { id: "i3", at: "idx", label: "id 1", sub: "→ (0,3)" },
+        { id: "b1", at: "idx", label: "balance 100", sub: "→ (0,1)", tone: "bad" },
+        { id: "b3", at: "idx", label: "balance 90", sub: "→ (0,3)" },
+        { id: "s1", at: "page", label: "slot 1", sub: "dead", tone: "dim" },
+        { id: "s2", at: "page", label: "slot 2", sub: "dead, heap-only", tone: "dim" },
+        { id: "s3", at: "page", label: "slot 3", sub: "live", tone: "ok" },
+      ],
+      focus: ["page"] },
+    { caption: "Vacuum **prunes** the page. Slot 2 was created by a HOT update, so no index points at it: its tuple and its slot are freed at once (`LP_UNUSED`). Slot 1 has index entries pointing at it, so only its tuple bytes are freed, and the slot stays as a stub (`LP_DEAD`).",
+      change: [{ id: "s2", sub: "unused" }, { id: "s1", sub: "LP_DEAD stub", tone: "bad" }],
+      focus: ["page"] },
+    { caption: "Vacuum remembers the address of every dead stub, here `(0,1)`, and scans **every index**, removing the entries that point at those addresses. On a table with several indexes this is usually the slowest step.",
+      remove: ["i1", "b1"],
+      focus: ["idx"], arrow: { from: "page", to: "idx", label: "dead: (0,1)" } },
+    { caption: "Back to the heap. Nothing points at slot 1 any more, so the stub can be freed as well: `LP_UNUSED`.",
+      change: [{ id: "s1", sub: "unused", tone: "dim" }],
+      focus: ["page"], arrow: { from: "idx", to: "page", label: "safe to free" } },
+    { caption: "Vacuum records in the **free space map** that page 0 has room, so inserts and updates can find it without searching.",
+      add: [{ id: "f", at: "fsm", label: "page 0", sub: "has room", tone: "new" }],
+      focus: ["fsm"], arrow: { from: "page", to: "fsm", label: "room" } },
+    { caption: "The next update of account 1 reuses the freed slot. The file didn't shrink. The space went back to this table.",
+      change: [{ id: "s1", sub: "next version", tone: "new" }, { id: "f", tone: "default" }],
+      focus: ["page"] },
   ]}
 />
 
+In words, one pass has five parts. Vacuum computes the horizon. It scans the heap, skipping all-visible pages, and prunes dead versions older than the horizon, collecting the addresses of the stubs in memory. It scans every index and removes the entries that point at those addresses. It goes back to the heap and frees the stubs. And it updates the free space map and the visibility map, freezes old tuples (section 6), and advances `relfrozenxid`. `maintenance_work_mem` limits the memory for the list of dead addresses; when the list fills, vacuum has to stop and do an index pass early, so a small budget means more index passes.
+
 <Why>Why doesn't VACUUM give the disk space back?</Why>
 
-Because it frees space *inside* pages, for future rows of the same table. It only
-truncates the file if the pages at the very end are empty. In the test below, a
-table doubled by a bulk update stayed at **25.2 MB** after `VACUUM` removed all
-100,000 dead versions. `VACUUM FULL` rewrote it to **12.6 MB**, and took an
-`ACCESS EXCLUSIVE` lock to do it: no reads or writes for the duration.
+Because it frees space inside pages, for future rows of the same table. It only shortens the file if the pages at the very end are empty. In section 4, a bulk update doubled a table to **25.2 MB**, and it stayed at 25.2 MB after `VACUUM` removed all 100,000 dead versions. `VACUUM FULL` rewrote it to **12.6 MB**, and took an `ACCESS EXCLUSIVE` lock to do it, which means no reads or writes on the table for the duration.
 
 | Tool | Returns disk to the OS | Lock | Use when |
 |---|---|---|---|
@@ -418,10 +462,9 @@ table doubled by a bulk update stayed at **25.2 MB** after `VACUUM` removed all
 
 </Sub>
 
-<Sub n="4.2" title="When autovacuum decides to run">
+<Sub n="5.2" title="When autovacuum decides to run">
 
-The autovacuum launcher wakes every `autovacuum_naptime` (60 s) and checks each
-table against a threshold:
+Nobody runs `VACUUM` by hand on every table. A background process called **autovacuum** does it. Its launcher wakes every `autovacuum_naptime` (60 s) and checks each table against a threshold. In the code, `reltuples` is the estimated number of rows in the table, and `vactuples` is the number of dead tuples counted so far.
 
 <SourceRead
   file="src/backend/postmaster/autovacuum.c"
@@ -441,17 +484,11 @@ table against a threshold:
 ```
 </SourceRead>
 
-With the defaults (threshold 50, scale factor 0.2), a table is vacuumed once dead
-tuples exceed **50 + 20% of its rows**. An insert-based threshold, added in
-[Postgres 13](https://www.postgresql.org/docs/13/routine-vacuuming.html), exists
-so append-only tables get vacuumed (and frozen) too.
+With the defaults (a base threshold of 50 and a scale factor of 0.2), a table is vacuumed once its dead tuples exceed **50 plus 20% of its rows**. A second threshold, based on inserts and added in [Postgres 13](https://www.postgresql.org/docs/13/routine-vacuuming.html), exists so that append-only tables get vacuumed (and frozen, which section 6 explains) too.
 
 <Why>Why does autovacuum fall behind on big tables?</Why>
 
-Two reasons. Under the default scale factor, a billion-row table waits for 200 million dead
-tuples before anything happens. And autovacuum is throttled on purpose: with
-`vacuum_cost_limit = 200` and `autovacuum_vacuum_cost_delay = 2 ms`, it sleeps
-every time it has done a small budget of page work, so it doesn't swamp your I/O.
+Two reasons. With the default scale factor, a billion-row table waits for 200 million dead tuples before anything happens. And autovacuum is throttled on purpose: with `vacuum_cost_limit = 200` and `autovacuum_vacuum_cost_delay = 2 ms`, it sleeps every time it has done a small budget of page work, so that it doesn't swamp your disks.
 
 | Setting | Default on 16 | What to change for a large, busy table |
 |---|---|---|
@@ -462,78 +499,78 @@ every time it has done a small budget of page work, so it doesn't swamp your I/O
 
 Per-table settings go in `ALTER TABLE … SET (autovacuum_vacuum_scale_factor = 0.01)`.
 
+Tuned or not, vacuum can only remove what the horizon allows, and the horizon is set by the oldest snapshot anyone is still holding.
+
 </Sub>
 
-<Sub n="4.3" title="The transaction that holds everything back">
+<Sub n="5.3" title="The transaction that holds everything back">
 
-Vacuum can't remove a version that some snapshot might still need. One old
-snapshot anywhere in the cluster blocks cleanup in every table.
+One old snapshot holds back cleanup in every table of its database. (A replication slot or a standby's feedback, listed below, holds back every database.) We can make one on purpose. We create a table `v` of 100,000 rows with autovacuum switched off, so that only our own vacuum runs. In session 1, `begin isolation level repeatable read` followed by a query takes a snapshot, and `pg_sleep(15)` keeps it open for 15 seconds while the trailing `&` runs it in the background. Session 2 then updates every row, looks at the open transactions in `pg_stat_activity`, and runs `vacuum (verbose)`, which prints a report. A `sleep 1` gives session 1 a moment to take its snapshot first.
 
-<TryIt what="Hold a REPEATABLE READ snapshot open, update 100,000 rows, and vacuum" lang="shell" toolchain="PostgreSQL 16.15, shared 4-CPU container, linuxkit 6.10">
+<TryIt what="Hold a REPEATABLE READ snapshot open, update 100,000 rows, and vacuum" lang="shell" toolchain="PostgreSQL 16.15 (postgres:16-alpine)">
 ```shell
-# session 1: an idle-looking transaction that holds a snapshot
-psql -c "begin isolation level repeatable read" -c "select count(*) from pg_class" -c "select pg_sleep(15)" &
+export PGUSER=postgres
+psql -c "create table v as select g as id, 0 as n from generate_series(1,100000) g" -c "alter table v set (autovacuum_enabled = off)"
 
-# session 2
+# session 1: a transaction that takes a snapshot and holds it for 15 seconds
+psql -c "begin isolation level repeatable read" -c "select count(*) from pg_class" -c "select pg_sleep(15)" &
+sleep 1
+
+# session 2, while session 1 is still sleeping
 psql -c "update v set n = n + 1"
+psql -c "select backend_xmin, state, left(query, 40) as query from pg_stat_activity where backend_xmin is not null and pid <> pg_backend_pid()"
 psql -c "vacuum (verbose) v"
 ```
 
 <Output>
 ```text
-tuples: 0 removed, 200000 remain, 100000 are dead but not yet removable
-removable cutoff: 400761, which was 1 XIDs old when operation ended
+ backend_xmin | state  |        query
+--------------+--------+---------------------
+          775 | active | select pg_sleep(15)
 
- backend_xmin |  state | left(query,40)
---------------+--------+------------------------------------------
-       400761 | active | begin isolation level repeatable read; s
+tuples: 0 removed, 200000 remain, 100000 are dead but not yet removable
+removable cutoff: 775, which was 1 XIDs old when operation ended
 ```
 
-After session 1 committed, the same `VACUUM` reported `100000 removed`. The phrase
+After session 1 ended, the same `VACUUM` reported `100000 removed`. The phrase
 to search your logs for is **"dead but not yet removable"**.
 </Output>
 </TryIt>
 
-Anything that pins an old transaction ID does the same:
+The activity table names the culprit: session 1 holds a snapshot with `backend_xmin` 775, and that number is the horizon. Vacuum's report agrees, with a removable cutoff of 775. The 100,000 versions replaced by the `UPDATE` count as dead in the sense of section 3, but the sleeping snapshot is older than their replacement, so vacuum can't be sure it doesn't need them and leaves all 100,000 in place. Once session 1 finishes, the horizon moves forward and the same vacuum removes them.
+
+Anything that pins an old transaction number does the same:
 
 | What holds the horizon | Where to see it | Fix |
 |---|---|---|
-| A long transaction, or one left `idle in transaction` | `pg_stat_activity.backend_xmin`, `state` | End it; set `idle_in_transaction_session_timeout` |
-| A replica with `hot_standby_feedback = on` running a long query | `pg_stat_replication.backend_xmin` | Shorter replica queries, or accept cancellations (section 8.4) |
+| A long transaction, or one left `idle in transaction` (open but doing nothing) | `pg_stat_activity.backend_xmin`, `state` | End it; set `idle_in_transaction_session_timeout` |
+| A replica with `hot_standby_feedback = on` running a long query | `pg_stat_replication.backend_xmin` | Shorter replica queries, or accept cancellations (section 9.4) |
 | A replication slot nobody consumes | `pg_replication_slots.xmin`, `catalog_xmin` | Drop the slot |
-| A forgotten prepared transaction | `pg_prepared_xacts` | `COMMIT PREPARED` or `ROLLBACK PREPARED` |
+| A forgotten prepared transaction (one parked by two-phase commit) | `pg_prepared_xacts` | `COMMIT PREPARED` or `ROLLBACK PREPARED` |
 
 <Callout label="Common mistake" kind="warn">
-Tuning autovacuum to run harder when the problem is a stuck horizon.
-If `VACUUM VERBOSE` says rows are "dead but not yet removable", no amount of
-vacuuming will help. Find the oldest `backend_xmin` first.
+Tuning autovacuum to run harder when the problem is a stuck horizon. If `VACUUM VERBOSE` says rows are "dead but not yet removable", no amount of vacuuming will help. Find the oldest `backend_xmin` first.
 </Callout>
+
+Vacuum has one more duty, and it's the reason you can't switch it off even on a table that never needs cleaning.
 
 </Sub>
 
-<SectionHeading n="05" id="wraparound">Transaction ID wraparound</SectionHeading>
+<SectionHeading n="06" id="wraparound">Transaction id wraparound</SectionHeading>
 
-Both `t_xmin` and `t_xmax` are 32 bits. At a few thousand write transactions
-a second, a 32-bit counter runs out in roughly five days. What Postgres does about that is the
-reason vacuum can't be optional.
+<Sub n="6.1" title="A 32-bit counter on a circle">
 
-<Sub n="5.1" title="A 32-bit counter on a circle">
+Transaction numbers in section 2 were 732, 733 and 734, which looks like a generous supply. But `xmin` and `xmax` in every tuple header are 32-bit numbers, and Postgres hands out the next number to every transaction that writes. At a few thousand write transactions a second, the counter gets halfway through its range in about five days, and what Postgres does about that is the reason vacuum can't be optional.
 
-Postgres compares transaction IDs modulo 2³². For any transaction, the 2³¹ IDs
-"behind" it are in the past and the 2³¹ "ahead" are in the future. There's no
-largest ID, only a circle.
+Postgres compares transaction ids modulo 2³². For any transaction, the 2³¹ ids behind it count as the past and the 2³¹ ahead of it count as the future, so there's no largest id, only a circle.
 
 <Why>What goes wrong when the counter laps?</Why>
 
-A row inserted by transaction 100 is visible because 100 is in the past. Roughly
-2.1 billion transactions later, 100 would suddenly be "in the future", and that
-committed row would vanish from every query. Postgres will stop accepting writes
-instead of letting that happen.
+Account 1's first version has an `xmin` of 732, which is visible because 732 is in the past. Roughly 2.1 billion transactions later, 732 would suddenly be in the future, and that committed row would vanish from every query. Postgres stops accepting writes instead of letting that happen.
 
-The fix is **freezing**. Vacuum marks old tuples as frozen, meaning "committed,
-older than everyone", and a frozen tuple is visible whatever the current ID is.
-Each table records `relfrozenxid`, the oldest unfrozen ID it could contain, and
-each database records the minimum as `datfrozenxid`.
+The fix is **freezing**. Vacuum marks old tuples as frozen, meaning "committed, and older than everyone", and a frozen tuple is visible whatever the current transaction number is. Each table records `relfrozenxid`, the oldest unfrozen transaction number it could still contain, and each database records the minimum of those as `datfrozenxid`.
+
+This experiment makes one table with one row and reads the tuple's flags before and after `vacuum (freeze)`, a vacuum that freezes every tuple it can. `age(relfrozenxid)` counts how many transactions old that number is, and the expression `(t_infomask & 768) = 768` tests the two hint bits that together mean "frozen".
 
 <TryIt what="Freeze a tuple and watch relfrozenxid advance" lang="sql" toolchain="PostgreSQL 16.15, pageinspect">
 ```sql
@@ -558,12 +595,13 @@ compared with anything.
 </Output>
 </TryIt>
 
+In both rows `t_xmin` stays the same, but `frozen` flips from false to true, and `relfrozenxid` moves forward from 454806 to 454808, so the table's oldest possible unfrozen id is now two transactions younger and its age drops to 0.
+
 </Sub>
 
-<Sub n="5.2" title="The limits, from the source">
+<Sub n="6.2" title="The limits, from the source">
 
-Postgres doesn't wait until the last ID. It computes a set of limits from the
-oldest `datfrozenxid`:
+Postgres doesn't wait until the last id before it acts. It computes a set of limits from the oldest `datfrozenxid`:
 
 <SourceRead
   file="src/backend/access/transam/varsup.c"
@@ -590,7 +628,7 @@ oldest `datfrozenxid`:
 ```
 </SourceRead>
 
-Put in order of age of the oldest unfrozen ID:
+Put in order of the age of the oldest unfrozen id, the thresholds are:
 
 | Age of `datfrozenxid` | What happens | Setting |
 |---|---|---|
@@ -600,61 +638,43 @@ Put in order of age of the oldest unfrozen ID:
 | About 2.1 billion − 40 million | `WARNING: database "x" must be vacuumed within N transactions` | Hard-coded |
 | About 2.1 billion − 3 million | `ERROR: database is not accepting commands to avoid wraparound data loss` | Hard-coded |
 
+How much time that leaves depends on the write rate, which varies a lot with hardware and workload, so treat this as one data point. A single `pgbench` client running single-row `UPDATE`s reaches about 4,700 write transactions a second:
+
 <Estimate
   rows={[
-    { label: "Write transactions a second", math: "one pgbench client, single-row UPDATEs, measured here", value: "≈ 4,700" },
+    { label: "Write transactions a second", math: "one pgbench client, single-row UPDATEs", value: "≈ 4,700" },
     { label: "Until the forced anti-wraparound vacuum", math: "200M / 4,700 per s", value: "≈ 11.8 hours" },
     { label: "Until writes stop, if nothing ever freezes", math: "(2³¹ − 3M) / 4,700 per s", value: "≈ 5.3 days" },
   ]}
   result={{ label: "Freezing runs well inside a week, or the database stops", value: "days, not years" }}
 />
 
-<Why>Why does a forced vacuum sometimes cause an outage of its own?</Why>
-
-Because it's the vacuum you can't skip, on a table that's been ignored for 200
-million transactions. It scans every unfrozen page, and it can't be cancelled
-by the lock conflicts that normally make autovacuum back off. A migration that
-needs an `ACCESS EXCLUSIVE` lock on that table will queue behind it, and every
-query on the table queues behind the migration.
+That forced vacuum can cause an outage of its own. It's the vacuum you can't skip, on a table that's been ignored for 200 million transactions, so it scans every unfrozen page, and the lock conflicts that normally make autovacuum back off don't cancel it. A migration that needs an `ACCESS EXCLUSIVE` lock on that table will queue behind it, and every query on the table queues behind the migration.
 
 </Sub>
 
-<Sub n="5.3" title="Two outages">
+<Sub n="6.3" title="Two outages">
 
 Both of these companies published what happened:
 
-- **Sentry, July 2015.** Write load outran autovacuum, and the database stopped
-  accepting writes for most of a US working day. Their writeup,
-  [Transaction ID Wraparound in Postgres](https://blog.sentry.io/transaction-id-wraparound-in-postgres/),
-  describes restarting in single-user mode and truncating a large, non-critical
-  table to recover.
-- **Mailchimp's Mandrill, February 2019.** One shard hit wraparound protection
-  and the outage lasted about 41 hours. The
-  [postmortem](https://mailchimp.com/what-we-learned-from-the-recent-mandrill-outage/)
-  explains that XIDs "are stored with 32 bits, and compared using modulo 2^32
-  arithmetic", and recovery again involved truncating tables so vacuum could
-  finish.
+- **Sentry, July 2015.** Write load outran autovacuum, and the database stopped accepting writes for most of a US working day. Their writeup, [Transaction ID Wraparound in Postgres](https://blog.sentry.io/transaction-id-wraparound-in-postgres/), describes restarting in single-user mode and truncating a large, non-critical table to recover.
+- **Mailchimp's Mandrill, February 2019.** One shard hit wraparound protection and the outage lasted about 41 hours. The [postmortem](https://mailchimp.com/what-we-learned-from-the-recent-mandrill-outage/) explains that XIDs "are stored with 32 bits, and compared using modulo 2^32 arithmetic", and recovery again involved truncating tables so that vacuum could finish.
 
 <Callout label="Design implication">
-Alert on `age(datfrozenxid)` per database and on the oldest `age(relfrozenxid)`
-per table, starting well below 200 million. By the time Postgres itself warns
-you, you're within 40 million transactions, which at the rate above is
-roughly two and a half hours.
+Alert on `age(datfrozenxid)` per database and on the oldest `age(relfrozenxid)` per table, starting well below 200 million. By the time Postgres itself warns you, you're within 40 million transactions, which at the rate above is about two and a half hours.
 </Callout>
+
+That limit comes from a fixed-size field in the header. Even the data after the header has a fixed size to respect: the 8 KB page.
 
 </Sub>
 
-<SectionHeading n="06" id="toast">TOAST: where big values go</SectionHeading>
+<SectionHeading n="07" id="toast">Big values: TOAST</SectionHeading>
 
-A tuple has to fit on an 8 KB page. A `text` or `jsonb` column can hold up to a
-gigabyte. **TOAST** (The Oversized-Attribute Storage Technique, added alongside
-WAL in [7.1](https://www.postgresql.org/docs/release/7.1.0/)) bridges the two.
+<Sub n="7.1" title="The 2 KB rule">
 
-<Sub n="6.1" title="The 2 KB rule">
+Every `UPDATE` writes a whole new version, and a version has to fit on one 8 KB page. So what happens to account 1 if we attach a 100,000-byte statement to it, and then update the balance? A `text` or `jsonb` column can hold up to a gigabyte, and copying 100,000 bytes for every balance change would be wasteful even if it fit. **TOAST** (The Oversized-Attribute Storage Technique, added alongside the log in [7.1](https://www.postgresql.org/docs/release/7.1.0/)) is how Postgres handles it.
 
-When a tuple is larger than `TOAST_TUPLE_THRESHOLD`, Postgres compresses its
-largest variable-length values, and if that isn't enough, moves them out of line
-into a separate TOAST table, leaving an 18-byte pointer behind.
+When a tuple is larger than `TOAST_TUPLE_THRESHOLD`, Postgres first compresses its largest variable-length values. If that isn't enough, it moves them out of line into a separate TOAST table, in chunks, and leaves an 18-byte pointer behind in the tuple.
 
 <SourceRead
   file="src/include/access/heaptoast.h"
@@ -674,8 +694,7 @@ into a separate TOAST table, leaving an 18-byte pointer behind.
 ```
 </SourceRead>
 
-For an 8 KB page that's (8192 − 40) / 4 = 2,038, aligned down to **2,032 bytes**.
-Measuring it agrees to the byte:
+TOAST aims to fit four tuples on a page, so for an 8 KB page the threshold is (8192 − 40) / 4 = 2,038, aligned down to **2,032 bytes**. We can find the byte where a value leaves the heap. We set the column's storage to `external`, which means "move out of line if needed, but don't compress", so only the size rule is at work. It inserts values of six lengths, then joins each row to its tuple on the page through `ctid` to read the tuple's size, `lp_len`.
 
 <TryIt what="Find the byte where a value leaves the heap" lang="sql" toolchain="PostgreSQL 16.15, pageinspect">
 ```sql
@@ -707,81 +726,98 @@ pointer. Postgres stored the values in chunks of at most 1,996 bytes; the
 </Output>
 </TryIt>
 
+The calculation holds to the byte. A 2,000-byte body gives a 2,032-byte tuple, exactly the threshold, and the rule is "larger than", so it stays. A 2,001-byte body moves out, and from then on the tuple is 46 bytes however big the value is.
+
 </Sub>
 
-<Sub n="6.2" title="Compression, and what TOAST saves you">
+<Sub n="7.2" title="Compression, and what TOAST saves you">
 
-The default storage for `text` and `jsonb` is `extended`: compress first, move
-out of line if still too big. The default compressor is `pglz`; `lz4` is
-available per column or through `default_toast_compression`.
+`text` and `jsonb` columns default to `extended` storage: compress first, and move out of line only if the value is still too big. `pglz` is the default compressor, and `lz4` is available per column or through `default_toast_compression`.
 
 | Value (100,000 bytes) | `pglz` | `lz4` |
 |---|---|---|
 | `repeat('a', 100000)` | 1,156 bytes | 411 bytes |
 | 3,125 concatenated MD5 hex strings | not compressed | not compressed |
 
-<Why>Why didn't pglz compress hex text at all?</Why>
+Neither compressor shrinks the hex text, because both are pure LZ compressors: they replace repeated byte sequences with back-references, and they have no entropy coding that could exploit a 16-letter alphabet. Random hex has few repeats, so `pglz` gives up and stores the value as it is.
 
-Because both compressors here are pure LZ: they replace repeated byte sequences
-with back-references, and they have no entropy coding to exploit a 16-letter
-alphabet. Random hex has few repeats. `pglz` gives up and stores the value raw.
+TOAST has a pleasant side effect for our update. Changing a row without changing its toasted column copies the 18-byte pointer, not the value. In a test with a 100,000-byte body, updating `id` left the TOAST table at 122,880 bytes, and appending one character to the body grew it to 221,184, because the changed value was stored again in full.
 
-TOAST has a pleasant side effect. Updating a row without changing its toasted
-column copies the 18-byte pointer, not the value. In the test, updating `id` on
-the row with the 100,000-byte body left the TOAST table at 122,880 bytes;
-appending one character to the body grew it to 221,184.
+The reverse is the usual way TOAST hurts. A large `jsonb` document that is rewritten often, kept in one column, writes the whole compressed document again on every change to any key, both to the TOAST table and to the log (section 8). If one field changes often, give it its own column.
 
-<Callout label="Common mistake" kind="warn">
-Keeping a large, frequently rewritten `jsonb` document in one column. Every change
-to any key writes the whole compressed document again, both to the TOAST table
-and to the WAL. If one field changes often, give it its own column.
-</Callout>
+Everything we've followed so far, the new versions, the stamps, the vacuum clean-up and the TOAST chunks, happens to pages in memory. The next question is what happens when the power goes out.
 
 </Sub>
 
-<SectionHeading n="07" id="wal">The write-ahead log</SectionHeading>
+<SectionHeading n="08" id="wal">The write-ahead log</SectionHeading>
 
-Data pages change in shared buffers, in memory, and reach disk later. If the
-server crashes before they do, the changes are gone, unless they were written
-somewhere first. That somewhere is the **write-ahead log**.
+<Sub n="8.1" title="Changes happen in memory">
 
-<Sub n="7.1" title="The rule, and a commit">
+When Postgres changes a page, it changes a copy held in memory, in a region called **shared buffers**. That's Postgres's own cache of pages, much like the OS page cache of chapter 08, and it behaves the same way: the page becomes dirty and is written to the table's file later. So when your `COMMIT` returns, account 1's new balance may exist only in memory while the file still says 100. A power cut at that moment would lose a commit that Postgres had already reported as done.
 
-One rule: a change's WAL record must be on disk before the data page
-it describes. Then a crash can always be repaired by replaying the log from the
-last checkpoint.
+Chapter 08's answer was `fsync`, and we could use it here by writing and flushing every changed page at commit. But one commit might touch five pages scattered across three tables and two indexes, and that's five random 8 KB writes and flushes before the client hears anything.
 
-<StepSequence
-  title="One INSERT and COMMIT, synchronous_commit = on"
-  actors={["Backend", "Shared buffers", "WAL buffers", "WAL on disk"]}
-  messages={[
-    { from: 0, to: 1, label: "modify page", note: "The backend changes the heap page **in memory** and marks it dirty. Nothing is on disk yet." },
-    { from: 0, to: 2, label: "XLogInsert", note: "It appends a WAL record describing the change, and the page's header LSN is set to that record's position." },
-    { from: 0, to: 2, label: "COMMIT record", note: "At commit, a 34-byte `COMMIT` record is appended." },
-    { from: 2, to: 3, label: "write + fsync", note: "The backend flushes WAL up to its commit record. **This fsync is the cost of durability**, and concurrent commits share it (group commit)." },
-    { from: 3, to: 0, label: "durable", note: "Only now does the client get `COMMIT`. The dirty data page is still only in memory." },
-    { from: 1, to: 3, label: "later: checkpoint", dashed: true, note: "The checkpointer or background writer writes the page eventually. It must never write a page whose LSN is ahead of the flushed WAL." },
+The fix is to write down what's about to change, in one place, before changing anything else. Postgres appends a short description of every change to a single file, the **write-ahead log**, or **WAL**. Each record has a position in the log, its **log sequence number** or **LSN**, which only ever goes up, and when a record changes a page, Postgres stamps the page's header with that record's LSN. The rule is that a change's log record must be on disk before the data page it describes. The stamp is how it's enforced: before writing a page to the table's file, Postgres checks that the log has been flushed at least up to the page's LSN. With that rule, a commit only has to flush the log, and any crash can be repaired by replaying the log.
+
+</Sub>
+
+<Sub n="8.2" title="One commit, then a crash">
+
+Here is the update of account 1 from 100 to 90, committing, followed by a power cut. Real LSNs are byte offsets, so the picture numbers them 1 and 2 to keep it small. A **checkpoint**, which turns up in the last frame, is a periodic moment when Postgres writes every dirty page to its file and notes the log position, so that recovery only has to replay the log from there.
+
+<Scene
+  title="One UPDATE and COMMIT, a crash, and the replay"
+  regions={[
+    { id: "client", label: "Client", col: 0, row: 0 },
+    { id: "buf", label: "Shared buffers", sub: "RAM · lost in a crash", col: 1, row: 0 },
+    { id: "walbuf", label: "WAL buffers", sub: "RAM · lost in a crash", col: 2, row: 0 },
+    { id: "data", label: "Table file", sub: "disk · survives a crash", col: 0, row: 1 },
+    { id: "wal", label: "WAL file", sub: "disk · survives a crash", col: 1, row: 1, span: 2 },
+  ]}
+  itemWidth={132}
+  frames={[
+    { caption: "Account 1 holds 100, on page 0 in the table file and in shared buffers. A client sends `UPDATE … SET balance = 90` and then `COMMIT`.",
+      items: [
+        { id: "pg", at: "buf", label: "page 0", sub: "balance 100", tone: "ok" },
+        { id: "dpg", at: "data", label: "page 0", sub: "balance 100" },
+      ],
+      focus: ["buf"], arrow: { from: "client", to: "buf", label: "UPDATE" } },
+    { caption: "The backend changes the page in memory, adding the new version and stamping the old one (section 2), and marks the page dirty. The file on disk still says 100.",
+      change: [{ id: "pg", sub: "balance 90", tone: "dirty" }],
+      focus: ["buf"] },
+    { caption: "It appends a log record describing the change to the WAL buffers and stamps the page with that record's LSN. At `COMMIT` it appends a small commit record too.",
+      change: [{ id: "pg", sub: "90 · page LSN 1" }],
+      add: [
+        { id: "r1", at: "walbuf", label: "LSN 1", sub: "100 → 90", tone: "new" },
+        { id: "r2", at: "walbuf", label: "LSN 2", sub: "commit", tone: "new" },
+      ],
+      focus: ["walbuf"] },
+    { caption: "The backend writes the log records to the WAL file and calls `fsync`. This wait is the price of durability, and other transactions committing at the same moment share the same flush. Only now does the client hear `COMMIT` succeeded. The changed page is still dirty and only in memory.",
+      change: [{ id: "r1", at: "wal", tone: "ok" }, { id: "r2", at: "wal", tone: "ok" }],
+      focus: ["wal"], arrow: { from: "walbuf", to: "wal", label: "write + fsync" } },
+    { caption: "A power cut. Everything in RAM is gone, including the dirty page. The table file still says 100, but the log file holds both records.",
+      change: [{ id: "pg", sub: "lost", tone: "bad" }],
+      focus: ["buf"] },
+    { caption: "On restart, Postgres reads the log from the last checkpoint and applies every record whose change isn't in the table file yet. Page 0 is rebuilt in memory with balance 90, and the committed update survived.",
+      change: [{ id: "pg", sub: "balance 90", tone: "ok" }],
+      focus: ["buf"], arrow: { from: "wal", to: "buf", label: "replay" } },
+    { caption: "Later, a checkpoint writes the dirty page to the table file. Now the file says 90, and the log before this point is no longer needed for recovery.",
+      change: [{ id: "dpg", sub: "balance 90", tone: "ok" }],
+      focus: ["data"], arrow: { from: "buf", to: "data", label: "checkpoint" } },
   ]}
 />
 
-<Why>Why is writing everything twice faster than writing it once?</Why>
+It sounds as if writing everything twice must be slower than writing it once, so why is it faster? Because the log is sequential and compact, and the data pages are neither. A commit that touched five scattered pages flushes a few hundred bytes of log, appended at the end of one file, instead of five random 8 KB writes. That's the performance argument the 7.1 release notes made when the log was added.
 
-Because the WAL is sequential and compact, and data pages aren't. A commit that
-touched five pages scattered across three tables and two indexes flushes a few
-hundred bytes of log instead of five random 8 KB writes. That's the performance
-argument the 7.1 release notes made.
+One thing the picture leaves out is that a dirty page nobody writes back would stay in memory forever. The checkpoint in the last frame, or the background writer (a process that trickles dirty pages out between checkpoints), writes pages back, and neither ever writes a page whose LSN is ahead of the flushed log, which is the rule from 8.1.
 
 </Sub>
 
-<Sub n="7.2" title="Full-page writes">
+<Sub n="8.3" title="Torn pages and full-page writes">
 
-A crash in the middle of an 8 KB page write can leave a page that's half old and
-half new: a **torn page**, since the OS and disk usually write in 4 KB units.
-Replaying a small WAL record onto a torn page doesn't fix it.
+There's a hole in the recovery story. A crash in the middle of an 8 KB page write can leave a page that's half old and half new, because the OS and the disk usually write in 4 KB units. This is a **torn page**, and replaying a small log record onto it doesn't repair it.
 
-So after each checkpoint, the first change to any page writes the **whole page**
-into the WAL. Replay starts from that full image. You can see it in the WAL
-volume:
+So the first time a page changes after each checkpoint, Postgres writes the **whole page** into the log, and replay starts from that full image. You can see it in the log volume. We force a checkpoint with `checkpoint;`, makes single-row updates on one page, and reads the log with `pg_waldump`, a tool that prints log records between two LSNs.
 
 <TryIt what="WAL bytes for the same single-row UPDATE, before and after a checkpoint" lang="shell" toolchain="PostgreSQL 16.15, pg_waldump">
 ```shell
@@ -806,33 +842,25 @@ page, so it carried two images.
 </Output>
 </TryIt>
 
-<Why>Why can more frequent checkpoints produce more WAL, not less?</Why>
+That kind of update costs 176 bytes of log when the page has already been imaged since the last checkpoint and 8,336 bytes when it's the first touch. In the records above, the `HOT_UPDATE` itself is 71 bytes and the commit record is 34. The big record is the `PRUNE` one, carrying an 8,196-byte page image.
 
-Because every checkpoint restarts the "first touch" clock for every page. With
-checkpoints every 30 seconds, a busy page gets a full image roughly twice a minute; at 15
-minutes, once. `checkpoint_timeout` (default 5 minutes) and `max_wal_size`
-(default 1 GB) trade WAL volume and I/O smoothness against recovery time after a
-crash.
+Log volume also shows what an extra index costs. On the three-index table from section 4, a HOT update of a non-indexed column wrote 425 bytes of log per update, and changing the indexed `email` column wrote 784 bytes, since the new index entries have to be logged as well.
+
+More frequent checkpoints can mean more log, not less, because every checkpoint restarts the "first touch" clock for every page. With checkpoints every 30 seconds, a busy page gets a full image roughly twice a minute, and with checkpoints every 15 minutes, once. `checkpoint_timeout` (default 5 minutes) and `max_wal_size` (default 1 GB) trade log volume and I/O smoothness against recovery time after a crash.
 
 <Callout label="Common mistake" kind="warn">
-Turning off `full_page_writes` to cut WAL volume. It's only safe on storage that
-guarantees atomic 8 KB writes, like ZFS. On anything else, a crash at the wrong
-moment leaves a corrupted page that replay can't repair, and you won't know until
-you read it.
+Turning off `full_page_writes` to cut log volume. It's only safe on storage that guarantees atomic 8 KB writes, like ZFS. On anything else, a crash at the wrong moment leaves a corrupted page that replay can't repair, and you won't know until you read it.
 </Callout>
+
+The log describes every change to every page, completely. That makes it more than a recovery tool, because anything that can replay it can reproduce the database.
 
 </Sub>
 
-<SectionHeading n="08" id="replication">Replication: shipping the WAL</SectionHeading>
+<SectionHeading n="09" id="replication">Replication: shipping the log</SectionHeading>
 
-WAL describes every physical change to every page. Replay it on another
-machine and you have a copy. That's all Postgres's built-in physical replication
-is.
+<Sub n="9.1" title="Streaming replication">
 
-<Sub n="8.1" title="Streaming replication">
-
-A standby starts from a base backup (`pg_basebackup`), then connects to the
-primary and streams WAL as it's written.
+If replaying the log after a crash rebuilds the database, replaying it on another machine builds a second copy, and that's all Postgres's built-in physical replication is. The server taking writes is the **primary**. A **standby** starts from a copy of the primary's files made with `pg_basebackup`, then connects to the primary and streams the log as it's written. On the primary a process called the **walsender** reads new log and sends it. On the standby the **walreceiver** writes what arrives, and the startup process replays it onto the standby's pages.
 
 <StepSequence
   title="One commit with a synchronous standby"
@@ -850,19 +878,13 @@ primary and streams WAL as it's written.
 
 <Why>Why can't a physical standby replicate one table, or run a newer major version?</Why>
 
-Because WAL records say things like "put these bytes at offset 4 of block 0 of
-relation 16531". They describe pages, not rows, so the standby has to be a
-byte-for-byte copy of the whole cluster on the same major version. **Logical
-replication** (`CREATE PUBLICATION` / `CREATE SUBSCRIPTION`) decodes the WAL into
-row changes instead. That's how you replicate a subset or cross versions for an
-upgrade.
+Because log records say things like "put these bytes at offset 4 of block 0 of relation 16531". They describe pages, not rows, so the standby has to be a byte-for-byte copy of the whole cluster, meaning every database one server holds, on the same major version. **Logical replication** (`CREATE PUBLICATION` and `CREATE SUBSCRIPTION`) decodes the log into row changes instead. That's how you replicate a subset of tables or cross versions for an upgrade.
 
 </Sub>
 
-<Sub n="8.2" title="What synchronous_commit buys">
+<Sub n="9.2" title="What synchronous_commit buys">
 
-With a synchronous standby named in `synchronous_standby_names`, the setting
-decides which point the commit waits for:
+In that sequence the primary held the client's `COMMIT` until the standby answered. That's optional, and how long the primary waits is the `synchronous_commit` setting. With a synchronous standby named in `synchronous_standby_names`, the setting decides which point the commit waits for:
 
 | `synchronous_commit` | The commit waits until… | Survives |
 |---|---|---|
@@ -872,8 +894,7 @@ decides which point the commit waits for:
 | `on` | The standby has fsynced it | Loss of either machine |
 | `remote_apply` | The standby has replayed it | Loss of either machine, and reads on the standby see the write |
 
-Measured with pgbench, one client, single-row inserts, primary and standby both
-in the same container:
+Each step down the table waits for one more thing, and the latency shows it. These runs used `pgbench` with one client doing single-row inserts, and the primary and standby on the same host, so there is no network delay in them:
 
 <Compare
   cols={["Configuration", "Mean commit latency", "vs async on"]}
@@ -887,31 +908,19 @@ in the same container:
   ]}
 />
 
-Medians of three 3,000-transaction runs, in a shared 4-CPU container on linuxkit
-6.10, with both data directories on a Docker Desktop bind mount. Across a real
-network, add roughly one round trip to every row from `remote_write` down.
+Each figure is the median of three runs of 3,000 transactions, and the exact values depend on the disks. Across a real network, add roughly one round trip to every row from `remote_write` down.
 
 <Callout label="Design implication">
-Postgres's default replication is asynchronous, so a failover can lose
-acknowledged commits, exactly like the Redis case in chapter 22. If you need
-zero loss, you pay a network round trip plus a remote fsync per commit, and a
-synchronous standby that goes down stops your commits unless you list more than
-one (`ANY 1 (a, b)`).
+Postgres's default replication is asynchronous, so a failover can lose acknowledged commits, exactly like the Redis case in chapter 22. If you need zero loss, you pay a network round trip plus a remote fsync per commit, and a synchronous standby that goes down stops your commits unless you list more than one (`ANY 1 (a, b)`).
 </Callout>
 
 </Sub>
 
-<Sub n="8.3" title="Replication slots, and the disk that fills">
+<Sub n="9.3" title="Replication slots, and the disk that fills">
 
-A primary normally recycles WAL segments (16 MB each) after a checkpoint. A
-standby that falls behind can find the WAL it needs already gone. That's what
-happened at GitLab in January 2017: "the replication failed as WAL segments needed
-by the secondary were already removed from the primary"
-([postmortem](https://about.gitlab.com/blog/2017/02/10/postmortem-of-database-outage-of-january-31/)).
+A standby can fall behind: its network drops or it restarts. A primary normally recycles its log segments, which are 16 MB files, after a checkpoint, so a standby that was away too long can find the log it needs already gone. That's what happened at GitLab in January 2017: "the replication failed as WAL segments needed by the secondary were already removed from the primary" ([postmortem](https://about.gitlab.com/blog/2017/02/10/postmortem-of-database-outage-of-january-31/)).
 
-A **replication slot** fixes that by making the primary keep every segment the
-consumer hasn't confirmed. It also means a consumer that disappears makes the
-primary keep WAL forever.
+A **replication slot** fixes that by making the primary keep every segment the consumer hasn't confirmed. It also means a consumer that disappears makes the primary keep log forever. This run loads a million rows twice into a primary with `max_wal_size = 64MB`, once with no slot and once with an unused slot, and measures the `pg_wal` directory each time.
 
 <TryIt what="The same load, with and without an unused slot" lang="shell" toolchain="PostgreSQL 16.15, max_wal_size = 64MB">
 ```shell
@@ -939,24 +948,19 @@ After the slot was dropped, the next load left `pg_wal` at 64 MB again. The
 </Output>
 </TryIt>
 
-`max_slot_wal_keep_size` (Postgres 13, default `-1`, unlimited) caps it: past the
-cap, the slot is invalidated instead of the disk filling. Slots also hold the
-xmin horizon (section 4.3) if they carry `xmin` or `catalog_xmin`, so a dead
-logical slot blocks vacuum as well.
+With no slot, the log directory stayed at its 64 MB limit. With a slot that nobody reads, it grew to 272 MB and the slot reports 253 MB retained, and it would keep growing with every write until the disk filled.
+
+`max_slot_wal_keep_size` (Postgres 13, default `-1`, unlimited) puts a cap on it: past the cap, Postgres gives up on the slot instead of letting the disk fill. Slots also hold the horizon from section 5.3 if they carry `xmin` or `catalog_xmin`, so a dead logical slot blocks vacuum as well.
 
 </Sub>
 
-<Sub n="8.4" title="Queries on a standby">
+<Sub n="9.4" title="Queries on a standby">
 
-A hot standby serves reads while it replays. Those reads can conflict with what
-replay needs to do.
+A hot standby serves read queries while it replays the log, and those reads can conflict with what replay has to do.
 
 <Why>Why does the primary's vacuum cancel a query on the replica?</Why>
 
-Because the standby's pages are copies of the primary's. When vacuum on the
-primary removes dead versions, the WAL tells the standby to remove them too, even
-if a long query on the standby still needs them. The standby waits up to
-`max_standby_streaming_delay` (30 s by default), then cancels the query.
+Because the standby's pages are copies of the primary's. When vacuum on the primary removes dead versions, the log tells the standby to remove them too, even if a long query on the standby still needs them. The standby waits up to `max_standby_streaming_delay` (30 s by default) and then cancels the query.
 
 <TryIt what="A REPEATABLE READ query on the standby while the primary deletes and vacuums" lang="shell" toolchain="PostgreSQL 16.15, hot_standby_feedback = off">
 ```shell
@@ -975,52 +979,48 @@ standby query ended after 30 s
 </Output>
 </TryIt>
 
-You can pick where the pain goes, but not remove it:
+The standby query held a snapshot, the primary removed versions that snapshot needed, and after 30 seconds of conflict the standby gave up on the query. You can pick where the pain goes, but not remove it:
 
 | Choice | Effect on standby queries | Effect on the primary |
 |---|---|---|
 | `max_standby_streaming_delay = 30s` (default) | Cancelled after 30 s of conflict | None; the standby's replay lags by up to 30 s |
 | A larger delay, or `-1` | Rarely cancelled | Replica lag grows, so failover loses more and reads are staler |
-| `hot_standby_feedback = on` | Not cancelled for this reason | Standby's oldest snapshot holds back vacuum on the primary (section 4.3) |
+| `hot_standby_feedback = on` | Not cancelled for this reason | Standby's oldest snapshot holds back vacuum on the primary (section 5.3) |
 
 </Sub>
 
-<Sub n="8.5" title="Archiving and point-in-time recovery">
+<Sub n="9.5" title="Archiving and point-in-time recovery">
 
-Streaming gives you a live copy. It doesn't give you yesterday. For that,
-`archive_command` (or an archive library) copies each finished 16 MB segment to
-durable storage, and a base backup plus the archived WAL lets you replay to any
-moment, then stop: `recovery_target_time`.
-
-A replica faithfully replays a `DROP TABLE` within milliseconds. Only the
-archive can take you back to one second before it.
+Streaming gives you a live copy, and it can't give you yesterday. A replica faithfully replays a `DROP TABLE` within milliseconds. For going back, `archive_command` (or an archive library) copies each finished 16 MB segment to durable storage, and a base backup plus the archived log lets you replay to any moment and then stop, using `recovery_target_time`. Only the archive can take you back to one second before the mistake.
 
 </Sub>
 
-<SectionHeading n="09" id="operating">Operating it</SectionHeading>
+<SectionHeading n="10" id="operating">Operating Postgres</SectionHeading>
 
-<Sub n="9.1" title="The queries to keep handy">
+<Sub n="10.1" title="The queries to keep handy">
+
+Each question this chapter raised has a query that answers it on a running server.
 
 ```sql
--- Dead tuples, HOT ratio and last autovacuum, per table
+-- How many dead versions, and how often is HOT working? (sections 4 and 5)
 select relname, n_live_tup, n_dead_tup, n_tup_upd, n_tup_hot_upd, last_autovacuum
 from pg_stat_user_tables order by n_dead_tup desc limit 20;
 
--- What's holding the xmin horizon
+-- What's holding the horizon? (section 5.3)
 select pid, state, backend_xmin, age(backend_xmin), xact_start, left(query, 60)
 from pg_stat_activity where backend_xmin is not null order by age(backend_xmin) desc;
 select slot_name, active, xmin, catalog_xmin, wal_status from pg_replication_slots;
 select * from pg_prepared_xacts;
 
--- Wraparound headroom
+-- How close is wraparound? (section 6)
 select datname, age(datfrozenxid) from pg_database order by 2 desc;
 select relname, age(relfrozenxid) from pg_class where relkind in ('r','t','m')
 order by 2 desc limit 20;
 
--- Vacuums running right now, and how far along
+-- Vacuums running right now, and how far along (section 5)
 select * from pg_stat_progress_vacuum;
 
--- Replication positions and lag
+-- Replication positions and lag (section 9)
 select application_name, state, sync_state, sent_lsn, write_lsn, flush_lsn,
        replay_lsn, write_lag, flush_lag, replay_lag
 from pg_stat_replication;
@@ -1028,7 +1028,32 @@ from pg_stat_replication;
 
 </Sub>
 
-<Sub n="9.2" title="Symptom, cause, fix">
+<Sub n="10.2" title="Rules that hold up">
+
+1. **Find the horizon before you tune vacuum.** If vacuum reports rows as "dead but not yet removable", look for the oldest `backend_xmin`, an `idle in transaction` session, an unused slot or a prepared transaction. Set `idle_in_transaction_session_timeout`.
+2. **Alert on `age(datfrozenxid)` long before 200 million.** The forced vacuum and the stop at 3 million before the limit are days away at most.
+3. **Tune autovacuum per table for the big, busy ones.** Lower `autovacuum_vacuum_scale_factor` to 0.01 or less, and raise the cost limit if the disks have headroom.
+4. **Index only what you query by.** Every index can switch HOT off, and costs an entry on every non-HOT update. Check `n_tup_hot_upd`.
+5. **Don't keep a large, frequently rewritten document in one column.** Give the field that changes its own column.
+6. **Leave `full_page_writes` on** unless your storage guarantees atomic 8 KB writes.
+7. **Drop replication slots nobody reads,** and set `max_slot_wal_keep_size`.
+
+</Sub>
+
+<Sub n="10.3" title="What you trade for what">
+
+| You get | You pay | When the bill arrives |
+|---|---|---|
+| Readers and writers that never block each other (MVCC) | Dead versions stay in the table until vacuum removes them | As bloat, and as a table that won't shrink |
+| `UPDATE` without touching indexes (HOT) | Spare room on each page, and no index on a column that changes | As a low `n_tup_hot_upd` ratio |
+| 32-bit transaction ids in every header | Freezing, so vacuum can never be optional | As a database that refuses writes |
+| Big values out of the page (TOAST) | A separate table, and a rewrite of the whole value when it changes | As log volume and TOAST growth on a changing `jsonb` |
+| A commit that survives a crash (WAL) | One log flush per commit, and full-page images after each checkpoint | As commit latency and log volume spikes |
+| A copy that can take over (replication) | Latency for every synchronous step, and log kept for slots | As slower commits, or a full disk |
+
+</Sub>
+
+<Sub n="10.4" title="Symptom, cause, fix">
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -1044,112 +1069,63 @@ from pg_stat_replication;
 
 </Sub>
 
-<SectionHeading n="10" id="summary">Summary</SectionHeading>
+<SectionHeading n="11" id="summary">Summary</SectionHeading>
 
-1. **Postgres never updates in place.** An `UPDATE` writes a new version and
-   stamps the old one's `xmax`; the table itself holds the history.
-2. **Every tuple carries a 24-byte header.** For narrow rows it's most of the
-   storage.
-3. **HOT avoids index writes** when no indexed column changes and the page has
-   room. An index on a busy column switches it off.
-4. **A bulk `UPDATE` doubles a table.** Random single-row updates barely grow it,
-   thanks to page pruning.
-5. **Vacuum removes versions no snapshot can see**, and one old snapshot anywhere
-   stops it everywhere.
-6. **`VACUUM` frees space for reuse, not for the OS.** Only a rewrite shrinks the
-   file.
-7. **Transaction IDs are 32 bits on a circle.** Freezing is mandatory, and the
-   database stops writes about 3 million IDs before data would be lost.
-8. **Values move to TOAST above 2,032 bytes a tuple**, in 1,996-byte chunks,
-   compressed first.
-9. **WAL is what makes a commit durable**, and full-page writes after each
-   checkpoint are much of its volume.
-10. **Replication is WAL shipping.** `synchronous_commit` picks how much latency
-    you trade for how much loss, and an unused slot can fill your disk.
+1. **A table is a heap of 8 KB pages.** Each page holds a header, line pointers and tuples, and a row's address, its ctid, is a page number and a slot number.
+2. **Postgres never updates in place.** An `UPDATE` writes a new version and stamps the old one's `xmax`, which is why account 1 left three versions on page 0 after two updates.
+3. **Every tuple carries a 24-byte header.** For narrow rows it's most of the storage.
+4. **MVCC lets each query read the versions its snapshot allows.** Readers and writers never block each other, and the price is the old versions.
+5. **HOT avoids index writes** when no indexed column changes and the page has room. An index on a busy column switches it off.
+6. **Vacuum removes versions no snapshot can see,** and one old snapshot stops it in every table of its database. A bulk `UPDATE` doubles a table, while random single-row updates barely grow it, thanks to page pruning.
+7. **`VACUUM` frees space for reuse, not for the OS.** Only a rewrite shrinks the file.
+8. **Transaction ids are 32 bits on a circle.** Freezing is mandatory, and the database stops writes about 3 million ids before data would be lost.
+9. **Values move to TOAST above 2,032 bytes a tuple,** in chunks of at most 1,996 bytes, compressed first.
+10. **WAL is what makes a commit durable.** The log record reaches disk before the page, and full-page writes after each checkpoint are much of its volume.
+11. **Replication is shipping the WAL.** `synchronous_commit` picks how much latency you trade for how much loss, and an unused slot can fill your disk.
 
-<SectionHeading n="11" id="build">Build this</SectionHeading>
+<SectionHeading n="12" id="build">Build this</SectionHeading>
 
 **A bloat and wraparound monitor for one cluster.**
 
-- Write a script that, every minute, records per-table `n_dead_tup`, HOT ratio,
-  `age(relfrozenxid)` and size, plus the oldest `backend_xmin` from
-  `pg_stat_activity`, slots and prepared transactions.
-- Make it alert on three things: a horizon older than ten minutes, any table
-  whose `age(relfrozenxid)` passes 150 million, and slot-retained WAL over a
-  fixed size.
-- Test it against the experiments in this chapter: the open `REPEATABLE READ`
-  session from section 4.3, the forgotten slot from section 8.3, and a bulk
-  `UPDATE` on a table with autovacuum off. Then use `pg_resetwal`'s `-x` option on
-  a throwaway cluster to start near a wraparound limit, and watch the warning
-  appear.
+- Write a script that, every minute, records per-table `n_dead_tup`, HOT ratio, `age(relfrozenxid)` and size, plus the oldest `backend_xmin` from `pg_stat_activity`, slots and prepared transactions.
+- Make it alert on three things: a horizon older than ten minutes, any table whose `age(relfrozenxid)` passes 150 million, and slot-retained log over a fixed size.
+- Test it against the experiments in this chapter: the open `REPEATABLE READ` session from section 5.3, the forgotten slot from section 9.3, and a bulk `UPDATE` on a table with autovacuum off. Then use `pg_resetwal`'s `-x` option on a throwaway cluster to start near a wraparound limit, and watch the warning appear.
 
-<SectionHeading n="12" id="interview">Interview questions</SectionHeading>
+<SectionHeading n="13" id="interview">Interview questions</SectionHeading>
 
 <QA level="beginner" q="What happens on disk when you UPDATE a row in Postgres?">
-A new row version is written, usually on the same page if there's room, and the
-old version's `xmax` is set to the updating transaction's ID with its `t_ctid`
-pointing at the new one. Nothing is overwritten. The old version stays until
-vacuum removes it, once no snapshot can see it.
+A new row version is written, usually on the same page if there's room, and the old version's `xmax` is set to the updating transaction's id with its `t_ctid` pointing at the new one. Nothing is overwritten. The old version stays until vacuum removes it, once no snapshot can see it.
 </QA>
 
 <QA level="beginner" q="Why does Postgres need VACUUM at all?">
-Because MVCC leaves dead row versions behind after every update and delete, and
-something has to reclaim their space. Vacuum also freezes old tuples so the
-32-bit transaction ID counter can wrap safely, and maintains the visibility map
-that makes index-only scans possible.
+Because MVCC leaves dead row versions behind after every update and delete, and something has to reclaim their space. Vacuum also freezes old tuples so the 32-bit transaction id counter can wrap safely, and maintains the visibility map, which lets some queries be answered from an index alone.
 </QA>
 
 <QA level="intermediate" q="What's a HOT update, and when can't you get one?">
-A heap-only tuple update puts the new version on the same page and skips every
-index, which follow the chain from the old line pointer. You don't get one if any
-indexed column changed or if the page has no room. Lower `fillfactor`, avoid
-indexing columns that change often, and check `n_tup_hot_upd`.
+A heap-only tuple update puts the new version on the same page and skips every index, which follow the chain from the old line pointer. You don't get one if any indexed column changed or if the page has no room. Lower `fillfactor`, avoid indexing columns that change often, and check `n_tup_hot_upd`.
 </QA>
 
 <QA level="intermediate" q="Autovacuum is running but the table keeps growing. What do you check?">
-First `VACUUM VERBOSE` on the table: if it reports rows "dead but not yet
-removable", something holds the xmin horizon. Check `backend_xmin` in
-`pg_stat_activity` for long or `idle in transaction` sessions, replication slots,
-`hot_standby_feedback` on replicas, and prepared transactions. If rows *are*
-removable, autovacuum is too slow: lower the table's scale factor and raise the
-cost limit.
+First `VACUUM VERBOSE` on the table: if it reports rows "dead but not yet removable", something holds the horizon. Check `backend_xmin` in `pg_stat_activity` for long or `idle in transaction` sessions, replication slots, `hot_standby_feedback` on replicas, and prepared transactions. If rows *are* removable, autovacuum is too slow: lower the table's scale factor and raise the cost limit.
 </QA>
 
 <QA level="intermediate" q="What's the trade-off in synchronous_commit?">
-Durability against latency. `off` returns before the local WAL flush and can lose
-recent commits in a crash without corruption. `on` with no synchronous standby
-waits for the local fsync. With a synchronous standby, `remote_write`, `on` and
-`remote_apply` wait for the standby to write, fsync or replay, adding a network
-round trip at least. In the test here, 0.18, 0.75, 1.37, 2.53 and 3.49 ms.
+Durability against latency. `off` returns before the local log flush and can lose recent commits in a crash without corruption. `on` with no synchronous standby waits for the local fsync. With a synchronous standby, `remote_write`, `on` and `remote_apply` wait for the standby to write, fsync or replay, which adds at least a network round trip. With one client on a single host, the mean commit latencies were about 0.18, 0.75, 1.37, 2.53 and 3.49 ms for `off`, `on` without a standby, and the three standby levels.
 </QA>
 
 <QA level="deep" q="Explain transaction ID wraparound and how Postgres prevents it.">
-XIDs are 32 bits and compared modulo 2³², so any XID sees 2³¹ as past and 2³¹ as
-future. An unfrozen tuple older than that would flip to "future" and disappear.
-Vacuum freezes tuples, and `relfrozenxid`/`datfrozenxid` track the oldest unfrozen
-ID. At 200 million autovacuum forces a freeze; at 1.6 billion the failsafe drops
-throttling; 40 million from the limit it warns; 3 million from it, it refuses new
-XIDs. A stuck xmin horizon is the usual root cause, because it stops freezing too.
+Transaction ids are 32 bits and compared modulo 2³², so any id sees 2³¹ as past and 2³¹ as future. An unfrozen tuple older than that would flip to "future" and disappear. Vacuum freezes tuples, and `relfrozenxid` and `datfrozenxid` track the oldest unfrozen id. At 200 million autovacuum forces a freeze, at 1.6 billion the failsafe drops throttling, 40 million from the limit Postgres warns, and 3 million from it, it refuses new ids. A stuck horizon is the usual root cause, because it stops freezing too.
 </QA>
 
 <QA level="deep" q="Why does WAL volume jump right after a checkpoint?">
-Full-page writes. The first modification of each page after a checkpoint logs
-the entire 8 KB page, so replay can recover from a torn write. In the test here a
-single-row HOT update wrote 176 bytes normally and 8,336 bytes when it was the
-first touch after a checkpoint. More frequent checkpoints mean more first touches
-and more WAL.
+Full-page writes. The first modification of each page after a checkpoint logs the entire 8 KB page, so replay can recover from a torn write. A single-row HOT update writes about 176 bytes normally and about 8,336 bytes when it's the first touch after a checkpoint. More frequent checkpoints mean more first touches and more log.
 </QA>
 
 <QA level="deep" q="A query on a hot standby is cancelled with 'conflict with recovery'. What are your options?">
-Replay needs to remove row versions (or take a lock) that the standby query
-depends on, usually because vacuum ran on the primary. The standby waits
-`max_standby_streaming_delay` and then cancels. You can raise the delay (replay
-lags, failover loses more), turn on `hot_standby_feedback` (the primary keeps
-those versions, so bloat moves there), or run such queries on a separate
-replica tuned for them, or on a logical copy.
+Replay needs to remove row versions (or take a lock) that the standby query depends on, usually because vacuum ran on the primary. The standby waits `max_standby_streaming_delay` and then cancels. You can raise the delay (replay lags, failover loses more), turn on `hot_standby_feedback` (the primary keeps those versions, so bloat moves there), or run such queries on a separate replica tuned for them, or on a logical copy.
 </QA>
 
-<SectionHeading n="13" id="resources">Go deeper</SectionHeading>
+<SectionHeading n="14" id="resources">Go deeper</SectionHeading>
 
 <Quiz>
   <Q q="A value is 2,000 bytes in a table of (int, text). Is it TOASTed?">
@@ -1174,6 +1150,10 @@ replica tuned for them, or on a logical copy.
 </Quiz>
 
 <CardGrid>
+  <WildCard name="Operating Systems: Three Easy Pieces, chapter 42">
+    Crash consistency with fsck and journalling: the same write-the-plan-first
+    idea the WAL uses, built up one step at a time. Free online at ostep.org.
+  </WildCard>
   <WildCard name="PostgreSQL docs: Routine Vacuuming">
     The official account of vacuum, freezing and wraparound, with every setting
     in this chapter. [docs/16/routine-vacuuming](https://www.postgresql.org/docs/16/routine-vacuuming.html).
@@ -1198,12 +1178,12 @@ replica tuned for them, or on a logical copy.
   </WildCard>
   <WildCard name="Uber: Why we switched from Postgres to MySQL (2016)">
     The case against the no-overwrite heap, from write amplification to
-    replication volume. Read it next to section 3.3.
+    replication volume. Read it next to section 4.1.
     [uber.com/blog](https://www.uber.com/blog/postgres-to-mysql-migration/).
   </WildCard>
 </CardGrid>
 
-<SectionHeading n="14" id="related">Related chapters</SectionHeading>
+<SectionHeading n="15" id="related">Related chapters</SectionHeading>
 
 <CardGrid>
   <WildCard name="Filesystems & the Page Cache">
