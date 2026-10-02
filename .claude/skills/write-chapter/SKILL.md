@@ -14,16 +14,18 @@ Then read `docs/CHAPTER_FORMAT.md` (component syntax) and a reference chapter:
 
 | Chapter | Use it for |
 |---|---|
-| `06-processes-scheduling` | Gentle start: hands-on first, then depth. The model for OS chapters |
+| `08-filesystems` | The reference: one running example, each section derived from the last one's problem, every term defined at first use |
+| `06-processes-scheduling` | Gentle start: hands-on first, then depth |
 | `04-virtual-memory` | Opening built from a problem, one worked numeric example |
 | `10-linux-networking` | Component usage, diagrams, tables |
 
 ## How the arc maps onto MDX
 
 - Opening: prose under the frontmatter, no heading.
-- Section 01 "touch it": a `<TryIt what lang toolchain>` with an `<Output>`
-  block. The output must come from a command you ran; the `toolchain` line names
-  the machine.
+- Experiments: a `<TryIt what lang toolchain>` with an `<Output>` block, placed
+  once the reader knows what to look for. The output must come from a command you
+  ran. `toolchain` records where, for maintainers only; it isn't rendered, and the
+  prose never mentions the machine.
 - Simple model: `<Steps>` for a pipeline (max 6 lanes), `<StepSequence>` for
   messages between actors, a markdown table for from / to / because.
 - Breaks then fix: a `<Predict q options answer>` with a small worked number.

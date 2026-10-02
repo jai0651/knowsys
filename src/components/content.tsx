@@ -39,10 +39,11 @@ export function Callout({
    Runnable code. Every one compiles and runs in CI, and Output is diffed
    against what it actually printed. */
 export function TryIt({
-  what, lang = "cpp", toolchain, children,
+  what, lang = "cpp", children,
 }: {
   what: string;
   lang?: string;
+  /** Where the block was run. For maintainers and scripts; never rendered. */
   toolchain?: string;
   children: React.ReactNode;
 }) {
@@ -53,7 +54,7 @@ export function TryIt({
       bodyClassName="p-0"
       right={
         <span className="shrink-0 rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-[9.5px] uppercase tracking-wider text-faint">
-          {toolchain ?? lang}
+          {lang}
         </span>
       }
     >
