@@ -4,6 +4,7 @@ import { Callout, TryIt, Output, SourceRead, Cost, QA, WildCard, CardGrid, StubN
 import { SectionHeading, Why } from "./section";
 import { Steps, StepSequence } from "./steps";
 import { Scene } from "./scene";
+import { Think, Decision, Elsewhere, Zoom } from "./design";
 import { Predict } from "./predict";
 import { RaceLab } from "./labs/race-lab";
 import { Milestone } from "./milestone";
@@ -27,6 +28,10 @@ export const mdxComponents: MDXComponents = {
   Steps,
   StepSequence,
   Scene,
+  Think,
+  Decision,
+  Elsewhere,
+  Zoom,
   Predict,
   RaceLab,
   Milestone,
