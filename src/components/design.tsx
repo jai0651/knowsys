@@ -128,3 +128,31 @@ export function Zoom({ path }: { path: string[] }) {
     </div>
   );
 }
+
+/* A real photo or illustration from outside the site. Every one carries its
+   credit and licence, linked to the page it came from. */
+export function Picture({
+  src, alt, caption, credit, href, narrow, paper,
+}: {
+  src: string;
+  alt: string;
+  caption?: string;
+  credit: string;
+  href?: string;
+  narrow?: boolean;
+  /** draw on a white card: for line drawings with a transparent background */
+  paper?: boolean;
+}) {
+  return (
+    <figure className={cn("not-prose my-10", narrow ? "mx-auto max-w-[520px]" : "lg:-mx-6")}>
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src={src} alt={alt} loading="lazy" className={cn("w-full rounded-xl border border-line", paper ? "bg-white p-4" : "bg-white/[0.02]")} />
+      <figcaption className="mt-2.5 px-1 font-[family-name:var(--font-inter)]">
+        {caption && <span className="block text-[14.5px] leading-relaxed text-muted">{caption}</span>}
+        <span className="mt-1 block text-[11.5px] text-faint">
+          {href ? <a href={href} target="_blank" rel="noopener" className="underline decoration-line-2 underline-offset-2 hover:text-ink">{credit}</a> : credit}
+        </span>
+      </figcaption>
+    </figure>
+  );
+}
