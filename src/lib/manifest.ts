@@ -37,6 +37,7 @@ const GROUP_COLOUR: Record<string, string> = {
   "distributed-systems": "dist",
   "cloud-infrastructure": "cloud",
   "designing-running-systems": "ops",
+  "system-design-case-studies": "cases",
   "the-labs": "lab",
 };
 

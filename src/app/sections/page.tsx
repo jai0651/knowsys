@@ -13,7 +13,7 @@ export const metadata: Metadata = {
 
 const DOT: Record<string, string> = {
   machine: "bg-machine", os: "bg-os", conc: "bg-conc", data: "bg-data",
-  dist: "bg-dist", cloud: "bg-cloud", ops: "bg-ops", lab: "bg-lab",
+  dist: "bg-dist", cloud: "bg-cloud", ops: "bg-ops", cases: "bg-cases", lab: "bg-lab",
 };
 
 export default function SectionsPage() {

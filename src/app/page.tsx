@@ -18,11 +18,11 @@ const TINT: Record<string, string> = {
 };
 const DOT: Record<string, string> = {
   machine: "bg-machine", os: "bg-os", conc: "bg-conc", data: "bg-data",
-  dist: "bg-dist", cloud: "bg-cloud", ops: "bg-ops", lab: "bg-lab",
+  dist: "bg-dist", cloud: "bg-cloud", ops: "bg-ops", cases: "bg-cases", lab: "bg-lab",
 };
 const TEXT: Record<string, string> = {
   machine: "text-machine", os: "text-os", conc: "text-conc", data: "text-data",
-  dist: "text-dist", cloud: "text-cloud", ops: "text-ops", lab: "text-lab",
+  dist: "text-dist", cloud: "text-cloud", ops: "text-ops", cases: "text-cases", lab: "text-lab",
 };
 
 /* A path through the book for someone who doesn't know where to start. */

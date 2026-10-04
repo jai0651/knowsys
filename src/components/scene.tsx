@@ -109,7 +109,7 @@ export function Scene({
     let y = PAD;
     for (let k = 0; k < rows; k++) { rowY.push(y); y += rowH[k] + RGAP; }
     for (const r of regions) { box[r.id].y = rowY[r.row]; box[r.id].h = rowH[r.row]; }
-    return { box, H: y - RGAP + PAD };
+    return { box, H: y - RGAP + PAD + 44 };
   }, [regions, states, IW, IH]);
 
   // Where every item sits in every frame (null when absent).
@@ -141,15 +141,21 @@ export function Scene({
   let arrow: { d: string; lx: number; ly: number; label?: string } | null = null;
   if (f.arrow && layout.box[f.arrow.from] && layout.box[f.arrow.to]) {
     const a = layout.box[f.arrow.from], b = layout.box[f.arrow.to];
-    const ax = a.x + a.w / 2, ay = a.y + a.h / 2, bx = b.x + b.w / 2, by = b.y + b.h / 2;
-    const sameRow = Math.abs(ay - by) < 1;
-    const sx = sameRow ? (bx > ax ? a.x + a.w : a.x) : ax;
-    const sy = sameRow ? ay : by > ay ? a.y + a.h : a.y;
-    const ex = sameRow ? (bx > ax ? b.x : b.x + b.w) : bx;
-    const ey = sameRow ? by : by > ay ? b.y : b.y + b.h;
-    const mx = (sx + ex) / 2, my = (sy + ey) / 2;
-    const cx = sameRow ? mx : mx + (ex - sx === 0 ? 46 : 0), cy = sameRow ? my - 30 : my;
-    arrow = { d: `M${sx} ${sy} Q${cx} ${cy} ${ex} ${ey}`, lx: (sx + 2 * cx + ex) / 4, ly: (sy + 2 * cy + ey) / 4, label: f.arrow.label };
+    const sameRow = Math.abs(a.y - b.y) < 1;
+    if (sameRow) {
+      // Dip below the row, so the label sits in the gap under the boxes
+      // and never covers a region's header or its items.
+      const right = b.x > a.x;
+      const sx = a.x + a.w * (right ? 0.72 : 0.28), ex = b.x + b.w * (right ? 0.28 : 0.72);
+      const sy = a.y + a.h, ey = b.y + b.h, mx = (sx + ex) / 2;
+      arrow = { d: `M${sx} ${sy} C${sx} ${sy + 40} ${ex} ${ey + 40} ${ex} ${ey + 2}`, lx: mx, ly: sy + 30, label: f.arrow.label };
+    } else {
+      const down = b.y > a.y;
+      const sx = a.x + a.w / 2, sy = down ? a.y + a.h : a.y;
+      const ex = b.x + b.w / 2, ey = down ? b.y : b.y + b.h;
+      const mx = (sx + ex) / 2, my = (sy + ey) / 2;
+      arrow = { d: `M${sx} ${sy} C${sx} ${my} ${ex} ${my} ${ex} ${ey}`, lx: mx, ly: my, label: f.arrow.label };
+    }
   }
 
   return (
