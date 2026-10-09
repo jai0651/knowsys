@@ -1,0 +1,1076 @@
+---
+title: Designing Valorant
+dek: "Ana is holding a corner and Leo swings around it. Both pull the trigger within a fraction of a second, and only one of them can win. We'll design the system that decides who hit whom first, from the server's 128-tick loop down to input buffers, rewound hitboxes, delta-compressed snapshots and Riot's own internet backbone, and look at the tradeoffs Riot made along the way."
+readingTime: "~50 min"
+level: "Intermediate"
+versions: "Figures from Riot's technology blog, Valve and Blizzard talks and docs, and AWS case studies, dated where they appear"
+prereqs: "chapter 10 (Linux networking) helps, chapter 26 (time and ordering) helps, the Uber case study (chapter 50) helps"
+updated: "2026-10-09"
+---
+
+Ana is defending a bombsite in a ranked match of Valorant, a five-against-five shooter where each side has one life per round. She's crouched behind a crate, crosshair resting on the edge of a doorway, waiting. Leo, on the attacking team, is on the other side of that doorway. He counts to two, strafes sideways into the opening and fires. On Ana's screen, Leo appears in the doorway and she clicks almost instantly. Her shot lands, her gun kicks, and then her screen goes grey: she's dead. The kill feed says Leo got her first.
+
+Ana is sure she shot first, and from where she sat, she may well have. Leo is sure too. Trouble is, there's no single "where they sat". Ana's computer is in Pune and Leo's is in Delhi, and the game server deciding the round is in a data centre in Mumbai. Every piece of information about what Leo did takes time to reach the server, and more time to reach Ana. So each player is looking at a slightly different, slightly old version of the same room, and each of them is pulling the trigger on that version.
+
+In this case study we'll design the system that settles that shot, the way an engineer would: start with the most obvious design, find exactly where it breaks, and fix it, step by step. The question we'll keep coming back to is this: **when two players shoot at each other a few milliseconds apart, from screens that disagree, how does the game decide who hit whom first, and keep that decision fair?** Along the way we'll go from boxes on a diagram down to a 7.8-millisecond frame budget, numbered input buffers, a history of hitboxes the server can rewind, bit-packed snapshots and the routes packets take across the internet.
+
+<SectionHeading n="01" id="requirements">What we're building, and how big</SectionHeading>
+
+<Sub n="1.1" title="What it has to do">
+
+Strip away the characters and the maps, and the networked core of a shooter like Valorant comes down to a short list:
+
+1. **Put ten players in a match**: pick ten people of similar skill, split them into two teams, and find a game server close to all of them.
+2. **Run the match**: move every player around the map as they press keys and move the mouse, many times a second, and show everyone everyone else.
+3. **Decide every shot**: when someone fires, work out whether the bullet hit, where, and for how much damage.
+4. **Keep it honest**: a modified game client mustn't be able to teleport, fire through walls, or see enemies it shouldn't.
+5. **Record the result**: who won, and how each player's rating should move.
+
+And the qualities it needs while doing that:
+
+- **Responsive**: when you press a key, your character moves at once, with no visible wait for a server.
+- **Fair**: Riot's engineers put this as "competitive integrity", the goal that a match's outcome depends on the players' planning and execution, and not on their internet connection, their computer, Riot's servers or other players' machines.
+- **Consistent**: all ten players must agree on what happened, especially on who died.
+- **Cheap enough to run for free**: the game is free to play, so the servers can't cost much per match.
+
+Compare this list with Uber's in chapter 50. Uber's hard problem was finding the right car among millions; it could afford to take a second or two. Here the population of each match is tiny, ten people, but the time scale is brutal. Gunfights in Valorant are decided by differences of tens of milliseconds, a twentieth of a second, and the internet alone adds that much between any two people. Almost everything in this case study is about time.
+
+</Sub>
+
+<Sub n="1.2" title="How big is it?">
+
+Valorant launched on 2 June 2020. A year later, in June 2021, Riot said the game had more than 14 million players a month and that half a billion matches had been played in that first year. Riot hasn't published newer official totals, so we'll use those.
+
+Inside each match, the numbers get more interesting. Riot's game servers run the match simulation 128 times a second. Each of those steps is called a **tick**: the server reads what every player did, moves everyone, settles any shots, and sends the new state out. 128 ticks a second means one tick every 7.8125 milliseconds. Riot's target for the network was that 70% of players should have a **ping**, the time for a message to reach the server and a reply to come back, of 35 milliseconds or less.
+
+<Think
+  q="Half a billion matches in a year. If an average match lasts about 35 minutes, roughly how many matches are running at any moment, and how many server CPU cores does that take if each core can run three matches?"
+  hint="Turn matches per year into matches per day, then multiply by the fraction of a day each one lasts."
+>
+Half a billion a year is roughly 1.4 million matches a day. Each lasts about 35 minutes, which is 35 / 1,440 of a day, so on average roughly 1.4 million × 35 / 1,440 ≈ 34,000 matches are running at once, with about 340,000 players in them. That 35 minutes is an assumption for the sake of the sum (Riot doesn't publish average match length, and casual modes are shorter), and real traffic probably peaks in each region's evening at two or three times the average.
+
+At three matches per core, 34,000 matches need roughly 11,000 cores, or about 300 servers with 36 cores each. That's not huge by the standards of chapter 50. What makes it hard is the other number: each of those 34,000 matches has to complete a full simulation step 128 times a second, every second, and never be late. That's over four million deadlines a second, each a few milliseconds long. And "three matches per core" isn't a guess, by the way. It's the target Riot set for itself, and section 3 shows what it took to hit it.
+</Think>
+
+</Sub>
+
+<SectionHeading n="02" id="v1">Version 1: let the players' computers decide</SectionHeading>
+
+<Sub n="2.1" title="The obvious design">
+
+The most obvious design has no game server at all. Each of the ten players' computers runs the whole game. When Leo moves, his computer sends "I'm now at this spot" straight to the other nine. When he fires and his computer works out that the bullet hit Ana, it sends "I hit Ana in the head" to everyone, and they all mark her dead. Computers that talk to each other directly like this, with no central server, are called **peers**, and the arrangement is **peer-to-peer**.
+
+<Picture
+  src="/images/designs/valorant/network-topologies.png"
+  alt="Seven network shapes drawn as green dots joined by lines: ring, mesh, star, fully connected, line, tree and bus"
+  caption="Two of these shapes matter here. Peer-to-peer among ten players is the fully connected one: every player talks to every other, 45 links in all. An authoritative server is the star: every player talks only to the hub."
+  credit="Image: Maksim and Malyszkz, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:NetworkTopologies.svg"
+  paper
+/>
+
+It looks attractive. Nobody pays for servers, and each message goes directly from one player to another without a detour through a data centre, which can make it faster.
+
+<SystemDiagram
+  title="Version 1: every player's computer tells the others what happened"
+  nodes={[
+    { id: "leo", label: "Leo's PC", sub: "Delhi", kind: "laptop", col: 0, row: 0 },
+    { id: "ana", label: "Ana's PC", sub: "Pune", kind: "laptop", col: 2, row: 0 },
+    { id: "p3", label: "Player 3's PC", kind: "laptop", col: 0, row: 2 },
+    { id: "p4", label: "Player 4's PC", kind: "laptop", col: 2, row: 2 },
+    { id: "rest", label: "6 more players", kind: "users", col: 1, row: 1 },
+  ]}
+  edges={[
+    { from: "leo", to: "ana", both: true }, { from: "leo", to: "p3", both: true },
+    { from: "leo", to: "p4", both: true }, { from: "ana", to: "p3", both: true },
+    { from: "ana", to: "p4", both: true }, { from: "p3", to: "p4", both: true },
+    { from: "rest", to: "leo", dashed: true, both: true }, { from: "rest", to: "ana", dashed: true, both: true },
+  ]}
+  steps={[
+    { caption: "Leo strafes into the doorway. His PC sends his new position directly to each of the other nine players.", path: ["leo", "ana"] },
+    { caption: "Leo fires. His PC decides by itself that the bullet hit Ana, and tells everyone: \"I hit Ana, 160 damage.\"", path: ["leo", "p4"] },
+    { caption: "Meanwhile Ana's PC, which saw Leo a few milliseconds later, decided that **she** hit **him** first, and tells everyone that.", path: ["ana", "p3"] },
+    { caption: "Now each PC holds two contradicting reports, and there's nobody to settle it. Worse, nothing stops Leo's PC from simply claiming the hit whether it happened or not.", focus: ["leo", "ana", "p3", "p4", "rest"] },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="2.2" title="Where it breaks">
+
+It breaks three ways, and each is fatal on its own.
+
+- **Nobody is in charge.** Ana's computer and Leo's computer each decided the duel on their own copy of the room, and those copies differ, because each learns about the other's movement only after a network delay. With no referee, the game must either pick one story by some rule, or let the players' screens disagree about who's alive. In a game where one death can lose a round, neither is acceptable.
+- **Anyone can lie.** If a player's computer is trusted to say "I hit Ana", then a modified copy of the game can say it whenever it likes, through walls, from across the map. A cheater doesn't even need to aim. Peer-to-peer turns every player's computer into a source of truth, and some of those computers belong to cheaters.
+- **It doesn't scale with the slowest connection.** Each player has to send every update to nine others, so the upload from a home connection is multiplied by nine, and some homes have very little upload. Many home routers also block incoming connections from strangers, so two players often can't reach each other directly at all. And a player on a bad connection degrades the game for all nine others, not just themself.
+
+All three have one fix: put one computer in charge: a **game server** run by Riot, in a data centre, that holds the one true copy of the match. Players send it only what they *did*, their key presses and mouse movements. It works out what *happened* and tells everyone. A server that holds the final say like this is called **authoritative**.
+
+<Decision
+  q="Who decides what happens in the match?"
+  options={[
+    { name: "Peer-to-peer", how: "Players' computers talk directly and each reports its own results.", good: ["No server costs", "No detour through a data centre"], bad: ["No referee when screens disagree", "Any client can claim any result", "Upload grows with the number of players"] },
+    { name: "One player hosts", how: "One player's computer acts as the server for the others.", good: ["No server costs", "One copy of the truth"], bad: ["The host has zero latency, an unfair edge", "The host can cheat freely", "The match dies if the host leaves"] },
+    { name: "Authoritative dedicated server", how: "A server in a data centre runs the match; clients send only inputs.", good: ["One referee nobody controls", "Clients can't invent results", "Each client talks to one place"], bad: ["Someone pays for thousands of servers", "Every action travels to the server and back"], chosen: true },
+  ]}
+>
+Riot built Valorant on authoritative servers from the start. Its 2020 netcode article states the rule plainly: the server never trusts a client's view of the world, and that rule is what limits a cheating client. Its price is the second "bad" item in the chosen box, the round trip, and the rest of this case study is largely about hiding it.
+</Decision>
+
+<Callout label="Design implication">
+Send intentions, not outcomes. A client in an authoritative design says "I pressed W and fired at this angle", never "I'm now at this position" or "I hit Ana". The server can check an intention against the rules of the game; it can't check an outcome it didn't compute.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="03" id="tick">The server's heartbeat: the tick</SectionHeading>
+
+<Sub n="3.1" title="Running the match one tick at a time">
+
+An authoritative server runs the match as a loop. It can't run the simulation continuously, because a computer only does things in steps, so it advances the world in small, fixed slices of time. Each tick, the server does the same five things:
+
+1. **Read inputs**: collect the inputs that have arrived from all ten players since the last tick.
+2. **Simulate**: move every player according to their inputs, and apply physics such as gravity and collisions with walls.
+3. **Settle shots**: for every shot fired, decide what it hit.
+4. **Decide visibility**: work out which players each client is allowed to know about (section 9).
+5. **Send state**: send each client a message describing the new state of the world it's allowed to see.
+
+<Scene
+  title="One tick on the game server, 7.8 ms"
+  regions={[
+    { id: "net", label: "Network in", sub: "inputs arriving", col: 0, row: 0 },
+    { id: "queue", label: "Input queues", sub: "one per player", col: 1, row: 0 },
+    { id: "sim", label: "Simulation", sub: "move, collide, shoot", col: 2, row: 0 },
+    { id: "out", label: "Network out", sub: "state to 10 clients", col: 1, row: 1 },
+    { id: "idle", label: "Idle", sub: "until the next tick", col: 2, row: 1 },
+  ]}
+  itemWidth={118}
+  frames={[
+    { caption: "Between ticks, inputs from players arrive over the network at any moment. Leo's input for his move number 408, \"strafe right, fire\", lands.",
+      items: [
+        { id: "leo", at: "net", label: "Leo #408", sub: "strafe + fire", tone: "new" },
+        { id: "ana", at: "queue", label: "Ana #530", sub: "crouch, aim", tone: "dim" },
+      ], focus: ["net"] },
+    { caption: "Each input waits in its player's queue until the tick begins. On average it waits about half a tick.",
+      change: [{ id: "leo", at: "queue", tone: "accent" }], focus: ["queue"], arrow: { from: "net", to: "queue", label: "enqueue" } },
+    { caption: "The tick starts. The server takes one input per player off the queues and **simulates**: Leo moves 4 cm to the right, Ana stays crouched.",
+      change: [{ id: "leo", at: "sim", tone: "accent" }, { id: "ana", at: "sim", tone: "accent" }], focus: ["sim"], arrow: { from: "queue", to: "sim", label: "take 1 each" } },
+    { caption: "Leo's input included a shot, so the server settles it now (section 7 shows how).",
+      add: [{ id: "shot", at: "sim", label: "shot", sub: "hit or miss?", tone: "dirty" }], focus: ["sim"] },
+    { caption: "The new state of the world is sent to each client, filtered to what that client may see.",
+      remove: ["leo", "ana", "shot"], add: [{ id: "snap", at: "out", label: "state", sub: "tick 9,231", tone: "ok" }], focus: ["out"], arrow: { from: "sim", to: "out", label: "send" } },
+    { caption: "If all that took less than 7.8 ms, the server sleeps until the next tick is due. If it took longer, the next tick starts late, and the whole match slows down a little.",
+      add: [{ id: "z", at: "idle", label: "sleep", sub: "spare time", tone: "dim" }], focus: ["idle"] },
+  ]}
+/>
+
+Fixed steps have a quiet benefit that turns out to be important later. Because both the server and every client advance movement in exactly the same slices, 128 per second, Riot's clients number each slice. Leo's "move 408" means the same 7.8 ms of the match on his machine and on the server. That shared numbering is what lets the two compare notes about what happened in a given move, which section 4 relies on.
+
+</Sub>
+
+<Sub n="3.2" title="Why 128 ticks a second?">
+
+The tick rate is a direct tradeoff between precision and cost. Everything the server learns waits, on average, half a tick before it's acted on, and then a tick to be processed and sent out, so a slower tick adds delay to everything. At 20 ticks a second, a tick is 50 ms; at 64 it's about 16 ms; at 128 it's under 8 ms. Faster ticks also mean that movement and shots are sampled more finely, so less happens "between" two snapshots of the world.
+
+Riot's 2020 article on the choice says the deciding reason was gameplay. Valorant is a game about holding positions: Ana crouched behind her crate is supposed to have the advantage over Leo, who has to walk into her view. If network and tick delays let attackers round a corner and kill a defender before the defender can react, holding a position stops working, and the game's design falls apart. Section 6 shows exactly how tick rate enters that calculation.
+
+<Picture
+  src="/images/designs/valorant/server-racks.jpg"
+  alt="A row of tall black server racks filled with flat rack-mounted servers, their blue status lights glowing"
+  caption="Game servers are ordinary rack-mounted machines like these. A host with 36 cores was Riot's planning unit in 2020: at three matches per core, 108 matches and 1,080 players on one machine."
+  credit="Photo: Victor Grigas, CC BY-SA 3.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Wikimedia_Foundation_Servers-8055_35.jpg"
+/>
+
+<Decision
+  q="How many ticks a second should the server run?"
+  options={[
+    { name: "20–30 Hz", how: "A tick every 33–50 ms, common in large-scale and older shooters.", good: ["Cheap: many matches per core", "Low bandwidth"], bad: ["Adds tens of ms of delay to everything", "Coarse movement and hit sampling"] },
+    { name: "64 Hz", how: "A tick about every 16 ms, the Counter-Strike default.", good: ["A good balance", "Half the CPU cost of 128"], bad: ["About 8 ms more delay than 128 Hz on every hop"] },
+    { name: "128 Hz", how: "A tick every 7.8125 ms.", good: ["Least added delay", "Finest sampling of fast flicks and peeks"], bad: ["Twice the CPU of 64 Hz", "Each frame has a very tight budget"], chosen: true },
+  ]}
+>
+Riot chose 128 Hz for every match, and for free, which left the problem of affording it. Next comes how they did.
+</Decision>
+
+</Sub>
+
+<Sub n="3.3" title="The frame budget">
+
+<Zoom path={["Valorant", "Game server", "One tick", "2.34 ms budget"]} />
+
+A tick that takes the full 7.8 ms uses a whole CPU core for one match. Riot's 2020 article on its 128-tick servers works the budget out like this. To be affordable, a core had to run more than three matches. Three matches in 7.8125 ms gives each about 2.6 ms per tick, and keeping 10% of the core back for the operating system and other software leaves **2.34 ms** for each match's tick. When the team first measured, a server frame took about 50 ms, twenty times over budget.
+
+<Predict
+  q="A match's tick takes 10 ms of work, but ticks are due every 7.8 ms. What do the players see?"
+  options={[
+    "Nothing; the extra 2 ms is absorbed by the network",
+    "The server skips some players' inputs to catch up",
+    "The match runs slower than real time, and everyone's game hitches",
+    "The server automatically drops to 64 ticks and runs fine",
+  ]}
+  answer={2}
+>
+The server can't do 128 ten-millisecond ticks in one second; it does about 100. The simulation falls behind the clock, inputs queue up, and clients see the world stutter and corrections arrive late. Nothing drops to 64 Hz gracefully on its own. That's why the budget is a hard ceiling, and why Riot measured frame times on every server: one slow match per core would also eat time from the other two matches on that core.
+</Predict>
+
+Getting from 50 ms to under 2 ms was a long list of changes, each a lesson in where server time goes. Riot reported these, among others:
+
+| Change | What it fixed | Reported effect |
+|---|---|---|
+| Send events as messages, instead of having the engine scan for changes | Unreal Engine checked every replicated variable every frame against each of the 10 clients' last known value | 100× to 10,000× faster for those variables |
+| Animate characters on only every 4th tick, and blend between saved poses when rewinding | Server-side animation, needed for accurate hitboxes, was one of the biggest costs | Animation cost down 75% |
+| Turn off server animation during the buy phase, when nobody can shoot | Animating players who are shopping | A further 33% off animation over a round |
+| Newer Intel Xeon Scalable CPUs instead of Xeon E5 | Many matches fighting over a shared cache | About 30% faster at similar clock speed |
+| Keep each match's memory on the CPU socket that runs it (`numactl`) | Reading memory attached to the other socket | About 5% |
+| Re-enable hyperthreading after testing | Idle execution units | About 25% |
+
+The final result was under 2 ms per frame, inside the 2.34 ms budget. Notice how mixed the list is: one change is in the game's own code, one in the engine, two in hardware and two in how the operating system places work on the machine. A frame budget this tight makes everything visible. One detail from the same article shows how shared the machine is: one match alone on a host took about 1.5 ms a frame, but with 168 matches running, each took about 5.7 ms, mostly because the matches were evicting each other's data from the CPU's shared cache (chapter 2 covers why that hurts).
+
+<Callout label="Common mistake" kind="warn">
+Measuring a game server alone on an idle machine. A tick that takes 1.5 ms in isolation can take nearly four times longer when a hundred other matches share the caches, memory bandwidth and scheduler. Budget for the loaded machine, the way Riot's load tests did.
+</Callout>
+
+So now we have a referee that's fast enough. But putting it in Mumbai has created a new problem for Ana in Pune and Leo in Delhi. Every key they press has to travel to Mumbai and back before they see its effect.
+
+</Sub>
+
+<SectionHeading n="04" id="prediction">Moving without waiting: client-side prediction</SectionHeading>
+
+<Sub n="4.1" title="Waiting for the server feels terrible">
+
+Leo's ping to Mumbai is roughly 50 ms. With a purely authoritative server, here's what happens when he presses D to strafe right: his computer sends the input, the server applies it on the next tick, sends back his new position, and only then does his screen show him moving. His character starts moving 50 ms or more after he pressed the key, plus a few frames of buffering. Every step, every turn, feels like walking through syrup. Players notice delays far smaller than that.
+
+So stop waiting. Leo's computer runs the same movement code as the server, so when he presses D, it moves his character on screen immediately, assuming the server will agree. This is called **client-side prediction**. It's safe to try because movement is deterministic: given the same starting position and the same keys held for the same 7.8 ms move, the client's code and the server's code compute the same result. Riot describes exactly this: clients predict their own movement locally, and the fixed 128-per-second move size is what makes the client's and server's results comparable, move for move.
+
+</Sub>
+
+<Sub n="4.2" title="When the prediction is wrong">
+
+Usually the prediction matches. Sometimes it doesn't: another player bumped Leo, an ability slowed him, or a packet was lost. The server's answer is authoritative, so the client has to accept it. But it can't jump straight to the position in the server's message, because that message is old. By the time it arrives, Leo has already pressed more keys, and his screen shows where those keys took him.
+
+Gabriel Gambetta's well-known series on client-server game architecture works this out with a small example. Suppose the server is 250 ms away and each key press moves a character one square. The player presses right twice, and the client predicts x = 12. Then the server's reply to the first press arrives, saying x = 11. If the client jumps to 11, the character twitches back a square, and then forward again when the second reply arrives.
+
+A better fix is to number every input and keep a copy of each one until the server confirms it. Each message from the server carries the number of the last input it has processed. When a correction arrives, the client:
+
+1. throws away its saved inputs up to and including that number, because the server has accounted for them;
+2. sets its own position to the server's position;
+3. replays every saved input the server hasn't processed yet, on top of that position.
+
+The result is the server's truth plus Leo's latest key presses. Once those presses arrive, the server will compute the same thing. This is called **server reconciliation**.
+
+<Scene
+  title="Leo's client reconciles with the server"
+  regions={[
+    { id: "pending", label: "Unacknowledged inputs", sub: "kept on Leo's PC", col: 0, row: 0, span: 2 },
+    { id: "screen", label: "Leo's screen", sub: "predicted position", col: 2, row: 0 },
+    { id: "server", label: "Server's message", sub: "authoritative", col: 0, row: 1 },
+    { id: "done", label: "Discarded", sub: "server has them", col: 1, row: 1 },
+    { id: "replay", label: "Replay", sub: "re-simulate", col: 2, row: 1 },
+  ]}
+  itemWidth={108}
+  frames={[
+    { caption: "Leo has sent moves 406, 407 and 408. His client predicted each one at once, so his screen shows him at x = 2.12 m.",
+      items: [
+        { id: "m406", at: "pending", label: "#406", sub: "strafe R" },
+        { id: "m407", at: "pending", label: "#407", sub: "strafe R" },
+        { id: "m408", at: "pending", label: "#408", sub: "strafe R, fire" },
+        { id: "pos", at: "screen", label: "x = 2.12", sub: "predicted", tone: "accent" },
+      ], focus: ["pending", "screen"] },
+    { caption: "A message from the server arrives: \"after your move #406, you're at x = 2.02.\" Leo's client had predicted 2.04 for that move: an ability slowed him slightly.",
+      add: [{ id: "srv", at: "server", label: "#406: 2.02", sub: "authoritative", tone: "new" }], focus: ["server"] },
+    { caption: "Move 406 is now accounted for by the server, so its saved copy is thrown away.",
+      change: [{ id: "m406", at: "done", tone: "dim" }], focus: ["done"] },
+    { caption: "The client resets Leo to the server's position, x = 2.02 after move 406.",
+      change: [{ id: "pos", sub: "reset to server", label: "x = 2.02", tone: "dirty" }], focus: ["screen"], arrow: { from: "server", to: "screen", label: "reset" } },
+    { caption: "Then it replays moves 407 and 408 from there, using the same movement code the server uses.",
+      change: [{ id: "m407", at: "replay", tone: "accent" }, { id: "m408", at: "replay", tone: "accent" }], focus: ["replay"], arrow: { from: "pending", to: "replay", label: "replay" } },
+    { caption: "Leo ends up at x = 2.10, a bit behind where he was drawn. That's what the server will compute too, once 407 and 408 arrive. 407 and 408 stay saved until the server confirms them.",
+      change: [{ id: "pos", label: "x = 2.10", sub: "corrected", tone: "ok" }, { id: "m407", at: "pending", tone: "default" }, { id: "m408", at: "pending", tone: "default" }], focus: ["screen", "pending"] },
+  ]}
+/>
+
+<Zoom path={["Valorant", "Client", "Prediction", "Ring buffer of moves"]} />
+
+Behind this sits a small data structure. The client keeps a **ring buffer**, a fixed-size array used as a queue that wraps around, of its recent moves. Each slot holds a move number, the input (which keys were held, the view angles, whether the fire button was down) and the position the client predicted after it. At 128 moves a second and a 50 ms ping, only roughly seven moves are ever waiting for confirmation, so a buffer of a few hundred slots covers even a terrible connection. Riot's article adds two details. When the server's result differs, only the affected player is corrected, usually by snapping straight to the right position, and the other nine players see that player move smoothly. And the server keeps its own short queue of each player's incoming moves, just long enough to absorb uneven arrival times. If a move hasn't arrived when the server needs it, the server guesses, usually by assuming the player is still holding the same keys as in the last move it received.
+
+<Why>Why does Leo predict his own movement, but not his shots' results?</Why>
+
+Prediction is safe when being wrong is cheap to undo. If Leo's position is off by 2 cm, the client slides or snaps him back and nobody notices. A kill can't be undone: if Leo's client showed Ana dying, played the sound and updated the scoreboard, and the server then disagreed, Ana would come back to life on his screen. So clients predict the cosmetic parts of a shot, the muzzle flash, the recoil, the bullet hole in the wall, but the hit, the damage and the death come only from the server.
+
+<Elsewhere items={[
+  { where: "Quake and QuakeWorld", how: "Client-side prediction for shooters was popularised by id Software's QuakeWorld in 1996, built so that players on dial-up modems could move without waiting for the server." },
+  { where: "Overwatch", how: "Blizzard's 2017 GDC talk describes the same move-numbered prediction and replay, applied not only to movement but to abilities, with the client running slightly ahead of the server." },
+  { where: "Google Docs and collaborative editors", how: "Your keystrokes appear at once and are reconciled with the server's order of edits afterwards, the same predict-then-reconcile shape (chapter 26 covers ordering)." },
+]} />
+
+So Leo's own movement now feels instant. But that only works for Leo's own character, because only Leo's computer knows which keys Leo is pressing. What does Leo's computer show for Ana?
+
+</Sub>
+
+<SectionHeading n="05" id="interpolation">Seeing everyone else: entity interpolation</SectionHeading>
+
+<Sub n="5.1" title="Other players arrive in jumps">
+
+Leo's computer can't predict Ana, because it doesn't know what Ana will do next. All it has is the stream of messages from the server, each describing where Ana was on some tick. Each of these messages is a **snapshot**: the state of the world, or the part of it this client may see, as of one tick.
+
+A naive way to draw Ana is to put her wherever the latest snapshot says. That breaks in two ways. Snapshots arrive in steps, so even at 128 a second, Ana would move in small jerks, and any frame that renders between two snapshots shows her frozen. Worse, the internet doesn't deliver packets at a steady rhythm. Some arrive early, some late, some not at all. The variation in arrival times is called **jitter**, and with it, Ana would stutter, freeze and leap.
+
+Engines fix this by drawing other players slightly in the past. Leo's client holds back the most recent snapshot or so, and draws Ana at a position blended between the last two snapshots it has. If it has Ana at x = 0.70 m on tick 9,230 and at x = 0.74 m on tick 9,231, and the frame being drawn falls halfway between those ticks, Ana is drawn at 0.72 m. Drawing a value between two known samples like this is called **interpolation**, and applied to other players it's **entity interpolation**.
+
+<Picture
+  src="/images/designs/valorant/linear-interpolation.png"
+  alt="Eight red dots at irregular heights joined by straight black line segments"
+  caption="Linear interpolation: the red dots are the snapshots that actually arrived, and the lines are what the client draws between them. Each frame Leo's screen shows a point on a line, so Ana moves smoothly, at the cost of always being drawn a little in the past."
+  credit="Image: Adrichel, CC BY-SA 2.0 DE, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Linear_interpolation.svg"
+  paper
+/>
+
+</Sub>
+
+<Sub n="5.2" title="How far in the past?">
+
+The client has to stay far enough behind that the next snapshot has usually arrived before it's needed. If it stays too close, a late packet leaves it with nothing to interpolate towards, and it must either freeze Ana or guess where she's going, which is called **extrapolation** and is often wrong, since players change direction constantly. If it stays far behind, Ana moves smoothly but is drawn where she was a long time ago.
+
+How long a client deliberately waits before using what arrives is called its **buffer**, and the two engines give very different answers about its size. Valve's Source engine, used by Counter-Strike: Source and Team Fortress 2, interpolates over 100 ms by default, long enough to survive one lost snapshot at its typical update rates. Riot's 2020 article says Valorant targets about one tick of buffered movement on clients, and an average of half a tick on servers. At 128 Hz, one tick is under 8 ms. That's possible only because snapshots come so often; a lost packet costs 7.8 ms of buffer, not 50. Riot also lets players change the client-side buffering, trading smoothness on a bad connection against delay on a good one.
+
+<Callout label="Design implication">
+Every buffer in a real-time system is a choice between smoothness and delay, and the right size depends on how often data arrives and how irregularly. A higher update rate is worth more than its own delay saving, because it also lets every buffer downstream shrink.
+</Callout>
+
+Interpolation fixed the stutter, but it moved a cost somewhere else. Leo now sees Ana where she was a few milliseconds ago, and Ana sees Leo where he was a few milliseconds ago. In a duel at a doorway, those milliseconds are the whole game.
+
+</Sub>
+
+<SectionHeading n="06" id="peekers-advantage">Peeker's advantage</SectionHeading>
+
+<Sub n="6.1" title="Why Leo sees Ana before Ana sees Leo">
+
+Go back to the doorway. Leo strafes into it. Leo's own screen shows his strafe at once, thanks to prediction, and the moment he's in the doorway, Ana is on his screen. She's been sitting still, so the slightly old picture of her is also correct.
+
+Ana's screen is another matter. For Leo to appear on it, his movement has to travel from his PC to the server, wait for a tick, be simulated, be sent to Ana's PC, wait in her interpolation buffer, and be drawn on her next frame. All that time, Ana is staring at an empty doorway that already has Leo in it. The head start this gives the player who moves into view is called **peeker's advantage**, and every online shooter has it. Riot's article calls it out by name as one of the three problems its netcode had to solve.
+
+<SystemDiagram
+  title="How long until Ana sees Leo?"
+  nodes={[
+    { id: "leo", label: "Leo's PC", sub: "sees Ana at once", kind: "laptop", col: 0, row: 0 },
+    { id: "net1", label: "Internet", sub: "Leo → server", kind: "external", col: 1, row: 0 },
+    { id: "srv", label: "Game server", sub: "Mumbai, 128 Hz", kind: "compute", col: 2, row: 0 },
+    { id: "net2", label: "Internet", sub: "server → Ana", kind: "external", col: 2, row: 1 },
+    { id: "ana", label: "Ana's PC", sub: "buffer + next frame", kind: "laptop", col: 1, row: 1 },
+  ]}
+  edges={[
+    { from: "leo", to: "net1" }, { from: "net1", to: "srv" }, { from: "srv", to: "net2" }, { from: "net2", to: "ana" },
+  ]}
+  steps={[
+    { caption: "Leo strafes into the doorway. Ana is already on his screen, because she hasn't moved. From this instant, Leo can react.", focus: ["leo"] },
+    { caption: "His move travels to Mumbai: half of his round trip.", path: ["leo", "net1", "srv"] },
+    { caption: "On the server it waits for the tick to start, gets simulated, and goes out with the next snapshot: about two ticks of buffering in Riot's model.", focus: ["srv"] },
+    { caption: "The snapshot travels to Ana: half of her round trip.", path: ["srv", "net2", "ana"] },
+    { caption: "Ana's client buffers it, interpolates, and draws it on her next frame: about three of her frames in Riot's model. Only now can Ana start to react.", focus: ["ana"] },
+  ]}
+/>
+
+Riot's article puts this into an equation. Leo's head start is the one-way trip from Leo to the server, plus the trip from the server to Ana (if both have the same ping, the two halves add up to one round trip), plus about two ticks of buffering on the server, plus about three frames of buffering and drawing on Ana's computer. Nothing in that sum is about skill.
+
+</Sub>
+
+<Sub n="6.2" title="Putting numbers on it">
+
+This program fills in the sum for a few setups. The server term is two ticks, the client term is three of the holder's frames, and the network term is the round trip:
+
+<TryIt what="Peeker's advantage for different tick rates, frame rates and pings" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+def peekers_advantage(rtt_ms, tick_hz, fps):
+    server = 2 * 1000 / tick_hz   # about two server frames of buffering
+    client = 3 * 1000 / fps       # about three client frames of buffering
+    return rtt_ms + server + client
+
+setups = [
+    # (round trip ms, server tick rate, holder's frame rate)
+    (35, 20, 60),
+    (35, 64, 60),
+    (35, 128, 60),
+    (35, 128, 144),
+    (80, 128, 144),
+]
+for rtt, tick, fps in setups:
+    adv = peekers_advantage(rtt, tick, fps)
+    print(f"{rtt:3} ms ping, {tick:3} Hz server, {fps:3} fps -> peeker's head start {adv:5.1f} ms")
+```
+<Output>
+```
+ 35 ms ping,  20 Hz server,  60 fps -> peeker's head start 185.0 ms
+ 35 ms ping,  64 Hz server,  60 fps -> peeker's head start 116.2 ms
+ 35 ms ping, 128 Hz server,  60 fps -> peeker's head start 100.6 ms
+ 35 ms ping, 128 Hz server, 144 fps -> peeker's head start  71.5 ms
+ 80 ms ping, 128 Hz server, 144 fps -> peeker's head start 116.5 ms
+```
+</Output>
+</TryIt>
+
+Read the lines from top to bottom. Going from 20 to 64 ticks saves almost 70 ms; going on to 128 saves roughly another 16. The third line is the setup Riot's article uses, 128 ticks, 35 ms round trip and 60 frames a second, and it comes to about 101 ms, which Riot reports as about 40 ms (28%) less than its starting baseline of about 141 ms. The fourth line is the same setup with a 144 Hz monitor: about 71 ms, matching Riot's figure of a 49% reduction. And the last line shows that ping still dominates. An 80 ms connection costs as much as all the tick and frame improvements together save.
+
+Now we can settle the opening scene with numbers. Say Ana's reaction time is 180 ms, which is very fast, and Leo's is 220 ms, a bit slower. With a 100 ms head start, Leo's shot leaves at 220 ms after he entered the doorway, while Ana's leaves at 100 + 180 = 280 ms. Leo wins by 60 ms despite being 40 ms slower. From Ana's chair, she reacted faster and lost.
+
+</Sub>
+
+<Sub n="6.3" title="What Riot did about it">
+
+Every term in the sum is something Riot attacked:
+
+| Term | What Riot did (2020) |
+|---|---|
+| Server buffering | 128-tick servers for every match; about half a tick of input buffering on average |
+| Client buffering | About one tick of movement buffering; a setting to change it |
+| Client frames | Optimised the client to run at 60 frames a second on most PCs from the previous decade, and higher on high-refresh monitors |
+| Network | Servers around the world, aiming for 35 ms ping for 70% of players, and Riot Direct, its own network (section 10) |
+
+Riot also measured how much each millisecond matters. Its team put top players into peeking duels across a matrix of tick rates, latencies, frame rates and weapons. The winner of a duel often came down to 20 to 50 ms. Skilled players could detect changes of about 10 ms, and a 10 ms change in peeker's advantage, which seems tiny, could swing a matchup from the holder winning 90% of the time to the peeker winning 90% of the time.
+
+Some of the fixes aren't networking at all. Riot lists game-design levers that give time back to the holder: maps shaped so a peeker's shoulder appears before their head, guns that are inaccurate while moving so a peeker must stop before firing accurately, and **hit tagging**, where being hit by a non-lethal shot briefly slows a player down.
+
+<Picture
+  src="/images/designs/valorant/esports-stage.jpg"
+  alt="An empty esports stage with two rows of desks, gaming chairs and PCs in front of a large red LED wall"
+  caption="The Riot Games Arena in Los Angeles during a 2024 Valorant tournament. At events like this all ten players are wired to a server on the same local network, so the network term in the sum shrinks to almost nothing, and peeker's advantage comes down to ticks and frames alone."
+  credit="Photo: DJTechYT, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Riot_Games_Arena_VCT_Americas_February_2024.jpg"
+/>
+
+So peeker's advantage can be made smaller but never zero; the speed of light sees to that. Which brings us back to the shot itself. Leo fired at Ana's head as drawn on his screen. That picture of Ana was a few milliseconds old, and by the time his shot reaches Mumbai it's older still. Where should the server check whether the bullet hit?
+
+</Sub>
+
+<SectionHeading n="07" id="hit-registration">Who hit whom: rewinding the world</SectionHeading>
+
+<Sub n="7.1" title="The naive check misses shots that should hit">
+
+An obvious way for the server to settle Leo's shot is to take the direction he fired in, trace a line from his gun, and see what it touches in the world as it is *now*, on the server's current tick. That's wrong for any target that moves.
+
+Picture a different duel: this time Ana is the one running across the doorway at 5 m/s, and Leo is holding. Leo's screen shows Ana where she was one interpolation buffer ago. He puts his crosshair on her chest and clicks. His click then takes half his round trip to reach the server. By the time the server checks, Ana has run on, and the line from Leo's gun passes behind her. Leo did everything right on the only screen he has, and the server calls it a miss. Players call this bad **hit registration**, and Riot's article lists it as the second of its three netcode problems.
+
+A better rule is for the server to judge the shot against what the shooter saw. Each shot carries the moment of the match the shooter was looking at, and the server keeps a short history of where every player was, and what pose their body was in, on every recent tick. To check the shot, it temporarily moves every other player back to where they were at that moment, traces the line, and then puts them back. This is called **lag compensation**, or **rewind**. Valve's documentation for the Source engine describes the rule as working out when the command was executed on the shooter's screen: the server's current time, minus the shooter's network delay, minus their interpolation delay. Riot's article describes the same idea: the client sends the time it was viewing when it fired, and the server rewinds to it.
+
+</Sub>
+
+<Sub n="7.2" title="Try it: rewinding a running target">
+
+This program puts Ana's body, 50 cm wide, running across a doorway at 5 m/s; past x = 1.0 m she's behind the wall. Leo's screen shows tick 20, with Ana's centre at 0.78 m, and he fires right at it. The server either checks Ana where she is when the shot arrives, or rewinds her to tick 20, with a limit of 200 ms on how far back it will go:
+
+<TryIt what="Lag compensation: check the target now, or rewind to what the shooter saw" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+TICK = 1 / 128   # seconds per server tick
+SPEED = 5.0      # the target runs across a doorway at 5 m/s
+WALL = 1.0       # past x = 1.0 m the target's body is behind the wall
+HALF = 0.25      # half the width of the target's body, in metres
+
+def target_x(t):
+    return SPEED * t                     # the target starts at x = 0 at t = 0
+
+# the server records where the target was on every tick
+history = {n: target_x(n * TICK) for n in range(256)}
+
+def judge(ping_ms, rewind, max_rewind_ms=200):
+    seen = 20                            # the shooter's screen shows tick 20...
+    aim = history[seen]                  # ...with the target at x = 0.78 m
+    arrives = seen * TICK + TICK + ping_ms / 1000   # one tick of interpolation + the round trip
+    if rewind:
+        back = min(arrives - seen * TICK, max_rewind_ms / 1000)
+        x = history[round((arrives - back) / TICK)]
+    else:
+        x = target_x(arrives)            # where the target is right now
+    hit = abs(aim - x) <= HALF
+    hidden_now = target_x(arrives) - HALF > WALL
+    return hit, x, hidden_now
+
+for ping in (20, 60, 150, 300):
+    for rewind in (False, True):
+        hit, x, hidden_now = judge(ping, rewind)
+        mode = "rewind" if rewind else "no rewind"
+        note = "  but the target is already behind the wall" if hit and hidden_now else ""
+        print(f"ping {ping:3} ms, {mode:9}: target checked at x={x:.2f} m -> {'HIT' if hit else 'miss'}{note}")
+```
+<Output>
+```
+ping  20 ms, no rewind: target checked at x=0.92 m -> HIT
+ping  20 ms, rewind   : target checked at x=0.78 m -> HIT
+ping  60 ms, no rewind: target checked at x=1.12 m -> miss
+ping  60 ms, rewind   : target checked at x=0.78 m -> HIT
+ping 150 ms, no rewind: target checked at x=1.57 m -> miss
+ping 150 ms, rewind   : target checked at x=0.78 m -> HIT  but the target is already behind the wall
+ping 300 ms, no rewind: target checked at x=2.32 m -> miss
+ping 300 ms, rewind   : target checked at x=1.33 m -> miss
+```
+</Output>
+</TryIt>
+
+Read the output from the top. (The program checks only the body's horizontal position, so "hit" means the bullet's line crossed her body.)
+
+- **20 ms, no rewind**: a hit, but only because Ana's body is wide; she had moved 14 cm and the line still crossed her. At low ping, a naive server gets lucky.
+- **60 ms, no rewind**: a miss. Ana has run 34 cm on, and Leo's perfect shot passes behind her. With rewind, the server checks her at 0.78 m, exactly what Leo saw: a hit.
+- **150 ms, rewind**: a hit, but by the time the shot reaches the server, Ana's whole body is already past the wall edge. On Ana's own screen she reached cover, and then died anyway. This is the price of lag compensation, and players know it as "I got shot behind the wall".
+- **300 ms, rewind**: a miss. The shot would need rewinding about 310 ms, the limit is 200 ms, so the server only goes back 200 ms, where Ana was at 1.33 m.
+
+</Sub>
+
+<Sub n="7.3" title="Favour the shooter, within limits">
+
+Lag compensation is a decision about whose screen wins when two screens disagree. With rewind, the shooter's screen wins: if your crosshair was on the target as you saw it, you hit. This is called **favouring the shooter**, and Blizzard's developers described Overwatch's netcode with the same phrase in 2016. Whoever is being shot at pays, who sometimes dies after reaching cover. The higher the shooter's ping, the further back the server rewinds, and the worse it gets for the target.
+
+<Decision
+  q="When the shooter's screen and the server's present disagree, whose view decides the hit?"
+  options={[
+    { name: "The server's present", how: "Trace the shot against the world as it is now; no rewind.", good: ["Nobody is ever shot behind cover", "Cheap: no history needed"], bad: ["You must lead every moving target by your own ping", "High-ping players can barely hit anything"] },
+    { name: "Unlimited rewind", how: "Always rewind to exactly what the shooter saw.", good: ["Every shot that looked right hits"], bad: ["A player on 500 ms can kill you half a second after you took cover", "Rewards bad connections"] },
+    { name: "Rewind, with a cap", how: "Rewind to the shooter's view, but never more than a tuned limit.", good: ["Normal pings get shots that feel right", "Extreme pings can't drag victims out of cover"], bad: ["Very high pings must lead their targets again", "Some behind-the-wall deaths remain"], chosen: true },
+  ]}
+>
+Riot's article says the server limits how far back it will rewind, giving exactly the example in the middle box: without limits, a player with 500 ms latency could kill you half a second after you'd moved behind cover. The limits are tuned per region, to cover the great majority of players there; the exact values are unpublished. For comparison, the Source engine's setting for the same limit, `sv_maxunlag`, defaults to one second.
+</Decision>
+
+<Zoom path={["Valorant", "Game server", "Hit registration", "History buffer"]} />
+
+The data structure is another ring buffer, this time on the server: for each player, one slot per tick for the last few hundred milliseconds, holding their position and the pose of their body, since a crouching or leaning player's head is somewhere else. With 128 ticks a second and a cap of a few hundred milliseconds, that's a few dozen slots per player, ten players per match. Riot's 128-tick article adds the costly part: the hitbox poses come from running character animation on the server. That made animation one of the biggest items in the frame budget, and it's why the team animated only every fourth tick and blended between saved poses when rewinding.
+
+</Sub>
+
+<Sub n="7.4" title="So who hit whom first?">
+
+Now the opening duel, as the server sees it. Leo's shot arrives first, because he started his reaction about 100 ms earlier. The server rewinds Ana to the tick Leo was viewing, finds his line passes through her head, and applies the damage. Ana is dead on the server as of that tick.
+
+Ana's shot arrives a few ticks later. On her screen she had Leo in her sights, and with rewind, her aim would check out. But the server processes events in order, and by the time it reaches her shot, she's already dead in the authoritative state, so her shot does nothing. This is the general rule in authoritative designs: the server's order of processing is the order in which things happened, and a dead player's later input has no effect. (Riot hasn't published how it breaks ties between two shots processed in exactly the same tick.) Ana's client, which played her muzzle flash and maybe a hit sound, gets corrected by the next snapshot: she's dead.
+
+So the answer to "who shot first" is never "whoever clicked first in real time". Nobody can know that, since no single clock watched both clicks. The answer is "whoever's shot the server processed first, judged against what that shooter saw". Everything in sections 3 to 7 is about making that answer agree with what players feel happened.
+
+<Elsewhere items={[
+  { where: "Counter-Strike 2", how: "Valve's 2023 'sub-tick' system timestamps each shot and movement with the exact moment between ticks it happened, so the server's rewind isn't rounded to a 64 Hz tick." },
+  { where: "Fighting games and rollback netcode", how: "GGPO-style rollback goes further: when a late input arrives, both peers rewind the whole game state and re-simulate forward, which works because a fighting game's state is tiny and only two players are involved." },
+  { where: "Databases", how: "Lag compensation is a read at a past snapshot, the same idea as multi-version concurrency control (chapter 19) letting a transaction read the database as of its start time." },
+]} />
+
+The rewind needs the server to know a great deal about each player, and the clients need to hear about it 128 times a second. What exactly is being sent?
+
+</Sub>
+
+<SectionHeading n="08" id="wire">What goes over the wire</SectionHeading>
+
+<Sub n="8.1" title="Inputs up, snapshots down">
+
+Two kinds of message flow between each client and the server. Going up, the client sends its **inputs**: for each move, its number, which buttons were held (forward, back, left, right, jump, crouch, walk, fire, each one bit), the view angles (where the mouse is pointing) and, for shots, the tick the client was viewing. That's a few bytes per move. Going down, the server sends **snapshots**.
+
+Both go over **UDP**, not TCP (chapter 10 covers both). TCP delivers bytes in order and resends anything lost, which sounds right but is fatal here: if one packet is lost, every packet behind it waits until the lost one is resent and arrives, at least one more round trip. For a game, a snapshot that arrives late is useless, because a newer one is already on the way. UDP delivers each packet independently, or not at all, and lets the game decide what to do about losses. The usual answer for inputs is redundancy: each packet carries the newest move plus the last few unacknowledged ones, so one lost packet costs nothing.
+
+</Sub>
+
+<Sub n="8.2" title="Making snapshots small">
+
+<Zoom path={["Valorant", "Network", "Snapshot", "Quantised delta"]} />
+
+Snapshots are the heavy direction, sent to ten clients 128 times a second, so every byte counts. Three tricks shrink them, and real engines use all three:
+
+1. **Quantise.** A position stored as three 32-bit floating-point numbers has far more precision than anyone can see. Positions to the nearest centimetre fit in 16-bit integers on a map a few hundred metres across, and angles in 16 bits are precise to about 0.005°.
+2. **Send only what changed.** Most of a player's fields, their health, armour and weapon, don't change from one tick to the next. Mark the changed fields with a bitmask and send only those. This is called **delta compression**.
+3. **Delta against what the client has confirmed.** The delta must be relative to a snapshot the client confirmed receiving. If the server encoded each snapshot against the previous one and a packet was lost, the client couldn't decode anything after it. So each client tells the server the last snapshot it got, and the server encodes against that one.
+
+This program builds a snapshot of ten players and encodes it three ways. In this tick six players moved and turned and one took damage:
+
+<TryIt what="Snapshot size: raw floats, quantised, and delta against the last acknowledged snapshot" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import random, struct
+random.seed(7)
+
+FIELDS = ["x", "y", "z", "yaw", "pitch", "health", "armor", "weapon", "flags"]
+
+def player():
+    return {"x": random.uniform(-60, 60), "y": random.uniform(-60, 60), "z": 0.0,
+            "yaw": random.uniform(0, 360), "pitch": 0.0,
+            "health": 100, "armor": 50, "weapon": 3, "flags": 0}
+
+def raw(p):        # floats as they sit in memory: 5 x 4 bytes + 4 x 1 byte
+    return struct.pack("<5f4B", p["x"], p["y"], p["z"], p["yaw"], p["pitch"],
+                       p["health"], p["armor"], p["weapon"], p["flags"])
+
+def q(p, f):       # quantize: positions to the centimetre, angles to 1/65536 of a turn
+    if f in ("x", "y", "z"):
+        return struct.pack("<h", round(p[f] * 100))
+    if f in ("yaw", "pitch"):
+        return struct.pack("<H", round(p[f] / 360 * 65536) % 65536)
+    return struct.pack("<B", p[f])
+
+def quantized(p):
+    return b"".join(q(p, f) for f in FIELDS)
+
+def delta(old, new):   # player index + 16-bit mask of changed fields + those fields
+    out = b""
+    for i, (a, b) in enumerate(zip(old, new)):
+        changed = [f for f in FIELDS if q(a, f) != q(b, f)]
+        if changed:
+            mask = sum(1 << FIELDS.index(f) for f in changed)
+            out += struct.pack("<BH", i, mask) + b"".join(q(b, f) for f in changed)
+    return out
+
+acked = [player() for _ in range(10)]          # the last snapshot the client confirmed
+now = [dict(p) for p in acked]
+for p in now[:6]:                               # six players moved and turned this tick
+    p["x"] += 0.05; p["y"] -= 0.03; p["yaw"] += 1.5
+now[7]["health"] = 61                           # one took a hit
+
+full_raw = sum(len(raw(p)) for p in now)
+full_q = sum(len(quantized(p)) for p in now)
+d = len(delta(acked, now))
+for name, size in [("raw floats", full_raw), ("quantized", full_q), ("delta vs acked", d)]:
+    print(f"{name:15} {size:4} bytes/tick  x 128 ticks = {size * 128 / 1000:5.1f} KB/s per client")
+```
+<Output>
+```
+raw floats       240 bytes/tick  x 128 ticks =  30.7 KB/s per client
+quantized        140 bytes/tick  x 128 ticks =  17.9 KB/s per client
+delta vs acked    58 bytes/tick  x 128 ticks =   7.4 KB/s per client
+```
+</Output>
+</TryIt>
+
+Quantising cuts the snapshot from 240 to 140 bytes, and sending only the changes cuts it to 58: for each of the six movers, a one-byte player index, a two-byte field mask and six bytes of x, y and yaw, and for the injured player, the index, the mask and one byte of health. The last column multiplies by 128 snapshots a second, and shows why the three tricks matter at this tick rate. (Real snapshots also carry projectiles, abilities, the spike and sounds, and every UDP packet carries 28 bytes of headers, so real traffic is higher; Riot hasn't published Valorant's.)
+
+Delta compression has one more failure mode. If a client stops acknowledging, because of a long burst of packet loss, the server's deltas grow, since they're relative to an older and older snapshot, until it's cheaper to send a full one.
+
+</Sub>
+
+<Sub n="8.3" title="Push events, don't poll for them">
+
+Riot's biggest single server optimisation, from section 3.3, was about this same problem. Unreal Engine's standard way of keeping clients up to date, **property replication**, is a form of polling: every frame, the server compares each replicated variable against what each of the ten clients last received, to find what changed. Riot's article calls that an anti-pattern for state that rarely changes, and replaced many such variables with **remote procedure calls** (RPCs), messages the server sends explicitly when an event happens, like "the spike was planted". For those variables, that was 100 to 10,000 times faster. It's the same choice as chapter 50's push channel replacing polling, made inside a single process.
+
+<Elsewhere items={[
+  { where: "Quake III Arena", how: "id Software's engine, open-sourced in 2005, delta-compresses every snapshot against the last one the client acknowledged, the design most shooters since have followed." },
+  { where: "Video codecs", how: "H.264 and its successors send occasional full keyframes and then only differences against earlier frames, the same delta-against-a-reference idea, with the same need for a fresh full frame after loss." },
+  { where: "rsync and Git", how: "Both send only the differences against what the other side is known to have, and Git's pack files store objects as deltas against similar ones." },
+]} />
+
+There's one thing the server deliberately leaves out of each snapshot, and it isn't to save bytes.
+
+</Sub>
+
+<SectionHeading n="09" id="fog-of-war">What each player is allowed to know</SectionHeading>
+
+<Sub n="9.1" title="Wallhacks read what the server sent">
+
+Ana's game client draws only the enemies she can see. But if the snapshot it received includes the positions of all five attackers, those positions are sitting in her computer's memory, whether or not they're drawn. A **wallhack** is a cheat that reads them and draws the enemies through walls. Kernel-level anti-cheat software, Riot's is called Vanguard, tries to stop programs reading the game's memory, but any defence on the player's own computer is a defence on territory the cheater controls.
+
+The stronger defence is not to send the information at all. If the server sends Ana only the enemies her character could plausibly see, a wallhack has nothing to show. Riot's anti-cheat lead described Valorant's version of this in April 2020 and named it after a feature of Riot's other big game: **fog of war**. In League of Legends, the server has never told players where unseen enemies are, so wallhacks were never a problem there. Valorant's version is built on Unreal Engine's network relevancy: an enemy who isn't relevant to a client stops getting updates and is hidden on that client until they become relevant again.
+
+<Picture
+  src="/images/designs/valorant/visibility-polygon.png"
+  alt="A white dot inside an irregular room outline; the area visible from the dot is shaded pale yellow and the hidden alcoves are grey"
+  caption="The region visible from one point inside a room with nooks (yellow). Anything in the grey alcoves is hidden behind walls. Fog of war asks this question for every pair of opposing players, every tick: is the enemy inside my visible region, or close to entering it?"
+  credit="Image: Dllu, CC0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Visibility_polygon_for_a_point_in_a_simple_polygon_1.svg"
+  narrow
+/>
+
+</Sub>
+
+<Sub n="9.2" title="Doing it cheaply, and without pop-in">
+
+The first prototype did the obvious thing: for each enemy and each player, once per tick, trace lines of sight from the player's eye, ten rays in all, to the corners of the enemy's bounding box, to their camera and to their centre. It worked, but it was expensive. Relevancy was being calculated over 350 times per frame in a ten-player match, frame times doubled, and the server dropped from 128 to 64 ticks. At first, fog of war took 50% of the frame.
+
+So the team precomputed. The map is divided into cells, and a lookup table, computed offline, records which cells can see which. This is called a **potentially visible set** (PVS), an idea from 1990s game engines. It's deliberately optimistic: if any part of one cell could see any part of another, the pair is marked visible. A visibility check becomes a table lookup. With that and other changes, such as letting a gun inherit the visibility of the player holding it, fog of war came down to under 2% of server frame time, and it also saves bandwidth, since hidden players generate no updates.
+
+Latency is the second problem, again. If the server starts sending Leo's position only when he becomes visible to Ana, the first snapshot that includes him arrives a ping later, and he pops into existence already in the doorway, which is worse than peeker's advantage. So the server looks ahead: it stretches each player's bounding box in the direction they're moving, by their velocity times a look-ahead time chosen to be longer than the expected ping, and tests that stretched box. Leo's position starts reaching Ana's computer just before he rounds the corner. That leaves a wallhack a sliver of warning, which is the compromise.
+
+<Decision
+  q="How much should each client know about the enemies?"
+  options={[
+    { name: "Everything", how: "Send every player's position to everyone; trust client-side anti-cheat.", good: ["Simplest", "No pop-in ever"], bad: ["A wallhack sees all five enemies all the time", "Defence relies on the cheater's own computer"] },
+    { name: "Exact line of sight", how: "Send an enemy only when they're visible right now.", good: ["Wallhacks show almost nothing"], bad: ["Enemies pop in a ping late", "Ray tests every tick are expensive"] },
+    { name: "Precomputed visibility plus look-ahead", how: "PVS lookup on a velocity-stretched box, a bit before visibility.", good: ["Under 2% of frame time", "No pop-in at normal pings", "Wallhacks lose most of the information"], bad: ["A short warning window remains", "Sounds and one-off events need special handling"], chosen: true },
+  ]}
+>
+Riot paired the server-side fog of war with Vanguard on the client: neither alone is enough. The article lists the awkward cases that followed. An enemy hidden by fog misses one-off events sent while hidden, so a player defusing the spike could appear in the wrong pose when they come into view; Riot built a system to restart and fast-forward effects on reappearance. Footstep sounds had to be tied into the fog too, since you can hear enemies you can't see. Riot measures it with telemetry on every fog-of-war query, which once exposed a bug: one agent's ability played a sound on a loop, keeping that agent visible to enemies far longer than it should have.
+</Decision>
+
+<Callout label="Common mistake" kind="warn">
+Treating the client as a display of private data. Anything sent to a client is readable by its owner, however it's drawn and whatever anti-cheat runs beside it. Filter on the server what each client is entitled to know, the same rule as never sending a web browser another user's records and hiding them with CSS.
+</Callout>
+
+Now the server is fast, fair and careful about what it sends. That leaves the biggest term in the peeker's advantage sum, the one the server can't touch: the network between the players and Mumbai.
+
+</Sub>
+
+<SectionHeading n="10" id="network">Getting packets to the server fast</SectionHeading>
+
+<Sub n="10.1" title="Distance sets a floor">
+
+Light in optical fibre travels at roughly two-thirds of its speed in a vacuum, roughly 200,000 km a second, or 200 km per millisecond. A round trip covers the distance twice, so every 100 km between a player and the server adds at least 1 ms of ping, before any router has touched the packet. Leo in Delhi is roughly 1,150 km from Mumbai in a straight line, so his ping can't be below roughly 12 ms even on a perfectly straight fibre, and real fibre doesn't run in straight lines.
+
+<div className="grid gap-4 sm:grid-cols-2">
+
+<Picture
+  src="/images/designs/valorant/optical-fibre.png"
+  alt="A cross-section of an optical fibre: light rays bounce along a core between two cladding layers"
+  caption="Inside a fibre, light bounces down the glass core. Glass slows it to about two-thirds of its speed in a vacuum, and the rule of 1 ms of round trip per 100 km follows from that."
+  credit="Image: Gringer, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Optical-fibre.svg"
+  paper
+/>
+
+<Picture
+  src="/images/designs/valorant/submarine-cables-map.png"
+  alt="A world map with red and blue lines tracing undersea cable routes, dense across the Atlantic and through the Mediterranean to Asia"
+  caption="Submarine cable routes as of 2007. Packets follow cables, not straight lines, so the distance that sets a player's ping is the cable path, which can be much longer."
+  credit="Map: Rarelibra, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:World_map_of_submarine_cables.png"
+/>
+
+</div>
+
+So the first fix is more servers in more places. Riot's 2020 target of 35 ms for 70% of players means a server within a few hundred kilometres of most players, with room left for routers and buffers. Riot added server locations as the player base grew, including Mumbai for India, and Amazon's case study of the launch says Riot used AWS Outposts, Amazon's racks installed in other facilities, to place game servers closer to players, cutting latency by 10 to 20 ms.
+
+</Sub>
+
+<Sub n="10.2" title="The internet takes the cheap route, not the fast one">
+
+Distance is the floor, but the route is often much worse than the floor. The internet is a collection of separate networks, run by internet service providers (ISPs) and long-haul carriers, that agree to carry each other's traffic. Which way a packet goes between them is decided by **BGP**, the Border Gateway Protocol, in which each network announces which destinations it can reach. Networks choose among the routes they hear by business rules, mostly by what's cheapest for them.
+
+Riot described the result in 2015, when it began working on this for League of Legends. Backbone providers and ISPs route traffic to the lowest-cost path, not the lowest-latency one. Its example: traffic from San Francisco to Portland that went via Los Angeles, Denver and Seattle, taking 70 ms instead of the 14 ms a direct route might take, five times longer. Each extra hop is also another router that can drop packets, and game traffic is unusually exposed to that: League of Legends' game messages averaged about 55 bytes, against the 1,500-byte packets most traffic uses, and routers' input buffers fill by packet count, not size, so small game packets fill them about 27 times faster.
+
+</Sub>
+
+<Sub n="10.3" title="Riot Direct: building its own backbone">
+
+Riot's answer, described in 2016, was to run its own network, which it calls **Riot Direct**. It placed routers in large internet hubs, ten of them in the United States at the time, linked them with leased fibre, and then struck agreements to connect directly to as many ISPs as it could. Two networks connecting directly to exchange traffic is called **peering**. Once Riot peers with a player's ISP near the player, the player's packets leave the ISP's network almost immediately and travel the rest of the way on Riot's own network, straight to the game servers, instead of wandering across carriers chosen for cost.
+
+<Picture
+  src="/images/designs/valorant/ix-patch-panel.jpg"
+  alt="Rows of yellow fibre cables plugged into blue connector modules in a rack at an internet exchange"
+  caption="An optical patch panel at AMS-IX, the Amsterdam internet exchange, in 2008. At exchanges like this, networks connect to each other directly. A game company's backbone picks up players' traffic close to home in places like this."
+  credit="Photo: Fabienne Serriere, CC BY-SA 3.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:AMS-IX_optical_patch_panel.jpg"
+/>
+
+<SystemDiagram
+  title="Leo's packets, over the public internet and over Riot Direct"
+  nodes={[
+    { id: "leo", label: "Leo's PC", sub: "Delhi", kind: "laptop", col: 0, row: 1 },
+    { id: "isp", label: "Leo's ISP", sub: "regional router", kind: "external", col: 1, row: 1 },
+    { id: "c1", label: "Carrier A", sub: "cheapest transit", kind: "external", col: 2, row: 0 },
+    { id: "c2", label: "Carrier B", sub: "another detour", kind: "external", col: 3, row: 0 },
+    { id: "rd", label: "Riot Direct", sub: "peering + own fibre", kind: "cdn", col: 2, row: 2 },
+    { id: "gs", label: "Game server", sub: "Mumbai", kind: "compute", col: 3, row: 1 },
+  ]}
+  edges={[
+    { from: "leo", to: "isp" }, { from: "isp", to: "c1", dashed: true }, { from: "c1", to: "c2", dashed: true },
+    { from: "c2", to: "gs", dashed: true }, { from: "isp", to: "rd", label: "peering" }, { from: "rd", to: "gs" },
+  ]}
+  steps={[
+    { caption: "Leo's packet leaves his PC and reaches his ISP's regional router.", path: ["leo", "isp"] },
+    { caption: "Over the public internet, BGP hands it to whichever carrier is cheapest for the ISP, which hands it on again. Every hop adds distance, queueing and a chance of being dropped.", path: ["isp", "c1", "c2", "gs"] },
+    { caption: "With Riot Direct, Riot peers with the ISP's regional router, so the packet crosses onto Riot's network straight away.", path: ["isp", "rd"] },
+    { caption: "Riot's own fibre carries it to the game server with few routers in between, on a path chosen for latency, not price.", path: ["rd", "gs"] },
+  ]}
+/>
+
+Riot reported the effect for League of Legends players in North America. As peering came online over about nine months in 2014 and 2015, the share of players under 80 ms rose from 31% to 50%; when Riot then moved its game servers to Chicago, the share jumped to 80% overnight. By 2016 Riot had network presence on every continent except Africa and Antarctica. Valorant launched on top of that network in 2020, with the 35 ms target.
+
+<Decision
+  q="How should players' packets reach the game servers?"
+  options={[
+    { name: "The public internet", how: "Rent servers and let ISPs and carriers route traffic as BGP decides.", good: ["No network to build or run", "Works everywhere at once"], bad: ["Routes chosen for cost, not latency", "Extra hops drop small UDP packets"] },
+    { name: "A cloud provider's backbone", how: "Bring traffic onto a provider's network at its nearest edge (for example AWS Global Accelerator).", good: ["A latency-oriented backbone without building one", "Quick to add regions"], bad: ["Pays the provider for the traffic", "Peering is the provider's, not tuned for one game"] },
+    { name: "Own backbone and peering (Riot Direct)", how: "Routers at hubs, leased fibre, direct peering with ISPs.", good: ["Routes chosen for game latency", "Fewer routers, less loss"], bad: ["Years of contracts (one took nearly eight months)", "A network team to run it"], chosen: true },
+  ]}
+>
+Riot started building Riot Direct in 2014 for League of Legends, at a time when the alternatives were all public-internet routing. It didn't treat the choice as exclusive later: AWS's case study of Valorant's launch describes game servers on AWS Outposts, and a talk at AWS's 2021 conference describes Riot running AWS Global Accelerator, which carries players' traffic on Amazon's network instead of the public internet, alongside Riot Direct, with both feeding the same game servers.
+</Decision>
+
+<Elsewhere items={[
+  { where: "Content delivery networks", how: "Cloudflare, Akamai and others peer with ISPs at exchanges for the same reason: to pick up traffic close to users and keep it off congested, cost-routed paths (chapter 35)." },
+  { where: "High-frequency trading", how: "Firms paid for straighter fibre and later microwave links between Chicago and New Jersey to shave milliseconds, the same fight against distance and detours." },
+  { where: "Google's and Microsoft's backbones", how: "Large cloud providers carry user traffic on their own fibre from an edge near the user; a cloud provider's accelerator product sells exactly that." },
+]} />
+
+The network gets Ana and Leo to the server quickly, but only if the server they're both on is near both of them. That's the job of the system that put them in the same match in the first place.
+
+</Sub>
+
+<SectionHeading n="11" id="matchmaking">Putting ten players in a match</SectionHeading>
+
+<Sub n="11.1" title="Skill as a number">
+
+Before any of this, someone had to choose Ana, Leo and eight others. A good match needs players of similar skill, on servers close to all of them, found without a long wait. For skill, every competitive game keeps a number per player, and updates it after each match based on whether the result was a surprise.
+
+Arpad Elo's system is the classic one, adopted by chess federations from the 1960s. Each player has a rating, and the difference between two ratings predicts the result: in the usual form, a player rated 400 points above another is expected to win roughly 91% of the time. After the game, each rating moves by a fixed factor K times the difference between what happened and what was expected. A favourite who wins gains a little; an underdog who wins gains a lot.
+
+<Picture
+  src="/images/designs/valorant/elo-expected-score.png"
+  alt="A chart with the rating difference on the horizontal axis, a black curve for the probability the stronger player wins rising from 0.5 to almost 1, and red curves for rating changes"
+  caption="The Elo curves. At a 400-point gap the stronger player is expected to win with probability 0.91. With K = 32, if they win they gain only 3 points; if the weaker player wins, they gain 29. Surprise is what moves ratings."
+  credit="Image: Cmglee, CC BY-SA 3.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Elo_rating_graph.svg"
+  paper
+/>
+
+Elo has two weaknesses for a game like Valorant. It treats every rating as equally certain, though a new player's number is a guess and a veteran's is well established; Mark Glickman's Glicko system (1995) adds an uncertainty to each rating that shrinks as games are played, so new players' ratings move fast and settle later. And Elo rates one player against one, but Valorant is five against five; Microsoft's TrueSkill (2006), built for Xbox Live, rates individuals from team results, keeping both a skill estimate and an uncertainty per player.
+
+</Sub>
+
+<Sub n="11.2" title="Valorant's two numbers">
+
+Riot hasn't published Valorant's rating formula. What it has said, in a March 2021 developer post, is that each player has two numbers. The hidden one is the **matchmaking rating** (MMR), which players never see and which is used to build fair matches. Riot describes it as a giant ladder of all players: win and you climb, pushing others down; lose and you're pushed down. The visible one is the rank, with **rank rating** (RR) points within it, deliberately kept slightly separate from MMR so that ranks don't swing wildly or demote instantly after a promotion. New and reset players are placed at the low end of where the system thinks they belong, and their rank then converges towards their MMR as they play. Glicko and TrueSkill formalise that same shrinking uncertainty.
+
+<Decision
+  q="How long should a player wait for a better match?"
+  options={[
+    { name: "Strict", how: "Only match players within a narrow rating band, on a low-ping server.", good: ["Fair, close matches"], bad: ["Long queues for very high and very low ratings", "Long queues at quiet hours"] },
+    { name: "Loose", how: "Match whoever is waiting.", good: ["Instant matches"], bad: ["Lopsided games", "Ratings learn little from predictable results"] },
+    { name: "Widen over time", how: "Start strict, and relax the rating band (and later the region) the longer a player waits.", good: ["Most players get close matches quickly", "Rare players still get a game"], bad: ["Some matches are worse than ideal", "Tuning per region and hour"], chosen: true },
+  ]}
+>
+Widening the search window as the wait grows is the standard compromise in matchmaking systems generally; the specific rules Valorant uses, and how it trades rating spread against ping, are unpublished. One constraint is certain from everything above: a fair match also has to be fair on the network, so a matchmaker picks a server location that keeps every player's ping low before it worries about the last few rating points.
+</Decision>
+
+<SystemDiagram
+  title="From pressing Play to the first tick"
+  nodes={[
+    { id: "players", label: "Ten players' PCs", sub: "Pune, Delhi, …", kind: "users", col: 0, row: 1 },
+    { id: "mm", label: "Matchmaker", sub: "queue by region + MMR", kind: "service", col: 1, row: 0 },
+    { id: "ratings", label: "Ratings store", sub: "MMR, RR per player", kind: "db", col: 2, row: 0 },
+    { id: "alloc", label: "Server allocator", sub: "picks a host", kind: "registry", col: 1, row: 2 },
+    { id: "gs", label: "Game server", sub: "Mumbai host, 1 of 108 slots", kind: "compute", col: 2, row: 2 },
+  ]}
+  edges={[
+    { from: "players", to: "mm", label: "queue" }, { from: "mm", to: "ratings" }, { from: "mm", to: "alloc" },
+    { from: "alloc", to: "gs" }, { from: "players", to: "gs", label: "UDP", dashed: true },
+  ]}
+  steps={[
+    { caption: "Each player presses Play. Their client measures ping to the server locations in its region and joins the queue.", path: ["players", "mm"] },
+    { caption: "The matchmaker reads hidden MMRs and builds two teams of five with similar total skill, all with low ping to one location, widening its search as people wait.", path: ["mm", "ratings"] },
+    { caption: "It asks for a game server in that location. The allocator picks a host with a free slot; each host runs about a hundred matches.", path: ["mm", "alloc", "gs"] },
+    { caption: "The ten clients connect directly to that server over UDP, and the first tick runs. From here on, sections 3 to 9 take over.", path: ["players", "gs"] },
+    { caption: "When the match ends, the server reports the result, and each player's MMR and RR are updated.", path: ["gs", "alloc", "mm", "ratings"] },
+  ]}
+/>
+
+</Sub>
+
+<SectionHeading n="12" id="whole">The whole system</SectionHeading>
+
+<Sub n="12.1" title="Every box, and why it's there">
+
+<SystemDiagram
+  title="One shot in a Valorant match, end to end"
+  nodes={[
+    { id: "leo", label: "Leo's client", sub: "predicts own moves", kind: "laptop", col: 0, row: 0 },
+    { id: "ana", label: "Ana's client", sub: "interpolates others", kind: "laptop", col: 0, row: 2 },
+    { id: "rd", label: "Riot Direct", sub: "peering + backbone", kind: "cdn", col: 1, row: 1 },
+    { id: "gs", label: "Game server", sub: "128 Hz, authoritative", kind: "compute", col: 2, row: 1 },
+    { id: "hist", label: "Hitbox history", sub: "ring buffer per player", kind: "cache", col: 3, row: 0 },
+    { id: "pvs", label: "Visibility table", sub: "PVS, precomputed", kind: "cache", col: 3, row: 2 },
+    { id: "mm", label: "Matchmaker", sub: "MMR + region", kind: "service", col: 2, row: 0 },
+    { id: "rating", label: "Ratings", kind: "db", col: 2, row: 2 },
+  ]}
+  zones={[{ label: "Inside each 7.8 ms tick", nodes: ["gs", "hist", "pvs"] }]}
+  edges={[
+    { from: "leo", to: "rd" }, { from: "ana", to: "rd" }, { from: "rd", to: "gs", both: true },
+    { from: "gs", to: "hist", label: "rewind" }, { from: "gs", to: "pvs", label: "visible?" },
+    { from: "mm", to: "gs", dashed: true }, { from: "gs", to: "rating", dashed: true },
+  ]}
+  steps={[
+    { caption: "Before the match, the matchmaker placed Ana, Leo and eight others on one Mumbai server with low ping for all of them.", path: ["mm", "gs"] },
+    { caption: "Leo strafes into the doorway. His client moves him at once (prediction) and sends move #408, with the fire button and the tick he was viewing, onto Riot Direct near Delhi.", path: ["leo", "rd", "gs"] },
+    { caption: "On the next tick, the server applies the move and rewinds Ana's hitbox to the tick Leo saw. His line passes through her head: a kill.", path: ["gs", "hist"] },
+    { caption: "Fog of war checks who may see whom. Leo's look-ahead box was already visible to Ana, so she had been receiving his position for a moment.", path: ["gs", "pvs"] },
+    { caption: "The server sends delta-compressed snapshots to all ten clients. Ana's client, a few ticks behind, learns she is dead; her own shot, processed later, does nothing.", path: ["gs", "rd", "ana"] },
+    { caption: "At the end of the match, the result updates everyone's MMR and rank rating.", path: ["gs", "rating"] },
+  ]}
+/>
+
+| Component | What it does | Added because |
+|---|---|---|
+| Authoritative game server | Runs the one true copy of the match | Peers disagree and can lie (§2) |
+| Fixed 128 Hz tick | Advances the match in 7.8 ms steps, numbered alike on client and server | Coarser ticks add delay and imprecision (§3) |
+| Frame budget work | Fits three matches per core in 2.34 ms each | 128 Hz for free must be affordable (§3) |
+| Client-side prediction | Moves your character at once, replays unconfirmed moves | Waiting a round trip to move feels awful (§4) |
+| Entity interpolation | Draws other players between two snapshots, slightly in the past | Snapshots arrive in jumps and with jitter (§5) |
+| Lag compensation | Rewinds hitboxes to what the shooter saw, within a cap | Shots at moving targets would miss (§7) |
+| Delta-compressed snapshots | Quantised fields, changes only, against the last acknowledged snapshot | 128 snapshots a second to every client (§8) |
+| Fog of war | Sends only enemies a player could see soon | Wallhacks read everything sent (§9) |
+| Server placement and Riot Direct | Servers near players; own backbone and peering | Distance and cost-based routing add the biggest delay (§10) |
+| Matchmaker and ratings | Fair teams on a server close to all ten | A fair match needs similar skill and similar ping (§11) |
+
+</Sub>
+
+<Sub n="12.2" title="From top to bottom">
+
+| Level | The choice | Data structure or algorithm |
+|---|---|---|
+| System | One authoritative server per match | Fixed-timestep simulation loop at 128 Hz |
+| Server frame | Three matches per core | 2.34 ms budget; RPC push instead of polling replicated variables |
+| Client movement | Predict, then reconcile | Ring buffer of numbered moves; replay unacknowledged moves on correction |
+| Other players | Draw slightly in the past | Snapshot buffer; linear interpolation between ticks |
+| Hit registration | Favour the shooter, with a cap | Per-player ring buffer of positions and poses; rewind, trace, restore |
+| Network messages | UDP, small and redundant | Bitmask of buttons; quantised fields; delta against the last acknowledged snapshot |
+| Visibility | Send only what could be seen soon | Precomputed cell-to-cell visibility table; velocity-stretched bounding boxes |
+| Routing | Latency over cost | Peering at internet exchanges; own fibre between hubs |
+| Matchmaking | Similar skill, similar ping | Hidden rating with uncertainty (Elo, Glicko, TrueSkill family) |
+
+</Sub>
+
+<SectionHeading n="13" id="breaks">What goes wrong, and what it costs</SectionHeading>
+
+<Sub n="13.1" title="Failures this design has to survive">
+
+| What happens | What the player sees | What the design does |
+|---|---|---|
+| A few packets are lost | Nothing, or a tiny stutter | Inputs are sent redundantly; the interpolation buffer covers a lost snapshot; the server guesses a missing move from the last keys held |
+| A burst of loss | Other players freeze, then jump | Deltas grow against an old acknowledged snapshot; the server falls back to full snapshots |
+| A player's prediction is wrong | A small snap or slide | Server reconciliation resets to the authoritative position and replays pending moves |
+| A server frame runs long | The whole match hitches | Budgets are set for a fully loaded host; frame times are tracked per server |
+| A player on very high ping | Their shots at moving targets miss | The rewind cap stops them dragging others out of cover |
+| Someone runs a wallhack | Enemies appear only just before they come into view | Fog of war withholds positions; Vanguard guards the client |
+| A bad route through the internet | High ping and loss | Riot Direct peering keeps traffic off cost-routed paths |
+
+</Sub>
+
+<Sub n="13.2" title="The tradeoffs, in one table">
+
+| Decision | Chosen | Given up | Why it was worth it |
+|---|---|---|---|
+| Who decides | Authoritative server | Server costs; a round trip on every action | One referee that clients can't lie to |
+| Tick rate | 128 Hz | Twice the CPU of 64 Hz | Less delay and finer sampling, so holding angles works |
+| Own movement | Predicted on the client | Occasional visible corrections | Instant response to every key |
+| Others' movement | Interpolated, about one tick behind | Seeing others slightly in the past | Smooth motion despite jitter |
+| Hit registration | Favour the shooter, capped | Some deaths behind cover | Shots that look right, hit |
+| Snapshots | Quantised deltas over UDP | Complexity; full resends after loss | Small enough for 128 a second |
+| Enemy information | Withheld unless nearly visible | CPU per tick; special cases for sounds and events | Wallhacks have little to show |
+| Network | Own backbone and peering | Years of contracts and a network team | Routes chosen for latency, not price |
+
+</Sub>
+
+<SectionHeading n="14" id="summary">Summary</SectionHeading>
+
+1. **Every player sees a slightly old, slightly different world**, so "who shot first" can't be answered by any player's screen; it needs a referee.
+2. **An authoritative server is that referee**: clients send inputs, never outcomes, so they can't invent hits.
+3. **The server advances the match in fixed ticks**, 128 a second in Valorant, 7.8125 ms each, and fitting three matches per core meant a 2.34 ms budget per tick, reached by work in the engine, the hardware and the OS.
+4. **Client-side prediction makes your own movement instant**, and server reconciliation fixes mistakes by resetting to the server's position and replaying numbered moves the server hasn't seen yet.
+5. **Entity interpolation draws everyone else slightly in the past**, between two snapshots, trading a small delay for smooth motion; a high tick rate lets that buffer shrink to about one tick.
+6. **Peeker's advantage is the sum of the delays** between the peeker seeing the holder and the holder seeing the peeker: about 101 ms at 128 Hz, 35 ms ping and 60 fps, and about 71 ms at 144 fps.
+7. **Lag compensation rewinds hitboxes to what the shooter saw**, which favours the shooter and occasionally kills targets behind cover, so the rewind is capped.
+8. **Snapshots are quantised and delta-compressed against the last acknowledged one**, and sent over UDP, because a late snapshot is worthless.
+9. **Fog of war withholds what a player can't see**, using a precomputed visibility table and a look-ahead box, for under 2% of server time.
+10. **Ping is set by distance and routing**: about 1 ms per 100 km at best, and Riot Direct peers with ISPs to keep traffic off cost-routed paths.
+11. **Matchmaking pairs similar hidden ratings on a server close to all ten players**, using the Elo idea that surprises move ratings, with uncertainty added for new players.
+
+<SectionHeading n="15" id="build">Build this</SectionHeading>
+
+**A tiny authoritative shooter.**
+
+- Write a server in Python that runs a fixed-timestep loop at 64 or 128 Hz, keeps two players' positions, and sends a snapshot to each client every tick over UDP. Clients send numbered inputs (four direction bits and a fire bit).
+- Add an artificial delay and packet loss on the client (sleep before sending, drop a random 5% of packets). First draw your own player only from snapshots and feel the lag; then add prediction with a ring buffer of pending moves and reconciliation.
+- Draw the other player from snapshots directly, then with interpolation one tick behind, and compare at 5% loss.
+- Add shooting: the client sends the tick it was viewing. Have the server keep a 64-slot history of positions and check shots both against the present and with rewind. Try a 200 ms delay and find the case from section 7.2, a hit after the target reached cover. Add a rewind cap.
+- Log the bytes per snapshot, then add quantisation and deltas against the client's last acknowledged snapshot, and compare.
+
+<SectionHeading n="16" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Why do competitive shooters use dedicated authoritative servers instead of peer-to-peer?">
+Two players' computers see slightly different worlds, because each learns about the other only after network delays, so if each computer decides its own shots, they disagree about who died, and there's no referee to settle it. Worse, any client trusted to report outcomes can lie: a modified game can claim hits it never made. An authoritative server runs the one true copy of the match, accepts only inputs from clients, and computes the outcomes itself. The costs are running servers and a round trip on every action, which prediction and interpolation then hide.
+</QA>
+
+<QA level="beginner" q="What is tick rate, and what does going from 64 to 128 Hz buy you?">
+The tick rate is how many times a second the server advances the simulation: read inputs, move everyone, settle shots, send state. At 64 Hz a tick is about 15.6 ms; at 128 Hz it's 7.8 ms. Every input waits on average half a tick before being processed and another tick before going out, so halving the tick removes several milliseconds of delay from every hop, and samples fast movement and flicks more finely. It also doubles the CPU per match; Valorant budgets 2.34 ms per tick to fit three matches per core.
+</QA>
+
+<QA level="intermediate" q="Explain client-side prediction and server reconciliation.">
+The client runs the same deterministic movement code as the server, so it applies each input immediately instead of waiting for the server. Each input carries a sequence number and is kept in a buffer until the server acknowledges it. Each server update says "after your input N, you're here". The client discards inputs up to N, resets to the server's position, and replays the inputs after N. If the prediction was right, nothing visible happens; if it was wrong, the player is corrected by a small snap or slide, and only that player sees it.
+</QA>
+
+<QA level="intermediate" q="What is peeker's advantage, and how would you reduce it?">
+The player who moves into view sees the stationary player immediately, while the stationary player only sees them after the peeker's movement reaches the server, waits for a tick, is sent out, and passes through the holder's buffering and rendering. Riot models it as round-trip network delay plus about two server ticks plus about three client frames: about 101 ms at 35 ms ping, 128 Hz and 60 fps. Reduce each term: servers closer to players and better routing, a higher tick rate, minimal buffering, higher client frame rates. Game design can give time back too: inaccuracy while moving, and slowing players who are hit.
+</QA>
+
+<QA level="deep" q="How does lag compensation work, and what does 'favour the shooter' cost?">
+The server keeps a short history of every player's position and pose per tick. Each shot carries the tick the shooter was viewing; the server rewinds all other players to that tick, traces the shot, then restores them. The shooter hits whatever was under their crosshair on their screen. The cost falls on the target: a target with low ping can reach cover on their screen and still be killed by a shot judged in the past, and the effect grows with the shooter's ping. So the rewind is capped, tuned per region, and players beyond the cap must lead their targets again.
+</QA>
+
+<QA level="deep" q="How would you stop wallhacks without trusting the client?">
+Don't send the information. The server decides, per pair of opposing players, whether one could see the other soon, and omits hidden enemies from that client's snapshots. Exact ray tests every tick are too expensive at 128 Hz, so precompute a cell-to-cell visibility table for the map and test a bounding box stretched by velocity times a look-ahead longer than the ping, so enemies don't pop in late. Handle the side effects: events missed while hidden must be replayed when a player reappears, and sounds must respect the same rules. Valorant's version costs under 2% of server frame time.
+</QA>
+
+<SectionHeading n="17" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Leo's ping doubles from 35 ms to 70 ms. Roughly how much does Ana's disadvantage at the doorway grow?">
+    About 35 ms, one-for-one with the extra round trip, since the network term in
+    peeker's advantage is the round trip itself. At 128 Hz and 60 fps the head
+    start goes from about 101 ms to about 136 ms, more than the whole saving from
+    moving from 64 to 128 ticks.
+  </Q>
+  <Q q="Why must snapshots be delta-compressed against the last acknowledged snapshot, not the previous one sent?">
+    Because packets are lost. If snapshot 101 is encoded against 100 and 100 never
+    arrived, the client can't decode 101 or anything after it. Encoding against a
+    snapshot the client has confirmed means every delta can be decoded on arrival.
+  </Q>
+  <Q q="With lag compensation, a target dies after reaching cover. Whose ping makes this more likely?">
+    Mostly the shooter's: the server rewinds by the shooter's delay, so the longer
+    it is, the further the target has moved since the moment being judged. That's
+    why the rewind is capped.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Peeking into VALORANT's Netcode (Riot Tech Blog, July 2020)">
+    Peeker's advantage as an equation, the buffering model, Riot's playtests, the
+    fixed 128 Hz move steps, prediction, reconciliation and capped rewind.
+  </WildCard>
+  <WildCard name="VALORANT's 128-Tick Servers (Riot Tech Blog, August 2020)">
+    The 2.34 ms frame budget and the long list of engine, hardware and OS work that
+    took a server frame from 50 ms to under 2 ms.
+  </WildCard>
+  <WildCard name="Demolishing Wallhacks with VALORANT's Fog of War (Riot Tech Blog, April 2020)">
+    Server-side visibility, the expensive ray-cast prototype, precomputed
+    visibility and the look-ahead box.
+  </WildCard>
+  <WildCard name="Fixing the Internet for Real-Time Applications, Parts I–III (Riot Tech Blog, 2015–2016)">
+    Why BGP routes cost-first, and how Riot Direct's peering and backbone were
+    built and what they changed for players' ping.
+  </WildCard>
+  <WildCard name="Gabriel Gambetta, Fast-Paced Multiplayer (gabrielgambetta.com)">
+    Client-server architecture, prediction and reconciliation, entity interpolation
+    and lag compensation, with a live demo you can play with.
+  </WildCard>
+  <WildCard name="Source Multiplayer Networking (Valve Developer Community)">
+    Ticks, snapshots, interpolation and lag compensation as implemented in the
+    Source engine, with the formula for the time a command is judged at.
+  </WildCard>
+  <WildCard name="Timothy Ford, 'Overwatch Gameplay Architecture and Netcode' (GDC 2017)">
+    How Overwatch structures its simulation, predicts abilities, and keeps the
+    client running just ahead of the server.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="18" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Designing Uber">
+    Another real-time system, where freshness beats exactness for locations and
+    the reverse holds for trips. [Chapter 50](/topics/50-design-uber).
+  </WildCard>
+  <WildCard name="Linux Networking">
+    UDP and TCP, sockets and the kernel's packet path under every snapshot.
+    [Chapter 10](/topics/10-linux-networking).
+  </WildCard>
+  <WildCard name="Time & Ordering">
+    Why no single clock can say whose click came first, and how systems order
+    events instead. [Chapter 26](/topics/26-time-and-ordering).
+  </WildCard>
+  <WildCard name="Memory Hierarchy">
+    Why a hundred matches sharing a CPU's cache slow each other down.
+    [Chapter 2](/topics/02-memory-hierarchy).
+  </WildCard>
+  <WildCard name="DNS, TLS & the Edge">
+    Peering, edges and getting traffic close to users.
+    [Chapter 35](/topics/35-dns-tls-edge).
+  </WildCard>
+</CardGrid>

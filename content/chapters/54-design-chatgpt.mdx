@@ -1,0 +1,1081 @@
+---
+title: Designing ChatGPT
+dek: "Arjun types a question for tomorrow's science class and presses Enter, and words start appearing a moment later. We'll design the serving system behind that reply, from tokens and GPU memory arithmetic down to continuous batching, paged KV-cache block tables, prefix caching, split prefill and decode fleets, speculative decoding, token-based rate limits and conversation storage."
+readingTime: "~55 min"
+level: "Intermediate"
+versions: "Figures from OpenAI's posts, docs and incident reports, the Orca, vLLM, SGLang, Sarathi-Serve, DistServe, Splitwise and speculative decoding papers, and NVIDIA's H100 datasheet, dated where they appear"
+prereqs: "chapter 45 (GPUs) helps a lot, chapter 04 (virtual memory) for the paging idea, the Uber case study (chapter 50) for the case-study format"
+updated: "2026-10-09"
+---
+
+It's late evening in Jaipur, and Arjun is planning tomorrow's science lesson for his class of ten-year-olds. He opens ChatGPT and types: *Why is the sky blue? Explain it to a ten-year-old.* He presses Enter. Less than a second later the first words appear, "Great question! Sunlight looks white, but", and the rest of the answer follows a few words at a time, about as fast as he can read it. When it's done he types a follow-up, *Now make it shorter*, and a tighter version streams in.
+
+From Arjun's side this looks like a web form talking to a very clever server. Underneath, it's a very expensive request path. Each answer is made one small piece at a time, and every piece requires the model to read all of its billions of learned numbers out of GPU memory. Arjun's conversation also has to keep a growing scratchpad on the GPU for as long as it's being answered, so the scarce resource turns out to be gigabytes of memory more than arithmetic. And Arjun isn't alone: in July 2025 ChatGPT was handling about 2.5 billion messages a day.
+
+In this case study we'll design the system that answers Arjun, starting from the most obvious design, finding exactly where it breaks, and fixing it, the way an engineer would. **When Arjun presses Enter, how does a fleet of GPUs turn his question into a stream of words within a second, for hundreds of millions of people, without running out of memory or money?** One caveat up front: OpenAI has published very little about how ChatGPT's inference fleet works inside. What it has published (product docs, API behaviour, incident reports, a database post) we'll use, dated. For the serving engine itself we'll design from the open systems and papers that the whole industry builds on (Orca, vLLM, SGLang, DistServe, Splitwise), and say so wherever OpenAI's own choice is unpublished.
+
+<SectionHeading n="01" id="requirements">What we're building, and how big</SectionHeading>
+
+<Sub n="1.1" title="What it has to do">
+
+Strip away images, voice, search and the rest, and the core of a chat product is a short list:
+
+1. **Accept a message** in a conversation, from an app or a browser.
+2. **Generate a reply** with a large language model, using everything said so far in that conversation.
+3. **Show the reply as it's written**, word by word, and let the user stop it halfway.
+4. **Keep the conversation**, so Arjun can come back to it tomorrow, edit a message, or ask a follow-up.
+5. **Share the hardware fairly**, so one heavy user or one runaway script can't starve everyone else.
+
+And the qualities it needs:
+
+- **Fast to start**: the first words should appear within about a second. A model writes in small pieces of text called tokens (section 2 shows exactly what they are), so the wait from pressing Enter to the first piece is called **time to first token (TTFT)**.
+- **Smooth while streaming**: once words are flowing, each new piece should follow quickly enough that reading never stalls. That gap is called **time per output token (TPOT)**.
+- **Affordable**: in the Splitwise paper's 2023 cost table, one 8-GPU H100 machine rents for about $38 an hour, so the fleet has to squeeze as many answers out of each GPU as it can.
+- **Private and correct**: Arjun's conversation must never show up in someone else's account, and must never be lost.
+
+Uber's hard problem was finding nearby things in space. This one's is a resource: the GPU is very fast at arithmetic but short of memory, and most of this case study is about using it well.
+
+</Sub>
+
+<Sub n="1.2" title="How big is it?">
+
+OpenAI's own research gives the scale. A study by OpenAI's economic research team, published through NBER in September 2025, reports that by July 2025 ChatGPT had about 700 million weekly users sending 18 billion messages a week, more than 2.5 billion a day, or roughly 29,000 messages a second on average. In February 2026 OpenAI announced 900 million weekly active users.
+
+The unit that matters for the hardware, though, is the token. How many tokens a ChatGPT message involves isn't published. Probably the best public stand-in is a trace that Microsoft released from its Azure LLM inference services, captured in November 2023 and analysed in the Splitwise paper (ISCA 2024): for the conversation service, the median request had 1,020 prompt tokens going in and 129 tokens coming out.
+
+<Think
+  q="Suppose every one of ChatGPT's 29,000 messages a second looked like that median Azure request. How many tokens a second does the fleet read, and how many does it write?"
+  hint="Multiply, once for the prompt and once for the output. Then ask which of the two the model can do in parallel."
+>
+Output: 29,000 × 129 ≈ 3.7 million tokens a second, all day. Input: 29,000 × 1,020, roughly 30 million tokens a second.
+
+Azure's trace isn't ChatGPT, and reasoning models write far longer answers than 129 tokens, so treat these as an order of magnitude. Even so, they tell us where the work is. Input tokens are ten times more numerous, but as section 3 will show, the model can process a prompt's tokens all at once. Output tokens have to be produced one after another, each one waiting for the last, and that one-at-a-time loop is what sets the shape of the whole design.
+</Think>
+
+</Sub>
+
+<SectionHeading n="02" id="tokens">What the model does with a message</SectionHeading>
+
+<Sub n="2.1" title="Text becomes tokens">
+
+A language model doesn't read letters or words. It reads numbers, each standing for a piece of text from a fixed vocabulary of about two hundred thousand pieces: common words, parts of words, punctuation, spaces glued to the word after them. Those pieces are the **tokens**, and the program that cuts text into them is a **tokenizer**. OpenAI publishes its tokenizers in an open-source library called `tiktoken`. This program cuts Arjun's question with `o200k_base`, the encoding `tiktoken` uses for GPT-4o and GPT-5 (install it with `pip install tiktoken`; the first run downloads the vocabulary):
+
+<TryIt what="Cut Arjun's question into tokens" lang="python" toolchain="Python 3.14, tiktoken 0.14.0">
+```python
+import tiktoken
+
+enc = tiktoken.get_encoding("o200k_base")   # what tiktoken uses for GPT-4o and GPT-5
+msg = "Why is the sky blue? Explain it to a ten-year-old."
+
+ids = enc.encode(msg)
+print(f"{len(msg)} characters -> {len(ids)} tokens")
+print(ids)
+print([enc.decode([i]) for i in ids])
+print(f"vocabulary size: {enc.n_vocab:,}")
+```
+<Output>
+```
+50 characters -> 14 tokens
+[13903, 382, 290, 17307, 9861, 30, 115474, 480, 316, 261, 4325, 8204, 12324, 13]
+['Why', ' is', ' the', ' sky', ' blue', '?', ' Explain', ' it', ' to', ' a', ' ten', '-year', '-old', '.']
+vocabulary size: 200,019
+```
+</Output>
+</TryIt>
+
+Fifty characters became 14 tokens, roughly 3.6 characters each. Notice that most tokens carry their leading space (`' sky'`), and that "ten-year-old" was cut into three pieces. Every cost in this chapter, from GPU memory to rate limits to the price of an API call, is counted in these units.
+
+</Sub>
+
+<Sub n="2.2" title="One token at a time">
+
+Given a list of tokens, the model does one thing: it computes, for every token in its vocabulary, how likely that token is to come next. One run of the model over its input is called a **forward pass**. Inside, the tokens' numbers flow up through a stack of identical **layers**, dozens of them. Each layer has an **attention** step, where every token looks back at the tokens before it to pick up context, and a feed-forward step that transforms each token on its own. Both steps are mostly matrix multiplications against the model's learned numbers, its **weights**.
+
+<Picture
+  src="/images/designs/chatgpt/gpt-architecture.svg"
+  alt="A diagram of a GPT model: input embedding, a stack of transformer blocks, then a linear layer and softmax; one block expanded on the right shows attention heads with matmul, mask and softmax, then a feed-forward part with two linear layers"
+  caption="A GPT-style model. Tokens enter at the bottom, pass through L identical transformer blocks, and come out as a probability for every possible next token (the softmax at the top). The expanded block shows the attention heads, each doing matrix multiplies against learned weights, and the feed-forward part. Every box marked Linear is a big weight matrix that has to be read for each token."
+  credit="Image: Marxav, vectorised by Mrmw, CC0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Full_GPT_architecture.svg"
+  paper
+  narrow
+/>
+
+To write an answer, the system runs a forward pass on Arjun's 14 tokens (plus whatever instructions come before them), picks one likely next token, say `Great`, appends it, and runs the model again on the longer list to get the next one. This is called **autoregressive** generation: each output token becomes part of the input for the next. Arjun's answer of a few hundred tokens means a few hundred forward passes, one after another, and none of them can start until the one before has finished.
+
+<Why>Why can't the model write the whole answer at once?</Why>
+
+Because token 40 of the answer depends on which token 39 turned out to be. The model only produces a probability for the *next* token, and the system has to choose one before it can ask about the token after. There's no way to compute the fifth word of a sentence before deciding the fourth, so generation is a loop, and its speed is the time of one trip around it.
+
+</Sub>
+
+<Sub n="2.3" title="The KV cache">
+
+Look inside the attention step again. To process token 40, every layer compares it with a **key** vector for each of tokens 1 to 39, and blends their **value** vectors. A key and a value are lists of numbers that each layer computes from each token. They depend only on the token and the tokens before it, so once computed they never change.
+
+A naive loop would recompute keys and values for all 39 earlier tokens at every step, which makes a 500-token answer cost roughly 500²/2 token-computations instead of 500. So every serving system keeps them: after computing a token's keys and values in every layer, it stores them in GPU memory and reuses them on every later step. That store is the **KV cache**. It makes each later step cheap in arithmetic, at the price of memory that grows with every token of the conversation. Section 6 will show that this memory, more than anything else, decides how many people one GPU can serve.
+
+</Sub>
+
+<SectionHeading n="03" id="v1">Version 1: one GPU, one conversation at a time</SectionHeading>
+
+<Sub n="3.1" title="The obvious design">
+
+Here's the simplest design that works: an API server receives Arjun's message, looks up his earlier messages in a database, builds the prompt, and hands it to a GPU server holding the model. It runs the loop until the model emits a special end-of-answer token, then returns the whole answer, which the API server saves and sends back to Arjun. One request at a time per GPU server, and a queue in front for everyone else.
+
+<SystemDiagram
+  title="Version 1: one model server, one request at a time"
+  nodes={[
+    { id: "arjun", label: "Arjun's browser", kind: "laptop", col: 0, row: 0 },
+    { id: "api", label: "API server", kind: "service", col: 1, row: 0 },
+    { id: "db", label: "Conversations", sub: "database", kind: "db", col: 1, row: 1 },
+    { id: "q", label: "Request queue", kind: "queue", col: 2, row: 0 },
+    { id: "gpu", label: "Model server", sub: "2 × H100, one request", kind: "compute", col: 3, row: 0 },
+  ]}
+  edges={[
+    { from: "arjun", to: "api", label: "message" }, { from: "api", to: "db" },
+    { from: "api", to: "q" }, { from: "q", to: "gpu" },
+  ]}
+  steps={[
+    { caption: "Arjun presses Enter. The API server loads his conversation so far and builds the prompt: instructions, earlier turns, his new message.", path: ["arjun", "api", "db"] },
+    { caption: "The prompt waits in the queue until the model server is free.", path: ["api", "q"] },
+    { caption: "The model server runs the whole generation loop, a few hundred forward passes, while every other request waits.", path: ["q", "gpu"] },
+    { caption: "Only when the answer is complete does it travel back to Arjun, who has been staring at a spinner the whole time.", path: ["gpu", "q", "api", "arjun"] },
+  ]}
+  caption="Correct, and wrong in two ways: Arjun sees nothing until the last token is written, and the GPU spends almost all of its time waiting."
+/>
+
+To see how badly this does, we need numbers. OpenAI doesn't publish the sizes of its ChatGPT models, so we'll do the arithmetic on a published model of the same class, Meta's Llama 3 70B: 80 layers and about 70 billion weights. At 2 bytes per weight that's 140 GB, which doesn't fit in one 80 GB NVIDIA H100, so it runs on two. Chapter 45 works through this model on this hardware in detail; here we'll take its numbers and see what they mean for a chat service.
+
+</Sub>
+
+<Sub n="3.2" title="Prefill and decode are different kinds of work">
+
+Arjun's request runs in two phases, and they behave very differently on a GPU.
+
+Arjun's first forward pass processes the whole prompt. All of its tokens are known already, so the model can push them through every layer together: one weight matrix, read once from memory, multiplied against a thousand tokens' worth of numbers at once. This phase is called **prefill**, and it produces the first output token plus the KV cache for every prompt token.
+
+Every pass after that processes exactly one new token, and this phase is called **decode**. Each weight is still read from memory, but now it's used for only one multiply and one add. Here is the arithmetic for both, taking Arjun's prompt as 1,000 tokens once the hidden instructions and history are counted, on two H100s (989 trillion floating-point operations, or FLOPs, a second of dense 16-bit math each, and 3.35 TB/s of memory bandwidth each, per NVIDIA's datasheet):
+
+<Estimate
+  rows={[
+    { label: "Prefill: arithmetic", math: "2 × 70 × 10⁹ weights × 1,000 tokens", value: "140 TFLOP" },
+    { label: "Prefill: time at peak compute", math: "140 TFLOP / (2 × 989 TFLOP/s)", value: "≈ 71 ms" },
+    { label: "Prefill: time to read the weights once", math: "140 GB / (2 × 3.35 TB/s)", value: "≈ 21 ms" },
+    { label: "Decode: arithmetic per token", math: "2 × 70 × 10⁹", value: "140 GFLOP" },
+    { label: "Decode: time at peak compute", math: "140 GFLOP / 1,978 TFLOP/s", value: "≈ 0.07 ms" },
+    { label: "Decode: time to read the weights", math: "140 GB / 6.7 TB/s", value: "≈ 21 ms" },
+  ]}
+  result={{ label: "one token at batch 1, so about 48 tokens a second", value: "≈ 21 ms" }}
+/>
+
+Prefill does about 1,000 operations for every byte it reads, so its time is set by arithmetic: it's **compute-bound**. Decode does about one operation per byte, so it spends 21 ms waiting for memory to deliver weights and 0.07 ms using them: it's **memory-bandwidth-bound**, and the GPU's arithmetic units sit idle roughly 99.7% of the time. Chapter 45's roofline section explains why the crossover between the two is near 300 operations per byte on an H100.
+
+<Picture
+  src="/images/designs/chatgpt/hbm-schematic.svg"
+  alt="A cross-section of a GPU package: the GPU die beside a stack of DRAM dies on a silicon interposer, connected by 1024 data links per stack"
+  caption="High Bandwidth Memory (HBM): stacks of DRAM dies sitting right beside the GPU on a silicon interposer, with a very wide connection between them. This is where the weights and the KV cache live, and its bandwidth sets the speed of decode. (The drawing shows a generic graphics GPU; data-centre GPUs like the H100 use the same packaging with more stacks.)"
+  credit="Image: ScotXW, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:High_Bandwidth_Memory_schematic.svg"
+  paper
+/>
+
+<Predict
+  q="NVIDIA ships a new GPU with twice the arithmetic and the same memory bandwidth. Roughly how much faster does one conversation's decode get, at batch 1?"
+  options={["About twice as fast", "About 40% faster", "Hardly faster at all", "Slower, because the chip runs hotter"]}
+  answer={2}
+>
+Hardly faster. Decode at batch 1 spends about 21 ms reading weights and 0.07 ms on arithmetic, so halving the arithmetic saves 0.035 ms out of 21. Only more bandwidth, fewer bytes of weights (smaller numbers, chapter 45's FP8), or more tokens per read of the weights helps. Prefill, by contrast, would get almost twice as fast.
+</Predict>
+
+Arjun's answer of about 300 tokens therefore takes 71 ms of prefill and then about 300 × 21 ms ≈ 6.3 seconds of decode, and version 1 shows him nothing for all of it. Meanwhile the hardware he's using is doing useful arithmetic well under 1% of the time. Those are the two problems to fix, and the first is the easier one.
+
+</Sub>
+
+<SectionHeading n="04" id="streaming">Streaming the answer as it's written</SectionHeading>
+
+<Sub n="4.1" title="Send each token as soon as it exists">
+
+Streaming doesn't make the answer any faster, but it feels completely different. Arjun's first token exists after 71 ms of prefill. If we send it to Arjun right away, and every later token the moment it's decoded, he starts reading within a fraction of a second, and at about 48 tokens a second the text arrives faster than he reads. So the user-facing latency becomes TTFT, and TPOT only has to beat reading speed.
+
+Over HTTP, the usual way to do this is **server-sent events (SSE)**: the client makes one ordinary HTTP request, and the server keeps the response open, writing a small text event each time it has something new. OpenAI's API documents exactly this for its streaming mode: with `stream=true`, the response arrives as server-sent events, starting with `response.created`, then a stream of `response.output_text.delta` events, each carrying a few characters, then `response.completed`. On the wire, each event is a couple of plain text lines followed by a blank line:
+
+```
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Great question!"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":" Sunlight looks white"}
+```
+
+<StepSequence
+  title="One streamed reply, from Enter to the last word"
+  actors={["Arjun's browser", "API gateway", "Model server"]}
+  messages={[
+    { from: 0, to: 1, label: "POST, stream=true", note: "One HTTP request. The gateway checks Arjun's account and limits, then keeps the connection open." },
+    { from: 1, to: 2, label: "prompt tokens", note: "Prefill runs: the whole prompt in one pass, about 71 ms in our arithmetic." },
+    { from: 2, to: 1, label: "token 1", note: "The first token exists. Time to first token ends here." },
+    { from: 1, to: 0, label: "delta: \"Great question!\"", note: "The gateway turns token ids back into text and writes one SSE event." },
+    { from: 2, to: 1, label: "token 2, 3, …", note: "Each decode step, about 21 ms apart at batch 1, produces one more token." },
+    { from: 1, to: 0, label: "delta, delta, …", note: "Arjun reads while the model is still writing." },
+    { from: 1, to: 0, label: "response.completed", note: "End of answer. The full text is saved to the conversation." },
+  ]}
+/>
+
+SSE suits this job because it's plain HTTP, so proxies and load balancers already handle it, and one-way, enough for an answer; the next message is a new request. The gateway also turns token ids back into text before sending, holding back any token that ends partway through a multi-byte character.
+
+</Sub>
+
+<Sub n="4.2" title="Stop generating, and cancellations">
+
+Streaming adds a button: Stop generating. If Arjun sees that the answer is going the wrong way and presses it, the browser closes the stream. That close has to travel all the way to the model server and free Arjun's place there, or the GPU will keep decoding a few hundred tokens nobody will read. So every layer in the path has to handle cancellation as an everyday event.
+
+Cancellation is also where a subtle class of bugs lives. On 20 March 2023, ChatGPT went offline after some users saw the titles of other users' conversations. OpenAI's write-up traced it to its Redis cache client, `redis-py`, used with Python's asyncio. If a request was cancelled after it had been sent to Redis but before its reply was read, the connection went back into the shared pool with that reply still in it, and the *next* request on that connection, belonging to someone else, received it. A server change that morning had sharply increased cancellations. That bug also exposed payment details of 1.2% of ChatGPT Plus subscribers active during a nine-hour window.
+
+<Callout label="Common mistake" kind="warn">
+Treating cancellation as rare. In a streaming service, users close tabs, press Stop and lose signal all the time, so every pooled connection, every cache client and every GPU slot must come back to a clean state when a request is abandoned halfway. OpenAI's fix included checking that data returned from the cache belonged to the user who asked for it.
+</Callout>
+
+Streaming fixed what Arjun sees. It did nothing for the other problem: the GPU is serving one conversation and wasting more than 99% of its arithmetic doing it, while thousands of other people wait in the queue.
+
+</Sub>
+
+<SectionHeading n="05" id="batching">Serving many conversations at once</SectionHeading>
+
+<Sub n="5.1" title="Read the weights once, use them many times">
+
+Decode is slow because every step reads 140 GB of weights to produce one token. But nothing says those weights can only be used for one conversation. If 32 conversations are each waiting for their next token, the GPU can read each weight once and multiply it against 32 tokens' worth of numbers, one from each conversation. That's called **batching**, and for decode it's nearly free: the step takes a little longer because each conversation's KV cache must be read as well, but it produces 32 tokens instead of one. Chapter 45's arithmetic for this model puts it at about 24 ms per step for batch 32 against 21 ms for batch 1: about 1,330 tokens a second instead of 48, 28 times the throughput.
+
+Look back at the estimate in section 1.2. At 3.7 million output tokens a second, serving each conversation alone at 48 tokens a second would take roughly 78,000 pairs of H100s, 155,000 GPUs, just for decode. At batch 32 it's roughly 2,800 pairs. (Real models, hardware and traffic differ; the ratio is the point.) Batching is where the economics of the whole service come from.
+
+One way to batch is the one used for most machine-learning serving: collect requests into a group, run the group from start to finish together, then take the next group. This is **request-level** (or static) batching, and it has a flaw that shows up immediately with chat.
+
+<Think
+  q="Four conversations are batched together. Their answers turn out to be 20, 50, 100 and 300 tokens long. The batch runs until the longest one finishes. What fraction of the batch's slots does useful work?"
+  hint="Count slot-steps: four slots for as many steps as the longest answer, and compare with the tokens actually produced."
+>
+With 4 slots for 300 steps, that's 1,200 slot-steps. Only 20 + 50 + 100 + 300 = 470 of them produce a token, so roughly 39% of the batch is useful. Whoever finished after 20 tokens holds its slot, idle, for 280 more steps, and the requests waiting in the queue can't use it until the whole batch is done. Answer lengths vary enormously in chat, and nobody knows them in advance, so this waste is the normal case.
+</Think>
+
+</Sub>
+
+<Sub n="5.2" title="Continuous batching">
+
+A fix came from a 2022 paper, **Orca** (OSDI 2022, from Seoul National University and FriendliAI). Its observation was that generation is a loop of forward passes, so the scheduler can make its decision at every pass instead of once per request. After each step, any conversation that has finished leaves the batch, and a waiting request takes its slot for the very next step. Orca called this **iteration-level scheduling**; today it's usually called **continuous batching**.
+
+<Scene
+  title="Continuous batching: slots are refilled every step"
+  regions={[
+    { id: "queue", label: "Waiting", sub: "request queue", col: 0, row: 0 },
+    { id: "batch", label: "Running batch", sub: "one forward pass per step", col: 1, row: 0, span: 2 },
+    { id: "done", label: "Finished", col: 1, row: 1 },
+    { id: "out", label: "Streamed out", sub: "SSE to users", col: 2, row: 1 },
+  ]}
+  itemWidth={112}
+  frames={[
+    { caption: "Three conversations are decoding together. Arjun's has just arrived and is waiting for a slot; the batch has room for three.",
+      items: [
+        { id: "a", at: "batch", label: "Meera", sub: "token 18 of ~20" },
+        { id: "b", at: "batch", label: "Sam", sub: "token 40" },
+        { id: "c", at: "batch", label: "Li", sub: "token 210" },
+        { id: "arj", at: "queue", label: "Arjun", sub: "1,000-token prompt", tone: "new" },
+      ], focus: ["batch", "queue"] },
+    { caption: "Each step reads the weights once and produces one token for **every** running conversation, and each token is streamed out at once.",
+      change: [{ id: "a", sub: "token 19" }, { id: "b", sub: "token 41" }, { id: "c", sub: "token 211" }],
+      add: [{ id: "t1", at: "out", label: "3 tokens", tone: "ok" }], focus: ["batch", "out"], arrow: { from: "batch", to: "out", label: "tokens" } },
+    { caption: "Meera's answer ends with an end-of-answer token. Under request-level batching her slot would sit empty until Li finished, 190 steps from now.",
+      change: [{ id: "a", at: "done", sub: "finished", tone: "dim" }], focus: ["done"], arrow: { from: "batch", to: "done", label: "end token" } },
+    { caption: "With iteration-level scheduling, Arjun joins on the **very next step**. His first step is prefill: all 1,000 prompt tokens go through in the same forward pass as the others' single decode tokens.",
+      change: [{ id: "arj", at: "batch", sub: "prefill, 1,000 tokens", tone: "accent" }], focus: ["batch"], arrow: { from: "queue", to: "batch", label: "joins" } },
+    { caption: "From then on Arjun decodes alongside Sam and Li, one token per step each, and nobody waited for anybody else's answer to finish.",
+      change: [{ id: "arj", sub: "token 1", tone: "ok" }, { id: "b", sub: "token 42" }, { id: "c", sub: "token 212" }], focus: ["batch", "out"] },
+  ]}
+/>
+
+Mixing a prefill of 1,000 tokens with single decode tokens in one pass raises a technical problem: the inputs have different shapes, and GPU kernels like rectangular batches. Orca's second idea, **selective batching**, handles it. Most of a layer (the weight multiplies, the normalisations) treats each token independently, so all the tokens from all the requests can be flattened into one long list and multiplied together. Only attention needs to know which tokens belong to which conversation, so it's run per request. Orca's evaluation on a GPT-3-sized 175-billion-weight model reported 36.9 times the throughput of NVIDIA's FasterTransformer at the same latency.
+
+<Picture
+  src="/images/designs/chatgpt/inflight-batching-step.svg"
+  alt="A diagram of one scheduler iteration: on the left an unscheduled red prompt; in the middle a paged KV cache with two requests' cached tokens; on the right the tokens processed this iteration, two decode tokens (G1) and two prompts' tokens (C); at the bottom the same tokens flattened into one row of 10"
+  caption="One iteration in NVIDIA's TensorRT-LLM scheduler, which calls continuous batching in-flight batching. Two requests are decoding (G1, one token each) while two new prompts are prefilled (C) in the same pass, and the bottom row shows all ten tokens flattened into one list: Orca's selective batching. A red prompt waits for room."
+  credit="Image: NVIDIA TensorRT-LLM documentation, Apache License 2.0 (canvas widened so the right-hand label isn't clipped)"
+  href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/media/TRTLLM_Scheduler_Vis_3.svg"
+  paper
+/>
+
+</Sub>
+
+<Sub n="5.3" title="When a long prompt joins">
+
+Continuous batching created a new problem, and it's visible in the Scene above. When Arjun joined, that step had to push 1,000 prompt tokens through the model, about 71 ms of arithmetic, where an ordinary decode step takes about 21 ms. Sam and Li each waited three or four times longer than usual for their next token. Now imagine someone pastes a 30,000-token document: a prefill of a couple of seconds, during which every conversation in the batch freezes mid-sentence.
+
+So prefill and decode interfere with each other. Prefill is compute-bound and wants big chunks of tokens; decode is memory-bound and wants short, regular steps. The Splitwise authors saw this in Azure's production traces: running both on the same machine "often leads to inconsistent end-to-end latencies".
+
+One fix is to cut the prompt into pieces. **Chunked prefill**, introduced by Sarathi-Serve (OSDI 2024, from Microsoft Research India and Georgia Tech), splits a long prefill into chunks of a few hundred tokens and adds one chunk to each step alongside the running decodes, so no step is much longer than the others. Arjun's first token arrives a little later, because his prefill is spread over several steps, but nobody else's stream stalls. The paper reports 2.6 times the serving capacity of vLLM for Mistral-7B on one A100 under tail-latency limits.
+
+<Decision
+  q="How should a new prompt's prefill share the GPU with running decodes?"
+  options={[
+    { name: "Prefill first", how: "Run each new prompt's whole prefill as soon as it arrives, pausing decodes.", good: ["Lowest time to first token for the newcomer"], bad: ["Every running stream stalls for the whole prefill", "Long prompts cause visible freezes"] },
+    { name: "Decode first", how: "Only admit new prompts when the running batch has spare time.", good: ["Smooth streams for those already running"], bad: ["Newcomers wait in the queue; time to first token suffers"] },
+    { name: "Chunked prefill", how: "Split prefills into chunks and add one chunk to each decode step.", good: ["Bounded step time, so smooth streams", "Steady GPU utilisation"], bad: ["A long prompt's first token comes slightly later", "Chunk size needs tuning"], chosen: true },
+  ]}
+>
+Chunked prefill is now the default way open-source engines mix the two: vLLM and SGLang both support it, and TensorRT-LLM calls the feature chunked context. Section 10 looks at the more radical fix, putting prefill and decode on different machines. Which approach OpenAI uses is unpublished.
+</Decision>
+
+Batching more conversations would give more throughput still, so why stop at 32? Because each conversation in the batch keeps its KV cache in GPU memory the whole time it's running, and that memory runs out first.
+
+</Sub>
+
+<SectionHeading n="06" id="kv-memory">Where the memory goes</SectionHeading>
+
+<Sub n="6.1" title="How big is one conversation's KV cache?">
+
+Attention in each layer is split into parallel copies called **heads**, each with its own keys and values. Modern models let several heads share one set of keys and values, a trick called **grouped-query attention** that shrinks the cache: Llama 3 70B has 64 heads asking questions (query heads) but stores only 8 key/value heads per layer. Every layer stores a key and a value per key/value head for every token, so the cache per token is easy to work out from a model's published shape: 2 (key and value) × layers × key/value heads × head size × 2 bytes per number.
+
+This program works out the per-token size for three models, then asks how many of Arjun's conversations fit on our two GPUs:
+
+<TryIt what="KV cache bytes per token, and conversations per GPU pair" lang="python" toolchain="Python 3.14">
+```python
+# KV cache bytes per token = 2 (a key and a value) x layers x KV heads x head size x bytes per number
+def kv_bytes_per_token(layers, kv_heads, head_dim, bytes_per_num=2):
+    return 2 * layers * kv_heads * head_dim * bytes_per_num
+
+models = {
+    # name: (layers, KV heads, head size), from each model's published config
+    "OPT-13B (vLLM paper)":  (40, 40, 128),
+    "Llama 3 70B":           (80, 8, 128),
+    "gpt-oss-120b, full-attention layers": (18, 8, 64),
+}
+for name, cfg in models.items():
+    print(f"{name:37} {kv_bytes_per_token(*cfg) / 1024:6.0f} KiB per token")
+
+# Llama 3 70B in BF16 on two 80 GB H100s: 140 GB of weights, ~20 GB left over
+per_token = kv_bytes_per_token(80, 8, 128)
+free = 20e9
+print(f"\nKV tokens that fit in 20 GB: {free / per_token:,.0f}")
+
+conversation = 1_020 + 129          # median prompt + median reply, Azure trace 2023
+print(f"one median conversation: {conversation} tokens, {conversation * per_token / 1e6:.0f} MB")
+print(f"conversations at once, packed tightly:       {free / (conversation * per_token):.0f}")
+print(f"conversations at once, reserving 8,192 each: {free / (8_192 * per_token):.0f}")
+```
+<Output>
+```
+OPT-13B (vLLM paper)                     800 KiB per token
+Llama 3 70B                              320 KiB per token
+gpt-oss-120b, full-attention layers       36 KiB per token
+
+KV tokens that fit in 20 GB: 61,035
+one median conversation: 1149 tokens, 377 MB
+conversations at once, packed tightly:       53
+conversations at once, reserving 8,192 each: 7
+```
+</Output>
+</TryIt>
+
+Read the three lines at the top first. OPT-13B, the model the vLLM paper used for its example, has no head sharing, so each token costs 800 KiB; the paper notes that a single 2,048-token request could need 1.6 GB. Llama 3 70B is five times bigger but needs less per token, thanks to grouped-query attention. OpenAI's own open-weight model, gpt-oss-120b (released in August 2025), goes further: half of its 36 layers use full attention with small 64-number heads, and the other half only look back at the last 128 tokens, so those layers never hold more than 128 tokens' worth of cache. Model designers now shape attention around the serving cost of the KV cache.
+
+Then the bottom half. On two H100s holding Llama 3 70B, about 20 GB is left after the weights (less in practice, since the forward pass needs working memory too). That's room for roughly 61,000 tokens of KV cache across *all* the conversations in the batch, and a median conversation from the Azure trace takes 377 MB of it. Packed tightly, 53 conversations fit. If the server instead sets aside room for each conversation's maximum length up front, say 8,192 tokens, only 7 fit, and batch 7 gives a fraction of batch 53's throughput.
+
+</Sub>
+
+<Sub n="6.2" title="Why reserving the maximum wastes most of the memory">
+
+Reserving up front is what serving systems did before 2023, for a simple reason: GPU frameworks expect each tensor in one contiguous block of memory, and a conversation's KV cache grows by one token per step to a length nobody knows in advance. An easy way to give it a contiguous region is to allocate the maximum it could ever need.
+
+The researchers behind vLLM (SOSP 2023, from UC Berkeley) measured what that costs. In existing systems, only 20.4% to 38.2% of the memory set aside for KV caches held actual tokens' keys and values. The rest was lost three ways:
+
+- **Reservation**: space held for tokens that haven't been generated yet. Arjun's answer will be 300 tokens long, but the space for token 300 is held from the first step.
+- **Internal fragmentation**: space for tokens that never come. The region was sized for 8,192 tokens; the conversation ends at 1,149.
+- **External fragmentation**: gaps between regions of different sizes, too small for the next conversation's region, the same problem a `malloc` heap has (chapter 05).
+
+It also measured how much this matters. On a 13-billion-weight model on a 40 GB A100, about 65% of GPU memory holds the weights and close to 30% holds KV caches, so the KV cache is the only part of memory that changes with load, and wasting two thirds of it caps the batch size and, with it, throughput.
+
+<Callout label="Design implication">
+On a GPU serving a large model, throughput is decided by how many conversations' KV caches fit in memory at once. Anything that shrinks or packs the KV cache (head sharing, smaller number formats, better allocation, sharing between requests) raises throughput directly. The next three sections are all about this one data structure.
+</Callout>
+
+So we need a way to give each conversation exactly as much KV memory as it has tokens, growing a little at a time, without needing it to be contiguous. Operating systems solved that problem for process memory decades ago.
+
+</Sub>
+
+<SectionHeading n="07" id="paged-attention">PagedAttention: the KV cache as virtual memory</SectionHeading>
+
+<Zoom path={["ChatGPT", "Model server", "KV cache manager", "Block table"]} />
+
+<Sub n="7.1" title="Blocks and block tables">
+
+Chapter 04 described how an operating system gives each process the illusion of one long contiguous address space: memory is cut into fixed-size pages, a process's pages can sit anywhere in physical RAM, and a **page table** maps each of the process's page numbers to the physical page that holds it. Pages are handed out only when first touched, and every page is the same size, so there are no awkward gaps.
+
+vLLM applies the same idea to the KV cache, and its paper states the analogy outright: think of blocks as pages, tokens as bytes, and requests as processes. GPU memory for the KV cache is cut into fixed-size **KV blocks**, each holding the keys and values for 16 tokens (vLLM's default block size). A conversation's cache is a list of **logical blocks**, numbered 0, 1, 2…, and a per-request **block table** maps each logical block to a **physical block** somewhere in GPU memory, along with how many of its 16 slots are filled. A free list holds the unused physical blocks.
+
+<Scene
+  title="Arjun's block table as his answer grows (16 tokens per block)"
+  regions={[
+    { id: "table", label: "Arjun's block table", sub: "logical → physical, #filled", col: 0, row: 0 },
+    { id: "gpu", label: "GPU KV memory", sub: "physical blocks", col: 1, row: 0, span: 2 },
+    { id: "free", label: "Free list", sub: "unused physical blocks", col: 1, row: 1, span: 2 },
+  ]}
+  itemWidth={120}
+  frames={[
+    { caption: "Before Arjun's request runs, all physical blocks are on the free list (only a few are drawn). Nothing is reserved for him.",
+      items: [
+        { id: "f3", at: "free", label: "block 3" }, { id: "f7", at: "free", label: "block 7" },
+        { id: "f1", at: "free", label: "block 1" }, { id: "f12", at: "free", label: "block 12" },
+      ], focus: ["free"] },
+    { caption: "Prefill: suppose the prompt is 40 tokens. That needs **three** blocks (16 + 16 + 8), taken from wherever they happen to be free: physical 7, 1 and 12.",
+      remove: ["f7", "f1", "f12"],
+      add: [
+        { id: "l0", at: "table", label: "0 → 7", sub: "16/16", tone: "accent" },
+        { id: "l1", at: "table", label: "1 → 1", sub: "16/16", tone: "accent" },
+        { id: "l2", at: "table", label: "2 → 12", sub: "8/16", tone: "accent" },
+        { id: "p7", at: "gpu", label: "block 7", sub: "Arjun, tokens 1–16" },
+        { id: "p1", at: "gpu", label: "block 1", sub: "Arjun, tokens 17–32" },
+        { id: "p12", at: "gpu", label: "block 12", sub: "Arjun, tokens 33–40" },
+      ], focus: ["table", "gpu"], arrow: { from: "free", to: "gpu", label: "3 blocks" } },
+    { caption: "Decode steps 1 to 8 write each new token's keys and values into the empty slots of block 12. No allocation at all, just a counter going up.",
+      change: [{ id: "l2", sub: "16/16" }, { id: "p12", sub: "Arjun, tokens 33–48" }, { id: "l0", tone: "default" }, { id: "l1", tone: "default" }],
+      focus: ["table"] },
+    { caption: "Token 49 needs a new block. The manager pops physical block 3 off the free list and adds a row to Arjun's table. At most 15 slots are ever wasted per conversation.",
+      remove: ["f3"],
+      change: [{ id: "l2", tone: "default" }],
+      add: [
+        { id: "l3", at: "table", label: "3 → 3", sub: "1/16", tone: "new" },
+        { id: "p3", at: "gpu", label: "block 3", sub: "Arjun, token 49", tone: "new" },
+      ], focus: ["table", "gpu"], arrow: { from: "free", to: "gpu", label: "1 block" } },
+    { caption: "When Arjun's answer ends, all four physical blocks go straight back on the free list for the next conversation. Every block is the same size, so there are never gaps too small to use.",
+      remove: ["l0", "l1", "l2", "l3", "p7", "p1", "p12", "p3"],
+      add: [
+        { id: "g7", at: "free", label: "block 7", tone: "ok" }, { id: "g1", at: "free", label: "block 1", tone: "ok" },
+        { id: "g12", at: "free", label: "block 12", tone: "ok" }, { id: "g3", at: "free", label: "block 3", tone: "ok" },
+      ], focus: ["free"], arrow: { from: "gpu", to: "free", label: "freed" } },
+  ]}
+/>
+
+Walk through what disappeared. Reservation is gone, because blocks are allocated only when a token needs one. Internal fragmentation shrinks to at most one partly filled block per conversation, at most 15 tokens' worth. External fragmentation is gone, because every block is the same size, so any free block fits any request. In the paper's measurements, vLLM used 96.3% of KV memory for real token states, against 20.4% to 38.2% before, and that bigger batch gave 2 to 4 times the throughput of FasterTransformer and Orca at the same latency.
+
+A whole batch is a set of these tables, one row per running request. When a new conversation joins, it gets a row; when one finishes, its row is reused:
+
+<Picture
+  src="/images/designs/chatgpt/vllm-persistent-batch-block-table.png"
+  alt="Three block tables side by side: rows for requests C, A and B; after D joins a fourth row appears; after A finishes, D takes A's row"
+  caption="vLLM's batch-wide block table. Each row is one running request's list of physical block numbers. Request D joins and gets a row; request A finishes and D is moved into its row. This is the data structure continuous batching (section 5.2) and paging share."
+  credit="Image: vLLM project documentation, Apache License 2.0"
+  href="https://github.com/vllm-project/vllm/blob/main/docs/assets/design/model_runner_v2/persistent_batch_v1.png"
+  paper
+/>
+
+</Sub>
+
+<Sub n="7.2" title="Attention over scattered blocks">
+
+There's a cost to all this, and it's in the attention computation. An ordinary attention kernel (a **kernel** is a function that runs on the GPU) expects a conversation's keys and values side by side in memory. Arjun's are now in blocks 7, 1, 12 and 3. So vLLM's attention kernel, **PagedAttention**, takes the block table as an extra input: for each logical block it looks up the physical block, fetches that block's 16 keys, computes attention scores against them, and moves on. It's a gather through an indirection table, much like a CPU walking a page table, except it's done in software inside the kernel.
+
+vLLM's authors measured that indirection at roughly 20 to 26% more attention-kernel time than FasterTransformer's contiguous kernel. Attention is only part of each step, and the bigger batch the paging allows wins back far more than that. That's why every major open-source engine (vLLM, SGLang, TensorRT-LLM) now manages KV memory in blocks.
+
+</Sub>
+
+<Sub n="7.3" title="Sharing blocks, and copy-on-write">
+
+Paging gives one more thing for free: two block tables can point at the same physical block. That's useful whenever two sequences start the same way. If Arjun's app asked for two alternative answers to the same prompt, both answers share the prompt's blocks and only diverge in the blocks after it. vLLM counts how many tables point at each physical block (a **reference count**), and if a sequence wants to write into a shared block, the manager first copies it and points that sequence at the copy. That's **copy-on-write**, exactly what an OS does for a process's pages after `fork()` (chapter 04).
+
+In the paper's experiments, sharing saved 6.1% to 9.8% of KV memory when generating several samples per prompt, and 37.6% to 55.2% for beam search (which keeps many candidate continuations that share most of their tokens) on one dataset, and more on chat-style prompts. A much bigger win from sharing, though, comes from blocks that are identical across *different* requests, which is the subject of section 8.
+
+</Sub>
+
+<Sub n="7.4" title="When the blocks run out">
+
+Blocks are allocated as conversations grow, so it's possible to admit a batch and then run out of free blocks halfway through everyone's answers. The engine must then **preempt** some conversation, take its blocks away, and give them back later. vLLM evicts all of a sequence's blocks or none of them, since attention needs every block of a sequence on every step, and it offers two ways to bring them back:
+
+- **Swap**: copy the evicted blocks to CPU memory over PCIe, and copy them back when there's room. It's chapter 04's swapping, with CPU RAM in the role of the disk.
+- **Recompute**: throw the blocks away, and when the conversation resumes, run its prompt and the tokens generated so far through one prefill to rebuild them. Since prefill is fast and compute-bound, this can be cheaper than the copies.
+
+Users never see either, except as a brief pause in the stream. vLLM prefers to preempt the most recently arrived requests, so the ones that have been running longest finish first.
+
+<Decision
+  q="How should a model server manage KV-cache memory?"
+  options={[
+    { name: "Contiguous, sized to the maximum", how: "Reserve one region per request for its longest possible length.", good: ["Simple kernels", "No lookup indirection"], bad: ["Only 20–38% of the memory holds real tokens", "Small batches, low throughput"] },
+    { name: "Contiguous, resized as it grows", how: "Reallocate and copy when a request outgrows its region.", good: ["Less reservation"], bad: ["Copies on the hot path", "External fragmentation remains"] },
+    { name: "Paged blocks with block tables", how: "Fixed-size blocks allocated on demand; a per-request table maps logical to physical blocks.", good: ["About 96% of the memory used", "Sharing and copy-on-write for free", "2–4× throughput in the vLLM paper"], bad: ["About 20–26% slower attention kernel", "A block manager and scheduler to build"], chosen: true },
+  ]}
+>
+Paging won because the bottleneck is memory capacity, and a slower attention kernel is a small price for a batch several times bigger. OpenAI hasn't published its KV-cache manager, but its prompt-caching documentation (section 8.2) describes cached key/value tensors kept per machine and evicted after a while, and from the outside that looks like a block-based cache with reuse.
+</Decision>
+
+<Elsewhere items={[
+  { where: "Operating systems", how: "Pages, page tables, a free list, reference counts and copy-on-write after fork(): the whole design of chapter 04, reused for keys and values." },
+  { where: "Memory allocators", how: "Slab allocators hand out fixed-size objects from pre-cut pages to avoid fragmentation, the same trade as fixed-size KV blocks (chapter 05)." },
+  { where: "Databases' buffer pools", how: "Postgres and InnoDB manage table data as fixed-size pages in a pool, with a mapping from page id to buffer slot and an eviction policy (chapters 18 and 21)." },
+]} />
+
+Paging lets one conversation's blocks be shared. The obvious next question is whether different conversations have blocks in common, and in a chat product they have a lot.
+
+</Sub>
+
+<SectionHeading n="08" id="prefix-caching">Prefix caching: don't redo the shared beginning</SectionHeading>
+
+<Sub n="8.1" title="Every request starts the same way">
+
+Look at what the model is given when Arjun sends his follow-up, *Now make it shorter*. A model has no memory between requests, so the prompt contains everything: the hidden instructions that ChatGPT puts before every conversation (called the **system prompt**; its length and content aren't published), then Arjun's first question, then the whole first answer, and only then the six new tokens. The Splitwise authors noted the same thing about chat APIs in general: the client sends the complete conversation so far, every time.
+
+Left alone, our server would prefill Arjun's entire conversation again from scratch, recomputing hundreds of tokens' keys and values that it computed a minute ago. And the system prompt at the start is identical for millions of conversations, computed again for each of them.
+
+So we cache KV blocks by content. A block's keys and values depend on its tokens *and on every token before it*, so its cache key has to cover the whole prefix. vLLM's automatic prefix caching does this by hashing each full block's tokens together with the hash of the block before it, so each hash stands for the whole prefix up to the end of its block. Two requests that share their first 64 tokens share their first four block hashes, so a lookup in a hash table from block hash to physical block finds the existing blocks, and prefill starts after them. Only full blocks are cached; a partly filled last block is computed fresh.
+
+This program builds block tables that way for three requests: Arjun's first turn (prompt plus answer, everything his KV cache holds when it ends), a different user, Sam, with the same system prompt, and Arjun's second turn.
+
+<TryIt what="Block tables with prefix caching: three requests, one shared system prompt" lang="python" toolchain="Python 3.14">
+```python
+BLOCK = 16                       # tokens per KV block, vLLM's default
+free = list(range(1000))         # physical block numbers on the GPU
+refcount = {}                    # physical block -> how many requests use it
+cache = {}                       # hash of (parent hash, tokens) -> physical block
+
+def allocate(tokens):
+    """Build a block table for a prompt, reusing cached full blocks."""
+    table, parent, hits = [], 0, 0
+    for i in range(0, len(tokens), BLOCK):
+        chunk = tuple(tokens[i:i + BLOCK])
+        key = hash((parent, chunk))
+        if len(chunk) == BLOCK and key in cache:      # same prefix seen before
+            block = cache[key]
+            hits += 1
+        else:
+            block = free.pop(0)
+            if len(chunk) == BLOCK:                   # only full blocks are shared
+                cache[key] = block
+        refcount[block] = refcount.get(block, 0) + 1
+        table.append(block)
+        parent = key
+    return table, hits
+
+system = list(range(100, 164))          # a 64-token system prompt, shared by everyone
+question = list(range(500, 514))        # "Why is the sky blue? ..." (14 tokens)
+answer = list(range(900, 950))          # the 50-token answer the model wrote
+arjun_1 = system + question + answer    # everything in Arjun's KV cache after turn 1
+sam = system + list(range(700, 720))    # Sam: same system prompt, different question
+arjun_2 = arjun_1 + list(range(800, 806))   # turn 2 adds "Now make it shorter."
+
+for name, prompt in [("Arjun, turn 1", arjun_1), ("Sam", sam), ("Arjun, turn 2", arjun_2)]:
+    table, hits = allocate(prompt)
+    print(f"{name:14} {len(prompt):3} tokens  blocks {table}  reused {hits}")
+
+print("blocks shared by all three:", [b for b, n in refcount.items() if n == 3])
+```
+<Output>
+```
+Arjun, turn 1  128 tokens  blocks [0, 1, 2, 3, 4, 5, 6, 7]  reused 0
+Sam             84 tokens  blocks [0, 1, 2, 3, 8, 9]  reused 4
+Arjun, turn 2  134 tokens  blocks [0, 1, 2, 3, 4, 5, 6, 7, 10]  reused 8
+blocks shared by all three: [0, 1, 2, 3]
+```
+</Output>
+</TryIt>
+
+The tokens are stand-in numbers and the system prompt is made up, but the mechanism is the real one. Arjun's first turn fills eight blocks. Sam's request reuses the four blocks of the system prompt, and only needs new blocks for his own question. Arjun's second turn reuses all eight blocks of his first turn, so its prefill only has to process the last 6 tokens instead of 134. (The program never frees anything, so the reference counts just add up; a real engine would drop the count when a request finishes and keep the block cached until it's evicted.)
+
+<Picture
+  src="/images/designs/chatgpt/vllm-prefix-caching-blocks.png"
+  alt="A diagram of two requests' block lists: request 0 with blocks 0 to 4, request 1 sharing blocks 0 and 1 and then having its own blocks 5 and 6; below, a hash-to-block-ID dictionary and a doubly linked free block queue"
+  caption="vLLM's own picture of the same structures. Two requests share blocks 0 and 1 (hashes A–D and A–H) because their prompts start the same way, then diverge into their own blocks. The 'Cache Blocks' dictionary maps block hashes to block IDs; the free queue at the bottom is a doubly linked list of blocks nobody is using, evicted least-recently-used first."
+  credit="Image: vLLM project documentation, Apache License 2.0"
+  href="https://github.com/vllm-project/vllm/blob/main/docs/assets/design/prefix_caching/example-time-4.png"
+  paper
+/>
+
+A finished request's blocks don't disappear when its reference count drops to zero. They go onto the free queue *with their hashes intact*, so if Arjun sends his follow-up a minute later and the blocks haven't been reused yet, they're found and revived. When the engine needs a block, it takes the one at the head of the queue, the least recently used, and deletes its hash from the table. vLLM even puts a finished request's blocks onto the queue in reverse order, so the last, most conversation-specific block is evicted before the shared beginning.
+
+SGLang (2024, from Stanford and UC Berkeley) organises the same idea differently. Its **RadixAttention** keeps every cached prefix in a **radix tree**, a trie whose edges are labelled with runs of tokens, so finding the longest cached prefix of a new prompt is a walk down the tree, and eviction removes least-recently-used leaves. The paper reports up to 6.4 times higher throughput than earlier systems on workloads with heavy prefix reuse, such as multi-turn chat and few-shot prompts.
+
+</Sub>
+
+<Sub n="8.2" title="Routing for cache hits">
+
+A prefix cache lives in the memory of one machine. Arjun's second turn only gets the benefit if it lands on the same machine as his first, and a load balancer that sends each request to the least busy server will scatter his turns across the fleet and miss almost every time.
+
+OpenAI's API documentation describes how its own **prompt caching** handles this, and it's one of the few public descriptions of how OpenAI's serving fleet behaves inside. When the feature launched in October 2024, caching applied to prompts of at least 1,024 tokens, matched in 128-token steps, and cached input tokens cost half price. As of October 2026 the docs say:
+
+- Requests are routed using a hash of the early tokens of the prompt, along with machine load and an optional `prompt_cache_key` the developer can set to group related requests.
+- Cached state lives on individual machines, and traffic above about 15 requests per minute for one prefix can overflow to other machines, which then have to compute it again.
+- For earlier models, cached prefixes typically stay active for 5 to 10 minutes of inactivity, up to an hour; an extended option keeps them up to 24 hours by storing encrypted key/value tensors in GPU-local storage.
+- Caches are never shared between organisations, and cached tokens still count toward rate limits.
+
+Every one of those rules follows from what we've built. Hash routing exists because the cache is per machine. Overflow exists because sending all traffic for a popular prefix to one machine would overload it. A minutes-long lifetime is what LRU eviction under memory pressure looks like. The 24-hour option moves blocks from GPU memory to slower local storage, a second tier like swapping. And keeping caches per organisation means one customer can't learn anything about another's prompts by timing cache hits.
+
+<Decision
+  q="How should the router pick a model server for each request?"
+  options={[
+    { name: "Least loaded", how: "Send each request to the replica with the most free capacity.", good: ["Even load", "Simple"], bad: ["Turns of one conversation land on different machines", "Prefix cache rarely hits"] },
+    { name: "Hash of the prefix", how: "Hash the start of the prompt; always send it to the same replica.", good: ["High cache hit rate", "Repeated system prompts computed once per replica"], bad: ["A popular prefix makes one replica hot"] },
+    { name: "Prefix hash with load-aware overflow", how: "Prefer the replica that owns the prefix; spill to others above a rate.", good: ["Most of the cache benefit", "Hot prefixes spread out"], bad: ["Spilled requests recompute", "Two signals to tune"], chosen: true },
+  ]}
+>
+This is the shape OpenAI's prompt-caching docs describe: routing by a hash of the early tokens and load, with overflow above about 15 requests per minute per prefix. It's the same compromise as consistent hashing with bounded loads, which keeps keys on their owners until an owner gets too busy.
+</Decision>
+
+Everything so far has assumed the model fits on one pair of GPUs. ChatGPT's models are larger than our 70-billion-weight example, and OpenAI doesn't publish by how much.
+
+</Sub>
+
+<SectionHeading n="09" id="parallelism">Models bigger than one GPU</SectionHeading>
+
+<Sub n="9.1" title="Splitting the work across GPUs">
+
+We've already been cheating slightly: Llama 3 70B needs 140 GB for its weights, so it was split across two 80 GB GPUs from the start. GPT-3, at 175 billion weights, needs 350 GB. A frontier model can need far more. GPUs for this work are usually built and sold in groups of eight on one board, connected to each other by NVIDIA's NVLink, which on the H100 generation carries 900 GB/s per GPU, against 128 GB/s for the PCIe link to the host (both figures add the two directions together).
+
+<Picture
+  src="/images/designs/chatgpt/hgx-b200-eight-gpu-board.jpg"
+  alt="An NVIDIA HGX B200 board on a table: eight GPU modules under tall black heatsinks in two rows of four, with a placard reading HGX B200 NVL8"
+  caption="One 8-GPU board, NVIDIA's HGX B200. Each of the tall heatsinks covers one GPU and its HBM; underneath, NVLink connects all eight so they can work as one model server. A board like this is the usual unit for serving a large model."
+  credit="Photo: Pokiiri, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Nvidia_DGX-B200-HGX.jpg"
+  narrow
+/>
+
+There are two basic ways to split a model across GPUs, and they cut it in different directions.
+
+**Tensor parallelism** splits every layer. Each big weight matrix is cut into slices, one per GPU, and every GPU multiplies its slice for every token. The scheme most engines use comes from NVIDIA's Megatron-LM work (2019): the feed-forward block's first matrix is split by columns and its second by rows, so each GPU can do both multiplies on its own and only the final results need adding up across GPUs. That adding-up, called an **all-reduce**, happens about twice per layer per step, once after attention and once after the feed-forward block. For an 80-layer model that's about 160 all-reduces per decode step, each moving only about 16 KB per token (8,192 numbers of 2 bytes) but each one making every GPU wait for the slowest. That's tolerable at NVLink speeds and painful over a network, so tensor parallelism stays inside one board.
+
+**Pipeline parallelism** splits the stack of layers instead. GPUs 0–7 hold layers 1–40, the next board holds layers 41–80, and each token's numbers are handed from one stage to the next once, a single small message per step.
+
+<Picture
+  src="/images/designs/chatgpt/pipeline-parallelism.svg"
+  alt="Six green layer bars: layers 1 to 3 over GPU 0, a purple Send arrow, then layers 4 to 6 over GPU 1"
+  caption="Pipeline parallelism with two stages: GPU 0 holds the first half of the layers and sends its output to GPU 1, which holds the rest. Only one hand-off per step crosses between them, so the stages can be on different machines. With tensor parallelism, by contrast, every layer is split across the GPUs and needs an all-reduce after it."
+  credit="Image: NVIDIA TensorRT-LLM documentation, Apache License 2.0"
+  href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/media/Pipeline_Parallel_Vis.svg"
+  paper
+/>
+
+<Why>If pipeline parallelism communicates so little, why not use it everywhere?</Why>
+
+Because it doesn't make one token any faster. Arjun's token has to pass through stage 1 and then stage 2, one after the other, so each stage is idle while the other works on his token. The pipeline only stays busy if several groups of requests are in flight at once, one in each stage, and the gaps when it can't fill them are called pipeline **bubbles**. Tensor parallelism does make one step faster, because every GPU works on every layer at once and each reads only its slice of the weights. So the usual layout, and the one Orca used for its 175-billion-weight model in 2022, is tensor parallelism inside an 8-GPU machine and pipeline parallelism across machines: 16 A100s as 2 pipeline stages of 8.
+
+Newer hardware has moved the boundary. NVIDIA's GB200 NVL72 puts 72 GPUs in one liquid-cooled rack, all connected by NVLink, so the "inside one machine" domain for tensor parallelism is now a whole rack.
+
+<Picture
+  src="/images/designs/chatgpt/gb200-nvl72-rack.jpg"
+  alt="A tall liquid-cooled server rack with stacked gold-fronted compute trays and NVLink switch trays"
+  caption="An NVIDIA GB200 rack: 72 B200 GPUs and 36 Grace CPUs in compute trays, with NVLink switch trays in the middle linking all 72 GPUs to each other. Racks like this let a single model be split across far more GPUs without leaving the fast interconnect."
+  credit="Photo: Pokiiri, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Nvidia_DGX_GB200.jpg"
+  narrow
+/>
+
+<Decision
+  q="How should a model too big for one GPU be split?"
+  options={[
+    { name: "Tensor parallel", how: "Slice every weight matrix across GPUs; all-reduce after each layer.", good: ["Each step is faster: every GPU reads only its slice", "Lowest per-token latency"], bad: ["Two all-reduces per layer per step", "Needs NVLink-class links; stays inside a machine or rack"] },
+    { name: "Pipeline parallel", how: "Put consecutive layers on different GPUs; hand activations along.", good: ["Very little communication", "Works across ordinary network links"], bad: ["No faster per token", "Bubbles unless many batches are in flight"] },
+    { name: "Both: tensor inside, pipeline across", how: "Tensor parallel within each NVLink domain, pipeline stages between them.", good: ["Fits very large models", "Fast links used where traffic is heaviest"], bad: ["Most complex to schedule and tune"], chosen: true },
+  ]}
+>
+How OpenAI shards its models is unpublished. The combination is what Orca evaluated and what open engines like vLLM and TensorRT-LLM expose as tensor-parallel and pipeline-parallel sizes. Mixture-of-experts models, like OpenAI's open gpt-oss-120b, which has 128 expert blocks per layer but uses only 4 of them per token (5.1 billion of its 117 billion weights), add a third option, **expert parallelism**: different GPUs hold different experts, and each token is sent to the GPUs holding the experts it needs.
+</Decision>
+
+</Sub>
+
+<SectionHeading n="10" id="disaggregation">Separate machines for prefill and decode</SectionHeading>
+
+<Sub n="10.1" title="Two workloads that want different machines">
+
+Chunked prefill (section 5.3) stopped long prompts from freezing everyone's streams, but it left prefill and decode sharing every GPU, and they want different things. Prefill is compute-bound and would like the most arithmetic it can get. Decode is bound by memory bandwidth and capacity, and would like lots of HBM. On a shared machine, one parallelism layout and one batch size have to serve both, and every prefill chunk still slows every decode step a little.
+
+Two 2024 papers took the next step and put the phases on different machines. **DistServe** (OSDI 2024, from Peking University and UC San Diego) measured serving capacity as the request rate a GPU can handle while meeting targets for both time to first token and time per output token, and reported that splitting the phases served 7.4 times more requests, or met 12.6 times tighter latency targets, than colocated systems. **Splitwise** (ISCA 2024, from the University of Washington and Microsoft) used Azure's production traces and made a hardware argument: from the A100 to the H100, compute grew 3.43 times but memory bandwidth only 1.64 times and capacity not at all. Since decode can't use the extra compute, it can run on older or power-capped GPUs. Splitwise clusters reached 1.4 times the throughput at 20% lower cost, or 2.35 times the throughput for the same cost and power.
+
+What it costs is moving the KV cache. Prefill builds Arjun's keys and values on one machine, and decode needs them on another.
+
+<Estimate
+  rows={[
+    { label: "Arjun-sized conversation, Llama 3 70B", math: "1,149 tokens × 320 KiB", value: "≈ 377 MB" },
+    { label: "Over NVLink, one direction", math: "377 MB / 450 GB/s", value: "≈ 0.8 ms" },
+    { label: "Over a 400 Gb/s network link", math: "377 MB / 50 GB/s", value: "≈ 7.5 ms" },
+    { label: "One decode step, for comparison", math: "section 3.2", value: "≈ 21 ms" },
+  ]}
+  result={{ label: "a few milliseconds, once per request, and overlappable", value: "small" }}
+/>
+
+A few milliseconds once per request is small next to the seconds of decode that follow, and Splitwise hides most of it by sending each layer's keys and values as soon as that layer's prefill finishes, while the next layer is still computing.
+
+<SystemDiagram
+  title="Prefill and decode on separate pools"
+  nodes={[
+    { id: "arjun", label: "Arjun's browser", kind: "laptop", col: 0, row: 1 },
+    { id: "router", label: "Inference router", sub: "prefix hash + load", kind: "lb", col: 1, row: 1 },
+    { id: "prefill", label: "Prefill pool", sub: "compute-heavy GPUs", kind: "compute", count: "×N", col: 2, row: 0 },
+    { id: "decode", label: "Decode pool", sub: "memory-heavy GPUs", kind: "compute", count: "×M", col: 3, row: 1 },
+    { id: "kv", label: "KV transfer", sub: "NVLink / RDMA", kind: "queue", col: 3, row: 0 },
+  ]}
+  edges={[
+    { from: "arjun", to: "router", label: "prompt" }, { from: "router", to: "prefill" },
+    { from: "prefill", to: "kv", label: "KV blocks" }, { from: "kv", to: "decode" },
+    { from: "decode", to: "router", label: "tokens" }, { from: "router", to: "arjun", dashed: true },
+  ]}
+  steps={[
+    { caption: "Arjun's prompt reaches the router, which picks a prefill machine (preferring one that has his conversation's prefix cached) and a decode machine with free KV blocks.", path: ["arjun", "router", "prefill"] },
+    { caption: "The prefill machine runs the prompt in big compute-bound batches and produces the first token, which can be streamed to Arjun straight away.", path: ["prefill", "router", "arjun"] },
+    { caption: "Layer by layer, his KV blocks are copied to the decode machine, overlapping with the remaining prefill.", path: ["prefill", "kv", "decode"] },
+    { caption: "The decode machine adds Arjun to its continuous batch, where only short, regular decode steps run, and streams each token back.", path: ["decode", "router", "arjun"] },
+    { caption: "The two pools are sized separately: more prefill machines when prompts get longer, more decode machines when answers do.", focus: ["prefill", "decode"] },
+  ]}
+/>
+
+<Picture
+  src="/images/designs/chatgpt/vllm-disaggregated-prefill.jpg"
+  alt="A three-lane flow diagram: a proxy API server sends a request with max_tokens 1 to a vLLM prefill instance, which prefills, buffers the KV cache on a transfer thread and returns the first token; the proxy then sends the request to a vLLM decode instance, which fetches the KV cache, skips prefill and streams the following tokens"
+  caption="How vLLM's disaggregated prefill works. The proxy first sends the request to a prefill instance with max_tokens = 1, so it computes the prompt and one token. The KV cache is handed over by a transfer thread, and the decode instance picks it up, skips prefill, and generates the rest of the answer."
+  credit="Image: vLLM project documentation, Apache License 2.0"
+  href="https://github.com/vllm-project/vllm/blob/main/docs/assets/features/disagg_prefill/overview.jpg"
+  paper
+  narrow
+/>
+
+<Decision
+  q="Should prefill and decode run on the same GPUs?"
+  options={[
+    { name: "Colocated, with chunked prefill", how: "Every machine does both, mixing prefill chunks into decode steps.", good: ["One kind of machine; simple to run", "No KV transfer", "Prefix cache and decode on the same machine"], bad: ["One parallelism and batch size for two workloads", "Prefill chunks still slow every decode step"] },
+    { name: "Disaggregated", how: "Prefill pool and decode pool, with KV caches copied between them.", good: ["Each pool tuned and sized for its phase", "Decode can use cheaper or power-capped GPUs", "7.4× (DistServe) and 1.4× at 20% less cost (Splitwise) in the papers"], bad: ["KV transfer needs fast links", "Two pools to balance", "More moving parts when something fails"], chosen: true },
+  ]}
+>
+For a service at ChatGPT's scale, with fast interconnects already in place, disaggregation is where the field went: vLLM, SGLang and TensorRT-LLM all support it, and NVIDIA's Dynamo serving framework, released in 2025, is built around it. Whether OpenAI's fleet splits the phases is unpublished. For a small deployment of a few machines, colocated serving with chunked prefill remains the simpler choice.
+</Decision>
+
+With the phases separated, decode is the part users wait on longest, a few hundred steps per answer, each one limited by memory bandwidth. One last trick in the serving engine attacks the number of steps itself.
+
+</Sub>
+
+<SectionHeading n="11" id="speculative">Speculative decoding: guess ahead, check in one pass</SectionHeading>
+
+<Sub n="11.1" title="Checking is cheaper than writing">
+
+Recall where decode's time goes: at small batch sizes the GPU spends about 21 ms reading weights and a fraction of a millisecond computing. So a decode step that processes 5 tokens costs almost the same as one that processes 1, because the weights are read once either way. Decode can't use this, because it doesn't know token 2 until it has chosen token 1. But it could if someone *guessed* the next few tokens.
+
+That's **speculative decoding**, published independently in 2022–2023 by Google (Leviathan, Kalman and Matias, ICML 2023) and DeepMind (Chen and colleagues, 2023). A small, fast **draft model** guesses the next few tokens, say 4. The big model then runs one forward pass over all 4 guesses together, shaped like a short prefill. That one pass tells it, for each position, what it would have produced itself. The system keeps the guesses up to the first one the big model disagrees with, takes the big model's own token at that position, and throws the rest away. If all 4 are accepted, the pass also yields a fifth token for free.
+
+A modified rejection-sampling rule decides acceptance, and it makes the output follow exactly the same probability distribution as the big model alone would. Arjun gets exactly the answer he would have got; it only arrives sooner. Leviathan's paper reported 2 to 3 times faster generation on T5-XXL with identical outputs, and Chen's reported 2 to 2.5 times on DeepMind's 70-billion-weight Chinchilla.
+
+<Think
+  q="The draft model's guess is accepted with probability 0.8 at each position, independently, and it guesses 4 tokens per round. How many tokens does each big-model pass produce on average?"
+  hint="You get one token for each accepted guess until the first rejection, plus the big model's own token at the end. The Leviathan paper's formula is (1 − α^(γ+1)) / (1 − α), with α the acceptance rate and γ the number of guesses."
+>
+(1 − 0.8⁵) / (1 − 0.8) = (1 − 0.328) / 0.2, roughly 3.36 tokens per big-model pass, instead of 1. Each pass costs a little more than a plain decode step, and the draft model's 4 small passes cost something too, so the real speed-up is smaller than 3.36, in line with the 2 to 3 times both papers measured. With an acceptance rate of 0.5 the same formula gives only about 1.9, which is why the draft has to agree with the big model most of the time to be worth running.
+</Think>
+
+<Why>Why doesn't every request use it, then?</Why>
+
+Because the trick spends spare arithmetic, and a busy server doesn't have much. At batch 1, decode leaves more than 99% of the GPU's arithmetic idle, so checking 5 tokens instead of 1 is almost free. At batch 64, the weights are already being reused 64 times per read, and attention over 64 KV caches adds real work, so verifying 4 extra tokens per conversation (most of which may be thrown away) starts to cost real time. Speculation helps most when latency matters more than throughput and the batch is small. Later designs drop the separate draft model and add extra prediction heads to the big model itself, as in Medusa, EAGLE and DeepSeek-V3's multi-token prediction, so the guesses come almost free with each step.
+
+OpenAI's API exposes something of the same shape: with **Predicted Outputs**, a developer editing a file supplies the expected answer (mostly the old file) to speed up the response. The docs don't describe the mechanism, but they note that rejected prediction tokens are billed like generated ones.
+
+<Elsewhere items={[
+  { where: "CPU branch prediction", how: "A core guesses which way a branch goes and runs ahead, then discards the work if the guess was wrong, the same guess-then-verify bargain at the scale of instructions (chapter 44)." },
+  { where: "Optimistic concurrency control", how: "A transaction proceeds as if there will be no conflict and checks at commit, redoing the work only when it was wrong (chapter 19)." },
+]} />
+
+That completes the serving engine: batched, paged, prefix-cached, split across GPUs and phases, speculating where it pays. Everything around it is about deciding which requests reach it, and remembering what was said.
+
+</Sub>
+
+<SectionHeading n="12" id="admission">Who gets the GPUs: routing and rate limits</SectionHeading>
+
+<Sub n="12.1" title="Count tokens, not requests">
+
+A web service usually limits each user to some number of requests per minute. Here that unit is nearly meaningless. Arjun's request had a 1,000-token prompt and a 300-token answer. Someone pasting a book chapter and asking for a long summary sends one request that costs a hundred times more prefill and holds KV memory for minutes. Two requests per minute can mean anything.
+
+So the limits are counted in tokens. OpenAI's API documents limits on requests per minute *and* tokens per minute (and per day), any of which can be hit first. Before a request runs, the output length is unknown, so the limiter charges the larger of the request's `max_tokens` and an estimate from its character count. That's why the docs advise setting `max_tokens` close to what you expect. Responses carry headers such as `x-ratelimit-remaining-tokens` and `x-ratelimit-reset-tokens`. A request over the limit gets HTTP 429; and separately, when a model is overloaded as a whole, the API returns 503 with `server_is_overloaded`, and clients are told to retry with exponential backoff and jitter.
+
+A natural way to build this is a **token bucket** per user or API key (chapter 40): the bucket refills at the allowed rate, each request takes out its estimated tokens up front, and the difference is refunded when the real count is known at the end. OpenAI's docs describe the limits and headers but not the algorithm behind them. ChatGPT's consumer limits (how many messages per few hours on each plan) work in the same spirit and change often, so we won't quote them.
+
+</Sub>
+
+<Sub n="12.2" title="Picking a replica, and saying no">
+
+A router in front of the model servers now has several things to weigh for each request: which model it's for, which replica holds its prefix in cache (section 8.2), and which replicas have free KV blocks and short queues. Admitting a request to a replica that's out of KV memory doesn't fail; it causes preemptions (section 7.4) that slow everyone on that replica. So the router's load signal should be KV memory and queue depth, not CPU or request count.
+
+<SystemDiagram
+  title="Admission: from Arjun's request to a model replica"
+  nodes={[
+    { id: "arjun", label: "Arjun's browser", kind: "laptop", col: 0, row: 1 },
+    { id: "gw", label: "API gateway", sub: "auth, SSE", kind: "lb", col: 1, row: 1 },
+    { id: "limit", label: "Rate limiter", sub: "token buckets", kind: "cache", col: 1, row: 0 },
+    { id: "router", label: "Inference router", sub: "model, prefix, KV free", kind: "lb", col: 2, row: 1 },
+    { id: "r1", label: "Replica A", sub: "has Arjun's prefix", kind: "compute", col: 3, row: 0 },
+    { id: "r2", label: "Replica B", sub: "KV 95% full", kind: "compute", col: 3, row: 1 },
+    { id: "r3", label: "Replica C", sub: "idle", kind: "compute", col: 3, row: 2 },
+  ]}
+  edges={[
+    { from: "arjun", to: "gw" }, { from: "gw", to: "limit", label: "tokens?" }, { from: "gw", to: "router" },
+    { from: "router", to: "r1" }, { from: "router", to: "r2", dashed: true }, { from: "router", to: "r3", dashed: true },
+  ]}
+  steps={[
+    { caption: "Arjun's follow-up arrives. The gateway checks his session and opens the SSE stream.", path: ["arjun", "gw"] },
+    { caption: "The rate limiter takes his estimated tokens from his bucket. Over the limit, he'd get a 'try again later' here, before any GPU is involved.", path: ["gw", "limit"] },
+    { caption: "The router hashes the start of his prompt. Replica A served his first turn, so its prefix cache probably still holds those blocks.", path: ["gw", "router", "r1"] },
+    { caption: "Had A been overloaded, the router would skip B, whose KV memory is nearly full, and send him to C, which recomputes his prefix but has room.", focus: ["r2", "r3"] },
+  ]}
+/>
+
+When the whole fleet is full, something has to give, and it's better to refuse some requests quickly than to queue everyone until they time out. Traffic can jump far beyond any forecast. OpenAI's January 2026 post on its database describes the March 2025 launch of image generation in ChatGPT, when more than 100 million new users signed up within a week. A design for that day needs queues with bounded length, clear errors that tell clients to back off, and limits that can be tightened for free users first, so paying users and the API keep working.
+
+<Callout label="Design implication">
+Put the cheap refusals first. The gateway and the token-bucket limiter can turn a request away in a millisecond on a CPU; the same request admitted to a full GPU replica costs prefill compute and KV memory, and pushes other conversations into preemption. Every layer in front of the GPUs exists to protect them.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="13" id="storage">Remembering the conversation</SectionHeading>
+
+<Sub n="13.1" title="A conversation is a tree of messages">
+
+GPUs forget everything when a request ends (apart from whatever prefix blocks happen to survive in cache for a few minutes), so the conversation itself has to live in ordinary storage. When Arjun sends his follow-up, the conversation service loads his earlier messages to build the prompt, and when the answer finishes streaming, it saves the new pair.
+
+A conversation isn't quite a list. ChatGPT lets you edit an earlier message or regenerate an answer and then flip between the versions, so one message can have several children, and the conversation the model sees is one path from the root to the latest message. A natural schema stores each message with its conversation, its parent, its role (user, assistant, tool) and its content, and keeps a pointer to the current leaf:
+
+| Field | Example | Why |
+|---|---|---|
+| `conversation_id` | `c_8f2…` | Partition key: all of Arjun's messages for this chat live together |
+| `message_id`, `parent_id` | `m_17`, `m_16` | A tree, so edits and regenerations branch instead of overwriting |
+| `role` | `assistant` | The model needs to know who said what |
+| `content`, `tokens` | the text, 286 | Rebuild the prompt; account for usage |
+| `created_at` | `2026-10-09T21:14Z` | Ordering, retention |
+
+Rebuilding the prompt means walking from the current leaf up through the parents to the root, which takes one query on the partition when all of a conversation's messages are stored together. The partition key matters most: every read and write for Arjun's chat goes to one place, and different conversations spread evenly across the store (chapter 29).
+
+</Sub>
+
+<Sub n="13.2" title="What OpenAI has published about its storage">
+
+Where OpenAI stores message contents is unpublished. What it has described, in a January 2026 post, is the PostgreSQL deployment behind ChatGPT: a single primary Azure PostgreSQL flexible server taking all writes, nearly 50 read replicas spread across regions, millions of queries a second, low double-digit-millisecond p99 latency and five-nines availability. To keep the single writer healthy, OpenAI moved "shardable, write-heavy workloads" to sharded systems such as Azure Cosmos DB, and requires new tables for new features to go there too. The post also describes the failure modes it designed against: a surge of cache misses sending a flood of reads to Postgres, handled with a lock so only one request per missing key refills the cache, and a write storm when the image-generation launch pushed write traffic up more than tenfold.
+
+The 2023 incident in section 4.2 adds one more piece: ChatGPT used a Redis Cluster to cache user information in front of its database. Put together, the published picture is the classic one: a relational core for accounts and metadata, read replicas and a cache to absorb reads, and a horizontally sharded store for the data that grows with every message.
+
+<Decision
+  q="Where should conversation messages live?"
+  options={[
+    { name: "The main relational database", how: "Messages as rows next to users and billing.", good: ["Transactions with account data", "Familiar tooling"], bad: ["Billions of new rows a day on one primary", "Write storms threaten everything else on it"] },
+    { name: "A sharded store, partitioned by conversation", how: "Each conversation's messages together on one shard; many shards.", good: ["Writes spread across machines", "One partition read rebuilds a prompt"], bad: ["No joins with account data", "Cross-conversation queries (search, export) need separate indexes"], chosen: true },
+  ]}
+>
+At 2.5 billion messages a day, messages look exactly like the "shardable, write-heavy workloads" OpenAI's post describes moving off the single Postgres primary, though OpenAI doesn't say which store holds them. The general rule from Uber's case study applies here too: sort data by what it costs to be wrong or slow. Conversations must never be lost or shown to the wrong user, but they're only ever read one conversation at a time, which is the easiest kind of data to shard.
+</Decision>
+
+</Sub>
+
+<SectionHeading n="14" id="whole">The whole system</SectionHeading>
+
+<Sub n="14.1" title="Every box, and why it's there">
+
+<SystemDiagram
+  title="Arjun's follow-up, end to end"
+  nodes={[
+    { id: "arjun", label: "Arjun's browser", kind: "laptop", col: 0, row: 1 },
+    { id: "gw", label: "API gateway", sub: "auth, SSE stream", kind: "lb", col: 1, row: 1 },
+    { id: "limit", label: "Rate limiter", sub: "tokens / minute", kind: "cache", col: 1, row: 0 },
+    { id: "conv", label: "Conversation service", sub: "build prompt, save reply", kind: "service", col: 2, row: 2 },
+    { id: "store", label: "Conversation store", sub: "sharded by conversation", kind: "db", col: 3, row: 2 },
+    { id: "router", label: "Inference router", sub: "prefix hash, KV load", kind: "lb", col: 2, row: 1 },
+    { id: "prefill", label: "Prefill pool", sub: "prefix cache, TP", kind: "compute", count: "×N", col: 3, row: 0 },
+    { id: "decode", label: "Decode pool", sub: "paged KV, batching", kind: "compute", count: "×M", col: 4, row: 1 },
+  ]}
+  zones={[{ label: "GPU fleet", nodes: ["prefill", "decode"] }]}
+  edges={[
+    { from: "arjun", to: "gw" }, { from: "gw", to: "limit" }, { from: "gw", to: "conv" },
+    { from: "conv", to: "store" }, { from: "conv", to: "router", label: "prompt" },
+    { from: "router", to: "prefill" }, { from: "prefill", to: "decode", label: "KV blocks" },
+    { from: "decode", to: "router", label: "tokens" },
+  ]}
+  steps={[
+    { caption: "Arjun types *Now make it shorter* and presses Enter. The gateway authenticates him, opens an SSE stream, and charges his estimated tokens to his bucket.", path: ["arjun", "gw", "limit"] },
+    { caption: "The conversation service loads the path from his latest message back to the root and builds the full prompt: system prompt, first question, first answer, new message.", path: ["gw", "conv", "store"] },
+    { caption: "The router hashes the prompt's start and picks the prefill replica that most likely still has his first turn's KV blocks, unless it's overloaded.", path: ["conv", "router", "prefill"] },
+    { caption: "Prefill finds his earlier blocks by their chained hashes and only computes the 6 new tokens, then hands the KV blocks to a decode replica.", path: ["prefill", "decode"] },
+    { caption: "The decode replica adds him to its running batch. Each step reads the weights once for dozens of conversations, through each one's block table, maybe checking a draft model's guesses too.", focus: ["decode"] },
+    { caption: "Tokens stream back through the router and gateway as text deltas. When the answer ends, the conversation service saves it as a new child of his message.", path: ["decode", "router", "conv", "gw", "arjun"] },
+  ]}
+/>
+
+| Component | What it does | Added because |
+|---|---|---|
+| SSE streaming | Sends each token as soon as it exists | Waiting for the whole answer felt like 6 s of nothing (§3, §4) |
+| Continuous batching | Refills batch slots every step | One conversation per GPU wastes 99% of the arithmetic (§5) |
+| Chunked prefill | Spreads long prompts over many steps | A long prefill froze everyone's streams (§5.3) |
+| Paged KV cache | Fixed-size blocks, per-request block tables | Contiguous reservation left 60–80% of KV memory empty (§6, §7) |
+| Prefix caching | Reuses blocks for shared prompt beginnings | Every turn resends the whole conversation (§8) |
+| Tensor and pipeline parallelism | Splits a model across GPUs and machines | The weights don't fit on one GPU (§9) |
+| Prefill/decode pools | Separate machines per phase | The phases want different hardware and interfere (§10) |
+| Speculative decoding | Draft tokens, checked in one pass | Decode steps are the user's wait, and leave arithmetic idle (§11) |
+| Token-based limits and router | Charge tokens; route by prefix and KV load | Requests differ a hundredfold in cost (§12) |
+| Conversation store | Message trees, sharded by conversation | GPUs forget everything between requests (§13) |
+
+</Sub>
+
+<Sub n="14.2" title="From top to bottom">
+
+| Level | The choice | Data structure or algorithm |
+|---|---|---|
+| System | Protect the GPUs: refuse cheaply in front, batch densely behind | Token buckets; bounded queues; 429 and 503 with backoff |
+| Request | Stream as you go | Server-sent events of text deltas |
+| Scheduler | Decide every iteration | Continuous batching, selective batching, chunked prefill |
+| Memory | Allocate KV on demand | Fixed 16-token blocks, block tables, free list, reference counts, copy-on-write |
+| Reuse | Share identical prefixes | Chained block hashes in a hash table with LRU free queue; or a radix tree (SGLang) |
+| Model | Split across GPUs | Megatron-style column/row splits with all-reduce; pipeline stages |
+| Fleet | Split the phases | Separate prefill and decode pools; layer-wise KV transfer |
+| Decode | Guess and verify | Draft model plus rejection sampling; (1 − α^(γ+1)) / (1 − α) tokens per pass |
+| Storage | One partition per conversation | Message tree with parent pointers |
+
+</Sub>
+
+<SectionHeading n="15" id="breaks">What goes wrong, and what it cost</SectionHeading>
+
+<Sub n="15.1" title="Failures this design has to survive">
+
+| What happens | What the user sees | What the design does |
+|---|---|---|
+| A long prompt joins a busy batch | Everyone's stream stutters | Chunked prefill, or a separate prefill pool |
+| KV memory runs out mid-answer | A pause in the stream | Preempt the newest requests; swap or recompute their blocks later |
+| A GPU or replica dies mid-answer | The answer stops | The router retries elsewhere; the conversation is rebuilt from the store and prefill recomputes it |
+| A cancelled request leaves a pooled connection dirty | Another user's data appears (March 2023) | Clean up on cancellation; check returned data belongs to the requester |
+| A fleet-wide change overloads the control plane | Everything down for hours (December 2024) | Stage rollouts by cluster size; keep the data path independent of the control plane |
+| A launch brings 100 million new users in a week | Errors and slow answers | Token limits tightened for free tiers; bounded queues; 503s with backoff |
+
+December 2024's row is worth a sentence more. On 11 December 2024 all OpenAI services were degraded or down for about four hours and twenty minutes. A new telemetry service made every node in each Kubernetes cluster run expensive calls against the cluster's API servers, the cost grew with cluster size, and the large clusters' control planes fell over. Model servers themselves were fine, but service discovery uses DNS, which depended on those API servers, so once cached DNS records expired, about twenty minutes later, services couldn't find each other. Engineers then couldn't reach the overloaded control plane to remove the change. Staging hadn't caught it because only the biggest clusters triggered it.
+
+</Sub>
+
+<Sub n="15.2" title="The tradeoffs, in one table">
+
+| Decision | Chosen | Given up | Why it was worth it |
+|---|---|---|---|
+| Delivery | Stream tokens over SSE | Simple request/response | The first words arrive in well under a second |
+| Scheduling | Continuous batching with chunked prefill | Simplicity; the newcomer's fastest TTFT | Dozens of conversations per weight read |
+| KV memory | Paged blocks | 20–26% slower attention kernel | 96% of KV memory used, 2–4× throughput |
+| Reuse | Prefix caching with hash routing | Perfectly even load | Repeated prompts computed once |
+| Model split | Tensor inside a machine, pipeline across | Scheduling simplicity | Models bigger than any GPU |
+| Phases | Separate prefill and decode pools | KV transfer; two pools to balance | Each phase on hardware that suits it |
+| Decode speed | Speculative decoding at small batch | Some wasted arithmetic | Several tokens per weight read, same outputs |
+| Limits | Tokens, not requests | Simple counting | Cost tracks tokens |
+| Messages | Sharded by conversation | Joins with account data | Write volume spread across machines |
+
+</Sub>
+
+<SectionHeading n="16" id="summary">Summary</SectionHeading>
+
+1. **A model writes one token per forward pass**, so an answer is a loop of a few hundred passes, each depending on the last.
+2. **Prefill is compute-bound and decode is memory-bound**: a 1,000-token prompt does about 1,000 operations per byte of weights read, a decode step about one, so at batch 1 the GPU's arithmetic is idle over 99% of the time.
+3. **Streaming over SSE turns a six-second wait into a sub-second one**, and makes cancellation a normal path that every layer has to clean up after.
+4. **Continuous batching refills batch slots every iteration**, so one read of the weights feeds dozens of conversations; chunked prefill keeps long prompts from freezing them.
+5. **The KV cache decides how many conversations fit**: 320 KiB per token for a 70-billion-weight model, so memory, not arithmetic, caps the batch.
+6. **PagedAttention manages the KV cache like virtual memory**: 16-token blocks, per-request block tables, a free list and copy-on-write, raising memory use from 20–38% to 96%.
+7. **Prefix caching reuses blocks for shared beginnings**, found by chained hashes, and only pays off if the router sends repeat prefixes to the same machine.
+8. **Big models are split by tensor parallelism inside a machine and pipeline parallelism across machines**, because all-reduces need NVLink and pipelines need many requests in flight.
+9. **Separating prefill and decode** lets each phase run on hardware and settings that suit it, at the cost of copying KV caches between machines.
+10. **Speculative decoding spends idle arithmetic on guesses** and verifies several tokens per pass without changing the output distribution.
+11. **Limits are counted in tokens and conversations are stored as trees**, sharded by conversation, because cost tracks tokens and the GPUs remember nothing.
+
+<SectionHeading n="17" id="build">Build this</SectionHeading>
+
+**A tiny inference server.**
+
+- Install vLLM on a machine with an NVIDIA GPU (or use SGLang), and serve a small open model such as a 1-to-8-billion-weight instruct model with its OpenAI-compatible server.
+- Write a load generator that sends chat requests with prompt and output lengths drawn from the Azure LLM inference traces Microsoft published (AzurePublicDataset), streaming the responses. Record time to first token and the gaps between tokens.
+- Raise the request rate step by step and plot throughput and p99 time per output token. Find the knee where the batch is limited by KV memory (vLLM logs its KV cache usage).
+- Give every request the same 2,000-token system prompt and compare runs with prefix caching on and off. Then add a second server behind a round-robin balancer, and see what happens to the cache hit rate.
+- Add a token-bucket limiter in front that charges `max_tokens` up front and refunds the difference, and show that one client sending huge prompts no longer slows the others.
+
+<SectionHeading n="18" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What is the KV cache, and why does it matter so much for serving?">
+Every attention layer computes a key and a value vector for each token, and later tokens need all of them. Storing them instead of recomputing them makes each decode step cheap, but the store grows with every token of every running conversation and sits in GPU memory the whole time. For a 70-billion-weight model it's about 320 KiB per token, so a few tens of thousands of tokens fill the memory left after the weights. That limit, not arithmetic, decides how many conversations one GPU can batch.
+</QA>
+
+<QA level="intermediate" q="Why is decode memory-bound when prefill is compute-bound, on the same model and GPU?">
+Both read every weight once per pass. Prefill multiplies each weight against every prompt token, about a thousand of them, so it does about a thousand operations per byte read and is limited by arithmetic. Decode multiplies each weight against one new token per conversation, about one operation per byte, so it waits on memory bandwidth: for a 70-billion-weight model on two H100s, about 21 ms reading weights against 0.07 ms of math. Batching many conversations raises decode's operations per byte, so serving systems batch aggressively.
+</QA>
+
+<QA level="intermediate" q="What problem does continuous batching solve, and what new problem does it create?">
+Request-level batching holds a slot for each request until the longest one in the batch finishes, so short answers leave their slots idle and new requests wait. Continuous batching, from the Orca paper, schedules at every iteration: a finished request leaves after its last token and a waiting one joins on the next step. The new problem is that a joining request's prefill is much heavier than a decode step, so a long prompt stalls every stream in the batch; chunked prefill or separate prefill machines fix that.
+</QA>
+
+<QA level="deep" q="Explain PagedAttention and what it borrows from operating systems.">
+Older servers gave each request one contiguous KV region sized for its maximum length, which wasted 60 to 80% of the memory to reservation and fragmentation. PagedAttention cuts KV memory into fixed-size blocks of 16 tokens, allocates them on demand, and keeps a per-request block table mapping logical blocks to physical ones, like a page table. Because all blocks are the same size there's no external fragmentation, and at most one partly filled block per request. Reference counts let several sequences share blocks, with copy-on-write when one diverges, as after fork(). The attention kernel reads through the block table, which costs about 20 to 26% kernel time, repaid many times over by a bigger batch.
+</QA>
+
+<QA level="deep" q="How would you design prompt caching for a chat API, and how should requests be routed?">
+Cache KV blocks by a hash that chains each full block's tokens with the hash of the block before it, so a lookup finds the longest cached prefix of a new prompt; keep finished requests' blocks on an LRU free list with their hashes so they can be revived. Because the cache lives in one machine's GPU memory, route requests by a hash of the prompt's beginning to the replica that likely holds it, and overflow to other replicas when a prefix gets too hot. OpenAI's docs describe exactly this shape: routing on a hash of early tokens plus load, overflow above about 15 requests a minute per prefix, minutes-long lifetimes, and no sharing across organisations.
+</QA>
+
+<SectionHeading n="19" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="A model doubles its number of layers but keeps the same heads and head size. What happens to its KV cache per token?">
+    It doubles. Every layer stores its own key and value for every token, so
+    the per-token size is 2 × layers × KV heads × head size × bytes per number.
+  </Q>
+  <Q q="Why can speculative decoding make generation faster without changing the answer?">
+    The big model checks all the draft's guesses in one pass, which costs about
+    the same as one decode step because decode is memory-bound. A rejection
+    sampling rule accepts guesses so that the output follows exactly the big
+    model's distribution; wrong guesses are replaced by the big model's own token.
+  </Q>
+  <Q q="Your prefix cache hit rate drops from 80% to 10% after you add servers behind a round-robin load balancer. Why?">
+    Each server caches only what it has computed. Round-robin sends a
+    conversation's turns, and requests sharing a system prompt, to different
+    servers, so most requests land where their prefix isn't cached. Route by
+    a hash of the prompt's beginning instead, with overflow for hot prefixes.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Efficient Memory Management for LLM Serving with PagedAttention (Kwon et al., SOSP 2023)">
+    The vLLM paper: KV-cache waste in earlier systems, blocks and block tables,
+    copy-on-write, preemption by swapping or recomputation, and the 2–4× result.
+  </WildCard>
+  <WildCard name="Orca: A Distributed Serving System for Transformer-Based Generative Models (Yu et al., OSDI 2022)">
+    Iteration-level scheduling and selective batching, the origin of continuous
+    batching, evaluated on models up to 341 billion weights.
+  </WildCard>
+  <WildCard name="DistServe (OSDI 2024) and Splitwise (ISCA 2024)">
+    Two routes to separating prefill and decode: one optimising latency targets
+    per GPU, the other using Azure's production traces and hardware costs.
+  </WildCard>
+  <WildCard name="Sarathi-Serve (OSDI 2024) and SGLang (NeurIPS 2024)">
+    Chunked prefill with stall-free schedules, and RadixAttention's radix tree
+    for reusing KV caches across requests.
+  </WildCard>
+  <WildCard name="Fast Inference from Transformers via Speculative Decoding (Leviathan et al., ICML 2023)">
+    The guess-and-verify algorithm, the acceptance-rate arithmetic, and why the
+    outputs are identical. Chen et al. (DeepMind, 2023) is the companion paper.
+  </WildCard>
+  <WildCard name="OpenAI: prompt caching and rate-limit docs; 'March 20 ChatGPT outage'; 'Scaling PostgreSQL to power 800 million ChatGPT users' (2026)">
+    The public pieces of OpenAI's own system: cache routing and lifetimes, token
+    limits, a cancellation bug in a cache client, and the database behind ChatGPT.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="20" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="GPUs for Systems Engineers">
+    The roofline, HBM bandwidth and the full decode arithmetic for Llama 3 70B
+    this chapter builds on. [Chapter 45](/topics/45-gpu-architecture).
+  </WildCard>
+  <WildCard name="Virtual Memory & Page Tables">
+    Pages, page tables, free lists and copy-on-write: the design PagedAttention
+    borrows. [Chapter 04](/topics/04-virtual-memory).
+  </WildCard>
+  <WildCard name="Speculative Execution">
+    Guess, run ahead, and throw away wrong work, at the scale of CPU
+    instructions. [Chapter 44](/topics/44-speculative-execution).
+  </WildCard>
+  <WildCard name="Queueing, Capacity & Scaling">
+    Why batching raises throughput, and what queues do near full load.
+    [Chapter 42](/topics/42-queueing-and-capacity).
+  </WildCard>
+  <WildCard name="Designing Uber">
+    Another case study, where the scarce thing is nearby drivers instead of
+    GPU memory. [Chapter 50](/topics/50-design-uber).
+  </WildCard>
+</CardGrid>

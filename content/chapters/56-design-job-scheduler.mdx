@@ -1,0 +1,1043 @@
+---
+title: Designing a Distributed Job Scheduler
+dek: "Every night at midnight, Meera's billing job has to charge forty thousand customers: once, on time, whatever breaks. We'll design the scheduler that makes that happen, from a single crontab line down to heaps, timing wheels, leases, retries and dependency graphs, and look at what Google, Airflow, Temporal, Netflix and Dropbox chose."
+readingTime: "~60 min"
+level: "Intermediate"
+versions: "Figures from published papers, engineering blogs and open-source docs, dated where they appear"
+prereqs: "chapter 26 (leases and fencing tokens), chapter 27 (consensus), chapter 29 (partitioning), chapter 31 (idempotency) helps"
+updated: "2026-10-09"
+---
+
+Meera looks after billing at a company that sells software by subscription. Every night at midnight UTC, a job called `invoice-nightly` wakes up, works out what each of about forty thousand customers owes, charges their cards and emails the invoices. Beside it on the same server, a job called `fx-rates` fetches currency exchange rates every minute. And whenever a card is declined, the billing code asks for a one-off job: "send this customer a reminder in three days." All three were set up with a few lines in a file on one machine, and for two years nobody thought about them.
+
+Then, one Tuesday, the finance team notices that no invoices went out overnight. Someone had rebooted the server for a kernel update at 23:58 and came back at 00:03, and the scheduler on it never saw midnight. The engineers add a second server running the same schedule, so that one can cover for the other. On the following night both servers are healthy, both see midnight, and forty thousand customers are charged twice.
+
+<Picture
+  src="/images/designs/job-scheduler/time-clock-1909.jpg"
+  alt="A 1909 book page showing workers punching time cards in a pendulum time recorder, with three filled-in time cards below"
+  caption="A time clock from a 1909 book on factory management. A clock like this records when something happened; it doesn't make anything happen. A scheduler has the harder job: at the right moment it has to start work, exactly once, and know whether it finished."
+  credit="Image: Jerome Lee Nicholson, Nicholson on Factory Organization and Costs (1909), public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Time_clock,_1909.jpg"
+  narrow
+/>
+
+Those two nights hold most of what makes scheduling hard. One machine is a single point of failure, so a job can be missed. Two machines that don't coordinate will both act, so a job can run twice. And there's no third option where you add machines and the problem goes away: the machines have to agree on who fires each job, and the jobs themselves have to cope when that agreement fails, as it sometimes will.
+
+In this case study we'll design a scheduler for Meera's company, and then grow it into one that could serve a large company's thousands of teams. Here's the question we'll keep returning to is this: **how do you make a job run when it's supposed to, once, when any machine can fail at any moment?** We'll start from a single line of cron, find exactly where it breaks, and fix it step by step, going down to heaps, timing wheels, leases, retries with backoff and dependency graphs, and looking at what Google, Apache Airflow, Temporal, Netflix and Dropbox built.
+
+<SectionHeading n="01" id="requirements">What we're building, and how big</SectionHeading>
+
+<Sub n="1.1" title="What it has to do">
+
+A job scheduler, in the sense of this chapter, starts work at a time given in advance. That's different from a job *queue*, which runs work as soon as possible after someone asks; a scheduler holds work back until its moment and then usually hands it to something like a queue. Meera's three jobs show the three kinds of schedule it has to accept:
+
+1. **Recurring jobs**, given as a schedule: `fx-rates` every minute, `invoice-nightly` every day at midnight.
+2. **One-off delayed jobs**: "send the reminder to customer 8812 at 14:05 on Friday."
+3. **Jobs that depend on other jobs**: invoices should only be computed after the day's usage has been totalled, and emailed only after the charges are done.
+
+Around those, it has to:
+
+4. **Run the work somewhere**, on machines other than the scheduler itself, and know whether it succeeded.
+5. **Retry failures** sensibly, and park jobs that keep failing where a person will see them.
+6. **Show history**: when did this job last run, how long did it take, did it work?
+
+And the qualities that matter, in order of how much pain their absence causes:
+
+- **Don't run a job twice when that does harm.** Charging cards twice is the worst outcome in Meera's story.
+- **Don't miss runs.** A missed invoice run means missing revenue and confused customers.
+- **On time, within reason.** A few seconds of lateness is fine for almost every job, and probably nobody notices; minutes usually are for nightly ones.
+- **Survive machine failures** without anyone being paged at midnight.
+
+Notice the tension between the first two. A scheduler that's never sure whether a job ran has to choose between running it again (risking a double run) and not running it (risking a missed one). Much of this chapter is about shrinking the cases where it isn't sure, and making the remaining ones harmless.
+
+</Sub>
+
+<Sub n="1.2" title="How big is it?">
+
+At Meera's company, the numbers are small: a few dozen recurring jobs and a few thousand reminder emails a day. Things get interesting when one scheduler serves a whole company, and the companies that have published figures give a sense of the range.
+
+Dropbox described its Async Task Framework (ATF) in November 2020. It was built for 10,000 tasks a second from the start and was then serving about 9,000 tasks a second, with the promise that 95% of tasks begin within five seconds of their scheduled time. Slack's job queue, a close cousin that runs work as soon as possible, was processing over 1.4 billion jobs on its busiest days, at a peak of 33,000 a second, when Slack wrote about it in 2017. Amazon's EventBridge Scheduler, a managed scheduler launched in November 2022, today allows 10 million schedules per AWS region by default.
+
+At the other end are workflow schedulers for data pipelines, where each job may run for hours. Netflix's Maestro, open-sourced in 2024, "schedules hundreds of thousands of workflows, millions of jobs every day," according to its repository. Here the number of jobs is smaller, but each one is bigger, and many depend on others.
+
+<Think
+  q="Suppose your scheduler holds 50 million pending one-off jobs (reminders, trial expiries, retries) spread evenly over the next 30 days, plus 20,000 recurring jobs that their owners all set to run at midnight. How many jobs become due per second on an ordinary second, and in the first second after midnight?"
+  hint="Thirty days is about 2.6 million seconds."
+>
+Fifty million jobs over about 2.6 million seconds is roughly 19 jobs a second, which any database could handle. It's the midnight jobs that hurt: twenty thousand in the same second is a thousand times the average, all wanting a worker at once.
+
+So two things set the scale. The first is the number of jobs that are *waiting*, which decides how we store them and find the due ones; that can be tens or hundreds of millions, most of them sitting idle for days. The second is how bunched together the due times are, which decides how much capacity we need at the worst moment. Next to those two, the average rate barely matters. Section 9 comes back to the midnight spike.
+</Think>
+
+</Sub>
+
+<SectionHeading n="02" id="v1">Version 1: cron on one machine</SectionHeading>
+
+<Sub n="2.1" title="How cron works">
+
+The tool Meera's company started with, **cron**, has been part of Unix since the 1970s. Each user has a **crontab**, a text file with one line per job: five fields saying when, then the command to run. In order, the fields are minute, hour, day of month, month and day of week, and `*` means "any".
+
+```
+# min hour dom mon dow  command
+  *   *    *   *   *    /opt/billing/fx-rates
+  0   0    *   *   *    /opt/billing/invoice-nightly
+```
+
+The first line matches every minute; the second matches when the minute is 0 and the hour is 0, so once a day at midnight. The cron daemon, a background process, wakes once a minute, reads the current time from the machine's clock, checks every line against it, and starts a process for each line that matches. That's the whole design, and for a single machine it's a good one: it's simple, it's been debugged for decades, and it has no dependencies beyond the machine itself.
+
+The one-off reminder doesn't fit cron at all, since cron only knows repeating patterns. People usually work around it with a database table of reminders with a `send_at` column, and a cron job that runs every minute to send whatever is due. We'll come back to that table; it turns out to be the seed of the real design.
+
+</Sub>
+
+<Sub n="2.2" title="Where it breaks">
+
+<SystemDiagram
+  title="Version 1: one machine runs cron and the jobs"
+  nodes={[
+    { id: "cron", label: "billing-01", sub: "cron + the jobs", kind: "compute", col: 0, row: 0 },
+    { id: "db", label: "Billing DB", sub: "customers, usage", kind: "db", col: 1, row: 0 },
+    { id: "pay", label: "Payment provider", sub: "charges cards", kind: "external", col: 2, row: 0 },
+    { id: "mail", label: "Email service", kind: "external", col: 2, row: 1 },
+  ]}
+  edges={[
+    { from: "cron", to: "db", label: "read usage" },
+    { from: "cron", to: "pay", label: "charge" },
+    { from: "cron", to: "mail", label: "send" },
+  ]}
+  steps={[
+    { caption: "At 00:00 the cron daemon on billing-01 sees that `0 0 * * *` matches and starts invoice-nightly as a local process.", focus: ["cron"] },
+    { caption: "The job reads the day's usage for each customer from the billing database.", path: ["cron", "db"] },
+    { caption: "It charges each customer's card through the payment provider, one by one, for about forty minutes.", path: ["cron", "pay"] },
+    { caption: "And emails each invoice. If billing-01 is down at 00:00, none of this happens, and nothing anywhere notices.", path: ["cron", "mail"] },
+  ]}
+/>
+
+Google's SRE book, in its 2016 chapter on distributed cron, puts the first problem in one sentence: "Cron's failure domain is essentially just one machine. If the machine is not running, neither the cron scheduler nor the jobs it launches can run." A **failure domain** is the set of things that fail together, and here it's the scheduler, the jobs and the record of what ran, all on one box. Walk through what Meera would see in each case:
+
+- **The machine is down at midnight.** The daemon isn't running, so nobody sees the time match. When the machine comes back at 00:03, cron looks at the current minute, which doesn't match, and does nothing. So the run is silently missed.
+- **The machine dies at 00:20, halfway through.** Half the customers have been charged. Nothing records which half. When the machine comes back, cron won't rerun the job, and if someone reruns it by hand, the first half is charged again.
+- **The job takes longer than its interval.** If `fx-rates` sometimes takes 90 seconds, cron happily starts a second copy at the next minute while the first is still running.
+- **The machine fills up.** Every job shares one CPU, one disk and one memory. A heavy nightly report can starve `invoice-nightly`, and it probably will on the busiest night.
+- **Nobody knows.** Cron's output goes to a local mail spool that nobody reads. There's no history, no alerting and no retry.
+
+The SRE book's example makes the reliability point in numbers: if the cron machine is one of 1,000 in a data centre, "a failure of just 1/1000th of your available machines could knock out the entire cron service."
+
+<Picture
+  src="/images/designs/job-scheduler/datacenter-server-racks.jpg"
+  alt="A row of open server racks with blue and white network cabling over a raised perforated floor"
+  caption="A data centre has many machines, and on any given day some of them are down for repairs, kernel updates or hardware faults. A scheduler that depends on one particular machine inherits that machine's bad days."
+  credit="Photo: Carl Lender, CC BY 2.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Datacenter_Server_Racks_(22370909788).jpg"
+/>
+
+</Sub>
+
+<Sub n="2.3" title="Two machines, twice the charges">
+
+The fix Meera's team tried, two servers with the same crontab, turns the missed run into a double run. Neither server knows the other exists, so both fire at midnight. Every later section depends on the general lesson here: **more copies of the scheduler make it more available, but only if they agree on which copy acts.** Agreement between machines is the problem chapter 27 spent its whole length on, and we'll borrow its answer in section 4.
+
+The SRE book also makes the second lesson explicit: not every job is equally dangerous to repeat. Some jobs are **idempotent**, meaning that running them twice has the same effect as running them once. `fx-rates` fetches the current rates and overwrites a table; a second run writes the same rows. Others are not: "a process that sends out an email newsletter to a wide distribution, should not be launched more than once." `invoice-nightly`, as written, is the newsletter kind. Google's stated preference, when its cron can't tell whether a launch happened, is to skip it, because "recovering from a skipped launch is more tenable than recovering from a double launch." Hold on to that; section 5 turns it around by making the jobs themselves safe to repeat.
+
+So we need three things that cron doesn't give us: somewhere to keep the jobs that isn't one machine's disk, a way for several scheduler machines to agree who fires each job, and a record of what has run. The first of these, storing jobs and finding the due ones quickly, is where we start.
+
+</Sub>
+
+<SectionHeading n="03" id="due">Storing jobs and finding the due ones</SectionHeading>
+
+<Sub n="3.1" title="A table of jobs with a time-ordered index">
+
+The reminders table from section 2.1 generalises. Put every job, recurring or one-off, in a database table, with a column for the next time it should fire:
+
+| job_id | schedule | next_run_at | payload |
+|---|---|---|---|
+| invoice-nightly | `0 0 * * *` | 2026-10-10 00:00:00 | `{}` |
+| fx-rates | `* * * * *` | 2026-10-09 14:03:00 | `{}` |
+| remind-8812 | once | 2026-10-12 14:05:00 | `{"customer": 8812}` |
+
+A scheduler process then wakes every second or so and asks the database for everything due: `SELECT ... WHERE next_run_at <= now() ORDER BY next_run_at`. For a recurring job, after firing it computes the next matching time from the schedule and writes it back to `next_run_at`; for a one-off job, it marks the row done.
+
+Without help, that query reads the whole table every second. With an **index** on `next_run_at`, a B-tree kept in time order (chapter 18 covers how a B-tree works), the database walks straight to the start of the tree and reads rows until it reaches one in the future. Its cost becomes proportional to the number of due jobs, not the number of stored ones. A time-ordered index is the single most important data structure in a scheduler, and everything in this section is a different way of building one.
+
+This design survives a scheduler crash, because the jobs live in the database, and it's what many real schedulers do. Dropbox's task framework and Quartz's database-backed store (section 4.3) both keep jobs in a table and query by time. Its cost is that the database is asked the same question every second, even when nothing is due, and a precise schedule means asking often. When the jobs due in the next few minutes number in the thousands, it's worth also keeping them in memory, in a structure that can answer "what's next?" without any I/O.
+
+</Sub>
+
+<Sub n="3.2" title="In memory: a min-heap">
+
+The classic structure for "always give me the smallest" is a **min-heap**: a binary tree in which every node's value is no larger than its children's. The smallest value is therefore always at the root. Adding a job puts it at the bottom and swaps it upward while it's smaller than its parent; removing the root moves the last element to the top and swaps it downward. Both take a number of steps equal to the tree's height, which for *n* items is about log₂ *n*, so twenty steps for a million jobs.
+
+<div className="grid gap-4 sm:grid-cols-2">
+
+<Picture
+  src="/images/designs/job-scheduler/min-heap-tree.png"
+  alt="A binary tree with 1 at the root, 2 and 3 below it, then 17, 19, 36 and 7, then 25 and 100"
+  caption="A min-heap. Every parent is smaller than its children, so the smallest value, 1, is at the root. For a scheduler, the values are due times."
+  credit="Image: Onar Vikingstad, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Min-heap.png"
+/>
+
+<Picture
+  src="/images/designs/job-scheduler/heap-tree-and-array.png"
+  alt="A binary heap drawn as a tree with the same values written in an array below it"
+  caption="A heap needs no pointers: it's stored as a flat array, level by level, and the children of position i sit at 2i + 1 and 2i + 2. (This one is a max-heap, largest on top; a min-heap is laid out the same way.)"
+  credit="Image: Maxiantor, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Heap-as-array.svg"
+  paper
+/>
+
+</div>
+
+This program puts a million jobs, due at random seconds over the next 30 days, into a heap, then plays the scheduler's loop for four seconds, comparing it with scanning the whole list every second:
+
+<TryIt what="Finding due jobs: scan everything, or keep a min-heap" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import heapq, random, time
+random.seed(7)
+
+# 1,000,000 scheduled jobs, each due at some second in the next 30 days
+N, MONTH = 1_000_000, 30 * 24 * 3600
+jobs = [(random.randrange(MONTH), f"job-{i}") for i in range(N)]
+
+# The scheduler wakes once a second and asks: what became due this second?
+def due_by_scan(now):
+    return sorted(j for j in jobs if now - 1 < j[0] <= now)
+
+heap = list(jobs)
+heapq.heapify(heap)            # the soonest job is always at heap[0]
+def due_by_heap(now):
+    out = []
+    while heap and heap[0][0] <= now:
+        out.append(heapq.heappop(heap))
+    return out
+
+for now in range(0, 4):
+    t = time.perf_counter(); a = due_by_scan(now); scan = time.perf_counter() - t
+    t = time.perf_counter(); b = due_by_heap(now); hp = time.perf_counter() - t
+    print(f"t={now}s  due={len(a)}  scan {scan*1e3:5.1f} ms  heap {hp*1e6:4.1f} µs  same={a == b}")
+```
+<Output>
+```
+t=0s  due=1  scan  13.6 ms  heap 18.7 µs  same=True
+t=1s  due=0  scan  13.4 ms  heap  1.1 µs  same=True
+t=2s  due=0  scan  13.1 ms  heap  0.8 µs  same=True
+t=3s  due=0  scan  14.1 ms  heap  1.7 µs  same=True
+```
+</Output>
+</TryIt>
+
+Both find the same jobs. Scanning pays about 13 milliseconds every second whether anything is due or not, because it looks at all million jobs. The heap answers an empty second in about a microsecond, since it only has to glance at the root and see that it's in the future; that's roughly ten thousand times less work (exact times vary by machine). Its first call is slower because it pops a job and reorganises the tree.
+
+Heaps are what most language runtimes use for timers. Java's `ScheduledThreadPoolExecutor` keeps its tasks in a heap-based queue, and Go's runtime keeps a heap of timers for each processor it schedules goroutines on, a 4-ary heap (each node has four children) to make the tree shallower.
+
+The heap has one weak spot for a scheduler: cancelling. Reminders get cancelled all the time, because the customer pays before the three days are up. Finding an arbitrary job inside a heap means searching it, unless every job remembers its position, which Java's executor does to bring removal down from O(*n*) to O(log *n*). And every insert and every removal still costs log *n* steps. When the number of timers is huge and most are cancelled before they fire, there's a structure that does both in constant time.
+
+</Sub>
+
+<Sub n="3.3" title="Timing wheels">
+
+<Zoom path={["Scheduler", "Due-job index", "Timing wheel", "Slots and levels"]} />
+
+In 1987, George Varghese and Tony Lauck at Digital Equipment Corporation published a paper on exactly this problem, for the timers inside an operating system's network code, where almost every timer is a timeout that gets cancelled. Their abstract states the result: "By using a circular buffer or timing wheel, it takes O(1) time to start, stop, and maintain timers within the range of the wheel."
+
+The idea is the one on a clock face. Make an array of slots, one per second, say 60 of them, arranged in a ring, and a pointer to the current slot. To schedule a job 42 seconds from now, put it in the list at slot (now + 42) mod 60. That's one array index and one list append, whatever the number of timers. Every second, the pointer moves one slot and everything in that slot's list fires. Cancelling a job removes it from its slot's list, which is constant time if the list is doubly linked and the job keeps a pointer to its entry.
+
+<Picture
+  src="/images/designs/job-scheduler/circular-buffer-ring.png"
+  alt="A ring divided into 24 equal segments"
+  caption="A ring of slots. A timing wheel is this shape with a list of timers hanging off each slot and a pointer that advances one slot per tick. Inserting a timer is one index calculation, whatever the number of timers."
+  credit="Image: Cburnett, CC BY-SA 3.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Circular_buffer.svg"
+  paper
+  narrow
+/>
+
+<Why>What about a reminder three days away?</Why>
+
+A single wheel only reaches as far as it has slots. Three days at one-second resolution is 259,200 slots, most of them empty, and the paper's own example is a timer facility for up to 100 days, which would take 8.64 million. Varghese and Lauck's answer is the one a clock already uses: separate hands. Keep a wheel of 60 seconds, a wheel of 60 minutes, a wheel of 24 hours and a wheel of 100 days, "Thus instead of 100 * 24 * 60 * 60 = 8.64 million locations to store timers up to 100 days, we need only 100 + 24 + 60 + 60 = 244 locations."
+
+A timer goes into the coarsest wheel that it needs. When that wheel's slot comes round, its timers are moved down into the next finer wheel, at the right position within that hour or minute. This move is called a **cascade**. Varghese and Lauck point out that this is a radix sort done lazily: each timer is sorted by days, then by hours, then by minutes, but only when it gets close enough for the finer order to matter.
+
+This program builds a three-level wheel (seconds, minutes, hours) and runs Meera's three jobs through a day, printing every time a job is placed or moved:
+
+<TryIt what="A hierarchical timing wheel: where each job sits, and when it moves" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+# A three-level hierarchical timing wheel, ticking once a second:
+#   seconds wheel: 60 slots of 1 s    (covers the next minute)
+#   minutes wheel: 60 slots of 60 s   (covers the next hour)
+#   hours wheel:   24 slots of 3600 s (covers the next day)
+LEVELS = [("seconds", 1, 60), ("minutes", 60, 60), ("hours", 3600, 24)]
+wheels = [[[] for _ in range(size)] for _, _, size in LEVELS]
+now = 0
+
+def add(name, due):
+    """Put a timer in the finest wheel whose span still reaches it: O(1)."""
+    for level, (label, tick, size) in enumerate(LEVELS):
+        if due - now < tick * size:
+            slot = (due // tick) % size
+            wheels[level][slot].append((name, due))
+            print(f"  t={now:>5}  {name} -> {label} wheel, slot {slot}")
+            return
+    raise ValueError("too far ahead for this wheel")
+
+add("rates-sync", 42)            # in 42 s
+add("reminder-email", 3725)      # in 1 h 2 min 5 s
+add("invoice-nightly", 86_399)   # in 23 h 59 min 59 s
+
+while now < 86_400:
+    now += 1
+    # When a coarser wheel's slot comes due, empty it into finer wheels
+    # (this is the "cascade"). Coarse slots first, so timers trickle down.
+    for level in (2, 1):
+        label, tick, size = LEVELS[level]
+        if now % tick == 0:
+            bucket, wheels[level][(now // tick) % size] = wheels[level][(now // tick) % size], []
+            for name, due in bucket:
+                if due == now:
+                    print(f"  t={now:>5}  FIRE {name}")
+                else:
+                    add(name, due)
+    for name, due in wheels[0][now % 60]:
+        print(f"  t={now:>5}  FIRE {name}")
+    wheels[0][now % 60] = []
+```
+<Output>
+```
+  t=    0  rates-sync -> seconds wheel, slot 42
+  t=    0  reminder-email -> hours wheel, slot 1
+  t=    0  invoice-nightly -> hours wheel, slot 23
+  t=   42  FIRE rates-sync
+  t= 3600  reminder-email -> minutes wheel, slot 2
+  t= 3720  reminder-email -> seconds wheel, slot 5
+  t= 3725  FIRE reminder-email
+  t=82800  invoice-nightly -> minutes wheel, slot 59
+  t=86340  invoice-nightly -> seconds wheel, slot 59
+  t=86399  FIRE invoice-nightly
+```
+</Output>
+</TryIt>
+
+Follow the reminder, due 1 hour, 2 minutes and 5 seconds from now. At time 0 it's too far away for the seconds or minutes wheel, so it goes into hour slot 1. Nothing touches it for an hour. At t = 3600 its hour slot comes round and it cascades into minute slot 2; at t = 3720 that slot comes round and it cascades into second slot 5; five seconds later it fires. Each move is one append, so a timer is handled at most once per level, three times here, however many millions of other timers exist. And for the whole day, the scheduler's per-second work was looking at one slot of the seconds wheel and, once a minute or once an hour, one slot of a coarser wheel.
+
+<Scene
+  title="The reminder cascading down the wheels"
+  regions={[
+    { id: "h", label: "Hours wheel", sub: "24 slots × 1 h", col: 0, row: 0 },
+    { id: "m", label: "Minutes wheel", sub: "60 slots × 1 min", col: 1, row: 0 },
+    { id: "s", label: "Seconds wheel", sub: "60 slots × 1 s", col: 2, row: 0 },
+    { id: "fire", label: "Fired", sub: "handed to a worker", col: 1, row: 1, span: 2 },
+  ]}
+  itemWidth={124}
+  frames={[
+    { caption: "At t = 0 the reminder is due in 1 h 2 min 5 s. That's beyond the seconds and minutes wheels' reach, so it goes into **hour slot 1**. `fx-rates`, due in 42 s, goes straight into the seconds wheel.",
+      items: [
+        { id: "rem", at: "h", label: "reminder", sub: "slot 1", tone: "accent" },
+        { id: "fx", at: "s", label: "fx-rates", sub: "slot 42" },
+        { id: "inv", at: "h", label: "invoice", sub: "slot 23", tone: "dim" },
+      ], focus: ["h"] },
+    { caption: "At t = 42 the seconds pointer reaches slot 42 and `fx-rates` fires. The other two haven't been touched.",
+      change: [{ id: "fx", at: "fire", tone: "ok", sub: "t = 42" }], focus: ["s", "fire"], arrow: { from: "s", to: "fire", label: "fire" } },
+    { caption: "At t = 3600 hour slot 1 comes round. The reminder isn't due yet, so it **cascades** into minute slot 2, its position within that hour.",
+      change: [{ id: "rem", at: "m", sub: "slot 2" }], focus: ["m"], arrow: { from: "h", to: "m", label: "cascade" } },
+    { caption: "At t = 3720 minute slot 2 comes round, and the reminder cascades again, into second slot 5.",
+      change: [{ id: "rem", at: "s", sub: "slot 5" }], focus: ["s"], arrow: { from: "m", to: "s", label: "cascade" } },
+    { caption: "At t = 3725 the seconds pointer reaches slot 5 and the reminder fires. It was moved twice and inspected three times in total, whatever else was in the wheels.",
+      change: [{ id: "rem", at: "fire", tone: "ok", sub: "t = 3725" }], focus: ["fire"], arrow: { from: "s", to: "fire", label: "fire" } },
+  ]}
+/>
+
+<Decision
+  q="How should the scheduler keep its pending timers in memory?"
+  options={[
+    { name: "Sorted list", how: "Keep timers in due-time order; insert by walking to the right place.", good: ["Next timer is always first", "Trivial to write"], bad: ["O(n) per insert", "Painful with millions of timers"] },
+    { name: "Min-heap", how: "Binary (or 4-ary) heap keyed by due time.", good: ["O(log n) insert and pop", "Exact ordering at any resolution", "In every standard library"], bad: ["Cancellation needs extra bookkeeping", "log n work per timer adds up at high rates"] },
+    { name: "Hierarchical timing wheel", how: "Rings of slots at several granularities; timers cascade down.", good: ["O(1) insert and cancel", "Per-tick work independent of the number of timers"], bad: ["Resolution fixed by the tick", "Needs a tick even when nothing is due", "Cascading costs work for timers that would be cancelled anyway"], chosen: true },
+  ]}
+>
+For an operating system or a broker with millions of short timeouts, most of them cancelled, the wheel wins clearly; Varghese and Lauck recommended their hashed or hierarchical schemes for "a general timer module". For a job scheduler with a modest number of jobs due soon, a heap is simpler and plenty fast, and many schedulers use one. A common combination in large schedulers is a durable time-ordered table for the far future, and an in-memory heap or wheel loaded with only the next few minutes.
+</Decision>
+
+</Sub>
+
+<Sub n="3.4" title="Where timing wheels run today">
+
+The best-documented production timing wheel is in Apache Kafka. A Kafka broker holds many requests that are waiting for something, a produce request waiting for replicas to confirm a write, a fetch waiting for enough data to arrive, each with a timeout. Kafka calls the holding area the **purgatory**. Until 2015, those timeouts sat in Java's `DelayQueue`, a heap. Yasuhiro Matsuda's October 2015 post explains why that hurt: heap timers "have O(log n) insert/delete cost", and the queue didn't support removing an arbitrary entry, so completed requests stayed in it until a separate thread scanned them out. When that thread fell behind, the broker could run out of memory.
+
+The replacement, shipped in Kafka 0.9, is a hierarchical timing wheel with a tick of 1 ms and 20 slots per wheel. A timer beyond the first wheel's 20 ms goes to an overflow wheel with 20 ms slots, then one with 400 ms slots, and so on, each "created on-demand." One detail solves the "tick even when nothing is due" problem: instead of waking every millisecond, the broker puts each non-empty *slot* into a `DelayQueue`, and sleeps until the earliest slot is due. The heap now holds at most a few dozen slots instead of every request. In the post's benchmark, with long timeouts, the old purgatory saturated at around 25,000 requests a second and the new one at 105,000.
+
+Linux has run a timer wheel for decades, and in 2016 it removed the very thing our program just showed. Thomas Gleixner's rework, released in Linux 4.8 in October 2016, observed that "the vast majority of the timer wheel timers are canceled or rearmed before expiration," so cascading them down the levels was "completely pointless in most cases." The new wheel has 64 slots per level, each level eight times coarser than the one below, and timers never move: a timeout set for an hour from now just fires within the precision of its level, up to about 12.5% late. For network timeouts that's fine. For Meera's invoice run it probably wouldn't be: the right timer structure depends on whether timers are mostly cancelled or mostly fired.
+
+<Elsewhere items={[
+  { where: "Linux", how: "The kernel's timer wheel (rebuilt in 2016 without cascading) handles timeouts; precise timers use hrtimers, kept in a red-black tree, another time-ordered structure." },
+  { where: "Netty", how: "HashedWheelTimer, 'optimized for approximated I/O timeout scheduling', defaults to a 100 ms tick and 512 slots, and credits Varghese and Lauck." },
+  { where: "Apache Kafka", how: "Request timeouts in the broker's 'purgatory' have used a hierarchical timing wheel since version 0.9 (2015)." },
+  { where: "Go and Java runtimes", how: "time.After and ScheduledThreadPoolExecutor keep timers in heaps: Go uses a 4-ary heap per processor." },
+]} />
+
+We now have a way to find due jobs in a durable table and in memory. But Meera's real problem was never speed; it was that two machines both fired the same job. If two scheduler processes read the same table and both see `invoice-nightly` due at midnight, they'll both fire it. Next we need them to agree.
+
+</Sub>
+
+<SectionHeading n="04" id="once">Firing each job once</SectionHeading>
+
+<Sub n="4.1" title="One leader, chosen by a lease">
+
+Run three scheduler processes on three machines, reading the same jobs table. Probably the simplest way to stop them all firing `invoice-nightly` is to let only one of them fire anything. Its peers stand by, ready to take over. The one that acts is the **leader**, and choosing it is **leader election**.
+
+The obvious way to elect a leader, "whoever holds the lock", runs into the problem chapter 26 dwelt on: a lock held by a machine that has crashed is never released, so it has to expire. A lock that expires after a set time unless renewed is a **lease**. A leader renews its lease every few seconds, say every 3 seconds for a 10-second lease; if it dies, the lease runs out and a standby takes it. Leases are kept in a small replicated store that uses consensus, such as etcd or ZooKeeper (chapter 27), precisely so that the store can't itself be a single machine that fails or disagrees with itself.
+
+<SystemDiagram
+  title="Version 2: three schedulers, one leader at a time"
+  nodes={[
+    { id: "a", label: "scheduler-a", sub: "leader", kind: "service", col: 0, row: 0 },
+    { id: "b", label: "scheduler-b", sub: "standby", kind: "service", col: 0, row: 1 },
+    { id: "c", label: "scheduler-c", sub: "standby", kind: "service", col: 0, row: 2 },
+    { id: "lease", label: "Lease store", sub: "etcd · 3 replicas", kind: "registry", col: 1, row: 1 },
+    { id: "jobs", label: "Jobs table", sub: "next_run_at index", kind: "db", col: 2, row: 0 },
+    { id: "work", label: "Job runner", sub: "starts the work", kind: "compute", col: 2, row: 2 },
+  ]}
+  edges={[
+    { from: "a", to: "lease", label: "renew" }, { from: "b", to: "lease", dashed: true }, { from: "c", to: "lease", dashed: true },
+    { from: "a", to: "jobs", label: "due?" }, { from: "a", to: "work", label: "launch" },
+  ]}
+  steps={[
+    { caption: "scheduler-a holds the lease and renews it every few seconds. b and c watch the lease and do nothing else.", path: ["a", "lease"], focus: ["b", "c"] },
+    { caption: "At midnight, only the leader reads the due jobs and finds invoice-nightly.", path: ["a", "jobs"] },
+    { caption: "It launches the job on the runner. Neither standby launches anything, so the double charge from section 2.3 can't happen while everyone agrees who the leader is.", path: ["a", "work"] },
+    { caption: "If scheduler-a dies, its renewals stop. When the lease runs out, b acquires it and starts reading due jobs, a few seconds after a's last renewal.", path: ["b", "lease"], focus: ["a"] },
+  ]}
+/>
+
+<Why>What if the old leader isn't dead, just slow?</Why>
+
+That's the case that makes leases tricky. Suppose scheduler-a pauses for 15 seconds, for a long garbage-collection pause or because its virtual machine was frozen. Its lease expires and b becomes leader. Then a wakes up, still believing it's leader for the moment it takes to notice, and launches the job it was about to launch. Now two leaders have acted. Chapter 26 walks through this exact failure and its fix, the **fencing token**: every lease grant comes with a number that only goes up, the leader attaches it to everything it does, and whatever receives the action rejects numbers lower than the highest it has seen. Our jobs table can do this with a check on write: the leader only marks a job as launched if its token is still the current one.
+
+Google's distributed cron, described in its SRE book, takes the same line in its own words. Only the leader may launch jobs, and "as soon as it loses its leadership for any reason, it must immediately stop interacting with the datacenter scheduler." Its replicas found a dead leader "quickly (within seconds)", well within the one-minute failover the cron service could tolerate.
+
+</Sub>
+
+<Sub n="4.2" title="The leader that dies halfway through a launch">
+
+A lease decides who fires. It doesn't tell the new leader what the old one had already done. Suppose scheduler-a decided to launch `invoice-nightly`, started it, and died before writing "launched" in the jobs table. scheduler-b takes over, sees the job still due, and launches it again.
+
+Google's cron solves this with two records per launch. Its state lives in a log replicated with Paxos (the consensus protocol chapter 27 compares with Raft), and before every launch the leader writes "about to launch" and waits until a majority of replicas have it; after the launch, it writes "finished". In the book's words: "We synchronously inform a quorum of replicas of the beginning and end of each scheduled launch for each cron job." A new leader that finds a launch with a start record and no finish record knows exactly which launch is in doubt.
+
+What it does next depends on being able to ask the cluster "did this launch happen?" Google's answer is to name every launch before it happens. The job's name in the data-centre scheduler, Borg, is computed from the cron job's name and its scheduled time, so `invoice-nightly` for 10 October always has the same name. The book: "If the cron service leader dies during launch, the new leader simply looks up the state of all the precomputed names and launches the missing names." The scheduled time has to be part of the name, especially for jobs that run every minute; otherwise the new leader can't tell this minute's launch from the last one's.
+
+<StepSequence
+  title="A leader dies mid-launch; its successor finishes the job without repeating it"
+  actors={["scheduler-a", "Paxos log", "Borg", "scheduler-b"]}
+  messages={[
+    { from: 0, to: 1, label: "start invoice-nightly@00:00", note: "Written to a majority of replicas before anything is launched." },
+    { from: 0, to: 2, label: "create inv-20261010-0000", note: "The Borg job's name, shortened here, is computed from the cron job and its scheduled time." },
+    { from: 0, to: 0, label: "crash", note: "scheduler-a dies before writing the finish record." },
+    { from: 3, to: 1, label: "read open launches", note: "scheduler-b becomes leader and finds one launch started but not finished." },
+    { from: 3, to: 2, label: "exists inv-20261010-0000?", note: "It asks Borg for the precomputed name. The job is there, so nothing is launched again." },
+    { from: 3, to: 1, label: "finish invoice-nightly@00:00", note: "The launch is closed. Had the job been missing, b would have launched it under the same name." },
+  ]}
+/>
+
+That's the general shape of the fix, and it's worth naming: when you can't make an action and its record happen atomically, give the action a **deterministic identity** that the next actor can check. We'll meet it twice more, in idempotency keys for the jobs themselves and in the payment provider's API.
+
+Google also explains where it keeps this state. The Paxos logs and snapshots live on the local disks of the three cron replicas, and only snapshots are backed up to the distributed filesystem, because "Small writes on a distributed filesystem are very expensive and come with high latency," and because "Base services for which outages have wide impact (such as cron) should have very few dependencies."
+
+</Sub>
+
+<Sub n="4.3" title="Or no leader at all: claiming rows">
+
+A single leader is simple, but it means one process does all the scheduling. There's a second common design that lets every scheduler work at once and still fire each job once: let the database decide, row by row.
+
+The trick is a pair of SQL clauses. `SELECT ... FOR UPDATE` locks the rows it returns, so no other transaction can claim them until this one commits. Adding `SKIP LOCKED` makes other schedulers step over locked rows instead of waiting for them. Each scheduler runs:
+
+```sql
+BEGIN;
+SELECT job_id FROM jobs
+ WHERE next_run_at <= now()
+ ORDER BY next_run_at
+ LIMIT 100
+ FOR UPDATE SKIP LOCKED;
+-- launch each job, then move next_run_at forward or mark it done
+COMMIT;
+```
+
+Two schedulers that run this at the same instant get disjoint sets of rows: whichever locks `invoice-nightly` first gets it, and the other one skips it. The database's own locking, which already has to be correct for everything else it does, provides the mutual exclusion.
+
+Apache Airflow, the most widely used open-source workflow scheduler, adopted exactly this when it added support for running several schedulers in version 2.0, released in December 2020. Its documentation says the schedulers don't talk to each other or run any consensus algorithm, a design that "kept the 'operational surface area' to a minimum"; they coordinate only through row locks with `SKIP LOCKED` or `NOWAIT` in the metadata database, so it requires PostgreSQL 12+ or MySQL 8.0+, whose locking supports them. The Quartz scheduler for Java, much older, clusters the same way: every node shares one database, takes a row lock in a `QRTZ_LOCKS` table, and "the first node to acquire it (by placing a lock on it) is the node that will fire it."
+
+<Picture
+  src="/images/designs/job-scheduler/airflow-distributed-architecture.png"
+  alt="Airflow's distributed architecture: triggerers, DAG processors, schedulers and workers, all connected to a metadata database, with an API server and three kinds of user"
+  caption="Airflow's architecture as its documentation draws it. The scheduler(s), DAG processors and triggerers all read and write one metadata database (the red dotted lines), and that database is where several schedulers coordinate. Workers run the tasks; the dashed [Executor] line is how the scheduler hands them work."
+  credit="Image: Apache Airflow documentation, The Apache Software Foundation, Apache License 2.0"
+  href="https://github.com/apache/airflow/blob/main/airflow-core/docs/img/diagram_distributed_airflow_architecture.png"
+  paper
+/>
+
+The cost is that the database becomes the one thing everything depends on, and every scheduler polls it. Quartz's clustering documentation adds a warning that matters for the rest of this chapter: "Never run clustering on separate machines, unless their clocks are synchronized." Each node decides what is due by its own clock.
+
+<Decision
+  q="How do several scheduler processes avoid firing the same job?"
+  options={[
+    { name: "One leader by lease", how: "A consensus store grants a lease; only the holder fires jobs.", good: ["Simple to reason about: one actor", "Leader can keep all due jobs in memory"], bad: ["One process's capacity", "Failover gap of a lease timeout", "Needs fencing against a paused ex-leader"] },
+    { name: "Row claims in the database", how: "Every scheduler claims due rows with SELECT … FOR UPDATE SKIP LOCKED.", good: ["All schedulers work at once", "No separate coordination service"], bad: ["The database is now the bottleneck and the single point of failure", "Polling load grows with the number of schedulers"] },
+    { name: "Shards, each with its own leader", how: "Split jobs by hash; a lease per shard.", good: ["Scales out with the number of shards", "A failure affects one shard"], bad: ["More moving parts", "Rebalancing shards when machines change"], chosen: true },
+  ]}
+>
+For Meera's company, either of the first two is plenty, and the second is attractive because the jobs table already exists. Section 10 explains why the very large schedulers end up with the third, which is the first one repeated per shard.
+</Decision>
+
+<Elsewhere items={[
+  { where: "Kubernetes", how: "The controller manager, which runs the CronJob controller among others, uses a lease object in the API server so that only one replica acts at a time." },
+  { where: "Database primaries", how: "Patroni and similar tools elect a Postgres primary with a lease in etcd or Consul, the same pattern for a different job (chapter 28)." },
+  { where: "Kafka", how: "Since KRaft, a quorum of controllers elects an active controller; before that, it was a lease-like ephemeral node in ZooKeeper (chapter 23)." },
+]} />
+
+So now exactly one scheduler fires `invoice-nightly` at midnight. But firing isn't running. It runs for forty minutes on some machine, and that machine can fail too.
+
+</Sub>
+
+<SectionHeading n="05" id="workers">Running the work: leases, heartbeats and idempotent jobs</SectionHeading>
+
+<Sub n="5.1" title="Separate the scheduler from the workers">
+
+In cron, the scheduler and the work share a machine, so one reboot lost both. So we split them. The scheduler only decides *when*; at that moment it puts a small message, "run `invoice-nightly` for 2026-10-10", onto a queue. A pool of **workers**, processes on other machines, take messages from the queue and do the work. Now a heavy job can't starve the scheduler, workers can be added when the queue grows, and the scheduler stays small enough to fail over in seconds.
+
+This is how most production designs look. Dropbox's ATF has a store consumer that polls the task store every two seconds for tasks whose trigger time has passed and pushes them onto Amazon SQS queues, from which controllers on the worker hosts pull them. Airflow's scheduler hands tasks to an executor, which sends them to Celery or Kubernetes workers.
+
+But the split creates a new question. A worker takes `invoice-nightly` off the queue and, twenty minutes in, its machine loses power. Who notices, and who finishes the job?
+
+</Sub>
+
+<Sub n="5.2" title="Leasing a job, and heartbeats">
+
+If a queue deleted a message the moment a worker took it, a crashing worker would lose the job. Instead the worker **leases** it, the same idea as the scheduler's lease in section 4.1, applied to one job: the message stays in the queue but becomes invisible to other workers for a fixed time. If the worker finishes and acknowledges it, the message is deleted. If the lease runs out first, the message reappears and another worker picks it up.
+
+Amazon SQS calls this the **visibility timeout**: 30 seconds by default, extendable up to 12 hours from when the message was first received. A forty-minute job can't just pick a forty-minute timeout, though, because then a crash at minute one wastes thirty-nine minutes before anyone retries. So long jobs keep the lease short and renew it while they're alive, by sending a **heartbeat**, a periodic "I'm still working on this", every few seconds. AWS's own advice is to "implement a heartbeat mechanism to periodically extend the visibility timeout." Temporal's activities do the same with a heartbeat timeout: if a running activity stops heartbeating for longer than that, it's treated as failed and retried.
+
+<Scene
+  title="A worker dies holding invoice-nightly; the lease brings it back"
+  regions={[
+    { id: "q", label: "Queue", sub: "visible jobs", col: 0, row: 0 },
+    { id: "w1", label: "worker-1", col: 1, row: 0 },
+    { id: "w2", label: "worker-2", col: 2, row: 0 },
+    { id: "leased", label: "Leased", sub: "invisible until the lease ends", col: 0, row: 1, span: 3 },
+  ]}
+  itemWidth={132}
+  frames={[
+    { caption: "At 00:00 the scheduler enqueues `invoice-nightly` for 10 October.",
+      items: [{ id: "job", at: "q", label: "invoice-nightly", sub: "2026-10-10", tone: "new" }], focus: ["q"] },
+    { caption: "worker-1 takes it with a **30-second lease**. The job is now invisible to everyone else, and worker-1 starts charging customers.",
+      change: [{ id: "job", at: "leased", tone: "accent", sub: "lease: worker-1" }], focus: ["w1", "leased"], arrow: { from: "q", to: "w1", label: "lease 30 s" } },
+    { caption: "Every 10 seconds worker-1 sends a **heartbeat**, which extends the lease by another 30 seconds. The job has been running for 20 minutes.",
+      change: [{ id: "job", sub: "renewed · 00:20" }], focus: ["w1"], arrow: { from: "w1", to: "leased", label: "heartbeat" } },
+    { caption: "At 00:20 worker-1's machine loses power. No more heartbeats. About 12,000 customers have been charged.",
+      change: [{ id: "job", tone: "bad", sub: "no heartbeat" }], focus: ["w1"] },
+    { caption: "Thirty seconds later the lease runs out and the job becomes **visible again**.",
+      change: [{ id: "job", at: "q", tone: "dirty", sub: "attempt 2" }], focus: ["q"] },
+    { caption: "worker-2 leases it and runs it from the start. Whether the first 12,000 customers get charged twice depends entirely on how the job is written.",
+      change: [{ id: "job", at: "leased", tone: "accent", sub: "lease: worker-2" }], focus: ["w2", "leased"], arrow: { from: "q", to: "w2", label: "lease 30 s" } },
+  ]}
+/>
+
+Leases have the same weakness here as in section 4. A worker that pauses for longer than its lease, then wakes up and carries on, now runs alongside the worker that took over. Dropbox's ATF guards against the common case from the worker's side: an executor "terminates itself as soon as three consecutive heartbeat calls fail," because if it can't renew its lease it must assume someone else is about to take the job. That narrows the window; it doesn't close it.
+
+</Sub>
+
+<Sub n="5.3" title="At-least-once, so make the job idempotent">
+
+Look at what the lease guarantees. A job whose worker crashes will run again, so it's never lost. But a job can run twice: once partly, on the dead worker, and again in full; or twice concurrently, if the first worker was paused instead of dead. This guarantee, "every job runs one or more times", is called **at-least-once execution**, and it's what every scheduler in this chapter offers. Dropbox's ATF "guarantees that a task is executed at least once after being scheduled"; EventBridge Scheduler "provides at-least-once event delivery to targets"; and Kubernetes' CronJob documentation says outright that "there are certain circumstances where two Jobs might be created, or no Job might be created ... the Jobs that you define should be idempotent."
+
+<Predict
+  q="Could a cleverer scheduler guarantee that invoice-nightly runs exactly once, if machines can crash and messages can be lost?"
+  options={[
+    "Yes, with a strongly consistent database recording each launch",
+    "Yes, with a short enough lease and frequent heartbeats",
+    "No: the scheduler can't tell a dead worker from a slow one, so it must either risk a second run or risk none",
+  ]}
+  answer={2}
+>
+A worker that has gone quiet might have crashed before charging anyone, after charging everyone, or might be paused and about to continue. Chapter 30 showed that silence can't be told apart from slowness. Whatever the scheduler decides, there's a case where it's wrong: rerun, and the paused worker may finish too; don't rerun, and the dead worker's job is lost. What *can* be made exactly-once is the job's *effect*, by making a second run do no harm.
+</Predict>
+
+So the work moves from the scheduler to the job. A job is safe under at-least-once if every action it takes is idempotent, and chapter 31 covers the standard tool, the **idempotency key**: a unique value for each logical operation, sent with every attempt, so the receiver can recognise a repeat. Here's how `invoice-nightly` becomes safe:
+
+- **Name the run.** The run is identified by the job and its scheduled time, `invoice-nightly/2026-10-10`, the same deterministic identity Google's cron used for launches in section 4.2. Every attempt of this run uses the same identity.
+- **Record each customer's invoice with a unique constraint** on (customer, billing period). Before charging customer 8812 for 10 October, the job inserts that row; if it already exists from an earlier attempt, the customer is skipped or the earlier result is reused.
+- **Charge with an idempotency key** built from the same pieces, such as `charge-8812-2026-10-10`. Payment providers such as Stripe remember the result of the first request with a given key and return it again for repeats, so even a crash between charging and recording can't produce a second charge.
+
+With those three changes, worker-2 in the diagram above walks through the first 12,000 customers finding each one already done, and charges only the rest. The job has become, in Google's terms, the garbage-collection kind instead of the newsletter kind.
+
+<Callout label="Design implication">
+Decide early which side owns "once". A scheduler can promise at-least-once cheaply and at-most-once by skipping anything in doubt, as Google's cron prefers. Nothing can promise exactly-once execution across crashes, so jobs that move money, send messages or call outside systems must carry their own idempotency keys. Write that into the scheduler's contract, as Kubernetes and Dropbox do, so job authors don't assume otherwise.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="06" id="retries">When a job fails: retries, backoff and dead letters</SectionHeading>
+
+<Sub n="6.1" title="Retry, but not immediately">
+
+Workers dying is one kind of failure. A commoner kind is the job itself failing: the payment provider times out, the database is overloaded, a bug throws an exception. Many of these failures are probably temporary, so the scheduler should try again. When should it try?
+
+Retrying at once is usually wrong. If the payment provider is overloaded, every failed job retrying immediately adds load to the thing that's already struggling. The standard answer is **exponential backoff**: wait a little after the first failure, twice as long after the second, and so on, up to a cap. Temporal's default retry policy is a typical example: the first retry after 1 second, a backoff coefficient of 2.0, so 2, 4, 8 seconds, capped at 100 times the initial interval (100 seconds), with unlimited attempts by default.
+
+Backoff alone still has a flaw. If a thousand reminder jobs fail together at 14:05:00 because the email service blipped, they all retry together at 14:05:01, then together at 14:05:03, a synchronised wave each time. Marc Brooker's 2015 AWS post on the subject compared ways of adding randomness, called **jitter**. The simplest, "full jitter", waits a random time between zero and the exponential delay; Brooker found that backing off without jitter was the "clear loser", and that jittered schemes gave "a substantial decrease in client work and server load." Chapter 40 covers retries, backoff and jitter for requests in general; jobs are the same story with longer delays.
+
+<Picture
+  src="/images/designs/job-scheduler/airflow-task-lifecycle-states.png"
+  alt="Airflow's task state diagram: none to scheduled to queued to running to success, with branches for failure, up_for_retry, upstream_failed and up_for_reschedule"
+  caption="Airflow's task lifecycle. A task moves from scheduled (by the scheduler) to queued (by the executor) to running (on a worker). On an error, the diamond asks whether it's eligible for retry: if so it goes to up_for_retry and back to the scheduler after its delay; if not, it's failed, and every task downstream of it becomes upstream_failed."
+  credit="Image: Apache Airflow documentation, The Apache Software Foundation, Apache License 2.0"
+  href="https://github.com/apache/airflow/blob/main/airflow-core/docs/img/task_lifecycle_diagram.png"
+  paper
+/>
+
+</Sub>
+
+<Sub n="6.2" title="When to give up: the dead-letter queue">
+
+Some failures aren't temporary. A reminder for a customer whose account has been deleted will fail forever, and retrying it forever wastes workers and hides the problem. So retries need a limit, a number of attempts or a total time, and some errors should never be retried at all: Temporal lets a retry policy list error types that are non-retryable.
+
+A job that exhausts its retries shouldn't vanish. It goes to a **dead-letter queue**, a separate place where failed jobs are kept with their last error, for a person to inspect, fix and replay. EventBridge Scheduler, by default, retries a failed delivery for up to 24 hours and 185 attempts; if you haven't configured a dead-letter queue, the event is then dropped. Airflow's equivalent is the `failed` state in the diagram above, and an alert.
+
+<Callout label="Common mistake" kind="warn">
+Retrying jobs that aren't idempotent. Every retry policy assumes a second attempt is harmless. If the first attempt failed after charging the card but before recording the charge, a retry charges again. Retries and idempotency from section 5.3 have to be designed together.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="07" id="dags">Jobs that depend on jobs</SectionHeading>
+
+<Sub n="7.1" title="From a schedule to a graph">
+
+Meera's nightly run is made of four jobs. `usage-rollup` totals each customer's usage for the day. `invoice-nightly` needs those totals and today's exchange rates from `fx-rates`. `send-invoices` emails the results, and needs the charges done. With cron, people handle this with gaps: rollup at 00:00, invoices at 00:30, emails at 01:30, and a hope that each finishes in time. On the night the rollup takes 45 minutes, invoices are computed from half the data.
+
+The fix is to say what each job depends on, not when it runs, and let the scheduler start each job when its inputs are ready. Together, the dependencies form a **directed graph**, jobs as nodes and "must finish before" as arrows. It has to be a **directed acyclic graph**, a **DAG**: if `A` waits for `B` and `B` waits for `A`, neither can ever start. Airflow uses the word for its whole unit of work: a "DAG" is a set of tasks and their dependencies, with a schedule for the whole graph.
+
+<div className="grid gap-4 sm:grid-cols-2">
+
+<Picture
+  src="/images/designs/job-scheduler/dag-topological-ordering.png"
+  alt="Ten nodes on a diagonal line with arrows all pointing down and to the right"
+  caption="A DAG drawn in topological order: every arrow points forward, so running the nodes left to right always runs a job after everything it depends on."
+  credit="Image: David Eppstein, CC0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Topological_Ordering.svg"
+/>
+
+<Picture
+  src="/images/designs/job-scheduler/airflow-graph-view.png"
+  alt="Airflow's graph view of a DAG run, with green succeeded tasks, one red failed task and a chain of orange upstream_failed tasks after it"
+  caption="A real DAG run in Airflow's graph view. The lower chain succeeded (green). In the upper one, empty_1 failed (red), so everything downstream of it was never run and is marked upstream_failed (orange)."
+  credit="Image: Apache Airflow documentation, The Apache Software Foundation, Apache License 2.0"
+  href="https://github.com/apache/airflow/blob/main/airflow-core/docs/img/ui-light/graph.png"
+/>
+
+</div>
+
+</Sub>
+
+<Sub n="7.2" title="Running a DAG">
+
+<Zoom path={["Scheduler", "Workflow engine", "DAG run", "In-degree counts"]} />
+
+The algorithm that runs a DAG is the one for **topological sorting**, usually Kahn's algorithm. For each job, count its unfinished dependencies, its **in-degree**. Every job with a count of zero is ready; send them all to workers. Each time a job succeeds, subtract one from the count of each job that depends on it, and any that reach zero become ready. For Meera's graph: `usage-rollup` and `fx-rates` start at once, in parallel; when both are done, `invoice-nightly`'s count reaches zero; when it's done, `send-invoices` runs.
+
+The same counts show what happens on failure. If `invoice-nightly` fails after its retries, `send-invoices`'s count never reaches zero, so it's never started, and the scheduler marks it `upstream_failed`, exactly what the orange tasks in the Airflow screenshot show. Now the run is stuck until someone fixes the failure and clears the task, at which point it reruns and the counts continue. If cycles slip in, Kahn's algorithm finds them too: jobs whose count never reaches zero even though nothing has failed.
+
+A DAG run needs a scheduler to remember state per run, not per job: which tasks of `nightly-billing/2026-10-10` have succeeded. That state lives in the same database as the schedule, and that's one reason workflow schedulers like Airflow are built around a metadata database.
+
+<Why>Which day's data does the 10 October run process?</Why>
+
+Airflow's answer catches out almost every newcomer. A daily DAG run covers a **data interval**, a span of time, and is started *after* that interval ends: "A Dag run is usually scheduled _after_ its associated data interval has ended." So the run that starts just after midnight on 10 October processes 9 October, and its **logical date**, the label it's known by, is the start of the interval, 9 October. That's right for billing, which should charge for a day once the day is over, and it gives every run a deterministic identity, the logical date, for idempotent tasks to key on.
+
+<Elsewhere items={[
+  { where: "Netflix Maestro", how: "Netflix's workflow orchestrator, open-sourced in 2024, runs workflows of jobs for data and ML pipelines at a scale of millions of jobs a day." },
+  { where: "Build systems", how: "Make, Bazel and every CI pipeline run a DAG of build steps with the same in-degree bookkeeping, and skip anything whose inputs haven't changed." },
+  { where: "Temporal and Cadence", how: "Instead of declaring a graph, a workflow is ordinary code whose every step is recorded durably, so dependencies are just the order the code runs in." },
+  { where: "Spark and database query plans", how: "A query becomes a DAG of stages; a stage runs when the stages feeding it have produced their output." },
+]} />
+
+</Sub>
+
+<SectionHeading n="08" id="time">Time itself: clocks, time zones and missed runs</SectionHeading>
+
+<Sub n="8.1" title="Whose midnight?">
+
+Every scheduler decision so far started from "is it time yet?", which assumes the machine knows what time it is. It only roughly does. Each machine's clock drifts, and is corrected by **NTP**, the Network Time Protocol, which sets it from servers that are themselves set from more accurate ones (chapter 26 covers how). On a well-run fleet clocks probably agree to within a few milliseconds; on a misconfigured machine they can be minutes apart.
+
+<Picture
+  src="/images/designs/job-scheduler/ntp-stratum-hierarchy.png"
+  alt="The NTP hierarchy: reference clocks at the top, then stratum 1, 2 and 3 servers, with arrows pointing down and between peers"
+  caption="NTP's hierarchy of time sources. Reference clocks (atomic clocks, GPS) set stratum 1 servers, which set stratum 2, and so on. A scheduler's sense of 'midnight' is only as good as this chain on the machine that asks."
+  credit="Image: Benjamin D. Esham, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Network_Time_Protocol_servers_and_clients.svg"
+  paper
+  narrow
+/>
+
+For a single leader, a skewed clock means jobs fire a bit early or late, and that's usually harmless. For designs where several machines each decide what's due, it's worse: a scheduler whose clock runs a minute fast can fire tomorrow's run early, or claim a row that another scheduler considers not yet due. That's why Quartz requires clustered nodes' clocks to be synchronised, and why Kubernetes' error for an unexpectedly large number of missed runs ends "or check clock skew". Three defences help: keep NTP healthy and monitored, to read "now" from one place where possible (the leader, or the database's `now()`), and to identify runs by their *scheduled* time, never by the wall-clock time at which they happened to start.
+
+Then there's the time zone. "Midnight" in a crontab means midnight in whatever zone the scheduling machine is set to, and that's how jobs move by an hour when a server is rebuilt with a different setting. Worse, in zones with daylight saving time, 02:30 doesn't exist on the night the clocks go forward and happens twice on the night they go back. Cron implementations each have their own rules for this. Modern schedulers make the zone explicit: Kubernetes added a `timeZone` field to CronJob, stable since version 1.27; Temporal schedules are in UTC unless told otherwise; EventBridge Scheduler takes a time zone per schedule. Billing that has to match a customer's calendar should name the zone; everything else is simpler in UTC.
+
+</Sub>
+
+<Sub n="8.2" title="Missed runs: catch up, skip, or run once">
+
+Now go back to Meera's first night, the reboot from 23:58 to 00:03. With the jobs in a database, the scheduler can see what it missed when it comes back: `invoice-nightly` has a `next_run_at` of 00:00 that has passed. Cron would have done nothing. What should we do instead?
+
+<Think
+  q="The scheduler was down from 23:58 to 00:03 on one night, and on another night from 21:00 to 03:00. For each of invoice-nightly, fx-rates (every minute) and an hourly report, what should happen when it comes back?"
+  hint="Ask, for each job, whether a late run is still useful and whether several missed runs are each worth doing."
+>
+For `invoice-nightly`, a run five minutes late is probably fine, and so is one six hours late: customers still need to be billed for the day. One run, as soon as possible.
+
+For `fx-rates`, the missed runs are worthless: fetching 300 old rates now would just fetch today's rate 300 times. Skip them all and run the next one on schedule.
+
+For an hourly report, it depends. If each run reports on its own hour, all six missed hours are wanted, so run them one after another: a **backfill**. If it just shows the latest numbers, one run now is enough.
+
+So there's no single right policy. The scheduler has to let each job choose.
+</Think>
+
+This choice is called a **misfire policy** or **catch-up policy**, and every serious scheduler has one:
+
+| Scheduler | Setting | Options and defaults |
+|---|---|---|
+| Kubernetes CronJob | `startingDeadlineSeconds` | Skip a run if it can't start within this many seconds of its time; unset means no deadline. More than 100 missed schedules logs a "too many missed start times" error. |
+| Quartz | misfire instruction | `FIRE_ONCE_NOW` (the default for cron triggers) or `DO_NOTHING`; a trigger counts as misfired after 60 seconds by default. |
+| Airflow | `catchup` | Run every missed interval in order (a backfill), or only the latest; Airflow 3.0 (April 2025) changed the default to not catching up. |
+| Temporal Schedules | catch-up window | Missed actions within the window run when the scheduler recovers; the default window is one year. |
+
+<Decision
+  q="What should a scheduler do with runs it missed while it was down?"
+  options={[
+    { name: "Run every missed run", how: "Backfill each missed time, oldest first.", good: ["Nothing is lost", "Right for jobs that process one interval each"], bad: ["A long outage releases a flood of runs", "Useless for 'latest state' jobs"] },
+    { name: "Run once, now", how: "Collapse all missed runs into one immediate run.", good: ["Catches up the state without a flood", "Right for most daily jobs"], bad: ["Per-interval work is skipped"], chosen: true },
+    { name: "Skip to the next one", how: "Ignore anything missed.", good: ["No surprise load after an outage", "Right for frequent, stateless jobs"], bad: ["Silently loses runs; needs an alert"] },
+  ]}
+>
+"Run once, now" is the most common default, Quartz's for cron triggers, and the right one for `invoice-nightly`. But the policy belongs to the job, not the scheduler: `fx-rates` should skip, and a per-hour report should backfill. Whatever the policy, a missed run should raise an alert, because a scheduler that quietly skipped the payroll run is worse than one that complains.
+</Decision>
+
+A related setting covers the case where the previous run hasn't finished when the next is due, the `fx-rates` problem from section 2.2. Kubernetes calls it `concurrencyPolicy` with `Allow` (the default), `Forbid` (skip the new run) and `Replace` (stop the old one). Temporal calls it an overlap policy, with `Skip` as the default and options to buffer one run, buffer all, cancel or terminate the old run, or allow both.
+
+</Sub>
+
+<SectionHeading n="09" id="herd">Midnight: the thundering herd</SectionHeading>
+
+<Sub n="9.1" title="Everyone picks 0 0 * * *">
+
+Meera's company grows, and other teams start using the scheduler. Each writes `0 0 * * *` for its nightly job, because midnight is the obvious time for "once a day". The Think in section 1.2 already counted what this means at a large company: thousands of jobs, all due in the same second, every night, when the average is a handful a second. When many waiting things are released at the same instant and all rush at the same resource, it's called a **thundering herd**.
+
+Google's SRE book describes the same thing: "When people think of a 'daily cron job,' they commonly configure this job to run at midnight... what if your cron job can spawn a MapReduce with thousands of workers? And what if 30 different teams decide to run a daily cron job like this, in the same datacenter?" Its fix was an extension to the crontab format, a question mark meaning "any value is acceptable", with the value chosen by "hashing the cron job configuration over the given time range (e.g., 0..23 for hour), therefore distributing those launches more evenly." Jenkins has the same idea as `H`, for "hash": its documentation warns that `0 0 * * *` "for a dozen daily jobs will cause a large spike at midnight," while `H H * * *` runs each job once a day "but not all at the same time."
+
+Why hash, and not pick a random time? Because a hash of the job's name gives the same answer every night. Each job keeps a stable time that its owners and its downstream jobs can rely on, while different jobs land on different times. This program spreads 20,000 midnight jobs over windows of different sizes:
+
+<TryIt what="Spreading 20,000 midnight jobs by hashing their names" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import hashlib
+from collections import Counter
+
+# 20,000 teams each wrote "0 0 * * *": run my job at midnight
+jobs = [f"team-{i}/nightly-report" for i in range(20_000)]
+
+def spread(name, window_s):
+    """A stable offset in [0, window): the same job lands on the same second every night."""
+    h = int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big")
+    return h % window_s
+
+for label, window in [("all at 00:00:00", 1), ("spread over 10 min", 600), ("spread over 1 hour", 3600)]:
+    starts = Counter(spread(j, window) for j in jobs)
+    peak_s = max(starts.values())
+    print(f"{label:20}  peak {peak_s:>6,} job starts in one second   average {len(jobs)/window:>8,.1f}")
+
+print("team-7/nightly-report starts", spread("team-7/nightly-report", 3600), "s after midnight, every night")
+```
+<Output>
+```
+all at 00:00:00       peak 20,000 job starts in one second   average 20,000.0
+spread over 10 min    peak     51 job starts in one second   average     33.3
+spread over 1 hour    peak     16 job starts in one second   average      5.6
+team-7/nightly-report starts 1344 s after midnight, every night
+```
+</Output>
+</TryIt>
+
+Spreading over an hour cuts the peak from 20,000 starts in one second to 16, more than a thousand times lower. Notice that the peak is a few times the average, not equal to it: hashing spreads jobs randomly, so some seconds get more than their share. And `team-7`'s report starts at the same second, 22 minutes and 24 seconds past midnight, every night.
+
+The last line also shows what this costs. A hashed time is fine for a report; it's wrong for `invoice-nightly`, whose owners care when it runs. So spreading is opt-in per job: Google's `?`, Jenkins' `H`, and EventBridge Scheduler's **flexible time window**, which lets a schedule say "anywhere in the 15 minutes after the hour", "dispersing your target invocations". Temporal schedules take a jitter setting, a random delay up to a maximum. And even with spreading, the SRE book admits the load "is still very spiky": the scheduler and the workers still need capacity for the peak, or a queue in front of the workers that lets a burst wait its turn.
+
+<Callout label="Design implication">
+Make the default schedule spread, and make exact times something a job asks for. Most jobs that say "midnight" probably mean "sometime overnight", and a scheduler that hashes them by default turns a nightly spike into a smooth hour. The same applies to retries: section 6's jitter is the same fix for the same herd, arriving from failures instead of from the clock.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="10" id="shards">One scheduler is not enough: sharding</SectionHeading>
+
+<Sub n="10.1" title="Splitting the timers">
+
+A single leader with an in-memory heap can fire a lot of jobs, but the company keeps growing, and someone wants to schedule a reminder for every one of fifty million users. Now the leader has too many timers to load, too many launches a second, and a failover that has to reload all of them. A database behind the row-claim design has the same problem: every scheduler polls one table.
+
+The fix is the one chapter 29 develops: **partition** the jobs. Hash each job's ID into one of a fixed number of **shards**, say 512. Each shard has its own slice of the jobs table, its own timer structure, and its own lease, so it's owned by exactly one scheduler process at a time. A machine might own a hundred shards, maybe more; when it dies, its shards' leases expire and other machines pick them up, each reloading only that shard's timers. Each shard is section 4.1's leader design in miniature.
+
+<SystemDiagram
+  title="Version 3: jobs hashed into shards, one owner per shard"
+  nodes={[
+    { id: "api", label: "Scheduling API", sub: "create, cancel", kind: "service", col: 0, row: 1 },
+    { id: "s1", label: "scheduler-1", sub: "owns shards 0–170", kind: "service", col: 1, row: 0 },
+    { id: "s2", label: "scheduler-2", sub: "owns shards 171–340", kind: "service", col: 1, row: 1 },
+    { id: "s3", label: "scheduler-3", sub: "owns shards 341–511", kind: "service", col: 1, row: 2 },
+    { id: "lease", label: "Shard leases", sub: "etcd / ZooKeeper", kind: "registry", col: 2, row: 0 },
+    { id: "store", label: "Job store", sub: "partitioned by shard", kind: "db", col: 2, row: 1 },
+    { id: "q", label: "Task queues", kind: "queue", col: 2, row: 2 },
+  ]}
+  edges={[
+    { from: "api", to: "store", label: "write" },
+    { from: "s1", to: "lease", dashed: true }, { from: "s2", to: "lease", dashed: true }, { from: "s3", to: "lease", dashed: true },
+    { from: "s2", to: "store" }, { from: "s2", to: "q", label: "enqueue" }, { from: "s3", to: "q" },
+  ]}
+  steps={[
+    { caption: "The billing code asks for a reminder for customer 8812. The API hashes the job ID, gets shard 207, and writes the job into that shard's partition of the store.", path: ["api", "store"] },
+    { caption: "scheduler-2 holds the lease for shard 207, so it adds the reminder to that shard's in-memory timers.", path: ["store", "s2"] },
+    { caption: "Three days later the timer fires, and scheduler-2 enqueues the reminder for a worker.", path: ["s2", "q"] },
+    { caption: "If scheduler-2 dies, the leases on its shards expire. scheduler-3 acquires shard 207, reloads that shard's timers from the store, and carries on.", path: ["s3", "lease"], focus: ["s2"] },
+  ]}
+/>
+
+<Why>Why a fixed number of shards?</Why>
+
+Because a job's shard has to stay put. If the shard were `hash(job) mod number-of-machines`, adding a machine would move almost every job, the problem chapter 29 opened with. With a fixed, generous shard count, machines come and go by taking over whole shards, and jobs never move between shards. Temporal, the open-source workflow engine that began in 2019 as a fork of Uber's Cadence, does exactly this. Its history service, which among other things durably stores every workflow's timers, is split into a number of history shards set when the cluster is created; the documentation is blunt that the count "cannot be changed" afterwards. Clusters have run with anywhere from 1 to 128K shards, and its Helm chart defaults to 512. Each shard maps to one partition of the database and has an internal timer task queue that durably persists timers, and a Temporal timer can be anything from one second to several years.
+
+<Elsewhere items={[
+  { where: "Uber Cadence", how: "Temporal's ancestor, open-sourced by Uber in 2017, uses the same history-shard design over Cassandra, with a matching service that hands tasks to polling workers." },
+  { where: "Kafka consumer groups", how: "Partitions are the shards and each is owned by one consumer at a time, reassigned when consumers join or leave (chapter 23)." },
+  { where: "Dropbox ATF", how: "Its task store is Edgestore, Dropbox's own sharded metadata store, polled every two seconds for tasks whose next trigger timestamp has passed." },
+]} />
+
+</Sub>
+
+<SectionHeading n="11" id="whole">The whole system</SectionHeading>
+
+<Sub n="11.1" title="Every box, and why it's there">
+
+<SystemDiagram
+  title="A distributed job scheduler, end to end"
+  nodes={[
+    { id: "clients", label: "Services and users", sub: "cron, one-off, DAGs", kind: "users", col: 0, row: 1 },
+    { id: "api", label: "Scheduling API", kind: "service", col: 1, row: 1 },
+    { id: "store", label: "Job store", sub: "next_run_at index, run history", kind: "db", col: 2, row: 0 },
+    { id: "sched", label: "Scheduler shards", sub: "timers in memory", kind: "service", count: "×512", col: 2, row: 1 },
+    { id: "lease", label: "Lease store", sub: "consensus", kind: "registry", col: 3, row: 0 },
+    { id: "q", label: "Task queue", sub: "leases, visibility", kind: "queue", col: 2, row: 2 },
+    { id: "workers", label: "Workers", sub: "heartbeats", kind: "compute", count: "×200", col: 3, row: 2 },
+    { id: "dlq", label: "Dead letters", sub: "+ alerts", kind: "queue", col: 3, row: 1 },
+  ]}
+  zones={[{ label: "Control plane", nodes: ["api", "store", "sched", "lease"] }]}
+  edges={[
+    { from: "clients", to: "api" }, { from: "api", to: "store" }, { from: "store", to: "sched" },
+    { from: "sched", to: "lease", dashed: true }, { from: "sched", to: "q", label: "due" },
+    { from: "q", to: "workers", label: "lease" }, { from: "workers", to: "store", label: "result" },
+    { from: "workers", to: "dlq", label: "gave up" },
+  ]}
+  steps={[
+    { caption: "Meera's team registers nightly-billing: a DAG of four jobs, daily, in UTC, with a 'run once now' misfire policy and a fixed start time.", path: ["clients", "api", "store"] },
+    { caption: "The shard that owns it, holding its lease, loads the next run's timer into memory from the job store's time-ordered index.", path: ["store", "sched"], focus: ["lease"] },
+    { caption: "At 00:00 the timer fires. The shard records the run nightly-billing/2026-10-09 and enqueues the tasks whose dependencies are met: usage-rollup and fx-rates.", path: ["sched", "q"] },
+    { caption: "Workers lease the tasks and heartbeat while they run. A worker that dies loses its lease, and the task reappears for another worker.", path: ["q", "workers"] },
+    { caption: "Results go back to the store; each success lowers its dependants' counts, and invoice-nightly, then send-invoices, are enqueued in turn. Every charge carries an idempotency key.", path: ["workers", "store", "sched", "q"] },
+    { caption: "A task that exhausts its retries goes to the dead-letter queue, its downstream tasks are marked upstream_failed, and someone is paged.", path: ["workers", "dlq"] },
+  ]}
+/>
+
+| Component | What it does | Added because |
+|---|---|---|
+| Job store | Jobs, schedules, `next_run_at` index, run history | Cron's state lived on one disk (§2) |
+| Timer structure | Heap or timing wheel of soon-due jobs | Polling the table every second is wasteful at scale (§3) |
+| Leases + fencing | One owner per scheduler shard | Two schedulers fired the same job (§2.3, §4) |
+| Deterministic run IDs | `job/scheduled-time` | A new leader must know what the old one launched (§4.2) |
+| Task queue with leases | Hands work to workers; reappears on crash | Workers die mid-job (§5) |
+| Idempotency keys in jobs | Make a second run harmless | Execution is at-least-once (§5.3) |
+| Retry policy + dead letters | Backoff with jitter; park hopeless jobs | Failures are mostly temporary, sometimes not (§6) |
+| DAG engine | Runs jobs when their inputs are ready | Fixed gaps between jobs broke on slow nights (§7) |
+| Misfire and overlap policies | Decide what to do with missed or overlapping runs | Schedulers go down; jobs overrun (§8) |
+| Spreading and jitter | Hash start times within a window | Everyone picks midnight (§9) |
+| Shards | Split jobs and timers across machines | One leader has a ceiling (§10) |
+
+</Sub>
+
+<Sub n="11.2" title="From top to bottom">
+
+| Level | The choice | Data structure or algorithm |
+|---|---|---|
+| System | Separate deciding *when* from doing the work | Scheduler → queue → workers |
+| Job store | Find due jobs without scanning | B-tree index on `next_run_at` |
+| In memory | Constant-time timers | Min-heap (O(log *n*)) or hierarchical timing wheel (O(1) insert and cancel) |
+| Coordination | One actor per job | Leases in a consensus store; fencing tokens; or `SELECT … FOR UPDATE SKIP LOCKED` |
+| Launch safety | Recover a half-done launch | Start/finish records; names derived from job and scheduled time |
+| Execution | At-least-once | Visibility timeouts, heartbeats, idempotency keys |
+| Retries | Back off without herding | min(cap, base × 2ⁿ) with full jitter |
+| Dependencies | Run when inputs are ready | Kahn's topological sort with in-degree counts |
+| Spreading | Stable, even start times | hash(job name) mod window |
+| Scale | Split by job | Fixed shard count; a lease per shard |
+
+</Sub>
+
+<SectionHeading n="12" id="breaks">What goes wrong, and what it cost</SectionHeading>
+
+<Sub n="12.1" title="Failures this design has to survive">
+
+| What happens | What Meera sees | What the design does |
+|---|---|---|
+| The scheduler leader dies | Runs a few seconds late | The lease expires; a standby takes over and reads open launches |
+| The old leader was only paused | Nothing, if fencing works | Its stale token is rejected by the job store |
+| A worker dies mid-job | The run takes longer | The lease expires; another worker reruns it; idempotency keys skip finished work |
+| The payment provider is down | Retries in the logs | Backoff with jitter; after the limit, dead letter and an alert |
+| The scheduler was down over midnight | Invoices a little late | Misfire policy: run once, now |
+| Usage rollup is slow | Invoices wait for it | The DAG holds invoice-nightly until its inputs are done |
+| Everyone schedules at midnight | Nothing, if spread | Hashed start times within a window |
+| A machine's clock is wrong | Early or late runs | NTP monitoring; one source of "now"; runs named by scheduled time |
+
+</Sub>
+
+<Sub n="12.2" title="The tradeoffs, in one table">
+
+| Decision | Chosen | Given up | Why it was worth it |
+|---|---|---|---|
+| Who fires jobs | One lease holder per shard | Instant failover | Two schedulers acting is worse than a few seconds' delay |
+| Execution guarantee | At-least-once, idempotent jobs | Exactly-once execution | Exactly-once isn't possible across crashes; exactly-once *effect* is |
+| In doubt about a launch | Check the deterministic run ID | Simplicity | Neither a blind rerun nor a blind skip is safe for billing |
+| Timer structure | Durable index + in-memory heap or wheel | Pure database polling | Microseconds per tick, and the store still survives crashes |
+| Missed runs | Per job: run once, backfill or skip | One simple rule | Jobs differ in whether a late run is useful |
+| Start times | Hashed within a window by default | Exact times for most jobs | Midnight spikes disappear |
+| Scale | Fixed shard count | Changing the count later | Jobs never move between shards |
+
+</Sub>
+
+<SectionHeading n="13" id="summary">Summary</SectionHeading>
+
+1. **Cron's failure domain is one machine**: if it's down at midnight the run is silently missed, and two uncoordinated copies run every job twice.
+2. **Jobs belong in a durable store with a time-ordered index**, so finding due jobs costs the number of due jobs, not the number stored.
+3. **In memory, a min-heap gives the next job in O(log *n*), and a hierarchical timing wheel inserts and cancels in O(1)**, by cascading timers from coarse slots to fine ones as their time approaches.
+4. **One process fires each job**: a lease elects the leader (or one per shard), fencing tokens stop a paused ex-leader, or `SKIP LOCKED` row claims let the database arbitrate.
+5. **Name each run by job and scheduled time**, so a new leader can tell which launches the old one completed.
+6. **Workers lease jobs and heartbeat**, so a crashed worker's job reappears; this makes execution at-least-once.
+7. **Exactly-once execution is impossible across crashes, so make jobs idempotent**, with unique constraints and idempotency keys built from the run's identity.
+8. **Retry with exponential backoff and jitter, then dead-letter**: temporary failures heal, permanent ones are parked where people look.
+9. **Dependencies form a DAG**, run by counting each job's unfinished inputs; a failure marks everything downstream as upstream_failed.
+10. **Clocks, time zones and missed runs need explicit policy**: UTC or named zones, runs identified by scheduled time, and a per-job choice of run once, backfill or skip.
+11. **Hash start times within a window** to dissolve the midnight thundering herd, and **shard by job** with a fixed shard count when one scheduler isn't enough.
+
+<SectionHeading n="14" id="build">Build this</SectionHeading>
+
+**A small scheduler with failover.**
+
+- Create a Postgres table `jobs(job_id, schedule, next_run_at, payload)` with an index on `next_run_at`. Write a scheduler loop in Python that claims due rows with `FOR UPDATE SKIP LOCKED`, enqueues them into a `tasks` table, and computes the next run from a cron expression (the `croniter` package parses them).
+- Run three copies of the scheduler. Add 10,000 jobs due in the same minute and check that each was enqueued exactly once. Then remove `SKIP LOCKED` and watch the copies queue up behind each other's locks.
+- Write workers that lease tasks by setting `leased_until = now() + 30 s`, heartbeat every 10 seconds, and occasionally `kill -9` themselves mid-task. Count how many tasks ran twice.
+- Make the task a fake "charge" that inserts into `charges(customer, period)` with a unique constraint, and confirm the duplicates disappear.
+- Add a nightly job set to `0 0 * * *` for 5,000 fake teams, measure the peak tasks per second, then spread them by hashing their names over an hour and measure again.
+
+<SectionHeading n="15" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Why not just run cron on two machines for redundancy?">
+Neither machine knows about the other, so both fire every job, and any job that isn't idempotent, like charging customers or sending emails, does its work twice. Redundancy only helps if the copies agree which one acts: a leader chosen by a lease in a consensus store, or a database row lock that only one scheduler can take per job.
+</QA>
+
+<QA level="beginner" q="How does a scheduler find the jobs that are due without scanning every job?">
+It keeps them ordered by due time. In a database that's an index on the next-run timestamp, so the query reads from the start of the index until it reaches a future time. In memory it's a min-heap, where the soonest job is always at the root, or a timing wheel, where jobs sit in slots by due time and the scheduler only looks at the current slot each tick.
+</QA>
+
+<QA level="intermediate" q="Explain a hierarchical timing wheel. Why would Kafka use one instead of a priority queue?">
+A timing wheel is a ring of slots, one per tick; a timer goes in slot (now + delay) mod size, and each tick fires the current slot, so insert and cancel are O(1). To reach far into the future without millions of slots, wheels are stacked at coarser granularities, like seconds, minutes and hours, and timers cascade down to finer wheels as their time nears. Kafka holds a timeout for most requests and cancels nearly all of them when the request completes. Its old heap-based DelayQueue cost O(log n) per operation and couldn't remove arbitrary entries, so completed requests piled up; the wheel, introduced in Kafka 0.9 in 2015, made both cheap.
+</QA>
+
+<QA level="intermediate" q="A worker crashes halfway through a job that charges customers. What happens, and how do you make it safe?">
+The worker held a lease on the task and was renewing it with heartbeats. When the heartbeats stop, the lease expires, the task becomes visible again, and another worker runs it, so the job runs at least once but possibly twice. To make the second run harmless, the job uses an identity derived from the job name and scheduled time, records each customer's charge under a unique constraint, and sends an idempotency key with each charge, so customers already charged are skipped and the payment provider rejects repeats.
+</QA>
+
+<QA level="deep" q="Google's cron prefers skipping a launch to risking a double launch. When would you choose otherwise?">
+Skipping is safer when a double run is hard to undo, like sending a newsletter, and a missed run can be noticed and rerun by hand. It's the wrong choice when missing a run is the expensive failure, like payroll or billing, and the job can be made idempotent; then you prefer at-least-once execution and let idempotency absorb the duplicates. Google's own design narrows the dilemma by recording the start and end of each launch in Paxos and deriving job names from the scheduled time, so a new leader can check whether a launch it's unsure about happened.
+</QA>
+
+<QA level="deep" q="Design a scheduler for 100 million one-off timers, most of them cancelled before they fire.">
+Partition timers by a hash of their ID into a fixed number of shards, each owned by one scheduler process through a lease. Each shard keeps its timers in a durable store indexed by due time, and loads only the next few minutes into an in-memory timing wheel, which makes insert and cancel O(1); far-future timers stay in the store until they come within range. Cancelling deletes the row and, if loaded, the wheel entry. Firing enqueues a task for workers with leases and heartbeats, and jobs are idempotent because delivery is at-least-once. Spread start times with jitter where exact time doesn't matter, and keep the shard count fixed so timers never move when machines change.
+</QA>
+
+<SectionHeading n="16" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="A hierarchical wheel has 60 one-second slots, 60 one-minute slots and 24 one-hour slots. How many times is a timer due in 2 hours 30 minutes 10 seconds moved before it fires?">
+    Twice. It starts in the hours wheel, cascades into the minutes wheel when its
+    hour slot comes round, and into the seconds wheel when its minute slot comes
+    round; then it fires from there.
+  </Q>
+  <Q q="Why does Google's cron put the scheduled time into each launched job's name?">
+    So that a new leader that takes over mid-launch can look the name up and see
+    whether that particular launch happened. Without the time, it couldn't tell
+    this run of an every-minute job from the previous one.
+  </Q>
+  <Q q="20,000 jobs are spread over a one-hour window by hashing their names. Why is the busiest second about three times the average rather than equal to it?">
+    The hash places jobs effectively at random, and random placement puts more
+    than the average into some seconds. Spreading removes the giant spike, but
+    you still size for a peak somewhat above the mean.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="'Distributed Periodic Scheduling with Cron' (Google SRE book, 2016; ACM Queue, 2015)">
+    Štěpán Davidovič on Google's Paxos-backed cron: skipping versus double
+    launches, precomputed job names, local logs and the "?" syntax for
+    spreading midnight jobs.
+  </WildCard>
+  <WildCard name="Varghese and Lauck, 'Hashed and Hierarchical Timing Wheels' (SOSP 1987)">
+    The seven timer schemes, from a decrement-everything loop to hierarchical
+    wheels, with their costs; the source of every timing wheel since.
+  </WildCard>
+  <WildCard name="'Apache Kafka, Purgatory, and Hierarchical Timing Wheels' (Confluent blog, 2015)">
+    Why Kafka replaced DelayQueue, how its overflow wheels and bucket-level
+    DelayQueue work, and the benchmark.
+  </WildCard>
+  <WildCard name="'How we designed Dropbox ATF' (Dropbox tech blog, 2020)">
+    A production task scheduler: Edgestore as the task store, SQS queues,
+    heartbeats, at-least-once execution and idempotent task handlers.
+  </WildCard>
+  <WildCard name="Temporal documentation: Schedules, retry policies, Temporal Server">
+    Overlap and catch-up policies, retry defaults, heartbeat timeouts and the
+    history shards that store durable timers.
+  </WildCard>
+  <WildCard name="Apache Airflow documentation: Scheduler, DAG runs">
+    Running several schedulers with SKIP LOCKED, data intervals and logical
+    dates, catch-up and task states.
+  </WildCard>
+  <WildCard name="Marc Brooker, 'Exponential Backoff And Jitter' (AWS Architecture Blog, 2015)">
+    Full, equal and decorrelated jitter compared by simulation.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="17" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Time & Ordering">
+    Clocks, NTP, and the leases and fencing tokens the scheduler's leader
+    election relies on. [Chapter 26](/topics/26-time-and-ordering#leases).
+  </WildCard>
+  <WildCard name="Consensus">
+    How a lease store like etcd stays correct, and how Raft and Paxos elect a
+    leader. [Chapter 27](/topics/27-consensus).
+  </WildCard>
+  <WildCard name="Partitioning">
+    Hashing jobs into a fixed number of shards and moving shards between
+    machines. [Chapter 29](/topics/29-partitioning).
+  </WildCard>
+  <WildCard name="Failure Detection">
+    Why a quiet worker can't be told from a dead one, and how heartbeats and
+    timeouts are chosen. [Chapter 30](/topics/30-failure-detection).
+  </WildCard>
+  <WildCard name="Distributed Transactions">
+    Idempotency keys and what "exactly-once" can honestly mean.
+    [Chapter 31](/topics/31-distributed-transactions#idempotency).
+  </WildCard>
+  <WildCard name="Reliability">
+    Retries, backoff and jitter for requests, the same tools at shorter time
+    scales. [Chapter 40](/topics/40-reliability#retries).
+  </WildCard>
+</CardGrid>
