@@ -1,14 +1,15 @@
 import Link from "next/link";
 import type { Page } from "@/lib/manifest";
 import { cn } from "@/lib/utils";
+import { BrandLogo, hasBrandLogo } from "./brand-logo";
 
 const TEXT: Record<string, string> = {
   machine: "text-machine", os: "text-os", conc: "text-conc", data: "text-data",
-  dist: "text-dist", cloud: "text-cloud", ops: "text-ops", lab: "text-lab",
+  dist: "text-dist", cloud: "text-cloud", ops: "text-ops", cases: "text-cases", lab: "text-lab",
 };
 const FROM: Record<string, string> = {
   machine: "from-machine", os: "from-os", conc: "from-conc", data: "from-data",
-  dist: "from-dist", cloud: "from-cloud", ops: "from-ops", lab: "from-lab",
+  dist: "from-dist", cloud: "from-cloud", ops: "from-ops", cases: "from-cases", lab: "from-lab",
 };
 
 export function PageCard({ page, colour }: { page: Page; colour: string }) {
@@ -26,6 +27,7 @@ export function PageCard({ page, colour }: { page: Page; colour: string }) {
       />
 
       <div className="mb-2 flex items-center gap-2 text-[12.5px]">
+        {hasBrandLogo(page.slug) && <BrandLogo slug={page.slug} size={26} />}
         <span className={cn("tnum font-semibold", TEXT[colour])}>{page.num}</span>
         {page.status === "stub" && <span className="text-faint">· not written yet</span>}
       </div>

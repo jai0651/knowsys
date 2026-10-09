@@ -3,6 +3,7 @@ import type { Frontmatter, Outline } from "@/lib/mdx";
 import Link from "next/link";
 import { PageStats } from "./page-stats";
 import { ChapterActions } from "./chapter-actions";
+import { BrandLogo, hasBrandLogo } from "./brand-logo";
 
 /* The chapter's front page: where it sits, what it's called, why you'd read
    it, what it costs you in time, and what's in it. The last word or two of
@@ -42,6 +43,8 @@ export function ChapterHeader({
         <span className="flex-1" />
         <PageStats pageId={page.slug} />
       </div>
+
+      {hasBrandLogo(page.slug) && <BrandLogo slug={page.slug} size={60} className="mb-5 shadow-[var(--shadow)]" />}
 
       <h1 className="mb-4 text-[38px] font-extrabold leading-[1.06] tracking-[-0.035em] text-ink sm:text-[52px]">
         {head}{" "}

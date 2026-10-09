@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { Check } from "lucide-react";
 import { groups } from "@/lib/manifest";
+import { BrandLogo, hasBrandLogo } from "./brand-logo";
 import { useDone } from "@/lib/progress";
 import { cn } from "@/lib/utils";
 
@@ -46,6 +47,7 @@ export function Sidebar({ currentSlug }: { currentSlug?: string }) {
                     >
                       {isDone ? <Check className="size-2.5" strokeWidth={3.5} /> : active ? <span className="size-2 rounded-full bg-accent" /> : null}
                     </span>
+                    {hasBrandLogo(p.slug) && <BrandLogo slug={p.slug} size={18} />}
                     <span className="min-w-0 flex-1">{p.short}</span>
                     {stub && <span className="text-[10.5px] text-faint">soon</span>}
                   </Link>
