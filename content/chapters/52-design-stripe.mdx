@@ -1,0 +1,1139 @@
+---
+title: Designing Stripe
+dek: "Maya taps Pay for a $20 print on a train, the train enters a tunnel, and the spinner never stops. Did she pay? We'll design the system that makes sure she pays exactly once, from card networks and idempotency keys down to ledger entries, signed webhooks, token buckets and a sharded document database, and look at the tradeoffs Stripe made along the way."
+readingTime: "~50 min"
+level: "Intermediate"
+versions: "Figures from Stripe's engineering blog, API docs, newsroom and card network documents, dated where they appear"
+prereqs: "chapter 19 (transactions) helps, chapter 29 (partitioning) helps, the Uber case study (chapter 50) helps"
+updated: "2026-10-09"
+---
+
+Maya is on the evening train home, scrolling a small online shop called Inkwell that sells art prints. She finds one she likes for $20, types in her card number, and taps Pay. The spinner starts turning. Then the train goes into a tunnel, the signal drops, and after twenty seconds the page says "Something went wrong. Please try again."
+
+<Picture
+  src="/images/designs/stripe/card-terminal-in-use.jpg"
+  alt="A card payment terminal at a shop checkout showing AMOUNT £4.55 and the words Insert, swipe or try another card"
+  caption="The same moment at a shop counter: the terminal asks for the card again. Whether it's a phone in a tunnel or a terminal at a till, the person paying is left asking whether the first attempt took any money."
+  credit="Photo: Daylon124, CC0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Ingenico_iPP350_payment_terminal.jpg"
+  narrow
+/>
+
+Maya now has a question that no amount of staring at the screen will answer: did she pay? Perhaps her tap never left the phone. Perhaps it reached the shop, the shop charged her card, and only the reply got lost in the tunnel. If she taps Pay again, she might buy the print, or she might buy it twice. Inkwell's server is in the same position one level down. It asked Stripe to charge Maya's card, the connection to Stripe hiccuped, and it has no idea whether the money moved.
+
+Every payment system lives with this problem, because every message between computers can be lost, and the sender can never tell whether a lost message arrived. In this case study we'll design the system behind Maya's tap the way an engineer would: start with the most obvious design, find exactly where it breaks, and fix it. The question we'll keep coming back to is this: **when any message can vanish, how does Stripe make sure Maya's $20 leaves her account exactly once and lands with the shop?** Along the way we'll go from card networks to idempotency key records, payment state machines, double-entry ledger entries, signed webhooks, backoff with jitter, token buckets and a database that moves its own data around without stopping.
+
+<SectionHeading n="01" id="requirements">What we're building, and how big</SectionHeading>
+
+<Sub n="1.1" title="What it has to do">
+
+Stripe does many things, but the part that moves money for a shop like Inkwell comes down to a short list:
+
+1. **Accept a payment**: take Maya's card details and ask her bank whether she can pay $20.
+2. **Collect the money**: once the bank agrees, take the money, now or a few days later.
+3. **Tell the shop** what happened, including things that happen later, such as a refund or a dispute.
+4. **Pay the shop out** to its own bank account, minus Stripe's fee.
+5. **Keep the books**: be able to say, for every cent, where it came from and where it went.
+
+And the qualities it needs while doing that:
+
+- **Never charge twice**: whatever the network does, one tap on Pay takes the money once.
+- **Never lose money**: a payment that succeeded must be recorded, paid out and accounted for, even if a server crashes in the middle.
+- **Available**: when Stripe is down, its customers can't sell anything, so the API has to stay up through failures and traffic spikes.
+- **Auditable**: banks, regulators and the shops themselves need to check the numbers, years later.
+
+This list differs from the Uber case study in an important way. Uber could afford to be approximate about most of its data: a driver's location four seconds old was fine, and a lost one was replaced by the next. Here almost nothing can be approximate. A payment either happened or it didn't, and the system has to know which, every time.
+
+</Sub>
+
+<Sub n="1.2" title="How big is it?">
+
+Stripe's own reports give the scale. In its annual letter of February 2026, Stripe said businesses on its platform processed $1.9 trillion in 2025, up 34% from 2024 and roughly 1.6% of global GDP, for more than 5 million businesses. Over the four days from Black Friday to Cyber Monday 2025, they processed more than 578 million transactions worth more than $40 billion, with a peak of more than 152,000 transactions a minute, and Stripe reported its API's availability over that weekend as above 99.9999%.
+
+"Six nines" means fewer than one failed request in a million. For scale, five nines (99.999%), the figure Stripe gave for 2023, allows roughly five minutes of downtime in a year.
+
+<Think
+  q="At the 2025 peak of 152,000 transactions a minute, how many payments per second is that? And if every payment causes a handful of writes (an API call, a few state changes, several ledger entries, a notification to the shop), roughly how many writes per second does the system absorb?"
+  hint="Divide by 60, then multiply by your guess at the writes per payment."
+>
+152,000 a minute is roughly 2,500 payments a second, modest next to Uber's quarter of a million location updates a second. But each payment fans out: at ten writes per payment, the peak is 25,000 durable writes a second, none of which may be lost or doubled. Stripe's 2024 post on its ledger said that system alone sees five billion events a day, about 58,000 a second on average. And unlike Uber's locations, none of it can be thrown away: a payment record from 2015 must still be correct today. So the design is shaped less by volume than by correctness under failure, which is where we start.
+</Think>
+
+</Sub>
+
+<SectionHeading n="02" id="card-payments">How a card payment moves money</SectionHeading>
+
+<Sub n="2.1" title="Five parties and one card">
+
+Before designing anything, we need to know what "charging a card" means, because Stripe can't move money out of Maya's bank by itself. A card payment involves five parties, and each has a name worth learning once:
+
+- **Maya, the cardholder**, who owns the card.
+- **Inkwell, the merchant**, who sells the print.
+- **Maya's bank, the issuer**, which issued her card and holds her money or her credit line. It's the only party that can say yes or no to spending it.
+- **The acquirer**, the bank or processor that works for the merchant: it sends the merchant's payments into the card system and receives the money on the merchant's behalf. For Inkwell, Stripe plays this role, working with acquiring banks.
+- **The card network**, Visa or Mastercard for example, which connects thousands of acquirers to thousands of issuers, routes messages between them and settles the money they owe each other.
+
+<div className="grid gap-4 sm:grid-cols-2">
+
+<Picture
+  src="/images/designs/stripe/card-front-anatomy.png"
+  alt="Diagram of the front of a payment card with numbered labels for the bank name, chip, hologram, card number, network logo, expiry date, cardholder name and contactless symbol"
+  caption="The front of a card names two of the parties: the issuing bank (1) and the card network whose logo sits in the corner (5). The first digits of the card number (4) identify the issuer, which is how a payment request finds its way to Maya's bank."
+  credit="Image: AlexJ, Andreasl01 and VulcanSphere, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:CCardFront.svg"
+  paper
+/>
+
+<Picture
+  src="/images/designs/stripe/card-back-anatomy.png"
+  alt="Diagram of the back of a payment card showing the magnetic stripe, signature strip and three-digit security code"
+  caption="The back: a magnetic stripe (1), a signature strip (2) and the security code (3). Online, where nothing is swiped, the number, expiry and code typed into a form are all the merchant gets."
+  credit="Image: AlexJ, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:CCardBack.svg"
+  paper
+/>
+
+</div>
+
+The network is the switchboard in the middle; Visa's fact sheets in 2017 and 2019 gave VisaNet's capacity as more than 65,000 transaction messages a second. When Inkwell calls Stripe, Stripe's request becomes a message travelling from acquirer to network to issuer and back.
+
+</Sub>
+
+<Sub n="2.2" title="Ask first, take later, settle in days">
+
+What surprises most programmers is that a card payment isn't one step. It's several, spread over days:
+
+<Steps
+  title="Maya's $20, from tap to Inkwell's bank account"
+  lanes={[
+    { t: "Maya", s: "cardholder" },
+    { t: "Stripe", s: "acquirer side" },
+    { t: "Card network", s: "Visa, Mastercard" },
+    { t: "Issuer", s: "Maya's bank" },
+    { t: "Inkwell", s: "merchant" },
+  ]}
+  steps={[
+    [0, "Maya enters her card and taps Pay. Inkwell's page sends the card details to Stripe, and Inkwell's server asks Stripe to charge **$20**."],
+    [2, "**Authorisation.** Stripe sends an authorisation request through the card network to Maya's bank: may this card spend $20 at Inkwell?"],
+    [3, "The issuer checks her balance or credit limit and its fraud rules, says yes, and puts a **hold** on $20. No money has moved yet; it has only been reserved."],
+    [1, "**Capture.** Stripe (or Inkwell, if it chose to wait) tells the network to take the money it authorised. Hotels and shops that ship later can capture days after authorising."],
+    [2, "**Clearing and settlement.** In batches, the network works out what every issuer owes every acquirer, then moves the money between banks: Maya's bank pays, Stripe's side receives."],
+    [4, "**Payout.** After a settlement delay (2 business days by default for a US Stripe account in 2026), Stripe sends Inkwell its money minus fees."],
+  ]}
+/>
+
+Authorisation used to be visible on paper. Before card terminals were online, a shop pressed the card's raised digits onto a carbon slip with a hand-operated imprinter, phoned the bank for large amounts, and wrote down the approval code it was given. The slips were collected and sent in later to get paid, which is capture and clearing done by post.
+
+<div className="grid gap-4 sm:grid-cols-2">
+
+<Picture
+  src="/images/designs/stripe/credit-card-imprinter.jpg"
+  alt="A manual credit card imprinter with a card in its bed and a blank carbon slip inserted, seen from above"
+  caption="A manual 'zip-zap' imprinter. Sliding the handle across pressed the card's embossed number and name through carbon paper onto the slip."
+  credit="Photo: Commons user 'My another account', CC0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Credit_card_imprinter.JPG"
+/>
+
+<Picture
+  src="/images/designs/stripe/imprinted-card-receipt-1997.jpg"
+  alt="A carbon card slip from 1997 with an imprinted card number, a handwritten total of 55.00 and a handwritten authorization number"
+  caption="A customer copy of an imprinted slip from 1997: the card number pressed in from the card, a total of $55.00, and a handwritten number in the AUTHORIZATION box, the issuer's approval of this amount."
+  credit="Photo: Bubba73, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Credit_card_receipt_-_old_style.jpg"
+/>
+
+</div>
+
+Today the steps are the same, done by messages in milliseconds instead of phone calls and couriers. So "the payment succeeded" can mean several different things: the issuer said yes (authorised), the merchant asked for the money (captured), the banks exchanged it (settled), or the merchant received it (paid out). An authorisation is also a promise with an expiry date. Stripe's documentation in 2026 says an authorisation for an online card payment usually holds for 7 days, after which the hold is released and the payment is cancelled if it hasn't been captured.
+
+<Callout label="Design implication">
+A payment is a process that runs for days through systems Stripe doesn't control. The design has to track where each payment is in that process, survive any step failing, and explain afterwards exactly what happened. Sections 6 and 7 are about those two needs: a state machine for the process, and a ledger for the money.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="03" id="v1">Version 1: one endpoint that charges</SectionHeading>
+
+<Sub n="3.1" title="The obvious design">
+
+Let's design the simplest thing that could work. Inkwell's server sends Stripe an HTTP request, `POST /v1/charges` with an amount and Maya's card. Stripe's API server sends an authorisation and capture to the card network, waits for the answer, writes a row to a `charges` table, and replies "succeeded" or "declined". Inkwell shows Maya a receipt.
+
+<SystemDiagram
+  title="Version 1: one synchronous call per payment"
+  nodes={[
+    { id: "maya", label: "Maya's phone", kind: "phone", col: 0, row: 0 },
+    { id: "shop", label: "Inkwell's server", kind: "service", col: 1, row: 0 },
+    { id: "api", label: "Stripe API server", kind: "service", col: 2, row: 0 },
+    { id: "net", label: "Card network", sub: "→ Maya's bank", kind: "external", col: 3, row: 0 },
+    { id: "db", label: "charges table", sub: "id, amount, status", kind: "db", col: 2, row: 1 },
+  ]}
+  edges={[
+    { from: "maya", to: "shop", label: "Pay" },
+    { from: "shop", to: "api", label: "POST /charges" },
+    { from: "api", to: "net", label: "authorise + capture" },
+    { from: "api", to: "db" },
+  ]}
+  steps={[
+    { caption: "Maya taps Pay; her phone sends the order to Inkwell's server.", path: ["maya", "shop"] },
+    { caption: "Inkwell's server asks Stripe to charge $20.", path: ["shop", "api"] },
+    { caption: "Stripe's API server asks the card network, which asks Maya's bank. The bank says yes.", path: ["api", "net"] },
+    { caption: "Stripe records the charge and replies \"succeeded\". Inkwell shows a receipt. When every message arrives, this works.", path: ["api", "db"], focus: ["shop"] },
+  ]}
+/>
+
+On a perfect network this design is fine, and in 2011 Stripe's first API looked much like it: a few lines of `curl` created a `Charge`, and the reply said whether it worked. Trouble hides in the phrase "when every message arrives".
+
+</Sub>
+
+<Sub n="3.2" title="Three ways the tunnel can strike">
+
+Go back to Maya's train, but move the tunnel to the link between Inkwell's server and Stripe, which can drop out just like a phone signal (a restarted load balancer, a full network queue, a timeout). Brandur Leach, writing on Stripe's blog in 2017, listed the three ways a request can fail, and they're worth walking through one by one on Inkwell's call:
+
+1. **The request never arrives.** The connection fails before Stripe sees anything. No charge was made, and retrying is safe.
+2. **The request arrives, and the server fails midway.** Stripe started the work, perhaps sent the authorisation to the network, then crashed. Maya's bank may have put a hold on her $20, or may not. Either way, the work is in limbo.
+3. **The work succeeds, and the reply is lost.** Stripe charged the card, wrote the row and sent "succeeded", but the reply died in the tunnel. Inkwell sees a timeout, exactly as in case 1.
+
+From Inkwell's side, all three look identical: the request went out and no answer came back. That's the core difficulty. The client can't tell "nothing happened" from "it all happened and I wasn't told".
+
+<Predict
+  q="Inkwell's call to charge Maya times out. Inkwell can't tell which of the three cases happened. With the Version 1 design, what should Inkwell do?"
+  options={[
+    "Retry: a timeout means the request didn't arrive",
+    "Don't retry: it probably worked, so assume it succeeded",
+    "Neither choice is safe: retrying risks charging twice, and not retrying risks never charging (or never recording a charge that happened)",
+    "Wait a few seconds and retry: by then the first request is guaranteed to have finished",
+  ]}
+  answer={2}
+>
+In case 1 a retry is needed, or Maya never pays. In case 3 a retry charges her a second time. Waiting doesn't help, because the first attempt may have finished already. Version 1 gives the client no safe move, and that's the problem the next two sections solve.
+</Predict>
+
+</Sub>
+
+<SectionHeading n="04" id="exactly-once">Why "exactly once" can't be had over a network</SectionHeading>
+
+<Sub n="4.1" title="The two generals">
+
+It's tempting to think a cleverer protocol would fix this: Stripe could acknowledge the request, Inkwell could acknowledge the acknowledgement, and so on. Computer scientists proved in the 1970s that no such protocol exists. Its classic form is the **Two Generals' Problem**, described by Akkoyunlu, Ekanadham and Huber in 1975 and named by Jim Gray in 1978.
+
+<Picture
+  src="/images/designs/stripe/two-generals-problem.png"
+  alt="Two red armies labelled A1 and A2 in valleys on either side of a larger blue army labelled B"
+  caption="The Two Generals' Problem. Armies A1 and A2 win only if they attack together, and every messenger between them has to cross the valley held by B, where any one of them may be caught."
+  credit="Image: Belbury, CC BY 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Two_Generals%27_Problem.svg"
+  paper
+/>
+
+Two allied armies, A1 and A2, camp on either side of a valley held by a stronger enemy, B. They win only if they attack at the same time, and they can communicate only by messengers who cross the valley and may be captured. A1's general sends "attack at dawn". A1 can't attack until it knows A2 got the message, so A2 sends back an acknowledgement. But now A2 can't be sure the acknowledgement arrived, so A2 wants an acknowledgement of the acknowledgement, and so on forever. Whatever the last message in the protocol is, its sender doesn't know it arrived, and the protocol must work even if it didn't, which means it wasn't needed, which means the one before it is now the last. Following that back, no finite number of messages gives both sides certainty.
+
+Inkwell and Stripe are the two generals, and the messages are HTTP requests and replies. However the API is designed, there's always a last message whose loss leaves one side unsure.
+
+</Sub>
+
+<Sub n="4.2" title="At most once, at least once, and the way out">
+
+If certainty is impossible, the client is left with two policies, and each has a name:
+
+- **At-most-once**: send once and never retry. A lost request means the payment never happens. Maya doesn't get her print; Inkwell loses a sale.
+- **At-least-once**: retry until an answer comes back. The payment always happens, but a lost reply (case 3) means it can happen twice.
+
+Neither is what a payment needs. One way out remains: stop trying to make the *delivery* exactly once and instead make the *effect* exactly once. The client retries until it hears back (at-least-once), and the server makes repeats harmless: when it receives a request it has already carried out, it doesn't do the work again; it returns the result it gave the first time. An operation that has the same effect however many times it's applied is called **idempotent**. Pressing a lift's call button is idempotent: pressing it five times calls one lift. "Charge $20" isn't, on its own.
+
+So exactly-once *processing* is at-least-once delivery plus idempotent handling. The server needs a way to recognise "I've seen this one before", and this program shows what's at stake. It sends 10,000 orders across a network that loses 5% of requests and 5% of replies, with a client that retries until it gets an answer. First the server treats every request as new; then it recognises repeats by a key the client attaches to each order and replays the saved answer:
+
+<TryIt what="Retrying payments over a lossy network, with and without a key" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import random, uuid
+random.seed(7)
+
+LOSS = 0.05          # 5% of requests or responses vanish on the way
+ORDERS = 10_000
+
+def run(use_keys):
+    charges = []        # every charge the server made
+    seen = {}           # idempotency key -> saved response
+    for order in range(ORDERS):
+        key = str(uuid.UUID(int=random.getrandbits(128)))
+        while True:                                   # retry until we hear back
+            if random.random() < LOSS:                # request lost: server never saw it
+                continue
+            if use_keys and key in seen:
+                response = seen[key]                  # replay the saved answer
+            else:
+                charges.append(order)                 # move the money
+                response = f"ch_{len(charges)}"
+                seen[key] = response
+            if random.random() < LOSS:                # response lost: client can't tell
+                continue
+            break
+    overcharged = len(charges) - len(set(charges))   # charges beyond the first per order
+    return len(charges), overcharged
+
+for label, keys in [("retry, no key", False), ("retry with key", True)]:
+    total, extra = run(keys)
+    print(f"{label:15} {ORDERS:,} orders -> {total:,} charges ({extra} extra)")
+```
+<Output>
+```
+retry, no key   10,000 orders -> 10,547 charges (547 extra)
+retry with key  10,000 orders -> 10,000 charges (0 extra)
+```
+</Output>
+</TryIt>
+
+Without a key, every lost reply turned into another charge: 547 extra charges on 10,000 orders, roughly the 5% you'd expect from the reply-loss rate. With a key, the server spotted each retry and returned the saved answer, so every order was charged exactly once even though the network lost just as many messages. Those two lines differ only in whether the server remembers the key, and that memory is what the next section builds.
+
+<Elsewhere items={[
+  { where: "Kafka", how: "Its idempotent producer gives each producer an ID and numbers its messages, so a broker can drop a retried duplicate; 'exactly-once' in Kafka is the same at-least-once plus dedupe (chapter 23)." },
+  { where: "TCP", how: "Sequence numbers let the receiver discard retransmitted segments it already has, which is idempotent handling at the transport layer." },
+  { where: "Message queues (SQS, RabbitMQ)", how: "Deliver at least once and expect consumers to deduplicate by message ID." },
+]} />
+
+</Sub>
+
+<SectionHeading n="05" id="idempotency">Idempotency keys</SectionHeading>
+
+<Sub n="5.1" title="The client names the request">
+
+The server can't recognise a retry by its contents. Two requests to charge $20 to the same card might be one retry, or Maya buying two prints on purpose. So the client gives each operation a name: a random string generated once per payment and sent with every attempt at it. Stripe calls this an **idempotency key**, and it travels in an HTTP header:
+
+```bash
+curl https://api.stripe.com/v1/payment_intents \
+  -u sk_live_...: \
+  -H "Idempotency-Key: 6f1c2a4e-8b0d-4f3e-9a51-2c7d8e4b1f90" \
+  -d amount=2000 \
+  -d currency=usd
+```
+
+(`amount=2000` is $20. Stripe counts money as integers in the currency's smallest unit, here cents, which avoids the rounding errors of floating-point numbers.)
+
+Stripe's API documentation, as of 2026, sets out the contract. The client picks the key; Stripe suggests a version 4 **UUID**, a 128-bit random identifier, so two keys never collide. Stripe saves **the status code and body of the first response** for each key, success or failure, and returns the same response to any later request with that key, even a `500` error. A request that reuses a key with *different* parameters gets an error, because that's probably a client bug. Keys can be removed once they're 24 hours old. Every `POST` accepts a key; `GET` and `DELETE` don't need one, because reading and deleting are already idempotent.
+
+Inkwell's server generates one key when Maya presses Pay, stores it with her order, and uses it for every retry. Back in the tunnel: in case 1, Stripe has never seen the key and processes the request normally. In case 3, Stripe finds the key with a saved "succeeded" response and returns it without charging again. Case 2, a crash midway, is harder, and we'll come to it in 5.4.
+
+<Decision
+  q="How should the server recognise a retried payment?"
+  options={[
+    { name: "By its contents", how: "Treat two requests with the same amount, card and merchant within a short window as one.", good: ["Needs nothing from the client"], bad: ["Two genuine identical purchases get merged", "Any window length is wrong for someone"] },
+    { name: "Server-issued ID first", how: "One call creates a payment and returns its ID; a second call executes it.", good: ["The ID is always unique"], bad: ["The first call can be lost too, leaving orphans", "Two round trips per payment"] },
+    { name: "Client-generated key", how: "The client invents a random key per operation and sends it with every attempt.", good: ["Works for any POST, retried any number of times", "The client decides what 'the same operation' means"], bad: ["Clients must store and reuse keys correctly", "The server must keep key records for a while"], chosen: true },
+  ]}
+>
+Stripe chose client-generated keys for every mutating endpoint, and its libraries handle the common case: as of 2026, the Ruby library adds a random UUID as the `Idempotency-Key` on `POST` requests whenever retries are on. The PaymentIntents of section 6 also use the second option, creating a payment object first and confirming it later; the two combine, since creating the object is itself a keyed POST.
+</Decision>
+
+</Sub>
+
+<Sub n="5.2" title="Inside the idempotency key record">
+
+<Zoom path={["Stripe", "API", "Idempotency layer", "key record"]} />
+
+What does the server store for each key? Stripe hasn't published its internal schema, but Brandur Leach, then a Stripe engineer, published a complete reference design in October 2017 ("Implementing Stripe-like Idempotency Keys in Postgres"). Here's its record, filled in for Inkwell's request:
+
+| Column | Type | Inkwell's request | Why it's there |
+|---|---|---|---|
+| `id` | bigint | 81,204,113 | Primary key |
+| `user_id` | bigint | Inkwell's account | Keys are unique per account, not globally |
+| `idempotency_key` | text | `6f1c2a4e-…` | The client's name for the operation |
+| `request_method`, `request_path` | text | `POST`, `/v1/payment_intents` | To spot a key reused for a different call |
+| `request_params` | JSON | `{"amount":2000,"currency":"usd"}` | To spot a key reused with different parameters |
+| `created_at`, `last_run_at` | timestamp | 18:42:07 | For expiry, and to find abandoned requests |
+| `locked_at` | timestamp, nullable | 18:42:07 | Set while a request is working on this key (5.3) |
+| `recovery_point` | text | `started` | How far the work has got (5.4) |
+| `response_code`, `response_body` | int, JSON, nullable | null until done | The saved answer |
+
+Two details carry most of the weight. A **unique index on (`user_id`, `idempotency_key`)** means the database itself refuses a second row for the same account and key, so even two retries racing each other can't both create one. And the saved response sits in the same row as the key, so replaying it is one lookup. A background job, a **reaper**, deletes records past the retention horizon; Brandur's post suggests 24 hours in one place and about 72 in another, to let a broken integration be fixed over a weekend.
+
+</Sub>
+
+<Sub n="5.3" title="Two attempts at once">
+
+Suppose Inkwell's first attempt is slow, not lost. Stripe is still waiting on the card network when Inkwell's client times out, probably after a few seconds, and sends the retry. Now two requests with the same key are inside Stripe at once, and if both ask "have I seen this key?" before either has saved a response, both will charge.
+
+A lock on the key record fixes this. The first request sets `locked_at` in the same transaction that creates the record. A second request that finds the record locked doesn't run; it gets `409 Conflict` and is expected to retry later, by which time there's a saved response to replay. The lock needs a timeout, so that if the first request's server dies holding it, a later attempt can take over. Stripe's documentation reflects this: a request that collided with a concurrent one never started executing, so no result is saved for it, and can be retried.
+
+</Sub>
+
+<Sub n="5.4" title="Crashing halfway: atomic phases and recovery points">
+
+Now case 2: the server crashes midway. Creating Maya's payment is a sequence inside Stripe: record the payment, send the authorisation to the card network, record the answer, build the response. Most steps change only Stripe's own database, where a transaction bundles several changes so they all happen or none do. One changes the outside world: once Maya's bank has put a hold on $20, no rollback in Stripe's database can take it back.
+
+Brandur's design calls a change to another system a **foreign state mutation** and splits the request at those points. Each stretch of local work between two foreign calls is an **atomic phase**, one database transaction that makes its changes *and* records how far the request has got, a named checkpoint called a **recovery point**. Each atomic phase commits before the next foreign call starts, so a retry can read the recovery point and resume from there.
+
+<Scene
+  title="Maya's payment, a crash, and a retry that resumes"
+  regions={[
+    { id: "started", label: "started", sub: "key recorded", col: 0, row: 0 },
+    { id: "created", label: "payment_created", sub: "row in Stripe's DB", col: 1, row: 0 },
+    { id: "network", label: "Card network", sub: "foreign call", col: 2, row: 0 },
+    { id: "authorised", label: "authorised", sub: "answer recorded", col: 1, row: 1 },
+    { id: "finished", label: "finished", sub: "response saved", col: 2, row: 1 },
+  ]}
+  itemWidth={112}
+  frames={[
+    { caption: "Inkwell's request arrives. **Phase 1**, one transaction: insert the key record with recovery point `started` and take the lock.",
+      items: [{ id: "r", at: "started", label: "Maya $20", tone: "accent" }], focus: ["started"] },
+    { caption: "**Phase 2**, one transaction: insert the payment row and move the recovery point to `payment_created`. A crash during it would roll the whole phase back.",
+      change: [{ id: "r", at: "created", tone: "accent" }], focus: ["created"], arrow: { from: "started", to: "created", label: "commit" } },
+    { caption: "The **foreign call**: authorise $20. Maya's bank says yes and places a hold. Then the server crashes before recording the answer.",
+      change: [{ id: "r", at: "network", tone: "bad" }], focus: ["network"], arrow: { from: "created", to: "network", label: "authorise" } },
+    { caption: "Inkwell retries with the same key. The record says `payment_created`, so phases 1 and 2 are done and the network call is the step in doubt. Stripe must find out what the network did before anything else.",
+      change: [{ id: "r", at: "created", tone: "warn" }], focus: ["created", "network"] },
+    { caption: "With the outcome known, **phase 3** records it and moves to `authorised` in one transaction.",
+      change: [{ id: "r", at: "authorised", tone: "accent" }], focus: ["authorised"], arrow: { from: "network", to: "authorised", label: "record" } },
+    { caption: "**Phase 4** saves the response on the key, sets `finished` and releases the lock. Any later retry gets this saved response.",
+      change: [{ id: "r", at: "finished", tone: "ok" }], focus: ["finished"], arrow: { from: "authorised", to: "finished", label: "save" } },
+  ]}
+/>
+
+These recovery point names are illustrative (Brandur's example, a ride-sharing app called Rocket Rides, uses `started`, `ride_created`, `charge_created` and `finished`), but the shape is general: a crash always leaves the request at a named point that says what's done and what's next.
+
+<Why>What if the crash happens during the call to the network?</Why>
+
+That's the fourth frame, and it hides the hardest question in payments. The server crashed *during* a foreign call, so it doesn't know whether the bank authorised the $20, and sending the authorisation again might place a second hold. The foreign call itself has to be safe to repeat or to look up, which pushes the same problem one level down. Card networks and acquirers handle it with their own identifiers on each message and with reversal messages that cancel an authorisation whose outcome is in doubt; how Stripe's systems use them isn't published. It's the principle from section 4: a call to another system is safe to retry only if that system can recognise the retry.
+
+Two more pieces close the gaps. If Inkwell gives up and never retries, the request would sit at `payment_created` forever, so Brandur's design adds a **completer**, a background process that finds abandoned keys and pushes them to the end through the same code. And work that can happen later, such as a receipt email, is written to a job table inside the phase that triggers it, so it's queued exactly when that phase commits.
+
+<Callout label="Common mistake" kind="warn">
+Wrapping a whole request, including a call to another service, in one database transaction and assuming a rollback undoes everything. The rollback undoes your rows; it doesn't undo the hold at Maya's bank, the email that went out or the message that was published. Commit what you know before each external call, so a crash leaves a record of what might have happened outside.
+</Callout>
+
+<Elsewhere items={[
+  { where: "Other payment APIs", how: "Adyen, PayPal and Square all accept an idempotency key or request ID on payment calls, and an IETF working-group draft, since expired, proposed standardising the `Idempotency-Key` HTTP header." },
+  { where: "Database upserts", how: "`INSERT … ON CONFLICT DO NOTHING` on a unique key is the same trick inside one database: the unique index turns a duplicate into a no-op." },
+  { where: "AWS APIs", how: "EC2's RunInstances and many other AWS calls take a client token, so a retried 'launch a server' doesn't launch two." },
+]} />
+
+</Sub>
+
+<SectionHeading n="06" id="payment-intent">A payment is a state machine</SectionHeading>
+
+<Sub n="6.1" title="When one call stopped being enough">
+
+Idempotency keys make one request safe to repeat. But section 2 showed that a payment is many steps: an authorisation, a capture, perhaps a pause for Maya to prove to her bank that she's the one paying, and days of settlement. Something has to remember where each payment is.
+
+Stripe's 2020 post "Stripe's payments APIs: the first 10 years" tells how it learned this. The 2011 API had a `Token`, made in the browser from the card details so the card number never touched the merchant's server, and a `Charge`, made from the token by the merchant's server. For US card payments that was enough, because a card payment is decided on the spot.
+
+Then came payment methods that didn't fit. ACH bank debits, added in 2015, take days to finish, so `Charge` gained a `pending` state. Methods like iDEAL in the Netherlands send the customer to their bank's website to approve the payment, so the customer decides when the money moves. Cards joined this group when banks began asking for **3D Secure**, an extra step where the bank checks that the cardholder is the one paying. Each new method bolted more onto `Charge`, which grew from 11 properties in 2011 to 36 by 2018.
+
+Its failures were concrete. A customer could approve an iDEAL payment at their bank, then close the tab before the browser told the merchant's server. The server never created the `Charge`, so Stripe returned the money, and the shop lost a sale the customer believed they'd paid for. Stripe's post compares the approach to building a spaceship by adding parts to a car.
+
+</Sub>
+
+<Sub n="6.2" title="The PaymentIntent">
+
+In late 2017 a team of five, four engineers and a product manager, spent three months in a conference room designing a replacement from first principles, and it launched in 2018 as two objects. A **PaymentMethod** describes *how* to pay: the card, or the bank account. A **PaymentIntent** describes *what* is being paid, $20 to Inkwell, and tracks every attempt to pay it until one succeeds. Its `status` field is a **state machine**: a fixed set of states, and a fixed set of allowed moves between them, so the payment's position in the process is always one of a few named values.
+
+Here's Maya's payment, assuming her bank asks for 3D Secure:
+
+<Scene
+  title="Maya's PaymentIntent, from creation to success"
+  regions={[
+    { id: "rpm", label: "requires_payment_method", col: 0, row: 0 },
+    { id: "rc", label: "requires_confirmation", sub: "optional", col: 1, row: 0 },
+    { id: "ra", label: "requires_action", sub: "3D Secure", col: 2, row: 0 },
+    { id: "proc", label: "processing", col: 0, row: 1 },
+    { id: "cap", label: "requires_capture", sub: "if capturing later", col: 1, row: 1 },
+    { id: "ok", label: "succeeded", col: 2, row: 1 },
+  ]}
+  itemWidth={104}
+  frames={[
+    { caption: "When Maya opens the checkout, Inkwell's server creates a PaymentIntent for $20 (with an idempotency key). It starts in **requires_payment_method**: nothing to charge yet.",
+      items: [{ id: "pi", at: "rpm", label: "pi_Maya", tone: "accent" }], focus: ["rpm"] },
+    { caption: "Maya types her card into Stripe's form in the page and taps Pay. That attaches a PaymentMethod and **confirms** the intent in one step, so most integrations pass straight through requires_confirmation.",
+      change: [{ id: "pi", at: "rc", tone: "accent" }], focus: ["rc"], arrow: { from: "rpm", to: "rc", label: "card" } },
+    { caption: "Maya's bank wants 3D Secure. The intent moves to **requires_action**, and Stripe's code in the page shows the bank's check. If Maya's connection drops here, the intent waits in this state; nothing is lost.",
+      change: [{ id: "pi", at: "ra", tone: "warn" }], focus: ["ra"], arrow: { from: "rc", to: "ra", label: "confirm" } },
+    { caption: "Had the bank declined, the intent would go back to **requires_payment_method** so Maya could try another card. There's no 'failed' state: the same object takes the next attempt.",
+      change: [{ id: "pi", at: "ra", tone: "warn" }], focus: ["rpm"], arrow: { from: "ra", to: "rpm", label: "if declined" } },
+    { caption: "In our story Maya approves, the card is authorised and, with automatic capture, captured at once. The intent moves to **succeeded**: the payment is complete and Inkwell can ship.",
+      change: [{ id: "pi", at: "ok", tone: "ok" }], focus: ["ok"], arrow: { from: "ra", to: "ok", label: "approved" } },
+    { caption: "Two other paths: a shop that captures later stops at **requires_capture** with the money on hold, and bank debits wait days in **processing**. A shop can also cancel an intent before it reaches processing or succeeded, which releases any hold.",
+      change: [{ id: "pi", at: "ok", tone: "ok" }], focus: ["cap", "proc"] },
+  ]}
+/>
+
+What changed most is where the state lives. With `Charge`, the merchant's server had to piece together the state of a payment from its own requests and the browser's reports, and a dropped connection could lose the thread. With a PaymentIntent, Stripe holds the state, the merchant creates the intent before anything can go wrong, and every party (Maya's browser, Inkwell's server, Stripe's own background jobs) moves the same object forward through allowed transitions. A disconnected browser leaves an intent in `requires_action`, waiting, instead of a payment nobody recorded.
+
+<Why>Why have a requires_capture state at all?</Why>
+
+Because some merchants shouldn't take the money until they've done their part. A hotel authorises the full stay when you book and captures it at checkout; a shop might capture only when the parcel ships, perhaps for less than it authorised if an item is out of stock. Setting `capture_method=manual` makes the intent stop in `requires_capture` after authorisation, and a later capture call takes up to the authorised amount. The clock matters: as of 2026, Stripe's documentation gives most card brands 7 days for online customer-initiated payments, after which the authorisation expires, the hold is released, and the intent becomes `canceled`.
+
+<Decision
+  q="One synchronous charge call, or a stateful payment object?"
+  options={[
+    { name: "Synchronous Charge (2011)", how: "One server call charges the card and returns the result.", good: ["Very simple: a few lines of curl", "Fits card payments decided on the spot"], bad: ["Payments that need the customer's action or take days don't fit", "Merchants track state across two objects and webhooks"] },
+    { name: "PaymentIntent state machine (2018)", how: "Create an object for the payment first; move it through named states until it succeeds.", good: ["One integration for every payment method", "State survives dropped connections", "Retries and failures have defined places"], bad: ["Card payments got harder to integrate", "Merchants must handle webhooks"], chosen: true },
+  ]}
+>
+Stripe's post is frank about the cost: the new API no longer felt like "seven lines of code", and rolling it out took almost two years. To avoid breaking existing integrations, every PaymentIntent still creates a `Charge` for each attempt, so analytics and reporting code built on charges kept working. That lesson generalises: model a long-running process as an explicit state machine owned by the server, instead of a single call whose outcome the client has to infer.
+</Decision>
+
+</Sub>
+
+<SectionHeading n="07" id="ledger">Where the money is: the ledger</SectionHeading>
+
+<Sub n="7.1" title="A balance column isn't enough">
+
+The PaymentIntent knows that Maya's payment succeeded. Now Stripe owes Inkwell $20, minus its fee, and must keep track of that until it pays out. An obvious way is a column: give each merchant a `balance` and run `UPDATE merchants SET balance = balance + 1912 WHERE id = 'inkwell'` when a payment succeeds (the amounts are in cents, so that's $19.12, after an 88-cent fee used here for illustration).
+
+That works until someone asks a question. Which payments make up Inkwell's balance? A bug credited some payments twice last March; which merchants were affected, and by how much? A balance column can't answer, because each update overwrote the number before it. If two servers update the same balance at once without care, one update can overwrite the other, the lost update problem from chapter 19. And nothing checks that the money Stripe says it owes merchants matches the money it has received.
+
+</Sub>
+
+<Sub n="7.2" title="Double-entry bookkeeping">
+
+Accountants solved this five centuries ago. The method was in use among Italian merchants by the 1300s, and the friar and mathematician Luca Pacioli published the first printed description in his *Summa de arithmetica* in 1494.
+
+<Picture
+  src="/images/designs/stripe/pacioli-summa-1523.jpg"
+  alt="The title page of Luca Pacioli's Summa de arithmetica geometria proportioni et proportionalita, 1523 edition, inside a black decorative border"
+  caption="The title page of the 1523 edition of Pacioli's Summa. Among the contents it lists a treatise on keeping accounts 'the Venetian way', the first printed description of double-entry bookkeeping, first published in 1494."
+  credit="Image: Luca Pacioli, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Pacioli_-_Summa_de_arithmetica_geometria,_1523_-_1363187.jpeg"
+  narrow
+/>
+
+The idea fits in two rules. First, money is always *somewhere*: every place it can be is an **account**, a named bucket such as "cash in Stripe's bank" or "owed to Inkwell". Second, money is never created or destroyed by bookkeeping, only moved: every **transaction** is recorded as two or more **entries**, each adding to or taking from one account, and the entries of one transaction must cancel out. Accountants call the two sides of each transaction **debits** and **credits**, and the rule is that each transaction's debits equal its credits. In a database it's simpler to store each entry as a signed amount, debits positive and credits negative, so the rule becomes: **the entries of every transaction sum to zero**.
+
+Because no transaction can break that rule, the whole ledger always sums to zero too. If it doesn't, something has been recorded wrongly, and the mistake shows up immediately, which is the property a payment company needs most.
+
+</Sub>
+
+<Sub n="7.3" title="Maya's $20, entry by entry">
+
+<Zoom path={["Stripe", "Ledger", "transaction", "entries"]} />
+
+Let's follow Maya's payment through a small ledger. Stripe's internal schema isn't public, so these accounts are a minimal design, named after the kinds of account Stripe's 2024 post describes. Five accounts are enough:
+
+- `network_receivable`: money the card network owes Stripe for captured payments, not yet received.
+- `cash`: money in Stripe's bank account.
+- `inkwell_pending`: money Stripe owes Inkwell that isn't available to pay out yet (Stripe's post calls this kind of account "charge undisbursed").
+- `inkwell_available`: Inkwell's balance, ready to be paid out ("business balance" in the post).
+- `fee_revenue`: Stripe's fees.
+
+Each **entry** is one row, and this is the data structure at the bottom of everything:
+
+| Field | Example | Purpose |
+|---|---|---|
+| `entry_id` | `le_8812` | Unique, so the same entry is never applied twice |
+| `transaction_id` | `tx_capture_pi_Maya` | Groups entries that must sum to zero |
+| `account` | `network_receivable` | Which bucket |
+| `amount` | `+2000` | Signed integer in the smallest currency unit: debit positive, credit negative |
+| `currency` | `usd` | An account never mixes currencies |
+| `effective_at` | 2026-10-09 18:42:11 | When the money moved, for balances at any point in time |
+| `source_ref` | `pi_Maya` | Which payment, payout or refund caused it, for tracing |
+
+Entries are only ever inserted, never updated or deleted. Now the four transactions that Maya's payment produces:
+
+| Transaction | Entries | Sum | What happened |
+|---|---|---|---|
+| 1. Capture | `network_receivable` +2000, `inkwell_pending` −1912, `fee_revenue` −88 | 0 | The network now owes Stripe $20; Stripe owes Inkwell $19.12 and has earned 88 cents |
+| 2. Settlement | `cash` +2000, `network_receivable` −2000 | 0 | The network paid; the receivable is back to zero |
+| 3. Release | `inkwell_pending` +1912, `inkwell_available` −1912 | 0 | After the settlement delay, the money becomes available to Inkwell |
+| 4. Payout | `inkwell_available` +1912, `cash` −1912 | 0 | Stripe sends $19.12 to Inkwell's bank |
+
+Add up each account after all four: `network_receivable` 0, `inkwell_pending` 0, `inkwell_available` 0, `cash` +88 and `fee_revenue` −88. Everything Maya paid has gone where it should, and what remains is Stripe's 88 cents, sitting in cash and recorded as revenue. A balance is now never stored as the truth; it's the sum of an account's entries, which can be cached for speed but always recomputed.
+
+Now the questions the balance column couldn't answer are easy. Inkwell's dashboard balance is the sum of `inkwell_available` entries, each pointing at the payment that caused it. The balance on any past date is the sum of entries up to that date. Last March's bug is a set of entries that can be found and corrected. Corrections, too, are new entries: because nothing is edited, a mistake is fixed by a reversing transaction, so the history of the mistake and of its fix both remain.
+
+</Sub>
+
+<Sub n="7.4" title="Clearing accounts and reconciliation">
+
+Look again at `network_receivable` and `inkwell_pending`. Each one goes up when a process starts and comes back to zero when it finishes. Accounts like these are called **clearing accounts**, and they're the ledger's alarm system. If the network never pays for Maya's capture, `network_receivable` stays at +2000. If a release never runs, `inkwell_pending` stays at −1912. A single query, "find clearing accounts with a non-zero balance older than they should be", lists every stuck payment in the company.
+
+Stripe's 2024 post on Ledger, its system of record for financial data ("an immutable and auditable log"), describes exactly this. It compares money to water flowing through pipes (processes) into reservoirs (balances): at steady state the clearing accounts are empty, and water left in the pipes means a problem. Its example has a `charge.creation` event placing funds in a `charge_undisbursed` account and a `charge.release` event moving them to the business's balance. As of early 2024 Ledger saw five billion events a day, and Stripe reported that 99.99% of dollar volume was fully ingested and checked within four days, and that over 99.9999% of money movement was explained.
+
+The last link is **reconciliation**: comparing Stripe's ledger with records kept by someone else. The card networks and banks send their own reports of what they settled. Every line in them should match entries in the ledger, and every receivable in the ledger should eventually match a line in a report. Where the two disagree, either Stripe or its partner has made a mistake, and the clearing account that didn't clear says where to look.
+
+<Decision
+  q="How should Stripe record who owns what?"
+  options={[
+    { name: "Mutable balances", how: "A balance column per merchant, updated in place.", good: ["One cheap read for the current balance", "Simple to build"], bad: ["No history: can't explain or audit a number", "Lost updates under concurrency", "Nothing catches money that went missing"] },
+    { name: "Append-only double-entry ledger", how: "Every movement as entries that sum to zero; balances derived by summing.", good: ["Every cent traceable to its cause", "Errors show up as imbalances or uncleared accounts", "Any past balance can be rebuilt"], bad: ["More rows: several entries per payment", "Balances must be computed or cached"], chosen: true },
+  ]}
+>
+For a company whose product is moving other people's money, the extra rows are cheap insurance. Stripe built Ledger to be the trusted record of all its financial data and the basis of its data quality checks, and because Ledger is immutable, its 2024 post says errors are fixed by reverting and reprocessing events, through a reviewed two-phase process, never by editing records.
+</Decision>
+
+<Elsewhere items={[
+  { where: "Banks' core systems", how: "Every bank account balance is the sum of postings in a double-entry general ledger; an end-of-day check that debits equal credits is standard." },
+  { where: "Database write-ahead logs", how: "An append-only log as the source of truth, with tables as a cached view derived from it, is how storage engines recover after a crash (chapter 18)." },
+  { where: "Event sourcing", how: "Storing every change as an immutable event and deriving current state from them is the same idea applied to any domain." },
+]} />
+
+</Sub>
+
+<SectionHeading n="08" id="webhooks">Telling the shop: webhooks</SectionHeading>
+
+<Sub n="8.1" title="The shop has to find out">
+
+Back on the train, Maya approved the 3D Secure check just as the signal died, and her browser never reported back to Inkwell. Stripe knows the PaymentIntent succeeded, and the ledger knows Inkwell is owed $19.12. Inkwell doesn't know, so it won't ship the print.
+
+Inkwell could ask Stripe every few seconds about every open payment, but most of the answers would be "no change", and some changes (a dispute, a refund, a bank debit that clears after four days) happen long after anyone is watching. So Stripe tells Inkwell instead. When something happens, Stripe creates an **event**, such as `payment_intent.succeeded`, and sends it as an HTTP POST to a URL Inkwell registered in advance. A request that a service sends to *your* server to tell you something happened is called a **webhook**. It's the same push-over-polling choice WhatsApp and Uber made for phones, applied between servers.
+
+</Sub>
+
+<Sub n="8.2" title="At least once, in any order">
+
+Delivering a webhook is the same problem as section 3 in reverse. Now Stripe is the client, Inkwell's server is the one that can be slow, down or unreachable, and Stripe can't know whether a delivery that timed out was processed. So the webhook system chooses at-least-once delivery: it retries until Inkwell answers with a `2xx` status, and accepts that Inkwell will sometimes see an event twice.
+
+Stripe's documentation sets out the rules, as of 2026. In live mode a failed delivery (a timeout, a redirect, any non-`2xx` answer) is retried for **up to three days with exponential backoff**, which section 9 explains. **Events may arrive more than once**, so merchants should log the IDs of events they've processed and skip repeats: idempotency again, on the merchant's side. **Events may arrive out of order**, so handlers mustn't depend on order and can fetch the current object from the API. And handlers should **answer quickly**, returning `2xx` before any slow work, or the delivery times out and is retried.
+
+<SystemDiagram
+  title="From a state change to Inkwell's server, at least once"
+  nodes={[
+    { id: "pay", label: "Payment logic", sub: "PaymentIntent succeeded", kind: "service", col: 0, row: 0 },
+    { id: "db", label: "Payment + events", sub: "same transaction", kind: "db", col: 0, row: 1 },
+    { id: "q", label: "Delivery queue", sub: "per endpoint", kind: "queue", col: 1, row: 1 },
+    { id: "send", label: "Webhook senders", sub: "sign, POST, retry", kind: "compute", col: 2, row: 1 },
+    { id: "shop", label: "Inkwell's endpoint", sub: "verify, record ID, 200", kind: "service", col: 3, row: 1 },
+    { id: "work", label: "Inkwell's queue", sub: "ship the print", kind: "queue", col: 3, row: 0 },
+  ]}
+  edges={[
+    { from: "pay", to: "db" }, { from: "db", to: "q", label: "event" },
+    { from: "q", to: "send" }, { from: "send", to: "shop", label: "POST" },
+    { from: "shop", to: "work" },
+  ]}
+  steps={[
+    { caption: "The PaymentIntent moves to succeeded. The state change and a new `payment_intent.succeeded` event are written in the same transaction, so there can't be one without the other.", path: ["pay", "db"] },
+    { caption: "The event is queued for every endpoint that subscribed to that event type.", path: ["db", "q"] },
+    { caption: "A sender signs the event and POSTs it to Inkwell. Inkwell's server is restarting, so the delivery fails.", path: ["q", "send", "shop"] },
+    { caption: "The sender schedules a retry with a growing delay. A later attempt reaches Inkwell, which verifies the signature, checks it hasn't seen this event ID, records it and replies 200 straight away.", path: ["send", "shop"] },
+    { caption: "Inkwell's own worker picks the event off its queue and ships Maya's print.", path: ["shop", "work"] },
+  ]}
+/>
+
+Stripe hasn't published the internals of its webhook system, so the left half of this diagram is a design that meets the rules, not a description of Stripe's. One step deserves copying: writing the event in the same transaction as the state change it reports. If the server wrote the state and then crashed before queueing the event, Inkwell would never hear about Maya's payment; writing them together means every committed change has its event. This is called the **transactional outbox** pattern, and it's the same move as 5.4's job table.
+
+</Sub>
+
+<Sub n="8.3" title="Proving the webhook came from Stripe">
+
+Inkwell's webhook URL is just a URL, and anyone who learns it can POST a fake `payment_intent.succeeded` to it and get a print for free. So every webhook carries a signature. Stripe and Inkwell share a secret, shown in Stripe's dashboard and starting `whsec_`. For each delivery, Stripe computes an **HMAC**, a keyed hash that only someone holding the secret can produce, over the current timestamp, a dot and the raw request body, using the standard SHA-256 hash function. It sends the result in a header:
+
+```
+Stripe-Signature: t=1492774577,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd
+```
+
+Inkwell recomputes the HMAC from the same timestamp and body with its copy of the secret and compares. Any change to the body changes the hash. The timestamp is inside the signed data too, which defeats a **replay attack**, where an attacker records a genuine webhook and sends it again later: Stripe's libraries reject signatures more than 5 minutes old by default. Each retry gets a fresh timestamp and signature. This short program checks a genuine webhook, one with its body altered, and a genuine one replayed an hour later:
+
+```python
+import hashlib, hmac
+
+secret = b"whsec_example_secret"                        # shared by Stripe and the shop
+body = b'{"id":"evt_1","type":"payment_intent.succeeded"}'
+
+def sign(body, t):
+    signed_payload = str(t).encode() + b"." + body      # timestamp, a dot, the raw body
+    return hmac.new(secret, signed_payload, hashlib.sha256).hexdigest()
+
+def verify(header, body, now, tolerance=300):
+    parts = dict(p.split("=", 1) for p in header.split(","))
+    t = int(parts["t"])
+    ok_sig = hmac.compare_digest(sign(body, t), parts["v1"])  # constant-time compare
+    fresh = abs(now - t) <= tolerance                         # within 5 minutes
+    return ok_sig and fresh
+
+t = 1_760_000_000
+header = f"t={t},v1={sign(body, t)}"
+for label, b, now in [("genuine", body, t + 2),
+                      ("body changed", body.replace(b"succeeded", b"failed"), t + 2),
+                      ("replayed an hour later", body, t + 3600)]:
+    print(f"{label:24} {verify(header, b, now)}")
+```
+
+It prints `True` for the genuine webhook and `False` for the other two. Two details in it come straight from Stripe's documentation. The comparison uses `compare_digest`, which takes the same time whether the first byte or the last one differs, so an attacker can't guess the signature a byte at a time by timing the responses. And the body is signed as raw bytes, so Stripe warns that a web framework that parses and re-serialises the JSON before verification will break every signature.
+
+<Callout label="Common mistake" kind="warn">
+Doing the real work (shipping, emailing, updating accounts) inside the webhook handler before replying. A slow handler times out, Stripe retries, and the work runs twice unless the handler deduplicates by event ID. Verify the signature, record the event ID, put it on a queue, reply 200, then do the work.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="09" id="retries">Retrying without making things worse</SectionHeading>
+
+<Sub n="9.1" title="When everyone retries at once">
+
+Idempotency keys made retries safe. They didn't make them polite. Suppose one of Stripe's database shards fails over and, for two seconds, every request touching it returns an error. Thousands of clients, Inkwell among them, get errors at the same moment. If each one retries immediately, the recovering system receives the whole load again at once, plus the new traffic, and may fall over again. If each waits exactly one second, they all come back at the same instant one second later. This is the **thundering herd** problem: identical clients, failing together, retry together.
+
+Half the fix is **exponential backoff**: wait a short time after the first failure, then double the wait after each further failure, up to a cap. Clients that keep failing back off quickly, giving the server room. Stripe's 2017 idempotency post recommends waits proportional to 2ⁿ, where n is the number of failures so far. The other half is **jitter**: make each wait random, so clients that failed together don't come back together. Marc Brooker's 2015 post on the AWS Architecture Blog, "Exponential Backoff And Jitter", simulated clients contending for one resource and found that adding jitter more than halved their total calls. Of the versions it compared, "full jitter", which picks the wait uniformly between zero and the backoff value, did the least work.
+
+<Predict
+  q="2,000 clients all get an error at the same moment. They all retry with exponential backoff (0.5 s, 1 s, 2 s, 4 s, capped at 5 s), and the server can answer 100 requests in each tenth of a second. Roughly how does adding random jitter change things?"
+  options={[
+    "Very little: the backoff already spreads them out",
+    "It makes things worse: random waits mean some clients wait much longer",
+    "It changes everything: without jitter all 2,000 arrive in the same instant every time, so only 100 get through per round",
+    "It only helps if the server is completely down",
+  ]}
+  answer={2}
+>
+Backoff alone spaces out the *rounds*, but every round still lands at one instant. The server can take 100 of the 2,000; the other 1,900 fail together, back off by the same amount, and arrive together again. Jitter spreads each round across the whole waiting window, where the server's spare capacity is.
+</Predict>
+
+This program runs that scenario with and without full jitter, retrying each client until it's served:
+
+<TryIt what="Exponential backoff with and without jitter" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import heapq, random
+from collections import Counter
+random.seed(3)
+
+CLIENTS = 2_000      # all of them hit an error at the same moment
+CAPACITY = 100       # the server can answer 100 requests per 100 ms slot
+BASE, CAP = 0.5, 5.0 # first wait 0.5 s, doubling, never more than 5 s
+
+def wait(attempt, jitter):
+    w = min(CAP, BASE * 2 ** attempt)
+    return random.uniform(0, w) if jitter else w
+
+def simulate(jitter):
+    retries = [(wait(0, jitter), 0) for _ in range(CLIENTS)]   # (when, attempt)
+    heapq.heapify(retries)
+    arrivals, served = Counter(), Counter()
+    sent, last = 0, 0.0
+    while retries:
+        t, attempt = heapq.heappop(retries)
+        slot = int(t * 10)                      # which 100 ms slot it lands in
+        sent += 1
+        arrivals[slot] += 1
+        if served[slot] < CAPACITY:             # the server has room: success
+            served[slot] += 1
+            last = t
+        else:                                   # overloaded: fail, back off again
+            heapq.heappush(retries, (t + wait(attempt + 1, jitter), attempt + 1))
+    return sent, max(arrivals.values()), last
+
+for jitter in [False, True]:
+    sent, peak, last = simulate(jitter)
+    label = "with jitter" if jitter else "no jitter  "
+    print(f"{label}  requests sent {sent:6,}  busiest 100 ms: {peak:5,}  everyone served by {last:4.1f} s")
+```
+<Output>
+```
+no jitter    requests sent 21,000  busiest 100 ms: 2,000  everyone served by 87.5 s
+with jitter  requests sent  4,460  busiest 100 ms:   580  everyone served by  5.6 s
+```
+</Output>
+</TryIt>
+
+Without jitter, every round arrives as one spike of everyone still waiting. The server serves 100 and rejects the rest, so it takes 20 rounds, 21,000 requests and nearly a minute and a half to serve 2,000 clients, with the server overloaded at every round. With jitter, the same clients spread out: the busiest tenth of a second sees 580 requests instead of 2,000, the total traffic is roughly a fifth, and everyone is served in under six seconds. The server's capacity is identical in both runs; only the timing of the retries changed.
+
+</Sub>
+
+<Sub n="9.2" title="What Stripe's own libraries do">
+
+Stripe's client libraries put all of this into practice, which makes them a useful reference. As of 2026, the Ruby library retries **twice by default**. Before retry *n* it waits `0.5 × 2^(n−1)` seconds, capped at **5 seconds**, then multiplied by a random factor between 0.5 and 1, a form of jitter that keeps at least half the backoff. It adds an `Idempotency-Key` to every `POST` so retries are safe. It retries timeouts, connection errors, `409 Conflict` (the "key in progress" answer from 5.3), `5xx` errors and `429`s caused by a lock timeout, but **not** `429`s caused by rate limiting, which would only add to the overload. And it obeys a `Stripe-Should-Retry` header when the API sends one, because the server knows things the client doesn't, such as whether an error was saved under the key and would just be replayed.
+
+<Callout label="Design implication">
+Retries multiply load exactly when a system is weakest. Every retry loop needs four things: a key so it's safe, a cap on attempts, exponential backoff so persistent failures slow down, and jitter so clients don't synchronise. Missing any one turns a short outage into a long one.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="10" id="rate-limits">Protecting the API: rate limits and load shedding</SectionHeading>
+
+<Sub n="10.1" title="The token bucket">
+
+Polite clients aren't enough, because not every client is polite. A merchant's script with a bug can loop on an endpoint thousands of times a second, and a merchant running a flash sale can send ten times its normal traffic. Stripe's API is shared by millions of businesses, so one client's flood must not slow Inkwell's checkout. The first defence is a **rate limiter**: a cap on how many requests each account may send per second, with excess requests rejected with HTTP `429 Too Many Requests`.
+
+Paul Tarjan's 2017 post on Stripe's blog, "Scaling your API with rate limiters", explains that Stripe's limiters use the **token bucket** algorithm. Each account has a bucket that holds up to some number of tokens. Tokens drip in at a fixed rate, and once the bucket is full, extra tokens overflow and are lost. Each request takes one token; if the bucket is empty, the request is rejected.
+
+<Picture
+  src="/images/designs/stripe/token-bucket.png"
+  alt="A hand-drawn token bucket labelled MAX b TOKENS, filled by r TOKENS/SEC, releasing tokens to let waiting packets through"
+  caption="A token bucket as network engineers draw it. Tokens arrive at r per second into a bucket that holds at most b; each request (here a packet) needs a token to pass. Stripe's version rejects a request when there's no token, instead of making it wait."
+  credit="Image: Lorenzo David and Luca Ghio, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:QoS_tocken_bucket.svg"
+  paper
+  narrow
+/>
+
+Two numbers give the bucket its character. The drip rate is the long-run limit, and the bucket's size is how big a burst it tolerates: an account that has been quiet has a full bucket and can spend it at once. Stripe's post says exactly this: after analysing traffic, it let accounts burst above the cap for sudden spikes such as flash sales. Here's a bucket that refills at 100 tokens a second and holds 100, fed a steady trickle, then a burst, then a sustained flood:
+
+<TryIt what="A token bucket under a burst and a flood" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+class TokenBucket:
+    def __init__(self, rate, capacity):
+        self.rate, self.capacity = rate, capacity   # tokens per second, bucket size
+        self.tokens, self.last = capacity, 0.0      # start full
+
+    def allow(self, now):
+        # drip in the tokens earned since the last request, up to the brim
+        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+        self.last = now
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False                                 # empty bucket: answer 429
+
+bucket = TokenBucket(rate=100, capacity=100)
+
+def phase(name, start, seconds, per_second):
+    n = int(seconds * per_second)
+    ok = sum(bucket.allow(start + i / per_second) for i in range(n))
+    print(f"{name:28} sent {n:4}  allowed {ok:4}  rejected {n - ok:4}")
+
+phase("steady 50/s for 2 s", 0.0, 2, 50)
+phase("burst: 150 in 0.1 s", 2.0, 0.1, 1500)
+phase("too fast: 300/s for 1 s", 3.0, 1, 300)
+phase("back to 50/s for 1 s", 4.0, 1, 50)
+```
+<Output>
+```
+steady 50/s for 2 s          sent  100  allowed  100  rejected    0
+burst: 150 in 0.1 s          sent  150  allowed  109  rejected   41
+too fast: 300/s for 1 s      sent  300  allowed  190  rejected  110
+back to 50/s for 1 s         sent   50  allowed   50  rejected    0
+```
+</Output>
+</TryIt>
+
+Read it phase by phase. At 50 a second the bucket never empties. The burst of 150 gets 109 through: the 100 tokens saved up, plus roughly 9 more that dripped in during the tenth of a second the burst lasted. During the flood the bucket starts nearly refilled (about 90 tokens, earned over the 0.9 seconds of quiet) and earns 100 more during the second, so 190 of the 300 pass and the rest get `429`. Then the client slows down and everything passes again. The bucket lets a client be bursty but not fast on average, a fair rule for a shared API.
+
+The bucket's state is two numbers per account, `tokens` and `last`, so it can live in a fast shared store. Stripe's 2017 post says its limiters run on Redis, an in-memory data store (chapter 22), so every API server checks and updates the same bucket for an account. As of 2026, Stripe's documentation gives a default global limit of 100 requests a second per account in live mode and 25 in a sandbox (the bucket sizes aren't published), and a rejected request carries a `Stripe-Rate-Limited-Reason` header saying which limit it hit.
+
+</Sub>
+
+<Sub n="10.2" title="Four limiters, in layers">
+
+A per-account rate limit protects Stripe from one noisy client. It doesn't protect Stripe from itself, when its own capacity drops during an incident. Tarjan's post describes four limiters, each a layer of defence:
+
+<SystemDiagram
+  title="Four limiters in front of the API, from Stripe's 2017 post"
+  nodes={[
+    { id: "shop", label: "Inkwell", sub: "and every other account", kind: "users", col: 0, row: 0 },
+    { id: "rate", label: "Request rate limiter", sub: "token bucket per account", kind: "lb", col: 1, row: 0 },
+    { id: "conc", label: "Concurrency limiter", sub: "in-flight per account", kind: "lb", col: 2, row: 0 },
+    { id: "fleet", label: "Fleet load shedder", sub: "reserve for critical", kind: "lb", col: 2, row: 1 },
+    { id: "work", label: "Worker load shedder", sub: "drop by priority", kind: "lb", col: 1, row: 1 },
+    { id: "redis", label: "Redis", sub: "shared counters", kind: "cache", col: 3, row: 0 },
+    { id: "api", label: "API workers", kind: "service", col: 0, row: 1 },
+  ]}
+  edges={[
+    { from: "shop", to: "rate" }, { from: "rate", to: "conc" }, { from: "conc", to: "fleet" },
+    { from: "fleet", to: "work" }, { from: "work", to: "api" },
+    { from: "rate", to: "redis", dashed: true }, { from: "conc", to: "redis", dashed: true }, { from: "fleet", to: "redis", dashed: true },
+  ]}
+  steps={[
+    { caption: "**Request rate limiter**: each account's token bucket. Stripe called it the most important of the four; it rejected millions of requests in the month the post describes, often from runaway test scripts.", path: ["shop", "rate"], focus: ["redis"] },
+    { caption: "**Concurrent requests limiter**: at most a fixed number of requests in progress per account at once (the post's example is 20). It protects expensive endpoints from one client's pile of slow requests, and fired about 12,000 times that month.", path: ["rate", "conc"] },
+    { caption: "**Fleet usage load shedder**: requests are split into critical (creating a charge) and non-critical (listing charges). A share of capacity is always reserved for critical ones; in the post's example, non-critical traffic beyond 80% of the fleet gets `503`.", path: ["conc", "fleet"] },
+    { caption: "**Worker utilisation load shedder**: the last line of defence. When a server's workers are saturated it sheds traffic in four categories, least important first: test-mode traffic, then (as load grows) GETs, POSTs and finally critical methods. It sheds and recovers slowly, to avoid flapping.", path: ["fleet", "work", "api"] },
+  ]}
+/>
+
+<Why>Why drop requests on purpose?</Why>
+
+The last two are **load shedding**: deliberately dropping some requests so that the important ones still succeed. It's a choice about which failures to have. When there isn't capacity for everything, refusing to list someone's old charges is a far better failure than refusing to take Maya's payment.
+
+<Decision
+  q="If the rate limiter's Redis fails, should requests be allowed or rejected?"
+  options={[
+    { name: "Fail closed", how: "No answer from the limiter means reject the request.", good: ["Abuse can't slip through during the outage"], bad: ["A limiter outage becomes a full API outage", "Every merchant's payments fail because of a side system"] },
+    { name: "Fail open", how: "No answer from the limiter means let the request through.", good: ["The API keeps taking payments", "The limiter can never be the cause of an outage"], bad: ["For a while, nobody is rate-limited"], chosen: true },
+  ]}
+>
+Stripe's 2017 post says to catch errors at every level so that bugs in the limiter or a Redis failure never break API requests, to put each limiter behind a feature flag that can switch it off, and to "dark launch" a new limiter first: run it, log what it *would* have blocked, and tune it before it blocks anything. A limiter exists to protect availability, so it mustn't be allowed to reduce it.
+</Decision>
+
+
+</Sub>
+
+<SectionHeading n="11" id="storage">Where it's all stored: DocDB</SectionHeading>
+
+<Sub n="11.1" title="A database that can't stop">
+
+Every design so far assumes a database underneath: idempotency key records, PaymentIntents, ledger entries, events. That database has demands of its own. It can't lose a committed write. It can't go down for maintenance, because Stripe has no quiet hour when nobody in the world is paying for anything. And it has to grow without limit, because the data never shrinks: a payment from 2014 still needs to be found for a refund, an audit or a tax return.
+
+When Stripe launched in 2011 it chose **MongoDB**, a document database that stores records as JSON-like documents instead of rows in fixed tables, for developer productivity, according to Stripe's 2024 post on its document databases. No hosted database service met its needs, so Stripe built its own service on top of MongoDB Community, the open-source edition, and called it **DocDB**. In mid-2024 the post put DocDB at over **five million queries a second**, more than 10,000 distinct query shapes over **petabytes** of financial data, and 5,000+ collections (MongoDB's equivalent of tables) split across **2,000+ database shards**, groups of machines that each hold one slice of the data, with API uptime of 99.999% through 2023.
+
+<Picture
+  src="/images/designs/stripe/server-racks.jpg"
+  alt="Rows of rack-mounted servers with blue status lights in black cabinets"
+  caption="Rack servers in a data centre. Each of DocDB's two thousand-plus shards is a small group of machines like these, one holding the primary copy of its slice of the data and the others holding copies."
+  credit="Photo: Victor Grigas, CC BY-SA 3.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Wikimedia_Foundation_Servers-8055_35.jpg"
+/>
+
+</Sub>
+
+<Sub n="11.2" title="Proxies, chunks and shards">
+
+No single machine can hold petabytes or serve five million queries a second, so the data is split. Chapter 29 covers the general idea; here's how DocDB does it, from the 2024 post. Each collection's data is divided into **chunks**, pieces of the collection, and each chunk lives on one **shard**. A shard is a **replica set**: a primary node that takes writes and several secondary nodes that copy it, with automatic failover if the primary dies.
+
+Applications never talk to shards directly. They send queries to a fleet of **database proxy servers**, written in Go, which enforce access control and admission control (refusing work when overloaded, the same instinct as 10.2), parse the query, and route it. To route, a proxy asks a **chunk metadata service**, which maps each chunk to the shard that holds it. Every write also flows out as a **change data capture (CDC)** stream: MongoDB keeps an **oplog**, a log of every operation that modified data on a shard, and Stripe ships each shard's oplog to Kafka, a distributed log (chapter 23), and archives it in Amazon S3.
+
+<SystemDiagram
+  title="DocDB: how a query finds its shard"
+  nodes={[
+    { id: "app", label: "Payments service", sub: "read pi_Maya", kind: "service", col: 0, row: 0 },
+    { id: "proxy", label: "DB proxies", sub: "Go, auth, admission", kind: "lb", col: 1, row: 0, count: "×N" },
+    { id: "meta", label: "Chunk metadata", sub: "chunk → shard", kind: "registry", col: 1, row: 1 },
+    { id: "s1", label: "Shard 0417", sub: "primary + secondaries", kind: "db", col: 2, row: 0 },
+    { id: "s2", label: "Shard 1290", sub: "primary + secondaries", kind: "db", col: 2, row: 1 },
+    { id: "kafka", label: "Oplog → Kafka", sub: "CDC", kind: "queue", col: 3, row: 0 },
+    { id: "s3", label: "Object store", sub: "S3 archive", kind: "blob", col: 3, row: 1 },
+  ]}
+  zones={[{ label: "2,000+ shards (2024)", nodes: ["s1", "s2"] }]}
+  edges={[
+    { from: "app", to: "proxy" }, { from: "proxy", to: "meta", label: "which shard?" },
+    { from: "proxy", to: "s1" }, { from: "proxy", to: "s2", dashed: true },
+    { from: "s1", to: "kafka" }, { from: "kafka", to: "s3" },
+  ]}
+  steps={[
+    { caption: "The payments service asks for Maya's PaymentIntent. It sends the query to a proxy, never to a shard.", path: ["app", "proxy"] },
+    { caption: "The proxy checks the service is allowed to run this query and that there's capacity, then asks the chunk metadata service which shard holds the chunk containing `pi_Maya` (the answer is cached).", path: ["proxy", "meta"] },
+    { caption: "It sends the query to that shard's primary. A query spanning several chunks would go to several shards and the proxy would combine the answers.", path: ["proxy", "s1"] },
+    { caption: "Every write on the shard lands in its oplog, which is streamed to Kafka and archived in object storage. That stream is what the next subsection uses to move data.", path: ["s1", "kafka", "s3"] },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="11.3" title="Moving a chunk without stopping">
+
+Splitting data across shards solves today's problem, and creates tomorrow's. Shards fill up, some get hot, and in quiet periods many are underused. Data has to move between shards while the payments using it keep flowing. Stripe's requirement, from the post, was that the critical moment of a move be shorter than a routine primary failover, a few seconds, so that it fits within the retries applications already make. The system that does it is the **Data Movement Platform**, where a coordinator service takes each migration through six steps:
+
+<StepSequence
+  title="Moving one chunk from shard A to shard B with zero downtime"
+  actors={["Coordinator", "Chunk metadata", "Shard A (source)", "Shard B (target)", "Proxies"]}
+  messages={[
+    { from: 0, to: 1, label: "register", note: "**1. Registration.** Record the intent to move the chunk in the metadata service, and build the chunk's indexes on shard B." },
+    { from: 2, to: 3, label: "bulk import", note: "**2. Bulk import** from a snapshot of shard A at time T. Inserting documents sorted by the most common index fields, so writes land near each other in the B-tree that holds B's data in sorted order, made this step about **10× faster**." },
+    { from: 2, to: 3, label: "replicate", note: "**3. Async replication.** Every write to the chunk since time T is read from the oplog stream (Kafka and S3, not shard A itself, so A's users aren't slowed) and applied to B. Replication also runs B to A, so traffic can be switched back." },
+    { from: 0, to: 3, label: "verify", note: "**4. Correctness check.** Compare point-in-time snapshots of the chunk on A and B." },
+    { from: 0, to: 2, label: "bump version", note: "**5. Traffic switch.** Raise the version token on A, so A rejects any request with an older token; wait for the last writes to replicate; point the chunk's route at B with the new token. Proxies pick up the new route. The whole switch takes **under two seconds**, and requests rejected meanwhile succeed on retry." },
+    { from: 0, to: 1, label: "deregister", note: "**6. Deregistration.** Mark the move complete and delete the chunk from A." },
+  ]}
+/>
+
+Step 5 is the clever part. Why is it needed? During the switch some proxies still have the old route and some the new one. Without care, a slow proxy could write Maya's payment to shard A *after* the final replication, and that write would be lost when A's copy is deleted. The **version token** prevents it. Each proxy stamps its requests with the version it knows, and Stripe patched MongoDB so a shard refuses requests carrying a version older than the one it holds. Once A's version is raised, no stale proxy can write there, so the last replicated write is guaranteed to be the last one. A rejected request gets an error, the application retries, and by then the proxy has the new route: the same retry-and-recover pattern from section 9, now inside the database.
+
+Stripe's post reports what this made possible. In 2023 Stripe bin-packed thousands of underused databases by migrating **1.5 petabytes** of data, transparently to applications, and cut the number of DocDB shards by roughly three quarters. It also upgraded MongoDB across the fleet by moving data straight onto shards running a newer version, skipping the intermediate versions an in-place upgrade would need.
+
+</Sub>
+
+<Sub n="11.4" title="Changing the shape of the data">
+
+Moving data between machines is one kind of migration; changing its *shape* is another. Jacqueline Xu's 2017 post "Online migrations at scale" describes how Stripe moved hundreds of millions of subscriptions out of an array inside each customer record into a table of their own, with every service running throughout, in four steps: **dual write** to the old and new places and backfill the old records; **switch reads** to the new place, after comparing both in production with GitHub's Scientist library; **switch writes** to the new place only; then **delete the old data**. Every step can be undone, and Stripe never changed more than a few hundred lines of code at once. It's the same shape as the chunk move: keep two copies in sync, check them against each other, switch when they agree.
+
+<Decision
+  q="What should hold Stripe's core data?"
+  options={[
+    { name: "A relational database", how: "Postgres or MySQL with schemas, joins and multi-row transactions.", good: ["Strong transactions across rows and tables", "Schemas catch mistakes early"], bad: ["Schema changes on huge tables are hard", "Sharding is bolted on"] },
+    { name: "A hosted document database", how: "Buy the database as a service.", good: ["No database team needed"], bad: ["In 2011 nothing met Stripe's needs for availability, sharding, quotas and security"] },
+    { name: "Own service on MongoDB (DocDB)", how: "MongoDB as the storage engine, with Stripe's own proxies, sharding and data movement.", good: ["Flexible documents for evolving API objects", "Proxies limit queries to safe shapes", "Online data movement, splits and merges"], bad: ["A large in-house platform to build and run", "Transactions across shards need care at the application level"], chosen: true },
+  ]}
+>
+Stripe chose MongoDB in 2011 for developer speed, and then, because nothing off the shelf met its reliability bar, built the platform around it. The proxies in particular let Stripe expose only a minimal set of database operations, so a badly written query from one team can't hurt everyone. Which parts of Stripe's money movement also use other databases isn't published; this section describes only what Stripe has written about DocDB.
+</Decision>
+
+</Sub>
+
+<SectionHeading n="12" id="whole">The whole system</SectionHeading>
+
+<Sub n="12.1" title="Every box, and why it's there">
+
+<SystemDiagram
+  title="Maya's $20, end to end"
+  nodes={[
+    { id: "maya", label: "Maya's phone", sub: "Stripe's card form", kind: "phone", col: 0, row: 0 },
+    { id: "shop", label: "Inkwell's server", sub: "keys, webhook endpoint", kind: "service", col: 0, row: 2 },
+    { id: "edge", label: "API edge", sub: "rate limits, shedding", kind: "lb", col: 1, row: 1 },
+    { id: "idem", label: "Idempotency layer", sub: "key records", kind: "service", col: 2, row: 1 },
+    { id: "pi", label: "PaymentIntents", sub: "state machine", kind: "service", col: 2, row: 0 },
+    { id: "net", label: "Card networks", sub: "→ issuers", kind: "external", col: 3, row: 0 },
+    { id: "ledger", label: "Ledger", sub: "double-entry, immutable", kind: "db", col: 3, row: 1 },
+    { id: "hooks", label: "Webhooks", sub: "signed, at least once", kind: "queue", col: 2, row: 2 },
+    { id: "docdb", label: "DocDB", sub: "proxies + shards", kind: "db", col: 3, row: 2 },
+  ]}
+  edges={[
+    { from: "shop", to: "edge", label: "create intent" }, { from: "maya", to: "edge", label: "confirm" },
+    { from: "edge", to: "idem" }, { from: "idem", to: "pi" }, { from: "pi", to: "net", label: "authorise" },
+    { from: "pi", to: "ledger", label: "entries" }, { from: "pi", to: "hooks", label: "event" },
+    { from: "hooks", to: "shop", label: "POST" }, { from: "idem", to: "docdb", dashed: true }, { from: "ledger", to: "docdb", dashed: true },
+  ]}
+  steps={[
+    { caption: "When Maya opens the checkout, Inkwell's server creates a $20 PaymentIntent, with an idempotency key. The API edge checks Inkwell's token bucket.", path: ["shop", "edge", "idem", "pi"] },
+    { caption: "Maya taps Pay. Her card goes from Stripe's form in the page straight to Stripe, never through Inkwell's server, and confirms the intent.", path: ["maya", "edge", "pi"] },
+    { caption: "The PaymentIntent asks the card network, which asks Maya's bank. 3D Secure, then authorised and captured: the intent moves to succeeded, through atomic phases that survive a crash.", path: ["pi", "net"] },
+    { caption: "The capture is recorded as ledger entries that sum to zero; later transactions will settle, release and pay out the money and empty the clearing accounts.", path: ["pi", "ledger"] },
+    { caption: "A `payment_intent.succeeded` event is written with the state change and delivered to Inkwell, signed, retried with backoff until Inkwell answers 200.", path: ["pi", "hooks", "shop"] },
+    { caption: "Underneath it all, key records, intents, entries and events live in DocDB, sharded behind proxies and moved between shards without downtime.", focus: ["docdb", "idem", "ledger"] },
+  ]}
+/>
+
+| Component | What it does | Added because |
+|---|---|---|
+| Idempotency keys | Recognise retries; replay saved responses | Lost replies made retries double-charge (§3, §4, §5) |
+| Atomic phases + recovery points | Make a request resumable after a crash | A crash midway leaves outside effects unrecorded (§5.4) |
+| PaymentIntent | A server-owned state machine per payment | Payments take many steps and days; clients lose track (§6) |
+| Ledger | Immutable double-entry record of all money | Balance columns can't explain, audit or catch errors (§7) |
+| Webhooks | Push signed events to merchants, at least once | Merchants must learn of changes they didn't see (§8) |
+| Client retry policy | Backoff with jitter, capped, keyed | Synchronised retries make outages worse (§9) |
+| Rate limiters + load shedders | Cap each account; protect critical traffic | One client or one incident mustn't take everyone down (§10) |
+| DocDB | Sharded document store with online data movement | Data grows forever and can't go offline (§11) |
+
+</Sub>
+
+<Sub n="12.2" title="From top to bottom">
+
+| Level | The choice | Data structure or algorithm |
+|---|---|---|
+| System | Make effects exactly once, since delivery can't be | At-least-once delivery plus idempotent processing everywhere |
+| API request | Name every mutation | Key record with unique index on (account, key), saved response, lock with timeout |
+| Inside a request | Commit before every outside call | Atomic phases, recovery points, completer, transactional job table |
+| Payment | Explicit states | PaymentIntent state machine: requires_payment_method → requires_action → succeeded |
+| Money | Never overwrite | Append-only entries; each transaction sums to zero; balances are sums; clearing accounts must empty |
+| Notifications | Push, then dedupe | Transactional outbox, retries for 3 days, HMAC-SHA256 over timestamp and body |
+| Retries | Spread them out | Exponential backoff, capped, with random jitter |
+| Admission | Bursty but fair | Token bucket per account in Redis; priority-based load shedding |
+| Storage | Split and move | Chunk → shard map; replica sets; oplog CDC; version-token gated switch |
+
+</Sub>
+
+<SectionHeading n="13" id="tradeoffs">What it cost</SectionHeading>
+
+<Sub n="13.1" title="The tradeoffs, in one table">
+
+| Decision | Chosen | Given up | Why it was worth it |
+|---|---|---|---|
+| Delivery guarantee | At least once + idempotency | Simple fire-and-forget calls | Exactly-once delivery is impossible; exactly-once effect isn't |
+| Who names a request | Client-generated key | Clients that don't have to store anything | Only the client knows what "the same payment" means |
+| Payment model | PaymentIntent state machine (2018) | "Seven lines of code" | One integration for every payment method; state survives disconnections |
+| Money record | Append-only double-entry ledger | Cheap in-place balances | Every cent explainable; errors visible as imbalances |
+| Merchant notifications | Push, at least once, unordered | Ordered exactly-once delivery | Merchants' servers fail; duplicates are easy to skip by ID |
+| Rate limiter failure | Fail open | Protection during a limiter outage | A protective system must not cause an outage |
+| Database | Own platform on MongoDB | Buying a hosted database | Availability, online data movement and safe query shapes at Stripe's scale |
+
+</Sub>
+
+<SectionHeading n="14" id="summary">Summary</SectionHeading>
+
+1. **A card payment is a process, not an event**: authorisation puts a hold, capture takes the money, the networks clear and settle in batches, and Stripe pays the merchant days later.
+2. **Over a network, the sender can't tell a lost request from a lost reply**, so a naive client must choose between charging twice and not charging at all.
+3. **Exactly-once delivery is impossible** (the Two Generals), but exactly-once *effect* isn't: deliver at least once and make processing idempotent.
+4. **Idempotency keys name each operation**: the server stores the key with the request's parameters and its first response, enforces uniqueness per account, locks it while working, and replays the response to retries.
+5. **Atomic phases and recovery points make a request resumable**: commit local work before every outside call, so a crash leaves a record of exactly what may have happened outside.
+6. **A PaymentIntent is a server-owned state machine**, so a payment that needs the customer's action, or takes days, has a defined place for every step and survives dropped connections.
+7. **Money lives in an append-only double-entry ledger**: every transaction's entries sum to zero, balances are sums, and clearing accounts that don't return to zero point at stuck payments.
+8. **Webhooks push events at least once and in any order**, signed with an HMAC over a timestamp and the body, and merchants deduplicate by event ID.
+9. **Retries need exponential backoff and jitter**, or synchronised clients turn a short outage into a long one.
+10. **Token buckets and load shedders protect the shared API**: bursty-but-fair limits per account, and priority shedding that keeps payments working when capacity drops.
+11. **DocDB splits data into chunks on thousands of shards behind proxies**, and moves chunks between shards with replication, verification and a version-gated switch in under two seconds.
+
+<SectionHeading n="15" id="build">Build this</SectionHeading>
+
+**A payments API that survives its own crashes.**
+
+- Write a small HTTP service with one endpoint, `POST /payments`, backed by Postgres or SQLite. It calls a fake "card network" function that sleeps a random time, succeeds most of the time, and fails or hangs some of the time.
+- Add an `idempotency_keys` table with the columns from 5.2 and a unique index on (account, key). Store the response and replay it on retries; return 409 when the key is locked; return an error when parameters differ.
+- Split the handler into atomic phases with recovery points. Kill the process at random points (`kill -9` from a script) while a client retries with backoff and jitter. Check afterwards that no order was charged twice and none was left half-done, adding a completer if needed.
+- Add a ledger table of entries. Record capture, settlement and payout as transactions that sum to zero; write a query that lists clearing accounts with non-zero balances, and simulate a "settlement" that never arrives.
+- Add a webhook sender with a transactional outbox, HMAC signatures and retries, and a receiver that deduplicates by event ID. Make the receiver fail half the time and confirm every event is processed exactly once.
+
+<SectionHeading n="16" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What is an idempotency key, and why does a payment API need one?">
+It's a unique value the client generates for one operation, such as "charge Maya for order 4411", and sends with every attempt at it. A network can lose either the request or the reply, and the client can't tell which, so it has to retry; without a key, a retry after a lost reply charges twice. With a key, the server stores the first response under it and returns that response to any retry, so the charge happens once however many times the request arrives. Stripe saves the status code and body for each key, including errors, and treats keys as removable after 24 hours.
+</QA>
+
+<QA level="intermediate" q="Your server crashes after the card network approved a charge but before you recorded it. How do you avoid charging twice or losing the payment?">
+Split the request into atomic phases: commit the local state, including a recovery point saying "about to call the network", in a database transaction before making the call. After a crash, the retry (or a background completer) sees the recovery point and knows the network call is in doubt, so it must look up the outcome or use the network's own identifiers and reversal messages, not blindly call again. Once the outcome is known, the next phase records it and moves the recovery point on. Never make an external call that you haven't first recorded you're about to make.
+</QA>
+
+<QA level="intermediate" q="Why does Stripe deliver webhooks at least once instead of exactly once, and what must the receiver do?">
+Exactly-once delivery over a network is impossible: if the receiver's reply is lost, the sender can't know whether the event was processed, so it either retries (risking a duplicate) or doesn't (risking a loss). For payments, losing an event is worse than a duplicate, so Stripe retries for up to three days. The receiver must verify the signature, record each event ID and skip IDs it has seen, not depend on events arriving in order, and return 2xx quickly before doing slow work.
+</QA>
+
+<QA level="deep" q="Design the ledger for a payments company. What are the invariants, and how do you detect errors?">
+Model every place money can be as an account and every movement as a transaction made of entries, with signed integer amounts in minor units that sum to zero per transaction. Entries are append-only: corrections are reversing transactions, never edits. Balances are sums of entries, cached if needed but always recomputable. Process steps go through clearing accounts (such as "owed by the card network" or "pending for this merchant") that must return to zero when the process completes, so a single query for old non-zero clearing balances finds stuck or broken flows. Finally, reconcile the ledger against external reports from banks and networks. Stripe's Ledger, described in 2024, works this way at five billion events a day.
+</QA>
+
+
+<SectionHeading n="17" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="A client retries a charge with the same idempotency key but a different amount. What should the server do?">
+    Return an error. The same key with different parameters is almost
+    certainly a client bug, and replaying the old response or charging the new
+    amount would both hide it. Stripe's idempotency layer compares parameters
+    and errors on a mismatch.
+  </Q>
+  <Q q="After a month, a clearing account called network_receivable holds $3,400. What does that tell you?">
+    That captures worth $3,400 were recorded but the matching settlements
+    never arrived, or arrived and weren't recorded. Either the network didn't
+    pay or the ledger missed an event, and reconciliation against the
+    network's settlement reports will say which.
+  </Q>
+  <Q q="Why does Stripe's Ruby library retry a 429 caused by a lock timeout but not a 429 caused by rate limiting?">
+    A lock timeout means another request was briefly holding the same
+    object, so trying again shortly will probably work. A rate-limit 429 means
+    the client is sending too fast, and retrying at once would only add to
+    the overload.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Designing robust and predictable APIs with idempotency (Stripe blog, 2017)">
+    Brandur Leach on the three ways a request fails, idempotency keys, and
+    exponential backoff with jitter.
+  </WildCard>
+  <WildCard name="Implementing Stripe-like Idempotency Keys in Postgres (brandur.org, 2017)">
+    The full reference design: the key table, atomic phases, recovery
+    points, the completer and the reaper.
+  </WildCard>
+  <WildCard name="Stripe's payments APIs: the first 10 years (Stripe blog, 2020)">
+    From Tokens and Charges to Sources to PaymentIntents, and why the new
+    state machine took three months to design and two years to roll out.
+  </WildCard>
+  <WildCard name="Ledger: Stripe's system for tracking and validating money movement (2024)">
+    Double-entry accounts, clearing accounts as an alarm, and data quality
+    checks over five billion events a day.
+  </WildCard>
+  <WildCard name="Scaling your API with rate limiters (Stripe blog, 2017)">
+    Paul Tarjan on token buckets in Redis, the four limiters, failing open
+    and dark launching.
+  </WildCard>
+  <WildCard name="How Stripe's document databases supported 99.999% uptime (2024)">
+    DocDB on MongoDB, the proxies and chunk metadata, and the Data Movement
+    Platform's version-gated traffic switch.
+  </WildCard>
+  <WildCard name="Stripe API docs: idempotent requests, webhooks, rate limits">
+    The current contract: 24-hour keys, three days of webhook retries,
+    signature verification, and the default limits.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="18" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Designing Uber">
+    Another state machine that must move exactly once, set against data that
+    can afford to be approximate. [Chapter 50](/topics/50-design-uber).
+  </WildCard>
+  <WildCard name="Transactions & Isolation">
+    Atomic phases are database transactions; lost updates are why balance
+    columns fail. [Chapter 19](/topics/19-transactions-isolation).
+  </WildCard>
+  <WildCard name="Distributed Transactions">
+    What it takes to commit across systems, and why payments use idempotent
+    steps instead. [Chapter 31](/topics/31-distributed-transactions).
+  </WildCard>
+  <WildCard name="Kafka & Logs">
+    Append-only logs, idempotent producers, and the change streams under
+    DocDB's data movement. [Chapter 23](/topics/23-kafka-logs).
+  </WildCard>
+  <WildCard name="Partitioning">
+    Chunks, shards and routing, the general version of DocDB's design.
+    [Chapter 29](/topics/29-partitioning).
+  </WildCard>
+  <WildCard name="Reliability">
+    Retries, backoff, load shedding and error budgets.
+    [Chapter 40](/topics/40-reliability).
+  </WildCard>
+</CardGrid>
