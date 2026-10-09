@@ -1,0 +1,1251 @@
+---
+title: "RPC, gRPC & QUIC"
+dek: "Follow one payment from an orders service to a payments service, and then from a phone on a moving train: how a function call becomes bytes, how many calls share one connection, and why the web rebuilt its transport on top of UDP."
+readingTime: "~55 min"
+level: "Intermediate"
+versions: "RFC 9000/9001/9002 (QUIC) · RFC 9113 (HTTP/2) · RFC 7541 (HPACK) · RFC 9114 (HTTP/3) · RFC 9204 (QPACK) · gRPC PROTOCOL-HTTP2.md · Python 3.14 · curl 8.7.1"
+prereqs: "TCP basics (chapter 10) and the TLS handshake (chapter 35); L4 and L7 load balancing (chapter 34) helps"
+updated: "2026-10-09"
+---
+
+A customer presses Pay in a shop's app. Somewhere in the shop's data centre an orders service receives the order, and before it can mark the order as paid it has to ask another program, the payments service, to charge the card. In the orders code that looks like one line: `reply = payments.Charge(order_id="ord_8812", amount_cents=4999, currency="USD")`. A reply comes back with a charge id, and the order moves on.
+
+That line reads like a call to a function in the same program, and it's built to read that way. But the payments service runs on a different machine, possibly in a different building. The arguments have to be turned into bytes, the bytes have to cross a network that loses and delays packets, the other machine has to turn them back into arguments, and the reply has to make the same trip back. Any of those steps can fail on its own, and some failures leave the orders service with no way of knowing whether the card was charged.
+
+This chapter follows that one `Charge` call down through each layer that carries it, asking one question the whole way: when one service calls another, what crosses the wire, and what happens when the wire misbehaves? We'll start with the idea of a remote call and its traps, turn the arguments into bytes by hand, carry those bytes over HTTP/1.1, then HTTP/2 and gRPC, and finally move the caller onto a phone on a train, where the transport underneath has to change too.
+
+<SectionHeading n="01" id="rpc">A call that leaves the machine</SectionHeading>
+
+<Sub n="1.1" title="Two programs that need to talk">
+
+Many companies split a large application into smaller programs, each owning one job and its own data, and each run by its own team. Each of these programs is called a **service**. Our shop has an orders service that keeps track of orders, and a payments service that is the only program allowed to talk to the bank, so card details stay in fewer hands.
+
+In exchange, the orders service can no longer call payments code directly. They run as separate processes on separate machines, with separate memory, so a pointer to an order in one means nothing to the other. Everything one sends the other has to travel as bytes over a network connection.
+
+You could write that by hand every time: open a TCP connection (chapter 10 covers what TCP promises), write some bytes describing the request, read bytes back, and work out what they mean. Every call site would repeat the same plumbing, and each team would invent its own format. In 1984 Andrew Birrell and Bruce Nelson described a way to hide all of it, in a paper called "Implementing Remote Procedure Calls".
+
+</Sub>
+
+<Sub n="1.2" title="Stubs: making a remote call look local">
+
+Their idea was to generate the plumbing. You write a short description of the functions a service offers and the types of their arguments. A tool reads that description and generates two pieces of code. On the caller's side it generates a function called `Charge` with exactly the signature you described, which packs the arguments into bytes, sends them, waits for the reply and unpacks it. That generated function is called a **stub**. On the server's side it generates the matching code that receives the bytes, unpacks them, calls your real `Charge` implementation and sends back whatever it returns.
+
+Packing values into bytes is called **serialization** (or marshalling), and unpacking them is deserialization. A language for these descriptions is called an **interface definition language**, or IDL. A call that goes through all this is a **remote procedure call**, or **RPC**: to the programmer it looks like calling a procedure, and the procedure runs somewhere else.
+
+<Picture
+  src="/images/chapters/63-rpc-grpc-quic/grpc-concept-diagram.png"
+  alt="A C++ service containing a gRPC Server, connected by arrows labelled Proto Request and Proto Response to a Ruby client and an Android-Java client, each of which contains a box labelled gRPC Stub"
+  caption="The stub idea as gRPC draws it. Each client holds a generated stub in its own language, Ruby on one side and Java on Android on the other, and both talk to one server written in C++. Notice that nothing in the picture says how the arrows are carried: the requests and responses are messages in an agreed format, and that shared format lets three languages use one service. Section 2 builds that format, and sections 3 to 5 build the arrows."
+  credit="Image: gRPC Authors, CC BY 4.0, from grpc.io"
+  href="https://grpc.io/docs/what-is-grpc/introduction/"
+  narrow
+  paper
+/>
+
+Nearly every service-to-service system since works this way, from Sun RPC, the protocol under NFS in the 1980s, to Google's internal system Stubby, whose open-source successor, **gRPC**, appeared in 2015. Most of this chapter is about gRPC, the most widely used of them today. But the problems start before any of its layers, with the idea itself.
+
+</Sub>
+
+<Sub n="1.3" title="What the disguise hides">
+
+A stub can change how a remote call looks, and nothing else. In 1994 four engineers at Sun Microsystems, Jim Waldo, Geoff Wyant, Ann Wollrath and Sam Kendall, wrote "A Note on Distributed Computing", arguing that treating remote calls as local ones was a mistake, and naming four differences no stub can hide:
+
+| Difference | A local call | A remote call |
+|---|---|---|
+| **Latency** | Nanoseconds | Well under a millisecond inside a data centre, and hundreds of milliseconds to a phone |
+| **Memory** | Arguments can be pointers into shared memory | Everything must be copied into bytes; a pointer means nothing on the other machine |
+| **Partial failure** | The caller and the callee fail together, if the process crashes | Either side, or the network between them, can fail while the other carries on |
+| **Concurrency** | You control the threads | Other callers reach the same service at the same moment, in an order you don't choose |
+
+It's the third row that bites. Walk through what can happen to our `Charge` call after the orders service sends it:
+
+- **The request is lost on the way.** Payments never sees it, the card isn't charged, and the orders service waits for a reply that will never come.
+- **Payments crashes before charging.** Same outcome as above, from the orders service's point of view: silence.
+- **Payments charges the card, then crashes before replying.** The money has moved, and the orders service still sees only silence.
+- **Payments charges the card and replies, and the reply is lost.** The money has moved, and once more the orders service sees silence.
+
+All four look identical from the caller's side. After a while with no answer, the orders service must choose: give up, and perhaps leave a paid order marked unpaid, or try again, and perhaps charge the card twice.
+
+<Predict
+  q="The orders service sent Charge, waited two seconds, got no reply, and sent Charge again. The second call succeeds. How many times was the card charged?"
+  options={[
+    "Once: the second call replaced the first",
+    "Once: the network guarantees each message arrives exactly once",
+    "Once or twice, and the orders service can't tell which from what it has seen",
+    "Twice, always",
+  ]}
+  answer={2}
+>
+If the first request or payments itself failed before charging, the retry is the only charge. If payments charged and then the reply was lost, the retry charges again. Nothing in the reply to the second call says which of these happened, because payments sees two separate requests.
+</Predict>
+
+The fix is to make the operation safe to repeat. An operation is **idempotent** when doing it twice has the same effect as doing it once. Charging a card isn't, so the caller attaches a unique **idempotency key**, such as `k-7719` for this checkout, and payments remembers the keys it has processed and returns the stored result for a repeat. Chapter 31 builds this in [Idempotency keys](/topics/31-distributed-transactions#idempotency). Section 2 adds the key to the message, and section 5 needs it.
+
+<Callout label="Design implication">
+Decide for every remote method whether it's safe to repeat, and write it down next to the method. Reads are usually safe. Anything that moves money, sends a message or creates a record needs an idempotency key before any layer, yours or the library's, is allowed to retry it.
+</Callout>
+
+</Sub>
+
+<Sub n="1.4" title="The eight wrong assumptions">
+
+Around the same time, a list circulated at Sun of assumptions that programmers new to networks tend to make without noticing. It's usually credited to L Peter Deutsch, with the eighth item added by James Gosling, and it's known as the **fallacies of distributed computing**. Each one is false, and each shows up somewhere in this chapter:
+
+| Fallacy | Where it bites our `Charge` call |
+|---|---|
+| The network is reliable | Requests and replies get lost; section 1.3 |
+| Latency is zero | Every call waits for bytes to cross the network and back; sections 3 and 7 |
+| Bandwidth is infinite | Message size matters, and so does how compactly it's encoded; section 2 |
+| The network is secure | The bytes need encryption; QUIC builds it in, section 7 |
+| Topology doesn't change | A phone moves from Wi-Fi to cellular mid-call; section 7.4 |
+| There is one administrator | A firewall you don't control blocks UDP; section 9.1 |
+| Transport cost is zero | Every connection costs handshakes, memory and CPU; sections 3.3 and 9.2 |
+| The network is homogeneous | A data-centre link and a train's cellular link behave nothing alike; section 9.4 |
+
+Everything after this builds layers that cope with them. First comes the one the stub does before anything is sent: turning `order_id="ord_8812", amount_cents=4999, currency="USD"` into bytes.
+
+</Sub>
+
+<SectionHeading n="02" id="serialization">Turning the call into bytes</SectionHeading>
+
+<Sub n="2.1" title="The obvious encoding: JSON">
+
+The most familiar way to write structured data as bytes is **JSON**, the text format that grew out of JavaScript's object syntax. Our call's arguments become:
+
+```json
+{"order_id":"ord_8812","amount_cents":4999,"currency":"USD"}
+```
+
+That's 60 bytes. It's easy to read, every language can parse it, and you can type it into `curl` by hand. Three things about it cost something, though. The field names travel with every message: `"amount_cents"` is 14 bytes spent saying which field the next 4 bytes belong to, and it's sent again on every one of millions of calls. And 4999 is stored as four characters of text, so the receiver has to parse decimal digits back into an integer. And nothing checks that the sender and receiver agree on what fields exist: if the orders team renames `amount_cents` to `amount`, the payments service silently reads a missing field as zero.
+
+The first two cost size and speed, and the third costs safety, which matters more as the number of teams grows. All three have the same fix: agree on the fields ahead of time, in a file both sides compile from, so the message only needs to carry values.
+
+</Sub>
+
+<Sub n="2.2" title="A schema with numbered fields">
+
+That file is a **schema**, a description of each message's fields and their types. **Protocol Buffers** (protobuf for short) is Google's schema language and binary format, and it's the IDL that gRPC uses by default. Here is the payments service's schema:
+
+```protobuf
+syntax = "proto3";
+package payments.v1;
+
+service Payments {
+  rpc Charge(ChargeRequest) returns (ChargeReply);
+}
+
+message ChargeRequest {
+  string order_id     = 1;
+  int64  amount_cents = 2;
+  string currency     = 3;
+}
+
+message ChargeReply {
+  string charge_id = 1;
+  string status    = 2;
+}
+```
+
+The stub generator reads the `service` block, which lists the methods. In the message blocks, what matters is the number after each `=`. That number, the **field number**, is what goes on the wire instead of the name. A receiver looks the number up in its own copy of the schema to learn that field 2 is `amount_cents`, an integer. Names stay in the source code, and only numbers travel.
+
+Each field on the wire is written as a short record: a key saying which field this is and how its value is laid out, then the value. The key is called the **tag**. It packs two things together: the field number, and a small number called the **wire type** that tells the reader how to find the end of the value. Two wire types cover our message. Wire type 0, `VARINT`, is for integers (and booleans and enums). Wire type 2, `LEN`, is for anything with a length, such as strings, raw bytes and nested messages: the value is preceded by its length in bytes. It's computed as `field_number << 3 | wire_type`, meaning the field number shifted left three bits with the wire type in the bottom three.
+
+Integers, including the tag itself and every length, are written as **varints**, short for variable-length integers. A varint stores a number seven bits at a time, lowest bits first. Each byte uses its top bit as a flag meaning "more bytes follow", and its other seven bits for the number. So a number under 128 fits in one byte, a number under 16,384 fits in two, and small numbers, the most common kind, stay small on the wire.
+
+Let's encode 4999 by hand. In binary it's `1001110000111`, thirteen bits. The lowest seven bits are `0000111`, which is 7. More bits remain, so this byte gets its top bit set: `10000111`, which is `0x87`. What's left is `100111`, which is 39, or `0x27`. Nothing remains after that, so its top bit stays clear. 4999 is therefore the two bytes `87 27`.
+
+</Sub>
+
+<Sub n="2.3" title="Encoding a Charge by hand">
+
+The program below does that for the whole message, with no protobuf library. `varint()` is the seven-bits-at-a-time loop, and `tag()` builds a key from a field number and a wire type. Each string is a tag, a varint length and the bytes; the integer is a tag and a varint. `separators` stops `json.dumps` from adding spaces to the JSON version.
+
+<TryIt what="Hand-encode a ChargeRequest in protobuf and compare it with JSON" lang="python" toolchain="Python 3.14">
+```python
+import json
+
+def varint(n):
+    out = bytearray()
+    while True:
+        low7 = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(low7 | 0x80)   # more bytes follow
+        else:
+            out.append(low7)          # last byte
+            return bytes(out)
+
+def tag(field, wire_type):
+    return varint(field << 3 | wire_type)
+
+VARINT, LEN = 0, 2
+order_id, amount_cents, currency = "ord_8812", 4999, "USD"
+
+pb = (tag(1, LEN) + varint(len(order_id)) + order_id.encode()
+      + tag(2, VARINT) + varint(amount_cents)
+      + tag(3, LEN) + varint(len(currency)) + currency.encode())
+
+js = json.dumps({"order_id": order_id, "amount_cents": amount_cents,
+                 "currency": currency}, separators=(",", ":")).encode()
+
+print("4999 as a varint:", varint(4999).hex(" "))
+print("protobuf:", pb.hex(" "))
+print("protobuf bytes:", len(pb))
+print("JSON:    ", js.decode())
+print("JSON bytes:", len(js))
+```
+<Output>
+```
+4999 as a varint: 87 27
+protobuf: 0a 08 6f 72 64 5f 38 38 31 32 10 87 27 1a 03 55 53 44
+protobuf bytes: 18
+JSON:     {"order_id":"ord_8812","amount_cents":4999,"currency":"USD"}
+JSON bytes: 60
+```
+</Output>
+</TryIt>
+
+Read the protobuf line in three records. `0a` is the tag for field 1 with wire type 2 (1 shifted left three bits is 8, plus 2 is 10, which is `0x0a`). `08` is the length, eight bytes, and `6f 72 64 5f 38 38 31 32` is `ord_8812` in ASCII. Next, `10` is field 2 with wire type 0 (16 plus 0), followed by our hand-made `87 27`. Last, `1a` is field 3 with wire type 2, `03` is the length and `55 53 44` is `USD`. These are the same 18 bytes the official protobuf library produces for this message.
+
+The protobuf form is 18 bytes against JSON's 60, about a third, and nearly all the saving comes from leaving the names out. Decoding is cheaper too: the reader never scans for quotes or parses digits, because each tag says exactly how to read what follows.
+
+<Why>Why are field numbers 1 to 15 special?</Why>
+
+Because the tag is itself a varint. A field number up to 15, shifted left three bits, still fits in seven bits, so its tag takes one byte. Fields 16 to 2047 take two bytes per tag. So the protobuf guide recommends giving 1 to 15 to the fields that are set most often.
+
+Negative numbers are a trap. Those in an `int32` or `int64` field are stored as 64-bit two's complement, so every negative value takes the full ten bytes of a varint, and a refund of `amount_cents = -1` costs eleven bytes for that one field. For fields that are often negative, protobuf's `sint32` and `sint64` use **ZigZag** encoding, which maps 0, -1, 1, -2 to 0, 1, 2, 3, so small negative numbers stay small.
+
+</Sub>
+
+<Sub n="2.4" title="Changing the schema without breaking anyone">
+
+Schemas change. Section 1.3 ended with a decision to send an idempotency key with every `Charge`, so the orders team adds a field:
+
+```protobuf
+message ChargeRequest {
+  string order_id        = 1;
+  int64  amount_cents    = 2;
+  string currency        = 3;
+  string idempotency_key = 4;   // new
+}
+```
+
+Orders deploys first. For a while, the new orders service sends field 4 to a payments service still built from the old schema, which has never heard of field 4. What should the old reader do with it?
+
+The wire type answers that. Even without knowing what field 4 means, the reader can see from its tag that it's wire type 2, so it reads the length and skips that many bytes. Bytes it can't place are kept as **unknown fields**, and proto3 libraries keep them when they re-serialize the message, so a service that passes the message along doesn't strip them. Below is a decoder that knows only the old three fields. Its second half shows what goes wrong when a field number is reused.
+
+<TryIt what="An old reader meets a new field, then a reused field number" lang="python" toolchain="Python 3.14">
+```python
+def read_varint(buf, i):
+    n = shift = 0
+    while True:
+        b = buf[i]; i += 1
+        n |= (b & 0x7F) << shift
+        shift += 7
+        if not b & 0x80:
+            return n, i
+
+def decode(buf, known):
+    """Decode with an OLD schema: known = {field number: name}."""
+    i, fields, unknown = 0, {}, []
+    while i < len(buf):
+        key, i = read_varint(buf, i)
+        field, wire_type = key >> 3, key & 7
+        if wire_type == 0:                       # VARINT
+            value, i = read_varint(buf, i)
+        elif wire_type == 2:                     # LEN
+            length, i = read_varint(buf, i)
+            value, i = bytes(buf[i:i + length]), i + length
+        else:
+            raise ValueError("wire type not handled here")
+        if field in known:
+            fields[known[field]] = value
+        else:
+            unknown.append((field, value))       # skipped, but kept
+    return fields, unknown
+
+old_schema = {1: "order_id", 2: "amount_cents", 3: "currency"}
+
+# A newer orders service added: string idempotency_key = 4;
+new_msg = bytes.fromhex("0a 08 6f 72 64 5f 38 38 31 32 10 87 27"
+                        "1a 03 55 53 44 22 06 6b 2d 37 37 31 39")
+print(decode(new_msg, old_schema))
+
+# Someone deleted amount_cents and reused number 2 for int64 amount_micros.
+# $49.99 = 49,990,000 micros, sent by the new code:
+reused = bytes.fromhex("0a 08 6f 72 64 5f 38 38 31 32 10 f0 92 eb 17 1a 03 55 53 44")
+print(decode(reused, old_schema))
+```
+<Output>
+```
+({'order_id': b'ord_8812', 'amount_cents': 4999, 'currency': b'USD'}, [(4, b'k-7719')])
+({'order_id': b'ord_8812', 'amount_cents': 49990000, 'currency': b'USD'}, [])
+```
+</Output>
+</TryIt>
+
+The first line is the safe case. Our old reader decoded its three fields correctly and set field 4, the key `k-7719`, aside as unknown. Adding a field broke nothing.
+
+The second line is the dangerous case. Suppose a later developer decides cents are too coarse, deletes `amount_cents`, and adds `int64 amount_micros = 2`, reusing the number because it looked free. A new sender encodes $49.99 as 49,990,000 micros. An old reader sees field 2, wire type 0, a valid varint, and has no way to know the meaning changed. It reads 49,990,000 cents: $499,900. Nothing failed to parse, and no error was raised anywhere.
+
+That's why protobuf has the `reserved` statement. When you delete a field, you list its number (and its name, for the JSON form) as reserved, and the compiler refuses to let anyone use them again:
+
+```protobuf
+message ChargeRequest {
+  reserved 2;
+  reserved "amount_cents";
+  string order_id        = 1;
+  string currency        = 3;
+  string idempotency_key = 4;
+  int64  amount_micros   = 5;
+}
+```
+
+Here are the rules that follow from the wire format:
+
+| Change | Safe? | Why |
+|---|---|---|
+| Add a field with a new number | Yes | Old readers skip it as unknown; new readers see the default value in old messages |
+| Delete a field and mark its number `reserved` | Yes | Nobody can reuse the number by accident |
+| Rename a field | For the binary form, yes | Only the number travels; the JSON form uses names, so it breaks there |
+| Reuse a deleted field's number | **No** | Old messages and old readers misread the bytes silently, as above |
+| Change a field's number | **No** | It's a deletion plus an addition; old and new code stop agreeing |
+| Change `int32` to `int64` | Mostly | Same wire type; values too big for the old type are cut short |
+
+<Callout label="Common mistake" kind="warn">
+Converting messages to JSON in the middle of a pipeline, for logging or to pass them through a tool that only speaks JSON, and then back to binary. The JSON form has no place for unknown fields, so any field the middle program didn't know about is silently dropped, and the next service receives a message missing the data its sender added.
+</Callout>
+
+A second trap comes from leaving defaults out. In proto3, a plain field set to its default (zero, an empty string, false) isn't written at all, so a reader can't tell "set to zero" from "not sent". When that difference matters, mark the field `optional`, and the library records whether it was set.
+
+We now have 18 bytes, or 26 with the key. They need a connection to travel on, and the first one most services reach for is HTTP.
+
+</Sub>
+
+<SectionHeading n="03" id="http1">One call per connection: HTTP/1.1</SectionHeading>
+
+<Sub n="3.1" title="The Charge call as an HTTP request">
+
+**HTTP** is the protocol browsers use to fetch pages, and its version 1.1 is plain text over a TCP connection. A request is a line naming the method and the path, then lines of headers, a blank line, and a body. Our `Charge` call could travel like this:
+
+```http
+POST /payments.v1.Payments/Charge HTTP/1.1
+Host: payments.internal
+Content-Type: application/x-protobuf
+Content-Length: 26
+
+<26 bytes of protobuf>
+```
+
+The `Content-Length` header is what lets the receiver find the end of the body. TCP delivers a stream of bytes with no boundaries in it, so a protocol on top of TCP has to mark where each message ends, either with a length or with a delimiter. HTTP/1.1 does both: headers end at a blank line, and the body's length is given in a header.
+
+Opening a TCP connection costs a **round trip**, one message out and its answer back, and setting up TLS on it, the encryption chapter 35 walks through in [the TLS handshake](/topics/35-dns-tls-edge#tls), costs at least one more. So the orders service doesn't open a fresh connection per call. It keeps the connection open after the reply and sends the next request on it, which HTTP/1.1 calls **keep-alive** and does by default.
+
+</Sub>
+
+<Sub n="3.2" title="Head-of-line blocking">
+
+Keep-alive saves the handshakes, but it has a rule that hurts. On one HTTP/1.1 connection, responses come back in the order the requests were sent, because a response carries no label saying which request it answers. So a client normally sends one request and reads the whole response before sending the next.
+
+Now suppose the orders service has two calls to make on the same connection: a `Charge` that waits on the bank and takes two seconds, and a `GetStatus` for a different order that payments can answer from memory in a millisecond. If `Charge` goes first, `GetStatus` waits behind it for two seconds, though payments could have answered it almost at once. A fast item stuck behind a slow one at the front of a queue is called **head-of-line blocking**, after the shopper with a full trolley at the front of the checkout line.
+
+HTTP/1.1 tried a partial fix called **pipelining**: the client sends several requests without waiting for each response.
+
+<Picture
+  src="/images/chapters/63-rpc-grpc-quic/http-pipelining.png"
+  alt="Two timing diagrams side by side. On the left, labelled no pipelining, a client sends a request, waits for the response, then sends the next, three times. On the right, labelled pipelining, the client sends three requests back to back and the server sends three responses back to back, finishing much sooner"
+  caption="Pipelining on the right saves the client's waiting between requests, so three exchanges finish in about one round trip plus the work. Look at the order of the purple arrows, though: the responses still come back in the order the requests went out. If the server's first answer is slow, the other two are ready and still have to wait behind it, so pipelining moves head-of-line blocking from the client to the server."
+  credit="Image: helix84, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:HTTP_pipelining.svg"
+  narrow
+  paper
+/>
+
+Pipelining also ran into proxies and servers that handled it badly, and browsers ended up shipping it switched off. In practice, HTTP/1.1 means one request in flight per connection.
+
+</Sub>
+
+<Sub n="3.3" title="Connection pools">
+
+If each connection can carry only one call at a time, the only way to make several calls at once is to open several connections. A client that keeps a set of open connections and lends one to each call is using a **connection pool**. Browsers settled on about six connections per host for the same reason.
+
+How big must the pool be? Chapter 16's [Little's law](/topics/16-contention-tail-latency#littles-law) says the number of calls in flight equals the arrival rate times the time each call takes. At 500 `Charge` calls a second taking 40 ms each, about 20 are in flight, so the orders service needs about 20 connections. If the bank slows down and calls take 2 seconds, the same traffic needs about 1,000.
+
+Each connection paid a TCP and a TLS handshake when it opened and holds kernel buffers on both machines. And when the bank slows down, the pool runs dry, new calls queue inside the orders service for a free connection, and the slowdown spreads to calls that have nothing to do with the bank.
+
+<Callout label="Common mistake" kind="warn">
+Sizing an HTTP/1.1 connection pool for the average latency. The pool has to cover calls in flight at the *worst* latency you'll tolerate, and when the downstream slows, a full pool turns its slowness into queueing for every caller that shares the pool.
+</Callout>
+
+Many calls, one connection each. What we'd like is many calls on *one* connection, each answered as soon as it's ready, in whatever order. That needs the responses to carry a label saying which request they belong to, and that is the change HTTP/2 made.
+
+</Sub>
+
+<SectionHeading n="04" id="http2">Many calls on one connection: HTTP/2</SectionHeading>
+
+<Sub n="4.1" title="Frames and streams">
+
+HTTP/2, published in 2015 and revised as RFC 9113 in 2022, keeps everything HTTP means (methods, paths, headers, status codes) and changes how it's written on the connection. Instead of text, each side sends small binary chunks called **frames**. Every frame starts with the same nine-byte header: three bytes of length, one byte of type, one byte of flags, and four bytes holding a **stream identifier**.
+
+A **stream** is one request and its response. Each new request gets the next unused stream number, and every frame belonging to that request or its response carries that number. Streams opened by the client use odd numbers, 1, 3, 5 and so on, and streams opened by the server use even numbers, so the two sides never pick the same one. A request is a `HEADERS` frame (type 1) carrying the method, path and headers, followed by `DATA` frames (type 0) carrying the body. The last frame of each direction carries a flag called `END_STREAM`.
+
+Because every frame is labelled, frames from different streams can be interleaved on the one connection, and the receiver sorts them back out by stream number. Sending many independent conversations over one connection this way is called **multiplexing**. Here is our orders service making three calls at once to payments over a single connection:
+
+<Scene
+  title="Three calls on one HTTP/2 connection"
+  regions={[
+    { id: "orders", label: "Orders service", sub: "client", col: 0, row: 0 },
+    { id: "wire", label: "One TCP connection", sub: "frames, in order", col: 1, row: 0 },
+    { id: "pay", label: "Payments service", sub: "server", col: 2, row: 0 },
+  ]}
+  itemWidth={112}
+  frames={[
+    { caption: "The orders service has three calls to make: a `Charge` that will wait on the bank, a quick `GetStatus` for another order, and a `Refund`. Over HTTP/1.1 these would need three connections or wait in line.",
+      items: [
+        { id: "c", at: "orders", label: "Charge" },
+        { id: "g", at: "orders", label: "GetStatus" },
+        { id: "r", at: "orders", label: "Refund" },
+      ], focus: ["orders"] },
+    { caption: "Each call gets its own **stream**: odd numbers, because the client opens them. The calls themselves don't change; they're just labelled.",
+      change: [{ id: "c", sub: "stream 1", tone: "accent" }, { id: "g", sub: "stream 3", tone: "accent" }, { id: "r", sub: "stream 5", tone: "accent" }], focus: ["orders"] },
+    { caption: "Each call is cut into a `HEADERS` frame and a `DATA` frame, and the frames are sent interleaved on the one connection. Every frame carries its stream number in its nine-byte header.",
+      change: [{ id: "c", at: "wire", sub: "HEADERS·1 DATA·1" }, { id: "g", at: "wire", sub: "HEADERS·3 DATA·3" }, { id: "r", at: "wire", sub: "HEADERS·5 DATA·5" }], focus: ["wire"], arrow: { from: "orders", to: "wire", label: "frames" } },
+    { caption: "Payments sorts the frames by stream number and starts all three calls at once. It doesn't have to finish one before reading the next.",
+      change: [{ id: "c", at: "pay", sub: "waiting on bank", tone: "dirty" }, { id: "g", at: "pay", sub: "running" }, { id: "r", at: "pay", sub: "running" }], focus: ["pay"], arrow: { from: "wire", to: "pay", label: "sort by stream" } },
+    { caption: "`GetStatus` and `Refund` finish first, and their replies go back on streams 3 and 5 straight away, ahead of `Charge`. No response waits behind another.",
+      change: [{ id: "g", at: "orders", sub: "reply on 3", tone: "ok" }, { id: "r", at: "orders", sub: "reply on 5", tone: "ok" }], focus: ["orders"], arrow: { from: "pay", to: "orders", label: "replies" } },
+    { caption: "Two seconds later the bank answers and `Charge` replies on stream 1. One connection carried all three calls, and the slow one held up nobody.",
+      change: [{ id: "c", at: "orders", sub: "reply on 1", tone: "ok" }], focus: ["orders"], arrow: { from: "pay", to: "orders", label: "reply on 1" } },
+  ]}
+/>
+
+That removes head-of-line blocking at the HTTP level, and replaces the pool with one connection that can carry hundreds of calls at once. Before the first request, each side sends a `SETTINGS` frame with its limits. One of them, `SETTINGS_MAX_CONCURRENT_STREAMS`, caps how many streams may be open at once; RFC 9113 recommends no fewer than 100.
+
+<Why>Why binary frames instead of text?</Why>
+
+Because a text protocol has to be scanned to find where each part ends, and two programs that scanned differently disagreed about where a request ended, a long-running source of bugs and security holes in HTTP/1.1. A frame states its length up front, the same reason protobuf puts lengths in front of strings.
+
+</Sub>
+
+<Sub n="4.2" title="Compressing the headers: HPACK">
+
+With the body down to 26 bytes, the headers are now the biggest part of each call. Every request repeats `:method POST`, the path, the host, the content type and any authorization token, often several hundred bytes saying almost exactly what the previous request said. (In HTTP/2 the method, path, scheme and host become **pseudo-headers** whose names start with a colon, `:method`, `:path`, `:scheme` and `:authority`.)
+
+Compressing them with gzip was tried first, and it leaked secrets: in the attack called CRIME, an attacker who could add text to a victim's requests guessed a cookie one character at a time, watching for the guess that made the compressed request shrink. So HTTP/2 uses **HPACK** (RFC 7541), a compressor built for headers that only ever matches whole values.
+
+HPACK replaces repeated headers with small numbers that index into tables both sides keep. A **static table** of 61 common headers is built into the protocol: entry 2 is `:method: GET`, entry 3 is `:method: POST`. A **dynamic table** is built up during the connection: when a header is sent for the first time, both sides add it to their dynamic table, and from then on it's sent as a one-byte index. Header values that aren't in either table can be shortened with a fixed **Huffman code**, which gives frequent characters shorter bit patterns.
+
+<Picture
+  src="/images/chapters/63-rpc-grpc-quic/hpack-header-compression.png"
+  alt="Three columns joined by arrows. Request headers such as :method GET, :scheme https, :path /resource, user-agent and a custom header; a static table with entries like 2 :method GET and 51 referer, and below it a dynamic table holding entries 62 user-agent and 63 host; and the encoded headers, mostly single numbers, with Huffman-coded strings for the values not in any table"
+  caption="HPACK in one picture. Headers already in the tables (left) are sent as one index each (right): `2` for `:method GET`, and `62` and `63` for the user agent and host this connection sent before. Only new values travel as Huffman-coded text. The diagram is simplified: its entry numbers are illustrative, and HTTP/2 calls the host `:authority`."
+  credit="Image: Fleshgrinder, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:HTTP_2_Header_Compression_HPACK.svg"
+  paper
+/>
+
+For the orders service, sending `Charge` after `Charge` on one connection, the second request's headers shrink to a handful of bytes, nearly all indexes into the dynamic table, whose default size is 4,096 bytes.
+
+There's a catch, and it matters in section 8. Both sides must apply table updates in exactly the order they were made, so HPACK assumes that header frames arrive in the order they were sent, across all streams. Over TCP, they always do.
+
+</Sub>
+
+<Sub n="4.3" title="Flow control">
+
+Multiplexing creates a new problem. Suppose one stream is a large download, such as a nightly export of all charges, and the receiving program reads it slowly. Its data piles up in the receiver's memory, and one greedy stream can hold up the rest.
+
+So HTTP/2 adds its own **flow control**, the receiver's way of telling a sender how much more it may send, on top of TCP's (chapter 10's [receive window](/topics/10-linux-networking#drops)). Each stream has a window, and so does the connection as a whole. Both start at 65,535 bytes. Every `DATA` frame uses up window, and a sender that has used it all must stop on that stream until the receiver sends a `WINDOW_UPDATE` frame granting more. A slow reader of the export stops granting window to that stream, and the other streams keep flowing. Only `DATA` frames count against the window, so control frames and headers always get through.
+
+A sender can have at most one window of data in flight per round trip, so 65,535 bytes is small for a fast link with a long round trip. The main gRPC implementations grow the window during the connection, sizing it from round trips they measure with `PING` frames.
+
+</Sub>
+
+<Sub n="4.4" title="What multiplexing costs">
+
+One connection carrying many streams means a server has to do more bookkeeping per connection, and attackers found a way to exploit it. In 2023, an attack called **HTTP/2 Rapid Reset** (CVE-2023-44487) opened streams and cancelled them at once with an `RST_STREAM` frame, over and over. The cancelled streams no longer counted against the concurrent-stream limit, yet each one had already made the server start work. Google reported an attack peaking above 398 million requests per second. Servers now count cancellations and close connections that send too many.
+
+<Callout label="Design implication">
+A multiplexed connection is a resource worth protecting on its own. Limit concurrent streams, limit how fast a client may open and reset them, and limit header size, because one connection can now carry the load that used to need hundreds.
+</Callout>
+
+HTTP/2 gives us labelled, interleaved, flow-controlled streams over one connection. That's very nearly what an RPC system needs, and gRPC is built directly on it.
+
+</Sub>
+
+<SectionHeading n="05" id="grpc">gRPC: RPC on top of HTTP/2</SectionHeading>
+
+<Sub n="5.1" title="One Charge call, frame by frame">
+
+gRPC maps each call to one HTTP/2 stream. Its rules are written down in a short document in the gRPC repository, `PROTOCOL-HTTP2.md`. The request is a `HEADERS` frame followed by `DATA` frames, and the method being called becomes the path: `/` plus the full service name, `/` and the method name. Our call goes to `/payments.v1.Payments/Charge`.
+
+Inside the `DATA` frames, each protobuf message is preceded by five bytes: one byte saying whether the message is compressed, and four bytes giving its length, most significant byte first. gRPC calls this a **length-prefixed message**. It needs its own length because HTTP/2 frame boundaries mean nothing to gRPC: a large message may be split across several `DATA` frames, and several small ones may share one, so the reader uses the prefix to find each message's end.
+
+The program below wraps our 18-byte `ChargeRequest` in the gRPC prefix, then puts that in an HTTP/2 `DATA` frame for stream 1 with the `END_STREAM` flag set. `struct.pack(">BI", ...)` writes a one-byte and a four-byte unsigned integer in big-endian order, and the frame's three-byte length is the last three bytes of a four-byte integer.
+
+<TryIt what="Wrap the ChargeRequest in a gRPC message and an HTTP/2 DATA frame" lang="python" toolchain="Python 3.14">
+```python
+import struct
+
+charge = bytes.fromhex("0a 08 6f 72 64 5f 38 38 31 32 10 87 27 1a 03 55 53 44")
+
+# gRPC: 1-byte compressed flag, 4-byte big-endian length, then the message
+grpc_msg = struct.pack(">BI", 0, len(charge)) + charge
+
+# HTTP/2 frame header: 24-bit length, 8-bit type, 8-bit flags, 31-bit stream id
+DATA, END_STREAM, stream_id = 0x0, 0x1, 1
+header = struct.pack(">I", len(grpc_msg))[1:] + struct.pack(">BBI", DATA, END_STREAM, stream_id)
+
+print("gRPC prefix:   ", grpc_msg[:5].hex(" "))
+print("frame header:  ", header.hex(" "))
+print("bytes on the connection:", len(header + grpc_msg),
+      f"({len(header)} frame + 5 gRPC + {len(charge)} message)")
+```
+<Output>
+```
+gRPC prefix:    00 00 00 00 12
+frame header:   00 00 17 00 01 00 00 00 01
+bytes on the connection: 32 (9 frame + 5 gRPC + 18 message)
+```
+</Output>
+</TryIt>
+
+The gRPC prefix reads: not compressed (`00`), length `0x12`, which is 18. The frame header reads: length `0x17`, which is 23 (prefix plus message), type `00` for `DATA`, flags `01` for `END_STREAM`, and stream `1`. So the body costs 32 bytes on the connection, and with HPACK the headers of a repeat call add only a few more. Here is the whole call, including the reply:
+
+<StepSequence
+  title="A unary gRPC call to Payments/Charge on stream 1"
+  actors={["Orders (client)", "Payments (server)"]}
+  messages={[
+    { from: 0, to: 1, label: "HEADERS", note: "`:method POST`, `:path /payments.v1.Payments/Charge`, `content-type: application/grpc+proto`, `te: trailers`, and `grpc-timeout: 800m`, the time the client is willing to wait." },
+    { from: 0, to: 1, label: "DATA (END_STREAM)", note: "The 5-byte prefix and the 18-byte `ChargeRequest`. `END_STREAM` says the client has nothing more to send on this stream." },
+    { from: 1, to: 0, label: "HEADERS", note: "`:status 200` and the content type. The HTTP status is 200 even if the call is about to fail: gRPC's own result comes at the end." },
+    { from: 1, to: 0, label: "DATA", note: "The length-prefixed `ChargeReply`, with the new charge id." },
+    { from: 1, to: 0, label: "HEADERS (END_STREAM)", note: "The **trailers**: `grpc-status: 0`, meaning OK, and optionally a `grpc-message`. Only now does the client know how the call ended." },
+  ]}
+/>
+
+A call with one request and one response, like this, is called a **unary** call. The `te: trailers` header looks odd, since it asks for something the server sends anyway. It's there so that a proxy in the middle that can't pass trailers through fails loudly at the start, before a call depends on them.
+
+</Sub>
+
+<Sub n="5.2" title="Status codes and trailers">
+
+Look at where the result went. The HTTP status in the first response `HEADERS` frame is `200`, and the real outcome, `grpc-status`, arrives in a second `HEADERS` frame after the body. Headers sent after the body are called **trailers**.
+
+<Why>Why put the status at the end?</Why>
+
+Because for many calls the server doesn't know the outcome until it has sent the body. A call that streams ten thousand records can fail on record nine thousand, and by then the response headers left long ago. Putting the status in trailers gives every call, short or long, one place to report how it ended. When a call fails before any reply is sent, such as a bad argument, the server sends a single `HEADERS` frame that is headers and trailers at once, which the spec calls **Trailers-Only**.
+
+gRPC defines seventeen status codes, numbered 0 to 16. These are the ones the orders service has to handle for `Charge`:
+
+| Code | Name | What it means for `Charge` |
+|---|---|---|
+| 0 | `OK` | The charge happened |
+| 1 | `CANCELLED` | The caller gave up; the charge **may or may not** have happened |
+| 3 | `INVALID_ARGUMENT` | The request was malformed; retrying won't help |
+| 4 | `DEADLINE_EXCEEDED` | Time ran out; same uncertainty |
+| 8 | `RESOURCE_EXHAUSTED` | Payments is rate-limiting this caller |
+| 13 | `INTERNAL` | Something broke inside; same uncertainty |
+| 14 | `UNAVAILABLE` | Payments couldn't be reached or refused the call, usually before doing anything |
+| 16 | `UNAUTHENTICATED` | Bad or missing credentials |
+
+`DEADLINE_EXCEEDED` and `INTERNAL` are section 1.3's silence with a name attached. A status code tells you how the call ended *for the caller*, and for those two it says nothing certain about what the server did.
+
+</Sub>
+
+<Sub n="5.3" title="Deadlines and cancellation">
+
+Section 1.3 left the orders service waiting for an answer that might never come. The fix is to decide in advance how long to wait. A **deadline** is the point in time after which the caller no longer wants the answer. gRPC sends it with the request as `grpc-timeout`, a number of at most eight digits followed by a unit letter: `H` for hours, `M` minutes, `S` seconds, `m` milliseconds, `u` microseconds and `n` nanoseconds. Our `800m` means 800 milliseconds. By default gRPC sets no deadline at all, so a client that never sets one can wait forever, and the gRPC docs tell you to always set one.
+
+Deadlines matter most across several hops, and our call sits in the middle of a chain. Our phone gave the shop's API one second for checkout; the API spent 150 ms before calling orders, and orders 50 ms before calling payments. If each hop picked its own timeout, payments might work for seconds on a checkout the phone abandoned long ago. Instead, each server passes the *remaining* time to its own calls. Because gRPC sends a duration, the receiver works out the deadline on its own clock, so clocks that disagree between machines don't matter. Java and Go pass deadlines on by default when the incoming call's context is used for the outgoing call; C++ needs it switched on. Chapter 40 covers [deadlines across hops](/topics/40-reliability#timeouts) in general; here is ours:
+
+<Scene
+  title="One second, passed down a chain of calls"
+  regions={[
+    { id: "phone", label: "Phone app", sub: "checkout", col: 0, row: 0 },
+    { id: "api", label: "Shop API", sub: "edge", col: 1, row: 0 },
+    { id: "orders", label: "Orders", sub: "gRPC client and server", col: 2, row: 0 },
+    { id: "pay", label: "Payments", sub: "gRPC server", col: 0, row: 1 },
+    { id: "bank", label: "Bank", sub: "outside", col: 1, row: 1, span: 2 },
+  ]}
+  itemWidth={120}
+  frames={[
+    { caption: "The phone sends checkout with a budget of **1,000 ms**. Everything below this point has to fit inside it.",
+      items: [{ id: "d", at: "phone", label: "deadline", sub: "1,000 ms left", tone: "new" }], focus: ["phone"] },
+    { caption: "The request reaches the shop's API, which spends 150 ms checking the session.",
+      change: [{ id: "d", at: "api", sub: "850 ms left" }], focus: ["api"], arrow: { from: "phone", to: "api", label: "checkout" } },
+    { caption: "The API calls orders with what's left, sent as `grpc-timeout: 850m`.",
+      change: [{ id: "d", at: "orders" }], focus: ["orders"], arrow: { from: "api", to: "orders", label: "850m" } },
+    { caption: "Orders spends 50 ms loading the order, then calls `Charge` with the remainder: `grpc-timeout: 800m`, the header in section 5.1.",
+      change: [{ id: "d", at: "pay", sub: "800 ms left", tone: "accent" }], focus: ["pay"], arrow: { from: "orders", to: "pay", label: "800m" } },
+    { caption: "Payments calls the bank. The bank is slow today, and 800 ms pass with no answer.",
+      change: [{ id: "d", at: "bank", sub: "0 ms left", tone: "bad" }], focus: ["bank"], arrow: { from: "pay", to: "bank", label: "authorize" } },
+    { caption: "Every hop's timer runs out at about the same moment, give or take the time each hop spent. Each server's gRPC library cancels its call, and the phone gets `DEADLINE_EXCEEDED`. Nobody keeps working on a checkout nobody is waiting for.",
+      change: [{ id: "d", at: "phone", sub: "DEADLINE_EXCEEDED", tone: "bad" }], focus: ["phone"] },
+  ]}
+/>
+
+When a deadline passes, or a caller gives up, the client sends an HTTP/2 `RST_STREAM` frame with the error code `CANCEL`, which ends the stream without closing the connection. This is **cancellation**, and it's only half automatic. gRPC can't interrupt your handler mid-task, so a handler doing long work has to check whether its call was cancelled and stop. Calls it makes using the incoming call's context are cancelled for it in Java, Go and C++.
+
+<Callout label="Common mistake" kind="warn">
+Starting a background task from a handler with a fresh context, cut off from the incoming call's deadline. The task keeps running after the caller has given up, and under load those orphaned tasks are what keep a struggling service struggling.
+</Callout>
+
+</Sub>
+
+<Sub n="5.4" title="Streaming calls">
+
+Because a gRPC call is an HTTP/2 stream, and a stream can carry any number of `DATA` frames each way, a call doesn't have to be one request and one reply. gRPC has four kinds:
+
+| Kind | Client sends | Server sends | Example in our shop |
+|---|---|---|---|
+| **Unary** | One message | One message | `Charge` |
+| **Server streaming** | One message | Many | `WatchCharge`: the status of a charge as the bank updates it |
+| **Client streaming** | Many | One | Uploading a day's refunds and getting one summary back |
+| **Bidirectional** | Many | Many | A live exchange of price quotes |
+
+In the schema, the word `stream` before an argument or a return type is all it takes: `rpc WatchCharge(WatchRequest) returns (stream ChargeEvent);`. Each message on a streaming call is length-prefixed exactly as in section 5.1, and the trailers come once, at the very end.
+
+Streams save starting a new call per message, at a cost that's easy to miss: a stream is pinned to its connection, and so to one server, for as long as it lasts. The gRPC performance guide warns that streams "cannot be load balanced once they have started", which section 5.6 comes back to.
+
+</Sub>
+
+<Sub n="5.5" title="Retries and hedging">
+
+Back to section 1.3's decision: when a call fails, should the orders service try again? gRPC can do it for you, following a **retry policy** that the service owner publishes in a configuration document called the service config:
+
+```json
+"retryPolicy": {
+  "maxAttempts": 4,
+  "initialBackoff": "0.1s",
+  "maxBackoff": "1s",
+  "backoffMultiplier": 2,
+  "retryableStatusCodes": ["UNAVAILABLE"]
+}
+```
+
+`maxAttempts` counts the first try, and values above 5 are treated as 5. Waits between attempts grow from `initialBackoff` by `backoffMultiplier` up to `maxBackoff`, each multiplied by a random factor between 0.8 and 1.2, so that a thousand clients that failed at the same moment don't all retry at the same moment too. Chapter 40 covers [retries, backoff and jitter](/topics/40-reliability#retries) in general. Two things here are specific to gRPC.
+
+First, the call's deadline covers *all* the attempts. A `Charge` with 800 ms left doesn't get 800 ms per try; when the deadline passes, the call fails, however many attempts remain.
+
+Second, look at `retryableStatusCodes`. `UNAVAILABLE` usually means payments never started the work, so retrying it is safe even for `Charge`. Adding `DEADLINE_EXCEEDED` or `INTERNAL` would retry calls that may already have charged the card, which is safe only with the idempotency key. gRPC can't mark a method idempotent; that judgement is yours, method by method.
+
+Even with no policy, gRPC retries by itself in one narrow case: when it knows your server code never saw the call, because the request never left the client or never got past the server's gRPC library. These are called **transparent retries**.
+
+Retries are dangerous at scale: if payments is overloaded, every client retrying four times multiplies the load on a service that's already drowning. So gRPC can throttle them per server. With `"retryThrottling": {"maxTokens": 10, "tokenRatio": 0.1}`, each client keeps a count that starts at 10, drops by 1 on each failure and rises by 0.1 on each success, and stops retrying while the count is at or below half of `maxTokens`. A server can also put `grpc-retry-pushback-ms` in its trailers, to say how long to wait or that the client shouldn't retry at all.
+
+The other policy is **hedging**, which chapter 16 introduces as [hedged requests](/topics/16-contention-tail-latency#fan-out). Instead of waiting for a failure, the client sends the same call again after a delay if no answer has come, possibly to a different server, takes whichever answer arrives first, and cancels the rest:
+
+```json
+"hedgingPolicy": { "maxAttempts": 3, "hedgingDelay": "0.2s", "nonFatalStatusCodes": ["UNAVAILABLE"] }
+```
+
+Hedging cuts the slow tail of response times by running some calls more than once on purpose, so it's only for methods that are safe to run several times. A hedged `GetStatus` is fine; a hedged `Charge` without an idempotency key charges customers twice.
+
+<Callout label="Design implication">
+Configure retries per method, and give each method's policy the question from section 1.3: if this runs twice, what happens? Retry `UNAVAILABLE` everywhere, retry anything else only on idempotent methods, and hedge only reads.
+</Callout>
+
+</Sub>
+
+<Sub n="5.6" title="Why gRPC breaks L4 load balancing">
+
+Payments doesn't run on one machine. Say it runs as five copies behind one address, with a load balancer spreading the work. Chapter 34 explains the two kinds in [Layer 4 or layer 7](/topics/34-load-balancing#the-job): an **L4** balancer sees only addresses and ports and chooses a backend once per TCP connection, and an **L7** balancer reads each request and chooses per request.
+
+Now put that next to what we've built. Our orders service opens *one* HTTP/2 connection to the payments address. An L4 balancer picks a backend when it opens, and every call the orders service ever makes goes there, while four copies sit idle. Section 4's improvement, many calls on one long-lived connection, is exactly what defeats a balancer that thinks in connections. Three fixes are standard:
+
+- **Client-side balancing.** The client looks up all five backend addresses, from DNS or a service registry, connects to each and spreads calls itself. gRPC's `round_robin` policy does this; the default, `pick_first`, doesn't.
+- **An L7 proxy.** A proxy that understands HTTP/2, such as Envoy, ends the client's connection and sends each call to a backend of its choosing. A service mesh puts one next to every service.
+- **Cycling connections.** The server closes each connection after a maximum age (`MAX_CONNECTION_AGE` in gRPC) by sending `GOAWAY`, the frame that tells a client to finish its current streams and reconnect. Each reconnect is a fresh L4 choice, so load evens out roughly, over time.
+
+<Callout label="Common mistake" kind="warn">
+Deploying a gRPC service behind a plain L4 balancer, such as a Kubernetes ClusterIP Service, and scaling it out. The new copies get no traffic from existing clients, because their connections were placed before the copies existed. Long-lived streaming calls make it worse: a stream stays on its backend until it ends.
+</Callout>
+
+So far every call has happened inside a data centre, over short, clean links. Now move the caller somewhere less friendly.
+
+</Sub>
+
+<SectionHeading n="06" id="tcp-hol">The wait HTTP/2 can't remove</SectionHeading>
+
+<Sub n="6.1" title="One lost packet">
+
+The customer is checking out on the shop's phone app, on a train. It talks to the shop's API over HTTP/2, one connection carrying several calls, just like orders and payments. On the checkout screen it makes three calls at once: `Checkout`, `GetCart` and `ListOffers`. Their replies come back interleaved over a mobile network where packets are lost far more often than inside a data centre.
+
+Recall what TCP promises (chapter 10's [What each protocol promises](/topics/10-linux-networking#stream-and-datagrams)): an ordered stream of bytes. The receiving kernel holds on to any bytes that arrive after a gap, and hands nothing past the gap to the program until the missing bytes have been re-sent and have arrived. TCP has no idea that the bytes belong to three different HTTP/2 streams. As far as it's concerned there is one stream, and it has a hole in it.
+
+<Scene
+  title="One lost packet holds up every stream"
+  regions={[
+    { id: "net", label: "Mobile network", sub: "lossy", col: 0, row: 0 },
+    { id: "tcp", label: "Phone's TCP buffer", sub: "kernel: delivers in order", col: 1, row: 0 },
+    { id: "app", label: "App's HTTP/2 layer", sub: "sorts frames by stream", col: 2, row: 0 },
+  ]}
+  itemWidth={104}
+  frames={[
+    { caption: "Four packets carry the replies, interleaved: packet 1 and 4 for `Checkout`, 2 for `GetCart`, 3 for `ListOffers`.",
+      items: [
+        { id: "p1", at: "net", label: "pkt 1", sub: "Checkout" },
+        { id: "p2", at: "net", label: "pkt 2", sub: "GetCart" },
+        { id: "p3", at: "net", label: "pkt 3", sub: "ListOffers" },
+        { id: "p4", at: "net", label: "pkt 4", sub: "Checkout" },
+      ], focus: ["net"] },
+    { caption: "Packet 2 is lost in the network. Packets 1, 3 and 4 arrive.",
+      change: [{ id: "p2", tone: "bad", sub: "lost" }, { id: "p1", at: "tcp" }, { id: "p3", at: "tcp" }, { id: "p4", at: "tcp" }], focus: ["tcp"], arrow: { from: "net", to: "tcp", label: "arrive" } },
+    { caption: "TCP hands packet 1 to the app, because nothing is missing before it. Packets 3 and 4 have arrived, but they come after the gap, so TCP **holds them back**.",
+      change: [{ id: "p1", at: "app", tone: "ok" }, { id: "p3", tone: "dirty", sub: "held" }, { id: "p4", tone: "dirty", sub: "held" }], focus: ["tcp"], arrow: { from: "tcp", to: "app", label: "pkt 1" } },
+    { caption: "The app can't finish `Checkout` or `ListOffers`, although every byte of `ListOffers` is sitting in the phone's memory. All three calls wait on the one lost packet.",
+      focus: ["app", "tcp"] },
+    { caption: "About one round trip later the server re-sends packet 2, and it arrives.",
+      change: [{ id: "p2", at: "tcp", tone: "accent", sub: "re-sent" }], focus: ["tcp"], arrow: { from: "net", to: "tcp", label: "re-send" } },
+    { caption: "The gap is filled, and TCP releases packets 2, 3 and 4 together. All three calls complete at the same late moment, though only `GetCart` lost anything.",
+      change: [{ id: "p2", at: "app", tone: "ok", sub: "GetCart" }, { id: "p3", at: "app", tone: "ok", sub: "ListOffers" }, { id: "p4", at: "app", tone: "ok", sub: "Checkout" }], focus: ["app"], arrow: { from: "tcp", to: "app", label: "pkts 2, 3, 4" } },
+  ]}
+/>
+
+This is head-of-line blocking again, one layer down. HTTP/2 removed it between requests, and TCP brings it back between packets. With HTTP/1.1 and six connections, a lost packet stalled only the one connection it belonged to; with HTTP/2's single connection, it stalls every call at once.
+
+</Sub>
+
+<Sub n="6.2" title="Counting the damage">
+
+A small model makes the cost concrete. Six packets carry the three replies, two each, interleaved. They're due to arrive one millisecond apart from 51 ms, and packet 2, half of `GetCart`, is lost; its re-sent copy arrives at 155 ms. The program computes when each call's last byte reaches the app, once with TCP's rule (a packet waits for every earlier packet on the connection) and once with a rule where each stream is ordered on its own (a packet waits only for earlier packets of its own call). Section 7 builds that second rule.
+
+<TryIt what="When does each call finish, if packet 2 is lost?" lang="python" toolchain="Python 3.14">
+```python
+# Six packets carry the replies to three calls, interleaved on one connection.
+# Packet k arrives at 50 + k ms. Packet 2 is lost; its resend arrives at 155 ms.
+packets = [(1, "Checkout"), (2, "GetCart"), (3, "ListOffers"),
+           (4, "Checkout"), (5, "GetCart"), (6, "ListOffers")]
+arrive = {k: 50 + k for k, _ in packets}
+arrive[2] = 155
+
+def tcp_delivery(k):
+    # TCP hands bytes to the app strictly in order: packet k waits for 1..k-1
+    return max(arrive[j] for j in range(1, k + 1))
+
+def quic_delivery(k):
+    # QUIC orders bytes per stream: packet k waits only for its own stream
+    stream = dict(packets)[k]
+    return max(arrive[j] for j, s in packets if s == stream and j <= k)
+
+print(f"{'call':<11}{'TCP (HTTP/2)':>14}{'QUIC (HTTP/3)':>15}")
+for call in ("Checkout", "GetCart", "ListOffers"):
+    last = max(k for k, s in packets if s == call)
+    print(f"{call:<11}{tcp_delivery(last):>11} ms{quic_delivery(last):>12} ms")
+```
+<Output>
+```
+call         TCP (HTTP/2)  QUIC (HTTP/3)
+Checkout           155 ms          54 ms
+GetCart            155 ms         155 ms
+ListOffers         155 ms          56 ms
+```
+</Output>
+</TryIt>
+
+In the TCP column every call finishes at 155 ms, the moment the re-sent packet arrives. In the second column only `GetCart`, the call that lost a packet, waits that long, and `Checkout` and `ListOffers` finish about 100 ms sooner. The loss cost one call a round trip instead of costing all three.
+
+Inside a data centre this rarely matters, because loss is rare and round trips are tiny. On a mobile network, with round trips of 100 ms or more and frequent loss, it decides whether a screen fills in as data arrives or freezes whenever a packet goes missing.
+
+</Sub>
+
+<Sub n="6.3" title="Why not fix TCP?">
+
+The obvious fix is to teach TCP about streams. People have tried, and the reason it didn't happen says a lot about the internet.
+
+TCP lives in the kernel, so changing it means changing every phone, laptop and server, and phones keep old kernels for years. Worse, TCP crosses many **middleboxes**, devices in the network such as firewalls and the address-sharing routers called **NATs** (network address translators), and many of them read, rewrite or drop TCP packets whose options they don't recognise. Google's QUIC paper puts it bluntly: "even modifying TCP remains challenging". A protocol the network has come to depend on in every detail, so that it can no longer change, is said to have **ossified**.
+
+So the fix was built somewhere middleboxes can't interfere, and somewhere that can be updated with an app: in user space, on top of UDP, with almost everything encrypted. That is QUIC.
+
+</Sub>
+
+<SectionHeading n="07" id="quic">QUIC: streams on top of UDP</SectionHeading>
+
+<Sub n="7.1" title="Streams the network can't see">
+
+**QUIC** started at Google in 2013 and was standardised by the IETF in 2021 as RFC 9000. It runs on **UDP**, which chapter 10 describes as delivering separate datagrams with no promises at all. Nearly every network passes UDP, because DNS depends on it, and UDP adds almost nothing of its own, so QUIC can build everything TCP did, and more, inside the UDP payload, where the network can't see it.
+
+<Picture
+  src="/images/chapters/63-rpc-grpc-quic/http-1-2-3-protocol-stacks.png"
+  alt="Three protocol stacks side by side under a shared bar labelled HTTP Semantics and above a shared bar labelled IPv4 / IPv6. Left: HTTP 1.1 over optional TLS over TCP. Middle: HTTP/2 over TLS 1.2 or later over TCP. Right: HTTP/3 over QUIC over UDP, with TLS 1.3 drawn inside the QUIC box"
+  caption="The three versions of HTTP share the top bar, meaning the same methods, headers and status codes, and the bottom bar, IP. Everything that changed is in between. Notice two things in the right-hand stack: TCP is gone, replaced by UDP with QUIC on top, and TLS 1.3 sits inside QUIC instead of above the transport, because QUIC's handshake and encryption are one piece. The QUIC box takes over jobs that lived in three places on the left: TCP's reliability and ordering, TLS's encryption, and HTTP/2's streams."
+  credit="Image: Sedrubal, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:HTTP-1.1_vs._HTTP-2_vs._HTTP-3_Protocol_Stack.svg"
+  narrow
+  paper
+/>
+
+A QUIC connection carries **streams**, as HTTP/2's did, but now the streams belong to the transport itself. Each QUIC packet carries one or more **frames**, and a `STREAM` frame says which stream its bytes belong to and at what offset within that stream. Each stream gets its own reassembly buffer at the receiver. A lost packet leaves a gap only in the streams whose bytes it carried, and every other stream's bytes are handed to the application as soon as they arrive. That's the second column of section 6.2's output.
+
+<Picture
+  src="/images/chapters/63-rpc-grpc-quic/quic-streams-as-chains.png"
+  alt="Two computers joined by two separate chains, one yellow and one blue"
+  caption="Daniel Stenberg's picture of QUIC streams: two independent chains between the same two machines. Break a link in the yellow chain and the yellow stream waits for the repair, while the blue chain keeps pulling. Over TCP, all the streams were links in one chain."
+  credit="Image: Daniel Stenberg, CC BY 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:HTTP3-QUIC-chain-streams.png"
+/>
+
+Stream numbers work a little differently from HTTP/2's. The lowest two bits of a QUIC stream ID say who opened it and whether it carries data both ways: client-opened two-way streams are 0, 4, 8 and so on, and server-opened ones are 1, 5, 9. Kinds 2 and 3 are one-way streams, and section 8 uses them.
+
+Packets have their own numbers, separate from stream offsets, and a packet number is never reused: re-sent data goes out in a new packet with a higher number. TCP re-sends a segment under its original sequence number, so when an acknowledgement arrives the sender can't tell which copy it's for, and its measurement of the round trip suffers. QUIC's unique numbers remove that doubt.
+
+</Sub>
+
+<Sub n="7.2" title="One handshake instead of two">
+
+Over TCP, a new connection pays twice before the first request: one round trip for TCP's handshake, then at least one more for TLS. A phone on a train with a 150 ms round trip spends 300 ms before it can even send `Checkout`.
+
+QUIC folds both into one. QUIC uses TLS 1.3 for its handshake (RFC 9001 says how), but carries the TLS messages inside QUIC's own packets instead of on top of a finished transport connection. The client's very first packet contains the TLS `ClientHello` with its key share, the same message chapter 35 walks through in [One handshake, step by step](/topics/35-dns-tls-edge#tls); the server's reply contains its `ServerHello`, certificate and `Finished`; and the client can send its request along with its own `Finished`. After one round trip, transport and encryption are both ready.
+
+<Picture
+  src="/images/chapters/63-rpc-grpc-quic/tcp-vs-quic-handshake.png"
+  alt="Two timing diagrams. On the left, a client and server exchange SYN, SYN ACK and ACK for the TCP handshake, then ClientHello, ServerHello with certificate, client key exchange and Finished messages for a TLS 1.2 handshake, before data. On the right, a client sends Initial and Hello, the server replies with Initial, Hello, Cert and Fin, and the client sends Fin with data"
+  caption="Count the diagonal lines before the word data on each side. On the left, TCP plus TLS 1.2 needs three round trips before the request goes out; TLS 1.3 would cut that to two. On the right, QUIC needs one: the client's Fin and its first data travel together in its second flight. The left side also shows that TCP's handshake carries nothing useful but the connection itself."
+  credit="Image: Sedrubal, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Tcp-vs-quic-handshake.svg"
+  narrow
+  paper
+/>
+
+The first packet has two safety rules. A client's first datagram must be padded to at least 1,200 bytes, and until the server has confirmed the client's address, it may send no more than three times what it has received. Together they stop an attacker from forging a tiny packet with a victim's address and getting a large certificate fired at the victim, an **amplification attack**.
+
+Almost everything after the first packets is encrypted, packet numbers and acknowledgements included, so a middlebox sees a small header and then ciphertext. It can't come to depend on what it can't read, and that's QUIC's cure for ossification.
+
+</Sub>
+
+<Sub n="7.3" title="0-RTT, and what can be replayed">
+
+One round trip is good. A phone that talked to the same server recently can do better. As in TLS 1.3, the server hands the client a session ticket, and next time the client can send a request in its very first flight, encrypted with keys from the ticket, before the server has replied at all. This is **0-RTT**, and chapter 35 covers it in [Resumption and 0-RTT](/topics/35-dns-tls-edge#tls). In Google's 2017 measurements, about 88% of QUIC connections from desktop browsers completed with a 0-RTT handshake, because people mostly revisit the same sites.
+
+0-RTT data has the same weakness here as in TLS: an attacker who records the first flight can send it again, and the server can't tell the copy from the original. RFC 9001 is direct about who has to deal with it: "the responsibility for managing the risks of replay attacks with 0-RTT lies with an application protocol." QUIC itself is safe from replays, because its own frames are idempotent. What isn't safe is whatever your request does.
+
+For the phone app, that splits the calls neatly. `GetCart` and `ListOffers` are reads, so a replay does no harm, and sending them in 0-RTT makes the checkout screen appear one round trip sooner. `Checkout` charges a card. It must not be accepted from 0-RTT data unless the server can rule out a replay, and the idempotency key from section 2.4 lets it do that. Otherwise the server should answer `425 Too Early`, which tells the client to send it again once the handshake is done.
+
+<Callout label="Design implication">
+Treat 0-RTT as a property of each request. Let idempotent reads travel early, and make every request that changes state either carry an idempotency key the server checks, or wait for the full handshake.
+</Callout>
+
+</Sub>
+
+<Sub n="7.4" title="Walking off the Wi-Fi: connection IDs">
+
+The train pulls out of the station, and the phone loses the platform's Wi-Fi and switches to the cellular network. Its IP address changes.
+
+A TCP connection is identified by four numbers: the two IP addresses and the two ports (chapter 34 adds the protocol and calls it the 5-tuple). Change any of them and, as far as the server is concerned, packets are arriving for a connection that doesn't exist. Every TCP connection the app had is dead. The app has to notice, which can take a timeout, then open new connections and pay the TCP and TLS handshakes again, and any call that was in flight has to be retried, which brings back section 1.3's question of whether `Checkout` already happened.
+
+QUIC identifies a connection by a **connection ID** instead, a value of up to 20 bytes that each side chooses for the other to put in its packets. A server finds the connection by its ID, whatever address the packets come from. Here's the switch:
+
+<Scene
+  title="A QUIC connection moves from Wi-Fi to cellular"
+  regions={[
+    { id: "phone", label: "Phone app", sub: "QUIC client", col: 0, row: 0 },
+    { id: "wifi", label: "Wi-Fi path", sub: "address A", col: 1, row: 0 },
+    { id: "server", label: "Shop API", sub: "QUIC server", col: 2, row: 0 },
+    { id: "cell", label: "Cellular path", sub: "address B", col: 1, row: 1 },
+  ]}
+  itemWidth={124}
+  frames={[
+    { caption: "The app is mid-checkout. `Checkout` is on stream 0 and `ListOffers` on stream 4, travelling over Wi-Fi in packets labelled with connection ID **c1**.",
+      items: [
+        { id: "conn", at: "wifi", label: "conn ID c1", sub: "streams 0, 4", tone: "accent" },
+        { id: "chk", at: "server", label: "Checkout", sub: "stream 0, running" },
+      ], focus: ["wifi"], arrow: { from: "phone", to: "server", label: "c1" } },
+    { caption: "The train leaves. The Wi-Fi path dies, and the phone's packets now leave from a new cellular address. A TCP connection would be gone at this point.",
+      change: [{ id: "conn", tone: "bad", sub: "path gone" }], focus: ["wifi", "cell"] },
+    { caption: "The app sends its next packets from address B, with a **new** connection ID, **c2**, that the server gave it earlier. Using a fresh ID stops an observer from linking the old path to the new one.",
+      change: [{ id: "conn", at: "cell", label: "conn ID c2", sub: "from address B", tone: "new" }], focus: ["cell"], arrow: { from: "cell", to: "server", label: "c2" } },
+    { caption: "The server finds the connection by the ID, though the address is new. Before sending much to address B, it checks that the phone really is there: a `PATH_CHALLENGE` with a random value, which the phone echoes in a `PATH_RESPONSE`.",
+      focus: ["server", "cell"], arrow: { from: "server", to: "cell", label: "PATH_CHALLENGE" } },
+    { caption: "The path checks out. Streams 0 and 4 carry on where they stopped: no new handshake, no lost calls, and `Checkout` was never interrupted.",
+      change: [{ id: "conn", tone: "ok", sub: "streams 0, 4" }, { id: "chk", tone: "ok", sub: "stream 0, still running" }], focus: ["server"] },
+  ]}
+/>
+
+This is **connection migration**. Only the client may start one, and a server that can't support it says so in its handshake with `disable_active_migration`. The path check stops anyone forging packets with a valid ID from a victim's address to make the server send its data there. The same mechanism handles a more common problem quietly: NATs often change the port they assign to a UDP flow after a short idle period, which would break a connection identified by address and port.
+
+The catch is on the server side. A load balancer that hashes the 5-tuple (chapter 34's [L4 balancers](/topics/34-load-balancing#layer-4)) sends packets from address B to a different server that has never heard of the connection. Migration needs the balancer to route by connection ID, usually by having each server encode its identity into the IDs it hands out; the IETF drafted a standard scheme for this, called QUIC-LB, though the draft hasn't become an RFC.
+
+</Sub>
+
+<Sub n="7.5" title="Loss recovery and congestion control in user space">
+
+QUIC still has to do everything TCP did to share the network fairly: acknowledge, detect loss, re-send, and run **congestion control**, the sender's estimate of how much the network can carry, which chapter 10 calls the [congestion window](/topics/10-linux-networking#send-path). RFC 9002 describes QUIC's version. It declares a packet lost once three later packets are acknowledged, as TCP does, and its default congestion controller is based on TCP's NewReno, though implementations may use others such as CUBIC or Google's BBR.
+
+The difference is *where* this code runs. TCP's congestion control is in the kernel. QUIC's is a library inside the application, Chrome or the YouTube app or a server process, running in **user space**, the ordinary memory of a program outside the kernel. That's what let QUIC evolve quickly: Google's paper describes changes made "at application update timescales", tried on a fraction of users and rolled out or back with the next release, where a TCP change takes years to reach every kernel.
+
+It has costs too. Every application ships its own transport, so a bug in one QUIC library isn't fixed by a kernel update, and the work a kernel does once, efficiently, for every program is now done by each program separately. That's where section 9.2's CPU bill comes from.
+
+QUIC is a transport: it moves streams of bytes. Our requests still need HTTP on top, and HTTP/2 can't be dropped onto QUIC unchanged.
+
+</Sub>
+
+<SectionHeading n="08" id="http3">HTTP/3 and QPACK</SectionHeading>
+
+<Sub n="8.1" title="HTTP mapped onto QUIC streams">
+
+**HTTP/3**, RFC 9114 from 2022, is HTTP carried over QUIC. Most of HTTP/2's machinery is no longer needed, because QUIC now provides it: each request and response travels on its own QUIC stream, so HTTP/3 needs no stream numbers of its own and no flow control of its own. What remains is small. A request stream carries a `HEADERS` frame and `DATA` frames, much as before. Each side also opens a one-way **control stream** for settings and connection-wide messages such as `GOAWAY`.
+
+A client can't know in advance whether a server speaks HTTP/3, since it would be on a different transport and port. So the first visit goes over TCP, using HTTP/2 or HTTP/1.1, and the server advertises HTTP/3 in a response header called `Alt-Svc` (alternative service): `alt-svc: h3=":443"; ma=86400` means "HTTP/3 is available on UDP port 443 of this host, and you may remember that for 86,400 seconds". `h3` is the name HTTP/3 uses in ALPN, the protocol negotiation inside the TLS handshake that chapter 35 describes. Newer clients can also learn it before the first connection, from an `HTTPS` record in DNS.
+
+The program below asks three sites which HTTP version they negotiated for a normal request, using curl's `-w '%{http_version}'` to print it, and then prints each site's `alt-svc` header, if any. `-I` asks for headers only.
+
+<TryIt what="Which sites offer HTTP/3, and how do they say so?" lang="shell" toolchain="curl 8.7.1 (nghttp2, no HTTP/3), macOS 26.5.1">
+```shell
+for h in www.google.com www.cloudflare.com www.wikipedia.org; do
+  curl -s -o /dev/null -w "$h  negotiated HTTP/%{http_version}\n" https://$h/
+  curl -sI https://$h/ | grep -i '^alt-svc'
+done
+```
+<Output>
+```
+www.google.com  negotiated HTTP/2
+alt-svc: h3=":443"; ma=2592000,h3-29=":443"; ma=2592000
+www.cloudflare.com  negotiated HTTP/2
+alt-svc: h3=":443"; ma=86400
+www.wikipedia.org  negotiated HTTP/2
+```
+</Output>
+</TryIt>
+
+All three connections used HTTP/2, because this curl was built without HTTP/3 support, so it couldn't take up the offer. Google and Cloudflare both advertise `h3` on port 443. Google remembers the offer for 2,592,000 seconds, 30 days, and also lists `h3-29`, a draft version of the protocol from before the RFC, for old clients. Wikipedia's servers sent no `alt-svc` header, so a browser would stay on HTTP/2 there. A browser that has seen the header tries QUIC on its next connection to the site.
+
+</Sub>
+
+<Sub n="8.2" title="QPACK: header compression without ordering">
+
+HTTP/3 still wants header compression, and section 4.2 left a warning about HPACK: both sides must apply dynamic-table updates in the order they were made, which HPACK gets for free because TCP delivers every stream's headers in one global order. QUIC deliberately removed that order. If request A's headers add an entry to the table and request B's headers refer to it, B's headers could now arrive first, referring to an entry that doesn't exist yet.
+
+**QPACK** (RFC 9204) keeps HPACK's static table, dynamic table and Huffman coding, and changes how the dynamic table is kept in step. Table updates travel on their own one-way **encoder stream**, and acknowledgements return on a **decoder stream**. A header block that uses a dynamic entry says which table version it needs, and if that update hasn't arrived, its request waits: a small head-of-line blocking that each side limits with `SETTINGS_QPACK_BLOCKED_STREAMS`, which defaults to zero. With that default, an encoder refers only to entries the decoder has already acknowledged, giving up a little compression so that no stream ever waits on another. QPACK's static table also has 99 entries, against HPACK's 61.
+
+<Why>Why go to all this trouble for headers?</Why>
+
+Because headers are most of the bytes in a small call. Our `Charge` body was 18 bytes, and its uncompressed headers several hundred. On a phone where every packet is a chance to be lost, fitting a request into one packet instead of two matters.
+
+The protocols are now in place. Whether they work for our customer on the train depends on things the RFCs don't control.
+
+</Sub>
+
+<SectionHeading n="09" id="deployment">QUIC in the real world</SectionHeading>
+
+<Sub n="9.1" title="When UDP is blocked">
+
+Some networks block UDP, apart from DNS, or limit its rate, usually because a firewall was configured long before QUIC existed. A client that only spoke QUIC would fail there. So clients **race**: they try QUIC and TCP together and use whichever connects first. In Google's 2017 paper, Chrome gave QUIC a head start, delaying its TCP attempt by up to 300 ms, and fell back to TCP if the QUIC handshake failed.
+
+The paper also measured how often that happens. In November 2016, 95.3% of YouTube video clients that tried QUIC used it successfully. 4.4% couldn't use it at all, mostly in corporate networks behind firewalls, and another 0.3% were on networks that seemed to rate-limit UDP. Google didn't find any whole internet provider blocking QUIC. The fallback is why a blocked network makes QUIC invisible to the user, instead of breaking the app.
+
+<Callout label="Common mistake" kind="warn">
+Testing a mobile app or a QUIC server only on networks where UDP works. Somewhere, a customer's office firewall drops UDP on port 443, and if your client has no TCP fallback, or your servers don't also listen on TCP, that customer can't connect at all.
+</Callout>
+
+</Sub>
+
+<Sub n="9.2" title="What it costs the CPU">
+
+Moving the transport into user space has a price on servers. Google's paper reports that when they started measuring YouTube traffic over QUIC, "QUIC's server CPU-utilization was about 3.5 times higher than TLS/TCP". Its three big costs were cryptography, sending and receiving UDP packets, and keeping QUIC's own state. After optimising all three, they brought it down to "approximately twice that of TLS/TCP".
+
+Chapter 10 shows why. The kernel's TCP path has had decades of tuning, and help from the network card, which cuts one large send into packets and merges received packets into larger chunks. A QUIC server instead makes a system call per UDP datagram, each costing on the order of the 250 ns that chapter 10 measures per `write()`, before any encryption. Linux can now send or receive many datagrams per call, and since 4.18 can let the kernel or card split one large buffer into datagrams (UDP generic segmentation offload), which recovers much of the gap.
+
+</Sub>
+
+<Sub n="9.3" title="How much of the web uses it">
+
+Google's paper estimated that in 2017, before QUIC was a standard, it already carried over 30% of Google's outgoing traffic and about 7% of all internet traffic. Since the RFCs:
+
+| Measure | Value | Source and date |
+|---|---|---|
+| Requests to Cloudflare over HTTP/2 | 50% | Cloudflare Radar 2025 Year in Review (December 2025), whole of 2025 |
+| Requests to Cloudflare over HTTP/1.x | 29% | same |
+| Requests to Cloudflare over HTTP/3 | 21% | same; 20.5% in 2024 |
+| Websites that support HTTP/3 | 40.9% | W3Techs, 9 October 2026 |
+
+The two sources measure different things. Cloudflare counts requests, so it reflects which clients connect and how often. W3Techs counts websites that offer HTTP/3, a figure pushed up by the large CDNs from chapter 35, which enable it for every customer. Together they say HTTP/3 is widely offered, and that about a fifth of the requests reaching one of the largest networks use it, a share that barely moved between 2024 and 2025. Most of the rest come from older clients, networks that block UDP, and automated traffic from libraries that speak only HTTP/1.1 or HTTP/2.
+
+Google also reported what QUIC bought: on average, Search responses 8.0% faster on desktop and 3.6% on mobile, and 18.0% fewer YouTube rebuffering stalls on desktop and 15.3% fewer on mobile. The gains were largest where round trips were long and loss high: desktop search latency improved by 13.2% in India, against 1.3% in South Korea.
+
+</Sub>
+
+<Sub n="9.4" title="Inside the data centre">
+
+That pattern explains where QUIC is used. Between orders and payments, round trips are well under a millisecond, loss is rare, connections live long so handshakes are paid once, and nobody walks off a Wi-Fi network. Every QUIC advantage shrinks, and its CPU cost doesn't. So service-to-service gRPC still runs over HTTP/2 almost everywhere, and the gRPC protocol document describes only HTTP/2. A separate gRPC proposal from 2021 defines gRPC over HTTP/3, and the implementation it lists is gRPC for .NET, whose client has supported HTTP/3 since .NET 6.
+
+So the shop ends up with two wires. The phone talks to the shop's edge over HTTP/3 and QUIC, where the network is long, lossy and changing. The edge turns each request into gRPC over HTTP/2 for the short, clean hop to orders and then payments. Through both, the deadline and the idempotency key travel the whole way.
+
+</Sub>
+
+<SectionHeading n="10" id="alternatives">Other ways to make the call</SectionHeading>
+
+<Sub n="10.1" title="Thrift, Cap'n Proto, Connect and JSON-RPC">
+
+gRPC isn't the only answer, and each alternative made a different trade:
+
+| System | From | Encoding | Transport | Choose it when |
+|---|---|---|---|---|
+| **Apache Thrift** | Facebook, open-sourced 2007 | Its own IDL; binary or compact binary | Its own framing over TCP, or HTTP | You're already in a Thrift shop; similar ideas to protobuf, with several encodings |
+| **Cap'n Proto** | Kenton Varda, a lead author of protobuf v2 | The wire format *is* the in-memory layout, so there's no encode or decode step | Its own RPC protocol | Messages are large and decoding cost matters; you want its "promise pipelining", where a call can use the result of another call before that result has come back |
+| **Connect** | Buf, 2022; a CNCF sandbox project | Protobuf, binary or JSON | HTTP/1.1, HTTP/2 or HTTP/3; also speaks gRPC and gRPC-Web | You want gRPC's schemas but calls that work from browsers and `curl` without a proxy |
+| **JSON-RPC 2.0** | A short spec from 2010 | JSON, no schema | Anything that moves text: HTTP, WebSockets, stdin and stdout | Simplicity matters more than size; it's what the Language Server Protocol and the Model Context Protocol use |
+
+One more name comes up often. Browsers can't use gRPC directly, because JavaScript in a browser can't read HTTP/2 trailers or control framing. **gRPC-Web** is a variant that moves the trailers into the body so browsers can call gRPC services, usually through a proxy that translates.
+
+Whatever the system, this chapter's questions apply to it: how compact the encoding is and how it survives schema changes, what blocks what on a connection, how deadlines travel, and what a retry can do twice.
+
+</Sub>
+
+<SectionHeading n="11" id="cost">What it all costs</SectionHeading>
+
+<Sub n="11.1" title="The numbers side by side">
+
+Here are the chapter's numbers together:
+
+<Cost items={[
+  { what: "ChargeRequest as JSON", value: "60 bytes", source: "field names and digits as text" },
+  { what: "ChargeRequest as protobuf", value: "18 bytes", source: "tags and varints; 26 with the idempotency key" },
+  { what: "gRPC request body on the connection", value: "32 bytes", source: "9-byte HTTP/2 frame header + 5-byte gRPC prefix + 18" },
+  { what: "HTTP/2 initial flow-control window", value: "65,535 bytes", source: "per stream and per connection, until WINDOW_UPDATE" },
+  { what: "Round trips before the first request: TCP + TLS 1.2", value: "3", source: "one for TCP, two for TLS" },
+  { what: "Round trips before the first request: TCP + TLS 1.3", value: "2", source: "one for TCP, one for TLS" },
+  { what: "Round trips before the first request: QUIC", value: "1, or 0 when resuming", source: "TLS 1.3 inside the transport handshake" },
+  { what: "QUIC server CPU against TLS over TCP", value: "about 2×", source: "Google 2017, after optimisation; 3.5× before" },
+]} />
+
+</Sub>
+
+<Sub n="11.2" title="The phone on the train">
+
+Now put the round trips to work on the customer's checkout. Take a 150 ms round trip on the cellular network, the figure chapter 35 uses for a bad mobile link, and count only network waiting, before any server does any work:
+
+<Estimate
+  rows={[
+    { label: "Cold start, TCP + TLS 1.3, then the request", math: "2 RTT handshake + 1 RTT request", value: "450 ms" },
+    { label: "Cold start, QUIC", math: "1 RTT handshake + 1 RTT request", value: "300 ms" },
+    { label: "Returning customer, QUIC 0-RTT (reads only)", math: "request in the first flight", value: "150 ms" },
+    { label: "After Wi-Fi to cellular, TCP", math: "detect, then 2 RTT handshake + 1 RTT, plus retrying the call", value: "≥ 450 ms" },
+    { label: "After Wi-Fi to cellular, QUIC", math: "path check runs alongside; no new handshake", value: "≈ 0 extra" },
+  ]}
+  result={{ label: "round trips the phone saves on a cold checkout", value: "450 ms → 300 ms" }}
+/>
+
+The third row comes with section 7.3's condition: the cart and offers can arrive in 150 ms from a resumed connection, but `Checkout` itself waits for the handshake unless the server can rule out a replay. The fourth row hides more than its number. Detecting that a TCP connection is dead can take seconds of timeouts, and a `Checkout` that was in flight has to be retried safely, which only the idempotency key makes possible.
+
+</Sub>
+
+<SectionHeading n="12" id="operating">Running it</SectionHeading>
+
+<Sub n="12.1" title="Tools">
+
+Each tool answers a question the chapter raised.
+
+```shell
+# What does a gRPC service offer, and does a call work? (sections 2 and 5)
+grpcurl -plaintext payments.internal:50051 list
+grpcurl -plaintext -d '{"order_id":"ord_8812","amount_cents":4999,"currency":"USD"}' \
+  -max-time 0.8 payments.internal:50051 payments.v1.Payments/Charge
+
+# Decode raw protobuf bytes without the schema (section 2.3)
+printf '\x0a\x08ord_8812\x10\x87\x27\x1a\x03USD' | protoc --decode_raw
+
+# Which HTTP version does a server negotiate, and does it offer HTTP/3? (sections 4 and 8)
+curl -sI --http2 https://host/ -o /dev/null -w '%{http_version}\n'
+curl -sI https://host/ | grep -i alt-svc
+curl --http3-only -sI https://host/          # needs a curl built with HTTP/3
+
+# Every HTTP/2 frame on a connection (section 4)
+nghttp -nv https://host/
+
+# How many connections does the client really hold to each backend? (section 5.6)
+ss -tn state established '( dport = :50051 )'
+
+# gRPC's own logs: transport events, retries, deadlines (section 5)
+GRPC_GO_LOG_VERBOSITY_LEVEL=99 GRPC_GO_LOG_SEVERITY_LEVEL=info ./orders
+GRPC_TRACE=http,retry GRPC_VERBOSITY=debug ./orders     # C-core based clients
+```
+
+For QUIC, packet captures are nearly useless because almost everything is encrypted. Instead, QUIC libraries write a structured event log called **qlog**, and the qvis tool draws it as a timeline of packets, losses and congestion window. Chrome records its own network events from `chrome://net-export`, and qvis can read those too.
+
+</Sub>
+
+<Sub n="12.2" title="Rules that hold up">
+
+1. **Never reuse a protobuf field number.** Mark deleted fields `reserved`, both number and name (section 2.4).
+2. **Set a deadline on every call, and pass the incoming one on.** gRPC's default is to wait forever (section 5.3).
+3. **Retry only `UNAVAILABLE` by default.** Retry or hedge anything else only on methods that are safe to run twice (section 5.5).
+4. **Put an idempotency key on every call that changes state.** It's what makes retries, hedges, 0-RTT and connection loss survivable (sections 1.3, 5.5 and 7.3).
+5. **Don't put gRPC behind a plain L4 balancer.** Use client-side balancing, an L7 proxy, or at least a maximum connection age (section 5.6).
+6. **Keep a TCP path for every QUIC endpoint.** Some networks block UDP (section 9.1).
+7. **Route QUIC by connection ID at the balancer** if you want migration to work (section 7.4).
+
+</Sub>
+
+<Sub n="12.3" title="What you trade for what">
+
+| You get | You pay | When the bill arrives |
+|---|---|---|
+| Protobuf: compact, fast, typed messages | Bytes nobody can read without the schema; strict rules for changing it | When someone reuses a field number |
+| HTTP/2: many calls on one connection | L4 balancers see one connection; one lost packet stalls every call | On scale-out, and on lossy networks |
+| gRPC deadlines and cancellation | Every handler has to check for cancellation itself | When orphaned work piles up under load |
+| Automatic retries and hedging | Calls that run more than once | As double charges, if a method isn't idempotent |
+| QUIC: independent streams, 1-RTT setup, migration | About twice the server CPU; UDP blocked on some networks | On your CPU bill, and in corporate offices |
+| 0-RTT | Early data can be replayed | As a request that runs twice |
+
+</Sub>
+
+<Sub n="12.4" title="Symptom, cause, fix">
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| One gRPC backend at 100% CPU, the rest idle | L4 balancing of long-lived HTTP/2 connections | `round_robin` client-side balancing, an L7 proxy, or `MAX_CONNECTION_AGE` |
+| A field's value is wildly wrong, no errors anywhere | A field number was reused with a new meaning | Revert, mark the number `reserved`, add a new field |
+| Calls queue in the client though the server is idle | The connection reached its concurrent-stream limit | More connections (a channel pool), or raise `MAX_CONCURRENT_STREAMS` |
+| Requests on a mobile app stall together, then all finish at once | TCP head-of-line blocking under packet loss | HTTP/3 to the edge |
+| A customer charged twice after a timeout | A non-idempotent call retried or hedged | Idempotency keys; retry only `UNAVAILABLE` |
+| Work continues long after callers gave up | No deadline, or the deadline wasn't passed on | Set deadlines; pass the incoming context to outgoing calls |
+| HTTP/3 never used from some offices | UDP blocked or rate-limited on that network | Nothing to fix if TCP fallback works; check it does |
+
+</Sub>
+
+<SectionHeading n="13" id="summary">Summary</SectionHeading>
+
+1. **A remote call can't be made to behave like a local one.** Latency, separate memory, partial failure and concurrency remain, and a lost reply looks exactly like a lost request.
+2. **A timeout leaves you not knowing what happened**, so anything that changes state needs an idempotency key before anyone retries it.
+3. **Protobuf sends field numbers instead of names.** Tags and varints shrank our `Charge` from 60 bytes of JSON to 18.
+4. **The wire type lets old readers skip new fields.** So adding a field is safe, and reusing a field number silently corrupts data.
+5. **HTTP/1.1 carries one request at a time per connection**, so concurrency costs a pool of connections, each with its own handshakes.
+6. **HTTP/2 labels every frame with a stream number**, so many calls share one connection, compressed by HPACK and governed by per-stream flow control.
+7. **gRPC is one HTTP/2 stream per call**, with length-prefixed protobuf messages, the outcome in trailers, and deadlines in `grpc-timeout` that each hop passes on.
+8. **One long-lived connection defeats an L4 balancer.** gRPC needs client-side or L7 balancing.
+9. **TCP's in-order delivery brings head-of-line blocking back**: one lost packet stalls every HTTP/2 stream on the connection.
+10. **QUIC moves streams, encryption and loss recovery into user space on UDP**, giving per-stream ordering, a one-round-trip handshake (zero when resuming, with replay risk), and connections that survive a change of address.
+11. **QUIC costs about twice the server CPU and needs a TCP fallback.** So it rules the hop to the phone while gRPC over HTTP/2 still rules the data centre.
+
+<SectionHeading n="14" id="build">Build this</SectionHeading>
+
+**Watch head-of-line blocking happen, then go away.**
+
+- Write a tiny gRPC service with two methods: `Slow`, which sleeps for 2 seconds, and `Fast`, which returns at once. Call `Slow` then `Fast` from one client and time `Fast`. Then expose the same two methods over HTTP/1.1 with a pool of one connection and time it again. You've reproduced sections 3.2 and 4.1.
+- Now add loss. On Linux, `tc qdisc add dev lo root netem loss 5% delay 50ms` makes loopback behave like a bad mobile link. Run fifty parallel small calls over one HTTP/2 connection and record each call's latency. Plot the distribution, and notice that slow calls arrive in groups, all released by the same re-sent packet.
+- Repeat with an HTTP/3 server and client (quiche, quic-go and aioquic all have examples) and compare the two distributions. The groups should break up, because one loss now stalls only its own stream.
+- Last, kill the client's connection mid-call and make your `Charge` retry with and without an idempotency key, and count the charges.
+
+<SectionHeading n="15" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Why is a remote procedure call harder than a local one?">
+Because the network adds failure modes a local call doesn't have. The request can be lost, the server can crash before or after doing the work, and the reply can be lost, and the caller sees the same silence in every case. So after a timeout it can't know whether the operation happened.
+
+That's why remote calls need deadlines, so the caller stops waiting at a chosen moment, and idempotency keys on anything that changes state, so the caller can retry without doing the work twice. Latency, separate memory and concurrency make up the rest of Waldo and colleagues' list.
+</QA>
+
+<QA level="intermediate" q="What changes to a protobuf schema are safe?">
+Adding a field with a new number is safe: old readers skip it, using the wire type to find its end, and keep it as an unknown field. Deleting a field is safe if you mark its number and name `reserved`. Renaming is safe for the binary form only.
+
+Reusing a field number, or changing one, is unsafe, because old readers decode the new bytes under the old meaning with no error. A deleted `amount_cents` reused for `amount_micros` turns $49.99 into $499,900.
+</QA>
+
+<QA level="intermediate" q="Why does HTTP/2 help with head-of-line blocking, and where does it fail?">
+HTTP/1.1 answers requests on a connection strictly in order, so a slow response holds up every response behind it. HTTP/2 labels every frame with a stream number, so responses are interleaved and each finishes when it's ready, all on one connection.
+
+It fails one layer down. TCP delivers bytes in order, so one lost packet holds back every byte after it, whichever streams they belong to. On a lossy mobile link, every call on the connection waits for that one re-send. QUIC fixes it by ordering bytes per stream.
+</QA>
+
+<QA level="intermediate" q="Why does gRPC load-balance badly behind an L4 load balancer, and what do you do?">
+An L4 balancer chooses a backend per TCP connection. A gRPC client sends all its calls over one long-lived HTTP/2 connection, so every call goes to whichever backend got that connection, and new backends get nothing from existing clients.
+
+The fixes are client-side balancing, where the client connects to every backend and spreads calls (gRPC's `round_robin`), an L7 proxy like Envoy that balances per call, or a server-side maximum connection age that sends `GOAWAY` so clients reconnect and are placed again.
+</QA>
+
+<QA level="deep" q="How does QUIC survive a phone moving from Wi-Fi to cellular, and what has to be true on the server side?">
+QUIC identifies a connection by a connection ID chosen by each endpoint, instead of the address-and-port tuple TCP uses. When the client's address changes, it keeps sending, with a fresh connection ID so observers can't link the two paths. The server finds the connection by ID, and validates the new path with `PATH_CHALLENGE` and `PATH_RESPONSE` before sending much there, so an attacker can't redirect traffic to a victim.
+
+On the server side, whatever routes packets has to route by connection ID. A load balancer that hashes the 5-tuple sends packets from the new address to a different server, which knows nothing of the connection. Servers usually encode their identity into the IDs they issue so the balancer can read it.
+</QA>
+
+<QA level="deep" q="When is QUIC 0-RTT safe to use for an API?">
+0-RTT data is sent with keys from a previous session's ticket, before the server has replied, so an attacker who records it can send it again and the server can't tell. QUIC's own frames are safe to replay. The application's requests may not be.
+
+Allow idempotent reads in 0-RTT. For anything that changes state, either have the server check an idempotency key that rules out a repeat, or reject it from early data with `425 Too Early`, so the client resends after the handshake.
+</QA>
+
+<SectionHeading n="16" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="What does the protobuf tag byte 0x1a mean?">
+    Field 3, wire type 2 (LEN). 0x1a is 26, which is 3 shifted left three bits
+    (24) plus 2. A length and that many bytes follow.
+  </Q>
+  <Q q="In HTTP/2, which streams does a client open? In QUIC?">
+    Odd-numbered streams in HTTP/2 (1, 3, 5). In QUIC, client-opened
+    bidirectional streams are 0, 4, 8: the lowest two bits encode who opened
+    the stream and whether it's one-way.
+  </Q>
+  <Q q="A gRPC call fails with DEADLINE_EXCEEDED. Did the server do the work?">
+    Unknown. The client stopped waiting; the server may have finished, may be
+    finishing, or may never have started. Only an idempotency key makes a retry
+    safe.
+  </Q>
+  <Q q="Why can't HTTP/3 reuse HPACK?">
+    HPACK assumes header blocks arrive in the order they were sent across all
+    streams, which TCP guaranteed and QUIC removed. QPACK sends table updates on
+    a separate encoder stream and lets each header block say which table version
+    it needs.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Birrell and Nelson, 'Implementing Remote Procedure Calls' (1984)">
+    The paper that introduced stubs and set the shape of every RPC system since,
+    including how to handle a server that crashes mid-call.
+  </WildCard>
+  <WildCard name="Waldo, Wyant, Wollrath and Kendall, 'A Note on Distributed Computing' (1994)">
+    Why remote objects can't be treated like local ones: latency, memory,
+    partial failure and concurrency. Short and still right.
+  </WildCard>
+  <WildCard name="gRPC: PROTOCOL-HTTP2.md and the retry design (gRFC A6)">
+    The exact mapping of calls onto HTTP/2 frames, headers and trailers, and the
+    full rules for retries, hedging, throttling and pushback.
+  </WildCard>
+  <WildCard name="protobuf.dev: Encoding, and the proto3 language guide">
+    Varints, tags, wire types and ZigZag, with the protoscope tool for reading
+    raw bytes, plus the rules for updating message types.
+  </WildCard>
+  <WildCard name="Langley et al., 'The QUIC Transport Protocol' (SIGCOMM 2017)">
+    Google's account of designing and deploying QUIC at scale: the handshake,
+    the measured latency gains, UDP blocking, and the CPU cost.
+  </WildCard>
+  <WildCard name="RFC 9000, 9001, 9002, 9113, 9114, 9204 and 7541">
+    QUIC, its use of TLS, its loss recovery, HTTP/2, HTTP/3, QPACK and HPACK.
+    RFC 9000's section on connection migration is readable on its own.
+  </WildCard>
+  <WildCard name="Daniel Stenberg, 'HTTP/3 explained'">
+    A free short book by curl's author, who also drew the chains picture in
+    section 7, on why HTTP/3 exists and how QUIC works.
+  </WildCard>
+  <WildCard name="Operating Systems: Three Easy Pieces, chapter 48">
+    Sun's Network File System, built on Sun RPC, and how it made a server crash
+    survivable by making every request idempotent. Free online at ostep.org.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="17" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="The Linux Networking Stack">
+    TCP's byte stream, receive windows and the send path that every gRPC call
+    rides on, and the per-call cost that makes QUIC expensive.
+    [Chapter 10](/topics/10-linux-networking).
+  </WildCard>
+  <WildCard name="DNS, TLS & the Edge">
+    The TLS 1.3 handshake that QUIC carries inside itself, and the 0-RTT replay
+    rules. [Chapter 35](/topics/35-dns-tls-edge).
+  </WildCard>
+  <WildCard name="Load Balancing & Traffic Management">
+    L4 and L7 balancers, and why a long-lived HTTP/2 connection defeats the
+    first kind. [Chapter 34](/topics/34-load-balancing).
+  </WildCard>
+  <WildCard name="Reliability Engineering">
+    Deadlines across hops, retry budgets and backoff, in general.
+    [Chapter 40](/topics/40-reliability).
+  </WildCard>
+  <WildCard name="Distributed Transactions">
+    Idempotency keys, and what "exactly once" can and can't mean.
+    [Chapter 31](/topics/31-distributed-transactions).
+  </WildCard>
+</CardGrid>
