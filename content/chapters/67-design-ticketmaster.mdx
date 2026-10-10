@@ -1,0 +1,1195 @@
+---
+title: Designing Ticketmaster
+dek: "At 10:00 sharp, Sofia and a few million other fans try to buy some of the same 70,000 stadium seats. We'll design the system that sells each seat exactly once, to people and not bots, without falling over: from a naive seats table that sells the same seat twice, through seat holds that expire, payment inside the hold window, a virtual waiting room, Verified Fan and bot defences, a cached seat map, and the isolation, pre-scaling and fairness tradeoffs around an on-sale."
+readingTime: "~55 min"
+level: "Intermediate"
+versions: "Figures from Ticketmaster's November 2022 statement, Live Nation's January 2023 Senate testimony, Ticketmaster's engineering blog, and Redis, Cloudflare and Queue-it documentation, dated where they appear"
+prereqs: "chapter 19 (transactions) helps, chapter 22 (Redis) helps, the Stripe case study (chapter 52) helps"
+updated: "2026-10-10"
+---
+
+It's 9:58 on a Tuesday morning in November 2022, and Sofia has two browser tabs open and a code in her email. A month earlier she registered for the presale of Taylor Swift's Eras Tour, an early sale open only to fans who signed up, and last night the code arrived: she's one of the fans invited to buy. Her show is at a stadium with about 70,000 seats, and she wants two of them, next to each other, for her and her sister. At 10:00 the page changes. It doesn't show seats. It shows a progress bar and a message: more than 2,000 people are ahead of her.
+
+<Picture
+  src="/images/designs/ticketmaster/eras-tour-crowd-us-bank-stadium.jpg"
+  alt="A large crowd of fans, many in sequins and cowboy hats, walking up a ramp towards a glass-fronted stadium with a sign advertising the Eras Tour"
+  caption="Fans heading into U.S. Bank Stadium in Minneapolis for an Eras Tour show in June 2023. Every one of them holds a ticket for one specific seat, and every one of those seats was sold, months earlier, during a few hours in which far more people wanted them than there were seats."
+  credit="Photo: Michael Hicks, CC BY 2.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:U.S._Bank_Stadium_for_the_Eras_Tour-2.jpg"
+/>
+
+Selling a ticket sounds like the easiest thing a website can do: show what's left, take a payment, mark it sold. What makes this sale hard is that everyone arrives at once and wants the same things. Ticketmaster said afterwards that its site received 3.5 billion requests during the sale, four times its previous peak, and that bots and people without codes made up much of it. Somewhere underneath that flood, each of the 70,000 seats at Sofia's show has to go to exactly one buyer. Two fans can't both be told they have seat 7 in row F, and a seat can't sit unsold because someone clicked it and wandered off. And all of it has to happen while bots run scripts that click faster than any person can.
+
+In this case study we'll design that system the way an engineer would: start with the most obvious design, find exactly where it breaks, and fix it, step by step. We'll keep coming back to one question: **when millions of people want the same 70,000 seats at 10:00 sharp, how do you sell each seat exactly once, to real fans, without the site falling over?** Along the way we'll go from a seats table to holds that expire, Redis keys, signed queue tokens, a seat-map bitmap, and the fairness choices that no amount of engineering makes for you.
+
+<SectionHeading n="01" id="requirements">What we're building, and how big</SectionHeading>
+
+<Sub n="1.1" title="What it has to do">
+
+Strip away resale, venue tools and marketing, and the part of Ticketmaster that sells a big show does a short list of things:
+
+1. **Show what's available**: a map of the venue with the seats that are still for sale and their prices.
+2. **Let a fan pick seats**, or ask the system for the best ones available, and keep them for the fan while they pay.
+3. **Take payment** and turn the kept seats into sold tickets.
+4. **Run the on-sale**: decide who gets to shop and in what order when far more people arrive than there are seats.
+5. **Keep bots and scalpers out**, as far as possible.
+6. **Deliver the ticket**, and let it be scanned at the gate once.
+
+And the qualities it needs while doing that:
+
+- **Never sell a seat twice.** This is the one rule that can't bend: two fans with the same seat is a fight at the stadium.
+- **Never strand a seat**: a seat someone picked and abandoned has to go back on sale.
+- **Survive the spike**: traffic at 10:00:01 can be thousands of times what it was at 9:55.
+- **Be fair**, and look fair, to fans who mostly won't get tickets.
+- **Keep the rest of the site working** while one huge sale is going on.
+
+Compare this with the Uber case study (chapter 50). There, every request needed a different answer: the nearest car to *this* rider. Here, everyone wants nearly the same thing at the same instant, and the thing is scarce. Most of what follows is about that **contention**, many requests competing for the same few items, and about the crowd that contention attracts.
+
+</Sub>
+
+<Sub n="1.2" title="How big is it?">
+
+Ticketmaster's own statement on the Eras Tour presale, published on 19 November 2022, gives the clearest numbers anyone has for a sale like this:
+
+- Over **3.5 million** people registered for the presale through Verified Fan, Ticketmaster's scheme in which fans sign up in advance and only those invited get a code to buy (section 6 looks at it closely). It was the largest registration in its history.
+- About **1.5 million** of them were sent codes to shop for the tour's 52 dates, 47 of them sold by Ticketmaster. The other 2 million were put on a waiting list.
+- The site received **3.5 billion system requests**, four times its previous peak, driven by "the staggering number of bot attacks as well as fans who didn't have codes".
+- Over **2 million tickets** were sold on 15 November, the most it had ever sold for one artist in a day.
+- About **15%** of interactions across the site ran into problems, including passcode validation errors that made fans lose tickets already in their carts.
+
+Roughly two months later, on 24 January 2023, Live Nation's president, Joe Berchtold, told the US Senate Judiciary Committee that the sale was hit with "three times the amount of bot traffic than we had ever experienced", and that for the first time in 400 Verified Fan on-sales, bots attacked the servers that check access codes. Separately, Live Nation's chairman, Greg Maffei, told CNBC in November 2022 that 14 million people, bots included, hit the site. For scale on a normal day, Ticketmaster describes itself as processing more than 600 million tickets a year in more than 35 countries.
+
+<Think
+  q="Ticketmaster says a stadium show usually sells out in about an hour. Take one show with 70,000 seats and three tickets per order. How many seats, and how many orders, does the system sell per second? Now compare that with 3.5 billion requests in a day."
+  hint="Divide 70,000 by 3,600 seconds, and 3.5 billion by 86,400 seconds."
+>
+70,000 seats in 3,600 seconds is roughly **20 seats a second**, or probably 6 or 7 orders a second at three tickets each. A laptop database can do that. Even all 47 Ticketmaster shows selling at once would be well under a thousand seats a second.
+
+Spread over a whole day, 3.5 billion requests is about **40,000 requests a second**, and far more than that in the first minutes, because almost everyone arrives at 10:00 and keeps refreshing.
+
+So the shape of the problem is lopsided. Selling seats, the part that has to be exact, is tiny work. Around it is an enormous amount of traffic, almost all of it people (and bots) asking "can I have one?" about the same few thousand seats at once. Our design has to make the small, exact part safe under contention, and keep the enormous part from ever reaching it.
+</Think>
+
+</Sub>
+
+<SectionHeading n="02" id="v1">Version 1: a table of seats</SectionHeading>
+
+<Sub n="2.1" title="The obvious design">
+
+Start with a database table with one row per seat for each show: the seat's ID (section 112, row F, seat 7), its price, and its status, available or sold. Sofia's seat map asks for every row and colours the available ones. When Sofia clicks Buy on seats F7 and F8, the server reads those two rows, sees that they're available, charges her card, and updates both rows to sold with her name on them.
+
+<Picture
+  src="/images/designs/ticketmaster/rem-ticket-stub-1986.jpg"
+  alt="A faded paper concert ticket for R.E.M. at the Kiel Opera House on 12 October 1986, with printed fields for section, row and seat"
+  caption="A Ticketmaster-printed ticket from 1986. Notice the fields along the top: SECTION, ROW, SEAT. A reserved seat isn't a unit of stock like a book; it's one particular chair, and each one can be sold exactly once. That's what makes the seats table a list of unique items and not a counter."
+  credit="Photo: Richard Newton, CC BY 2.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:REM_Ticket_Stub.jpg"
+  narrow
+/>
+
+<SystemDiagram
+  title="Version 1: every fan reads and writes one seats table"
+  nodes={[
+    { id: "fans", label: "Fans' browsers", sub: "seat map + Buy", kind: "users", col: 0, row: 0 },
+    { id: "web", label: "Web servers", kind: "service", col: 1, row: 0, count: "×20" },
+    { id: "db", label: "seats table", sub: "seat, price, status", kind: "db", col: 2, row: 0 },
+    { id: "pay", label: "Card processor", kind: "external", col: 2, row: 1 },
+  ]}
+  edges={[
+    { from: "fans", to: "web" },
+    { from: "web", to: "db", label: "SELECT / UPDATE" },
+    { from: "web", to: "pay", label: "charge" },
+  ]}
+  steps={[
+    { caption: "Sofia's browser loads the seat map: the web server reads every row for the show and sends back which seats are available.", path: ["fans", "web", "db"] },
+    { caption: "She clicks Buy on F7 and F8. The server reads those two rows again: both say available.", path: ["fans", "web", "db"] },
+    { caption: "The server charges her card.", path: ["web", "pay"] },
+    { caption: "It updates both rows to sold, with her name on them, and tells her she has the seats.", path: ["web", "db"] },
+  ]}
+/>
+
+On a quiet Wednesday, selling seats for a small club show, this works. Now put Sofia's show on it at 10:00.
+
+</Sub>
+
+<Sub n="2.2" title="Two fans, one seat">
+
+Sofia isn't the only person looking at row F. Raj, a few hundred kilometres away, sees the same map and clicks the same two seats a fraction of a second after her. Here's what the server does for the two of them, interleaved the way it can happen when thousands of requests run at once:
+
+1. Sofia's request reads F7 and F8: available.
+2. Raj's request reads F7 and F8: still available, because Sofia's request hasn't written anything yet.
+3. Sofia's request charges her card and writes "sold to Sofia".
+4. Raj's request charges his card and writes "sold to Raj", over the top of Sofia's.
+
+Both of them get a confirmation email. Both have been charged. Now the table says Raj, and Sofia finds out at the stadium gate. This failure has a name: a **race condition**, where the result depends on the exact order in which two concurrent operations happen to run. This particular shape, read a value, decide, then write based on what you read, is called **check-then-act**, and it's broken whenever someone else can act between your check and your act.
+
+With two fans you'd need bad luck. At 10:00, with thousands of fans looking at the same best-available seats, you'd need good luck to avoid it. This program runs 1,000 fans against 100 seats. Each fan reads the free seats, picks one, and then writes, and the fans' steps are interleaved at random, as concurrent requests on many web servers would be. Its first run uses check-then-act; its second makes the write conditional, which the next subsection explains:
+
+<TryIt what="Check-then-act versus a conditional write, 1,000 fans and 100 seats" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import random
+random.seed(7)
+
+SEATS, FANS = 100, 1_000
+
+def on_sale(atomic):
+    owner = {s: None for s in range(SEATS)}   # the seats table: seat -> buyer
+    confirmations = []                          # "You got seat N!" emails sent
+
+    def fan(f):
+        # step 1: SELECT the free seats and pick one
+        free = [s for s, o in owner.items() if o is None]
+        if not free:
+            return
+        seat = random.choice(free)
+        yield                                   # other fans run here
+        # step 2: UPDATE the row
+        if atomic:                              # ... WHERE owner IS NULL
+            if owner[seat] is None:
+                owner[seat] = f
+                confirmations.append(seat)
+        else:                                   # trusts what step 1 saw
+            owner[seat] = f
+            confirmations.append(seat)
+
+    running = [fan(f) for f in range(FANS)]
+    while running:                              # interleave fans at random
+        g = random.choice(running)
+        try:
+            next(g)
+        except StopIteration:
+            running.remove(g)
+
+    sold_twice = sum(1 for s in range(SEATS) if confirmations.count(s) > 1)
+    print(f"{'conditional UPDATE' if atomic else 'SELECT then UPDATE':20}"
+          f" confirmations: {len(confirmations):4}   seats sold more than once: {sold_twice}")
+
+on_sale(atomic=False)
+on_sale(atomic=True)
+```
+<Output>
+```
+SELECT then UPDATE   confirmations:  587   seats sold more than once: 89
+conditional UPDATE   confirmations:  100   seats sold more than once: 0
+```
+</Output>
+</TryIt>
+
+Read the first line slowly. A hundred seats produced 587 confirmations, and 89 of the 100 seats were sold to more than one person. That's because hundreds of fans read the table in the same instant, all saw the same free seats, and all acted on what they'd seen. In the second line every seat was sold exactly once and exactly 100 people were told yes.
+
+</Sub>
+
+<Sub n="2.3" title="Make the check and the write one step">
+
+In the second run, the fix is to stop separating the check from the write. Instead of reading the row and then writing it, the server sends one statement that writes only if the seat is still free, and reports how many rows it changed:
+
+```sql
+UPDATE seats
+   SET status = 'sold', buyer = 'sofia'
+ WHERE show_id = 4217 AND seat_id IN ('112-F-7', '112-F-8')
+   AND status = 'available';
+-- 2 rows updated: the seats are Sofia's.
+-- 0 or 1 rows updated: someone got there first; undo and tell her.
+```
+
+A database runs the condition and the write together, holding a lock on each row while it does, so Raj's identical statement either runs entirely before Sofia's or entirely after it. Whoever runs second finds `status = 'sold'` and changes nothing. This is a **compare-and-set**: change a value only if it still holds what you expect. (Wrapping both seats in a transaction makes the pair all-or-nothing, so Sofia never ends up with F7 but not F8; chapter 19 covers how.)
+
+So Version 1 is fixed? Not quite, and the order of the steps in 2.1 shows why. Our server charged the card *before* it marked the seats sold. Paying isn't instant: Sofia has to type a card number, her bank may ask her to confirm in its app, and the card network takes a second or two to answer. That's minutes, not milliseconds. If we charge first and then try the conditional update, Raj can be charged for seats that Sofia's update took a moment earlier, and we have to refund him. If we run the conditional update first and *then* send her to pay, the seats are marked sold to someone who may never pay.
+
+<Why>Why not lock the rows until she's paid?</Why>
+
+A database can hold a row lock for as long as a transaction stays open, so we could open a transaction, lock F7 and F8, wait for Sofia to pay, then commit. But a database transaction is meant to last milliseconds. Holding one open for five minutes per fan, for tens of thousands of fans, ties up a database connection for each of them, and anyone else who tries to read those rows with a locking read waits behind her. If her browser closes, the lock lingers until something notices. We need the seats to be Sofia's for a few minutes, without a database transaction staying open for those minutes.
+
+</Sub>
+
+<SectionHeading n="03" id="holds">Holding a seat while she pays</SectionHeading>
+
+<Sub n="3.1" title="A third state: held, until a deadline">
+
+What we want is what a shop assistant does when you say "can you keep that one aside for ten minutes while I fetch my wallet?" The seat isn't sold, but it isn't for sale either, and if you don't come back in ten minutes it goes back on the shelf. In ticketing this is a **hold**: a reservation of specific seats for one buyer that ends automatically at a deadline. So a seat now has three states, and the deadline is part of the third:
+
+- **available**: anyone can take it.
+- **held** by one cart until a time: only that cart can buy it, and only before that time.
+- **sold**: final.
+
+<Scene
+  title="Seats in row F during the first minutes of the sale"
+  regions={[
+    { id: "avail", label: "Available", sub: "anyone can hold", col: 0, row: 0 },
+    { id: "held", label: "Held", sub: "one cart · until a deadline", col: 1, row: 0 },
+    { id: "sold", label: "Sold", sub: "final", col: 2, row: 0 },
+    { id: "fans", label: "Fans", col: 0, row: 1, span: 3 },
+  ]}
+  itemWidth={118}
+  frames={[
+    { caption: "10:04. Sofia is let in to shop. Row F still has seats 7, 8 and 9 available.",
+      items: [
+        { id: "f7", at: "avail", label: "F7" },
+        { id: "f8", at: "avail", label: "F8" },
+        { id: "f9", at: "avail", label: "F9" },
+        { id: "sofia", at: "fans", label: "Sofia", tone: "accent" },
+        { id: "raj", at: "fans", label: "Raj" },
+      ], focus: ["avail"] },
+    { caption: "She clicks F7 and F8. Both are taken into a **hold** for her cart, in one all-or-nothing step, with a deadline 8 minutes away.",
+      change: [{ id: "f7", at: "held", sub: "Sofia · 10:12", tone: "accent" }, { id: "f8", at: "held", sub: "Sofia · 10:12", tone: "accent" }],
+      arrow: { from: "avail", to: "held", label: "hold F7+F8" } },
+    { caption: "A second later Raj asks for F8 and F9. F8 is held, so his request fails as a whole; he isn't left with F9 alone. His screen says someone beat him to it.",
+      change: [{ id: "raj", tone: "bad", sub: "F8 taken" }], focus: ["held"] },
+    { caption: "Raj picks F9 and walks away from his laptop without paying. His hold has a deadline too.",
+      change: [{ id: "f9", at: "held", sub: "Raj · 10:13", tone: "dirty" }, { id: "raj", tone: "dim", sub: "gone" }] },
+    { caption: "Sofia pays at 10:09. Her hold is still hers and still in time, so F7 and F8 become **sold**.",
+      change: [{ id: "f7", at: "sold", sub: "Sofia", tone: "ok" }, { id: "f8", at: "sold", sub: "Sofia", tone: "ok" }, { id: "sofia", tone: "ok", sub: "2 tickets" }],
+      arrow: { from: "held", to: "sold", label: "pay" } },
+    { caption: "10:13. Raj's hold passes its deadline, and F9 is available again for the next fan, without anyone having to clean it up.",
+      change: [{ id: "f9", at: "avail", sub: "", tone: "new" }], arrow: { from: "held", to: "avail", label: "expired" } },
+  ]}
+/>
+
+Two rules make this safe, and the rest of this section is about building them. First, taking a hold must be a compare-and-set, like the conditional update in 2.3: a seat can be held only if it's available, or held but past its deadline. Second, turning a hold into a sale must check that the hold still belongs to this cart and hasn't expired. Let's build it twice, once in the database and once in Redis.
+
+</Sub>
+
+<Sub n="3.2" title="A hold as a database row with a deadline">
+
+Our smallest change to Version 1 is two more columns on each seat row: who holds it, and until when.
+
+```sql
+-- seats(show_id, seat_id, price, status, holder, hold_until, buyer)
+
+-- Take a hold: succeeds only for seats that are free, or held but expired.
+UPDATE seats
+   SET status = 'held', holder = 'cart-sofia-81f2', hold_until = now() + interval '8 minutes'
+ WHERE show_id = 4217 AND seat_id IN ('112-F-7', '112-F-8')
+   AND (status = 'available' OR (status = 'held' AND hold_until < now()));
+-- Inside a transaction: commit if 2 rows changed, roll back otherwise.
+
+-- Turn the hold into a sale: succeeds only if it's still ours and in time.
+UPDATE seats
+   SET status = 'sold', buyer = 'sofia', holder = NULL, hold_until = NULL
+ WHERE show_id = 4217 AND seat_id IN ('112-F-7', '112-F-8')
+   AND status = 'held' AND holder = 'cart-sofia-81f2' AND hold_until > now();
+```
+
+Notice what isn't here: nothing ever has to *release* an expired hold. A held seat whose deadline has passed is treated as available by the very next statement that looks at it, so expiry is **lazy**: it happens when someone next asks, not on a timer. A background job may still sweep expired holds back to `available` now and then, so that reports and the seat map look tidy, but correctness doesn't depend on it running on time. That matters because background jobs are exactly the thing that falls behind during the busiest minute of the year.
+
+One detail is easy to miss: whose clock is `now()`? If each web server compared deadlines using its own clock, two servers whose clocks disagree by a few seconds would disagree about whether a hold has expired. Using the database's `now()` in the statement means one clock decides every deadline.
+
+</Sub>
+
+<Sub n="3.3" title="A hold as a Redis key that expires">
+
+<Zoom path={["Ticketmaster", "Inventory", "Seat hold", "SET key NX PX"]} />
+
+This database version works, but every hold, every failed attempt and every expiry check is a write to the system of record, in the minutes when it's busiest. A common alternative keeps holds in **Redis**, an in-memory key-value store (chapter 22) that can expire keys by itself. One Redis command does almost everything a hold needs:
+
+```
+SET hold:4217:112-F-7 cart-sofia-81f2 NX PX 480000
+```
+
+Reading it word by word, from the Redis documentation for `SET`:
+
+- `hold:4217:112-F-7` is the key: one per seat per show.
+- `cart-sofia-81f2` is the value: who holds it.
+- `NX` means "only set the key if it does not already exist". If someone already holds the seat, nothing changes.
+- `PX 480000` sets the key to expire after 480,000 milliseconds, 8 minutes. After that, Redis behaves as if the key was never there.
+
+Redis replies `OK` if Sofia got the hold, or nil if someone else holds it. Check and write are one command, so it's a compare-and-set, and Redis's own expiry is the deadline: an expired key is never returned to a reader, so expiry is lazy here too, with Redis also deleting expired keys in the background to reclaim memory.
+
+Sofia wants two seats, though, and two separate `SET`s aren't all-or-nothing: she could get F7 and lose F8 to Raj in between. Redis can run a script written in Lua, a small programming language, as one indivisible step, so a short script can check every seat first and hold them only if all are free:
+
+```lua
+-- KEYS: the seat keys, e.g. hold:{4217}:112-F-7, hold:{4217}:112-F-8
+-- ARGV[1]: the cart id, ARGV[2]: hold length in milliseconds
+for _, k in ipairs(KEYS) do
+  if redis.call('EXISTS', k) == 1 then return 0 end   -- one is taken: hold nothing
+end
+for _, k in ipairs(KEYS) do
+  redis.call('SET', k, ARGV[1], 'PX', ARGV[2])
+end
+return 1
+```
+
+The `{4217}` in the key names is a **hash tag** for Redis Cluster, the mode in which Redis spreads keys across several servers: only the part inside the braces is hashed to decide which server stores the key, so every seat of show 4217 lands on the same server, which a multi-key script requires.
+
+Releasing a hold early, when Sofia removes a seat from her cart, has the opposite trap. A plain `DEL` could delete a hold that has already expired and been taken by Raj. Redis's documentation answers this: delete only if the value is still yours, again in one script:
+
+```lua
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+else
+  return 0
+end
+```
+
+<Why>If Redis loses a hold, do we sell a seat twice?</Why>
+
+Redis keeps data in memory and copies it to replicas without waiting for them, so if the server holding show 4217's keys crashes, the replica that takes over can be missing the last few holds. Sofia's hold could vanish, and Raj could hold F7 a second later. That's a real failure, but notice what it costs: two people *think* they're about to buy, and one of them will be disappointed at checkout. It's not a double sale, as long as the sale itself is recorded with the conditional update from 3.2 in the durable database. A hold store may be briefly wrong; the sold record must never be. This is the same sorting Uber's design did with driver locations and trips: decide how much it costs for each piece of data to be wrong, and pay for exactness only where wrong is expensive.
+
+</Sub>
+
+<Sub n="3.4" title="The confirm step must check the hold">
+
+Holds fix the double sale only if the step that turns a hold into a sale checks that the hold is still yours. It's tempting to skip that check: Sofia was given a hold, she's paying, so mark the seats sold. This simulation shows why that's wrong, and also why holds need a deadline at all. Three thousand fans are let in one every 0.6 seconds for 1,000 seats. Each holds one seat for 8 minutes; 75% pay within 1 to 6 minutes, 15% abandon their cart, and 10% are slow and try to pay after 9 to 12 minutes. It runs the same fans under three policies: holds that never expire; holds that expire, with a confirm step that trusts the fan; and holds that expire, with a confirm step that checks the hold first.
+
+<TryIt what="Holds with and without deadlines, and a confirm step that does or doesn't check" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import heapq, random
+
+SEATS, FANS, TTL = 1_000, 3_000, 8 * 60      # holds last 8 minutes
+
+def on_sale(policy):
+    rnd = random.Random(42)                  # same fans for every policy
+    hold = {}                                # seat -> (fan, expires_at)
+    sold = {}                                # seat -> [fans who were charged]
+    events = []
+    for f in range(FANS):                    # one fan admitted every 0.6 s
+        heapq.heappush(events, (f * 0.6, "arrive", f, None))
+    late_rejected = 0
+
+    def is_free(seat, now):
+        if seat in sold:
+            return False
+        h = hold.get(seat)
+        if h is None:
+            return True
+        return policy != "no expiry" and h[1] <= now   # an expired hold is free
+
+    while events:
+        now, kind, f, seat = heapq.heappop(events)
+        if kind == "arrive":
+            free = [s for s in range(SEATS) if is_free(s, now)]
+            if not free:
+                continue
+            seat = rnd.choice(free)
+            hold[seat] = (f, now + TTL)      # SET seat f NX PX ttl
+            r = rnd.random()
+            if r < 0.75:                     # pays within 1 to 6 minutes
+                heapq.heappush(events, (now + rnd.uniform(60, 360), "pay", f, seat))
+            elif r < 0.90:                   # abandons the cart
+                pass
+            else:                            # pays after 9 to 12 minutes
+                heapq.heappush(events, (now + rnd.uniform(540, 720), "pay", f, seat))
+        else:                                # "pay": try to turn the hold into a sale
+            h = hold.get(seat)
+            still_mine = h is not None and h[0] == f and (policy == "no expiry" or h[1] > now)
+            if policy == "TTL, confirm checks hold" and not still_mine:
+                late_rejected += 1           # card is not charged; fan is told
+                continue
+            sold.setdefault(seat, []).append(f)
+            hold.pop(seat, None)
+
+    oversold = sum(1 for fans in sold.values() if len(fans) > 1)
+    unsold = SEATS - len(sold)
+    locked = sum(1 for s in hold if s not in sold) if policy == "no expiry" else 0
+    print(f"{policy:25} sold: {len(sold):4}  sold twice: {oversold:3}  "
+          f"unsold: {unsold:3} (locked forever: {locked:3})  late payers refused: {late_rejected}")
+
+for p in ["no expiry", "TTL, confirm trusts fan", "TTL, confirm checks hold"]:
+    on_sale(p)
+```
+<Output>
+```
+no expiry                 sold:  853  sold twice:   0  unsold: 147 (locked forever: 147)  late payers refused: 0
+TTL, confirm trusts fan   sold: 1000  sold twice:  87  unsold:   0 (locked forever:   0)  late payers refused: 0
+TTL, confirm checks hold  sold:  995  sold twice:   0  unsold:   5 (locked forever:   0)  late payers refused: 124
+```
+</Output>
+</TryIt>
+
+Each line is one of the failure modes we've been circling:
+
+- **No expiry**: nothing is sold twice, but 147 seats, about 15%, sit in holds whose owners abandoned them and are never sold. Those are the 15% who walked away. In a real sale that's thousands of seats per show that fans can see are "taken" and that never reach anyone.
+- **Expiry, but the confirm step trusts the fan**: every seat sells, but 87 seats are sold twice. Each is a slow payer whose hold expired, whose seat was then held and bought by someone else, and who was charged anyway when they finally paid.
+- **Expiry, and the confirm step checks the hold**: nothing is sold twice and nothing is locked forever. The 124 late payers are refused before their card is charged, and told their time ran out. The 5 unsold seats are holds that expired after the last fan had been let in; they're available again for whoever comes next.
+
+So both halves are needed: a deadline so abandoned seats come back, and a check at confirm time so a hold that has expired can't be turned into a sale.
+
+<Callout label="Common mistake" kind="warn">
+Checking the hold when the fan *starts* checkout and not when the sale is recorded. Those few minutes in between are exactly when a hold can expire and be taken by someone else. The final write, the one that marks the seat sold, must itself carry the condition "still held by this cart, still in time", as the second statement in 3.2 does.
+</Callout>
+
+</Sub>
+
+<Sub n="3.5" title="Where the holds should live">
+
+We now have two working hold stores. A third option comes from Ticketmaster itself.
+
+In July 2014, Kurt Granroth of Ticketmaster wrote about the company's Inventory Service on its engineering blog, in a post called "The Tao of Ticketing". Its lowest layer, the Inventory Core, is written in C++ "with assembly bits for hyper-critical sections", and in the post's own words it "doesn't scale; and can't be distributed". That was deliberate. Searching for seats has to look across a whole event, because sections, rows and price levels overlap, and at an on-sale every "best available" search goes after the same section at once. Splitting an event across machines would mean every search taking an event-wide lock anyway. So "each event is assigned exclusively to one Core, which loads it into memory and performs the search algorithm from there", and the post reports search times measured in microseconds. A scalable service layer in front routes each request to the right Core.
+
+That design is a **single writer per event**: one process owns all of one show's seats and handles requests for them one at a time. It doesn't need compare-and-set tricks, because no two requests for the same show ever run at once; the race in 2.2 can't happen. How Ticketmaster's inventory works today, twelve years after that post, is unpublished.
+
+<Decision
+  q="Where should seat holds live?"
+  options={[
+    { name: "Rows in the main database", how: "Status, holder and deadline columns; conditional updates take and confirm holds.", good: ["One system, one source of truth", "Transactions make multi-seat holds all-or-nothing"], bad: ["Every hold attempt is a write to the busiest database at its busiest moment", "Hot rows: everyone contends for the same best seats"] },
+    { name: "Redis keys with an expiry", how: "SET NX PX per seat, a Lua script for several seats; the sale is recorded in the database.", good: ["Fast, in memory, expiry built in", "Keeps hold churn off the database"], bad: ["Holds can be lost in a failover", "Two systems to keep consistent at confirm time"] },
+    { name: "One owner process per event", how: "Each show's seats are loaded into one process that handles that show's requests one at a time and writes sales durably.", good: ["No races inside an event, by construction", "Can run whole-event searches (best available, no single-seat gaps) in memory"], bad: ["One event's capacity is one process: the front door must limit what reaches it", "Needs failover for the owner and a durable log of sales"], chosen: true },
+  ]}
+>
+For a stadium on-sale we'd follow Ticketmaster's 2014 shape: an owner per event, holding seats and holds in memory, recording each sale durably before confirming it. The deciding facts are the ones from the Think in 1.2: the number of sales per second per show is small, so one process is plenty for the real work, and the demand is concentrated on the same seats, so spreading an event across machines buys nothing. What it does require is that the crowd never reaches that process directly. Most of the rest of the design exists to protect it. For a smaller platform without such peaks, database rows with deadlines are simpler and entirely sound.
+</Decision>
+
+<Elsewhere items={[
+  { where: "Airline and hotel booking", how: "Seat maps and room inventory hold a selection while you pay, with a countdown, and give it back when the timer runs out." },
+  { where: "Job queues in Postgres", how: "SELECT … FOR UPDATE SKIP LOCKED lets many workers claim different rows without waiting on each other, the same 'claim it atomically or move on' idea as a hold." },
+  { where: "Leases in distributed systems", how: "A lock that expires on its own (chapter 30's leases, Chubby, etcd) solves the same problem as a hold: the holder might vanish, so ownership must end by itself." },
+  { where: "Stripe's idempotency keys", how: "Stripe locks a key while a request is in flight and releases it with a timeout, so a crashed client can't wedge the key forever (chapter 52)." },
+]} />
+
+</Sub>
+
+<SectionHeading n="04" id="payment">Paying inside the hold window</SectionHeading>
+
+<Sub n="4.1" title="How long should a hold last?">
+
+How long a hold lasts is a choice, and every value hurts someone. Too short, and Sofia's bank asks her to approve the payment in its app, she fumbles for her phone, and the seats are gone when she gets back. Too long, and every abandoned cart keeps seats off sale for longer, while fans in the queue watch the map show seats as taken that nobody is going to buy. Ticketmaster shows a countdown during checkout; how long it is, and whether it varies by sale, isn't something it publishes in one place, and we'll use 8 minutes as our own choice.
+
+<Decision
+  q="How long should a hold last?"
+  options={[
+    { name: "Short (2–3 minutes)", how: "Seats come back fast if a fan walks away.", good: ["Abandoned seats return quickly", "The map stays closer to the truth"], bad: ["Fans who need to confirm payment with their bank lose their seats", "More fans hit the 'time ran out' page, then retry"] },
+    { name: "Moderate (around 8 minutes)", how: "Long enough for a normal checkout, including a bank's confirmation step.", good: ["Almost every real buyer finishes in time"], bad: ["An abandoned seat is invisible to everyone else for up to 8 minutes"], chosen: true },
+    { name: "Long (15+ minutes)", how: "Generous; nobody feels rushed.", good: ["Fewest unhappy late payers"], bad: ["Bots can hold large amounts of inventory just by opening carts", "During a sell-out, seats circulate slowly"] },
+  ]}
+>
+Hold length also has a security side. A hold costs the holder nothing, so a bot that can open many carts can take seats off sale without buying them, and then release them to an accomplice. Holds therefore come with a cap on how many seats one account can hold, and the longer the hold, the more that cap matters. Pick a length from how long real checkouts take, measured from past sales, plus a margin.
+</Decision>
+
+</Sub>
+
+<Sub n="4.2" title="Charging the card without charging twice">
+
+Payment is where the hold, the card network and the network between them all meet, and any message between them can be lost. Chapter 52's Stripe case study is about exactly this problem, and its main tools carry over. Two of them matter here.
+
+First, a card payment can be split in two. An **authorization** asks the card's bank to set the money aside without moving it; a **capture**, later, takes it. An authorization that's never captured is released, and the customer is never charged. That lets us put the seat sale *between* the two steps: if the seat sale fails, we cancel the authorization and Sofia was never charged.
+
+Second, every request to the payment provider carries an **idempotency key**, a unique ID for this attempt, so that if our server retries after a timeout, the provider recognises the retry and returns the first answer instead of charging again (chapter 52's [section 5](/topics/52-design-stripe#idempotency)). A cart ID makes a natural key.
+
+<StepSequence
+  title="Sofia's checkout, with the sale between authorize and capture"
+  actors={["Sofia's browser", "Checkout service", "Event owner (inventory)", "Payment provider"]}
+  messages={[
+    { from: 0, to: 1, label: "pay for cart 81f2", note: "**1.** Sofia submits her card. The checkout service has her cart: F7 and F8, held until 10:12." },
+    { from: 1, to: 3, label: "authorize $X, key=cart-81f2", note: "**2. Authorize** the amount, with the cart ID as the idempotency key. If this times out, retrying with the same key can't create a second authorization." },
+    { from: 3, to: 1, label: "authorized", note: "**3.** The bank has set the money aside. Nothing has been charged yet." },
+    { from: 1, to: 2, label: "confirm F7+F8 for cart 81f2", note: "**4. Confirm the sale**: the event owner checks the hold is still cart 81f2's and still in time, records the sale durably, and only then answers yes." },
+    { from: 2, to: 1, label: "sold", note: "**5.** The seats are Sofia's. If the answer had been no (the hold expired), the checkout service would cancel the authorization and tell her, and she'd never see a charge." },
+    { from: 1, to: 3, label: "capture, key=cart-81f2-capture", note: "**6. Capture** the payment, again with an idempotency key. Retries are safe." },
+    { from: 1, to: 0, label: "you have 2 tickets", note: "**7.** Confirmation, and the tickets appear in her account." },
+  ]}
+/>
+
+<Why>What if the hold expires while the bank is still answering?</Why>
+
+Then step 4 says no, and the authorization is cancelled. It's an unhappy ending for Sofia, but a clean one: no double sale, no charge, no refund to chase. A friendlier version probably extends the hold by a minute or two at step 2, when payment has begun, so that only fans who started paying at the last second are affected. The rule that makes it safe doesn't change: the sale is recorded only by the event owner, only for a hold that's still valid.
+
+</Sub>
+
+<Sub n="4.3" title="When the error is ours">
+
+Ticketmaster's November 2022 statement mentions a failure that this design has to plan for: "passcode validation errors that caused fans to lose tickets they had carted". Those fans hadn't done anything wrong. A service the checkout depended on, here the one that checks presale codes, was failing under load, and while the fans retried, their holds ran down.
+
+The hold clock is a promise to the fan: "these are yours for 8 minutes, if *you* act in time". When the platform is the reason they can't act, burning their time breaks that promise.
+
+<Callout label="Design implication">
+Make the hold clock pause or extend when the delay is the platform's fault. Checkout steps that fail on the server side (a dependency timing out, a code check erroring) should extend the cart's hold, up to a cap, instead of letting it expire. And dependencies that every buyer must pass through, like code validation, belong at the front of the flow, checked once when a fan is let in, not at the last step where a failure costs them seats.
+</Callout>
+
+So far we've made the sale exact: holds that expire, a sale recorded only for a valid hold, a payment that can't charge twice. But all of it assumed fans arrive one by one. At 10:00 they don't.
+
+</Sub>
+
+<SectionHeading n="05" id="waiting-room">The crowd at 10:00</SectionHeading>
+
+<Sub n="5.1" title="Why holds don't save you from the crowd">
+
+Picture the first second of the sale. Hundreds of thousands of browsers, plus the bots, send requests within a moment of 10:00:00: load the seat map, hold these seats, hold those. Every one of them for Sofia's show ends up at the single event owner from 3.5. Even at microseconds per search, a queue of a million requests in front of one process means the requests at the back wait for many seconds, their browsers time out and retry, and the retries pile on top of the original queue. Meanwhile the web servers in front each have thousands of connections open, waiting.
+
+This is a **thundering herd**: a crowd of clients woken by the same event, all asking at once, where the crowd itself, and its retries, makes the system slower for everyone. Ticketmaster's 2014 post saw this coming. It says on-sales "require both queuing and prioritizing": queuing because the commerce layer could send far more requests than the Inventory Core can take, and prioritizing so that one huge on-sale doesn't overwhelm requests for everything else.
+
+Notice what a fast sales system would do even if it never fell over: hand out seats to whoever's request reached the inventory first. The ones who reach it first are those with the fastest connection and the fastest script. So even a sale that never slowed down would have a fairness problem, and bots would win it. So the fix has to solve both: let only as many people reach the sale as it can serve, and decide *who* in a way that a script can't win just by being quick.
+
+</Sub>
+
+<Sub n="5.2" title="A waiting room in front of the sale">
+
+People solved this long before websites: you queue at the box office, and the person at the window serves one customer at a time.
+
+<Picture
+  src="/images/designs/ticketmaster/ticket-queue-kharkov-1981.jpg"
+  alt="A line of people in winter coats outside a small white building with a sign reading kassa, the Russian for ticket office"
+  caption="Queueing for cinema tickets in Kharkiv, around 1981. The ticket window is the scarce resource; the queue in front of it decides who reaches it, and in what order, at the rate the window can serve. A virtual waiting room does the same thing for a website, with a token in place of a place in line."
+  credit="Photo: L. P. Dzhepko, CC BY-SA 3.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Kharkov_1981_Kassy_kinoteatra_Ukraina.jpg"
+/>
+
+A **virtual waiting room** is the same arrangement in software: a separate, very simple system in front of the sale that every fan must pass through. It holds them on a waiting page, and lets them into the real sale at a controlled rate. What lets someone through is a **token**: a small piece of data, signed by the waiting room, that says "this person may shop for this event until this time". Our sale checks the token on every request and turns away anyone without a valid one.
+
+The waiting room has to sit somewhere the whole crowd can reach without touching the sale. That place is the **edge**: servers run by a **content delivery network (CDN)**, spread across hundreds of cities, which sit between users and the site, answer whatever they can from their own copies, and pass the rest on (chapter 25). An edge server can hand out a cached waiting page, or check a token, without asking anything behind it.
+
+Ticketmaster describes its own version, Smart Queue, in four steps (December 2025): fans sign in and join the waiting room before the sale; once the sale starts, they're assigned a spot in the queue; they enter the sale "at a rate that minimizes check-out errors and maximizes sell-through"; then they pick seats and check out. Here is that flow as a design:
+
+<SystemDiagram
+  title="The waiting room: admission by signed token"
+  nodes={[
+    { id: "fans", label: "Fans + bots", sub: "millions of sessions", kind: "users", col: 0, row: 1 },
+    { id: "edge", label: "Edge / CDN", sub: "checks token on every request", kind: "cdn", col: 1, row: 1 },
+    { id: "wait", label: "Waiting room", sub: "static page, positions", kind: "service", col: 1, row: 0 },
+    { id: "queue", label: "Queue + admitter", sub: "admits N per minute", kind: "queue", col: 2, row: 0 },
+    { id: "keys", label: "Signing key", kind: "keys", col: 3, row: 0 },
+    { id: "sale", label: "Sale (seat map, holds)", sub: "only token holders", kind: "service", col: 2, row: 1 },
+    { id: "owner", label: "Event owner", sub: "show 4217", kind: "compute", col: 3, row: 1 },
+  ]}
+  edges={[
+    { from: "fans", to: "edge" }, { from: "edge", to: "wait", label: "no token" },
+    { from: "wait", to: "queue" }, { from: "queue", to: "keys", dashed: true },
+    { from: "edge", to: "sale", label: "valid token" }, { from: "sale", to: "owner" },
+  ]}
+  steps={[
+    { caption: "Before 10:00, Sofia signs in and lands in the waiting room. Its page is static and cached at the edge, so a million copies of it cost almost nothing to serve.", path: ["fans", "edge", "wait"] },
+    { caption: "At 10:00 every session in the waiting room is given a position. Sofia's is 2,143. Her page polls every few seconds to learn how far the queue has moved.", path: ["wait", "queue"] },
+    { caption: "The admitter lets people in at a fixed rate. When Sofia's turn comes, it signs a token for her: event 4217, her account, valid until 10:34.", path: ["queue", "keys"], focus: ["queue"] },
+    { caption: "Her browser now sends the token with every request. The edge checks the signature and the expiry, which needs no database, and passes her through to the sale.", path: ["fans", "edge", "sale"] },
+    { caption: "Only admitted fans ever reach the sale and the event owner behind it, so the owner sees the few thousand people it can serve, not the millions waiting.", path: ["sale", "owner"] },
+  ]}
+/>
+
+<Zoom path={["Ticketmaster", "On-sale", "Waiting room", "Signed admission token"]} />
+
+Let's look closely at the token, because it's what makes the waiting room cheap. It might carry:
+
+| Field | Example | Why it's there |
+|---|---|---|
+| event | 4217 | A token for one show can't be used for another |
+| account | sofia | Ties the token to a signed-in account, so it can't be handed to a friend or a bot |
+| position | 2,143 | Lets the sale log and audit who was admitted when |
+| issued, expires | 10:04, 10:34 | A token for a session, not forever; she has 30 minutes to shop |
+| signature | HMAC-SHA256 over the fields above | Proves the waiting room issued it; any change to a field breaks it |
+
+An **HMAC** is a short code computed from the message and a secret key; anyone holding the key can check that the message is unchanged and was made by someone else holding the key, and nobody without the key can forge one. Because every edge server holds the key, every edge server can check every token on its own, with no lookup. So the sale's front door turns from "ask a database whether this person is allowed" into "check a signature", which an edge server can do tens of thousands of times a second. The token's details here are our design; Ticketmaster doesn't publish its format. Cloudflare's Waiting Room does the same job with a cookie that tracks each visitor's place, and Queue-it sends each visitor back to the site with a queue token when their turn comes.
+
+Its own servers stay simple on purpose: a cached page, a counter of who's been admitted, and a way to hand out positions. It's the one part of the system that has to accept the whole crowd, so it does as little as possible per request.
+
+</Sub>
+
+<Sub n="5.3" title="How fast to let people in">
+
+Of all the dials, the admission rate matters most, and Ticketmaster's November 2022 statement shows it being turned during an emergency: "we slowed down some sales and pushed back others to stabilize the systems. The trade off was longer wait times in queue for some fans."
+
+To pick the rate, use **Little's law** (chapter 42): the number of people in a system equals the rate they arrive times how long each one stays. If we admit 1,000 fans a minute and the average fan spends 5 minutes choosing seats and paying, then about 1,000 × 5 = **5,000 fans are shopping at any moment**. That's the load the sale and the event owner must handle, and we can test for it in advance. Cloudflare's Waiting Room exposes exactly these two dials: "total active users", the number of people allowed on the site at once, and "new users per minute", the rate at which they're let in.
+
+That rate also tells Sofia the truth about her chances, if we're willing to tell her. Her show has about 70,000 seats; at three tickets an order that's roughly 23,000 orders. If Ticketmaster's historical figure holds (about 40% of invited fans go on to buy, from the 2022 statement), probably something like 58,000 admitted fans would use up the seats. Someone at position 2,143 will probably get seats. Someone at position 200,000 almost certainly won't, and at 1,000 admissions a minute they'd wait over three hours to find out. A waiting room that shows how much inventory is left, which Ticketmaster's Smart Queue page says it does, lets that fan stop waiting.
+
+</Sub>
+
+<Sub n="5.4" title="First come, or random?">
+
+At 10:00:00 the waiting room has hundreds of thousands of sessions and has to put them in an order. An obvious rule is **FIFO**, first in, first out: whoever's request arrived first goes first. Before reading on, predict how that plays with bots in the room.
+
+<Predict
+  q="200,000 fans each have one browser tab. 500 scalpers run 40 sessions each, 20,000 sessions in all, about 9% of the total. People's clicks reach the queue 0.5 to 5 seconds after 10:00; the scripts fire within 50 milliseconds. With FIFO, what share of the first 10,000 places do the bots get?"
+  options={[
+    "About 9%, their share of sessions",
+    "About 50%: speed helps, but people are fast too",
+    "Nearly all of them",
+    "None: a queue can't be gamed",
+  ]}
+  answer={2}
+>
+All of them, near enough. Every bot session reaches the queue before the fastest human click, so the first 20,000 places in arrival order are all bots. With FIFO, being quick is the only thing that counts, and scripts are quicker than people by a factor of a hundred.
+</Predict>
+
+Most waiting rooms fix this with a **pre-queue**: a waiting page that opens some time before the sale, where it doesn't matter when you arrive, followed by a random shuffle of everyone in it at the moment the sale opens. Queue-it's documentation puts it directly: "at sale or registration start, visitors are randomized and assigned a place in line", and "visitors who arrive after the sale starts get a first-come, first-served place in the queue." Cloudflare's Waiting Room has a setting for the same thing: with "Shuffle at event start", "all users in the pre-queue will be randomly admitted at event start."
+
+This program runs the scenario from the prediction under four rules: FIFO; a shuffle of every session; a shuffle where each account keeps only its best-placed session; and one entry per account, shuffled once.
+
+<TryIt what="Who gets the front of the queue: FIFO, shuffles, and one entry per account" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import random
+rnd = random.Random(2022)
+
+HUMANS = 200_000              # one browser tab each
+BOTS, TABS_PER_BOT = 500, 40  # 500 scalpers running 40 sessions each
+FIRST = 10_000                # roughly the people who will get tickets
+
+# Seconds after 10:00:00 at which each session's request reaches the queue.
+# People react and click in 0.5 to 5 s; scripts fire within 50 ms.
+humans = [("human", i, rnd.uniform(0.5, 5.0)) for i in range(HUMANS)]
+bots = [("bot", b, rnd.uniform(0.0, 0.05))
+        for b in range(BOTS) for _ in range(TABS_PER_BOT)]
+sessions = humans + bots
+
+def bot_share(order):
+    front = order[:FIRST]
+    return sum(1 for kind, _, _ in front if kind == "bot") / FIRST
+
+# 1. FIFO: the first request to arrive after 10:00 is first in line
+fifo = sorted(sessions, key=lambda s: s[2])
+
+# 2. Pre-queue: every session waiting at 10:00 is shuffled, like a raffle
+shuffled = sessions[:]
+rnd.shuffle(shuffled)
+
+# 3. Shuffle every session, then keep each account's best place
+best_tab, seen = [], set()
+for s in shuffled:
+    if (s[0], s[1]) not in seen:
+        seen.add((s[0], s[1]))
+        best_tab.append(s)
+
+# 4. One entry per account first, then shuffle
+one_entry = list({(s[0], s[1]): s for s in sessions}.values())
+rnd.shuffle(one_entry)
+
+print(f"sessions: {len(humans):,} human, {len(bots):,} bot "
+      f"({len(bots) / len(sessions):.0%} of all)")
+print(f"FIFO by arrival time:         bots get {bot_share(fifo):6.1%} of the first {FIRST:,} places")
+print(f"shuffle every session:        bots get {bot_share(shuffled):6.1%}")
+print(f"shuffle, keep best per acct:  bots get {bot_share(best_tab):6.1%}")
+print(f"one entry per acct, shuffle:  bots get {bot_share(one_entry):6.1%}")
+```
+<Output>
+```
+sessions: 200,000 human, 20,000 bot (9% of all)
+FIFO by arrival time:         bots get 100.0% of the first 10,000 places
+shuffle every session:        bots get   9.0%
+shuffle, keep best per acct:  bots get   4.3%
+one entry per acct, shuffle:  bots get   0.3%
+```
+</Output>
+</TryIt>
+
+Read it top to bottom; each line removes one advantage:
+
+- **FIFO** hands the whole front of the queue to scripts. Speed is everything.
+- **Shuffling every session** removes the speed advantage: bots get 9%, exactly their share of sessions. But they still have 40 lottery tickets each to a person's one.
+- **Keeping each account's best session after the shuffle** looks like "one per account" but isn't: each bot still drew 40 times and kept its luckiest draw, so bots get 4.3%, far above their 0.25% share of accounts. This is a real trap; deduplicating after the draw rewards whoever entered the draw most often.
+- **One entry per account, then shuffle** gives each account one draw, and bots fall to their share of accounts, 0.3%. Now the only way to get more places is to have more accounts, which moves the fight to account creation and identity, the subject of section 6.
+
+<Decision
+  q="In what order should the waiting room admit people?"
+  options={[
+    { name: "FIFO by arrival", how: "First request after the sale opens is first in line.", good: ["Simple, and feels fair to people who were early", "Rewards fans who stay on the page"], bad: ["A race decided by milliseconds, which scripts always win", "Punishes slow connections and slow devices"] },
+    { name: "Random among everyone waiting at the start, then FIFO", how: "A pre-queue opens early; at the start everyone in it is shuffled; latecomers join the back in order.", good: ["Arriving early is enough: no advantage to being fastest", "Removes the reason to hammer the site at 10:00:00"], bad: ["Can feel arbitrary: you waited an hour and got position 180,000", "Multiple sessions still buy more draws unless entries are per account"], chosen: true },
+    { name: "A lottery before the sale (registration, codes)", how: "Fans register days ahead; a draw decides who is invited to shop at all.", good: ["Caps the crowd before it forms", "Time to screen out bots"], bad: ["Fans who weren't invited can't buy at all", "Registration itself becomes the thing bots attack"] },
+  ]}
+>
+We combine the last two, as the Eras Tour presale did in outline: a registration and invitation step to cap the crowd, then a randomised pre-queue with one entry per account on the day. Exactly how Ticketmaster orders its queue isn't published. In May 2026 its global president, Saumil Mehta, replying to a fan on X, said he didn't know where the idea that queue positions are random came from, although Ticketmaster's own account had said in 2018 that the waiting room assigns places randomly. Fans are left to infer the rule from experience, not from documentation. Whatever the rule, publish it. A fair rule that people can't see looks the same as an unfair one.
+</Decision>
+
+<Elsewhere items={[
+  { where: "Cloudflare Waiting Room", how: "Total active users and new users per minute as the two dials, FIFO or random admission, a pre-queue with shuffle at event start, and a cookie that carries each visitor's place." },
+  { where: "Queue-it", how: "A hosted waiting room used for ticketing, retail drops and government sign-ups: randomised at the start, first-come after, with server-side connectors so the queue can't be skipped by editing the page." },
+  { where: "Sneaker drops (Nike SNKRS)", how: "Nike gives up on queues entirely for its most sought-after shoes: you enter during a window, and when it closes, winners are chosen at random." },
+  { where: "Load shedding in services", how: "Admitting work at the rate a system can serve it, and making the rest wait outside, is the same admission control as chapter 52's rate limits and chapter 42's queueing." },
+]} />
+
+</Sub>
+
+<SectionHeading n="06" id="bots">Real fans, not bots</SectionHeading>
+
+<Sub n="6.1" title="What the bots want">
+
+Section 5 ended with the fight moved to accounts. To see why bots fight so hard, look at what they're after. Live Nation's Senate testimony in January 2023 described ticket scalping as a $5 billion industry in concerts alone, "largely accomplished by using bots to acquire tickets and online secondary marketplaces to sell them". Artists often price tickets well below what fans would pay, so a ticket bought at face value and resold is profit. For a scalper, every seat a bot gets is money, and a few thousand dollars spent on servers, proxies and accounts probably pays for itself many times over.
+
+So bots do whatever gives them more seats than a person: arrive first (beaten by the shuffle), run many sessions (beaten by one entry per account), run many accounts, hold seats without buying (beaten by hold caps), and attack anything in the flow that's weaker than the front door. In 2022, that last one was the code-checking servers.
+
+</Sub>
+
+<Sub n="6.2" title="Verified Fan: deciding who gets in before the day">
+
+Ticketmaster's answer is Verified Fan, which it launched in 2017; the presale for Ed Sheeran's North American tour that March was one of the first to use it, and dozens of tours followed that year. It moves the contest from the on-sale, where everything happens in seconds, to registration, days earlier, where there's time to look at each account. In the 2022 statement's words: "By requiring registrations, Verified Fan is designed to help manage high demand shows – identifying real humans and weeding out bots." Fans register for a tour; Ticketmaster screens the registrations; invited fans get a code; only verified accounts can enter the queue, and, for this sale, buyers also had to enter their code to complete a purchase.
+
+It's also a forecasting tool, and the 2022 numbers show how.
+
+<Think
+  q="1.5 million fans were invited. Ticketmaster says about 40% of invited fans usually show up and buy, typically 3 tickets each. How many tickets should it expect the invited fans to buy, and how does that compare with what was on sale?"
+  hint="Multiply, then compare with the 2 million tickets sold in the Verified Fan on-sale."
+>
+1.5 million × 40% × 3 = about **1.8 million tickets**, close to the 2 million Ticketmaster says the Verified Fan on-sale sold. In other words, the invitation count was chosen so that the expected demand roughly matched the supply. That's why the other 2 million registered fans went on a waiting list "on the small chance that tickets might still be available".
+
+It also gives the engineers a number to plan for: about 600,000 expected buyers across the dates, not 3.5 million registrants, and not the 14 million visitors Live Nation's chairman described. The traffic that did arrive was made up mostly of people and programs that weren't meant to be shopping at all.
+</Think>
+
+Ticketmaster also reported results, and they're its own figures, so treat them with some care: less than 5% of the Eras Tour tickets had been sold or posted for resale by 19 November 2022, against 20 to 30% for on-sales that don't use Verified Fan.
+
+</Sub>
+
+<Sub n="6.3" title="Rate limits, CAPTCHAs and attestation">
+
+Registration can't catch everything, and on the day the platform still needs defences at the door. Three are standard, and they work at different layers.
+
+**Rate limits** cap how often one client can make a request: so many hold attempts per account per minute, so many requests per IP address per second. Usually the mechanism is a **token bucket**, the same one chapter 52 uses to protect Stripe's API. A bucket fills with tokens at a fixed rate, up to a maximum; each request spends one; a request that finds the bucket empty waits or is refused. It allows a short burst, a person clicking quickly, but caps the sustained rate, which is what a script relies on.
+
+<Picture
+  src="/images/designs/ticketmaster/token-bucket.png"
+  alt="A hand-drawn diagram of a bucket filled with tokens at r tokens per second, holding at most b tokens, with arriving packets waiting until a token can be removed"
+  caption="A token bucket: tokens drip in at rate r, the bucket holds at most b, and each request (here a packet) must take a token to pass. A burst of up to b requests goes through at once; after that, requests are held to rate r. Per-account and per-address buckets let a person click freely and stop a script from hammering."
+  credit="Image: Lorenzo David and Luca Ghio, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:QoS_tocken_bucket.svg"
+  paper
+  narrow
+/>
+
+Rate limits have a known weakness: they're per something, and scalpers spread their traffic across thousands of accounts and residential IP addresses, each staying under the limit.
+
+**CAPTCHAs** ask the client to do something that's easy for a person and hard for a program, like reading distorted text or picking out pictures of buses. They raise the cost of each automated attempt. They also annoy every real fan, and both machine-learning models and paid human solving services have made them much weaker than they were, so they work best as a challenge shown only to sessions that already look suspicious.
+
+<Picture
+  src="/images/designs/ticketmaster/captcha-distorted-text.png"
+  alt="A word in a wavy, blurred and distorted typeface, of the kind used to tell people from programs"
+  caption="A classic text CAPTCHA: letters warped so that, when it was designed, people could read them and programs couldn't. Modern image recognition reads many of these easily, which is why ticketing sites lean more on signals they can check without asking the fan anything."
+  credit="Image: public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Captcha.svg"
+  paper
+  narrow
+/>
+
+**Attestation** asks a trusted party to vouch for the client without bothering the fan. A phone app can ask the operating system to sign a statement that it's a genuine copy of the app on a real device (Apple's App Attest, Google's Play Integrity). On the web, Privacy Pass, standardised by the IETF in 2024 as RFCs 9576 to 9578, lets a device that has already proved itself to an issuer present an unlinkable token saying "a real device vouches for this request", without revealing who the person is. None of these is proof of a fan; all of them make each fake session cost more.
+
+</Sub>
+
+<Sub n="6.4" title="The side doors">
+
+The 2023 testimony contains the most useful single detail of the 2022 sale for a designer: "for the first time in 400 Verified Fan onsales they came after our Verified Fan access code servers." The front door, the queue that admits only verified accounts, held. The bots went for a service that sat beside it and that every real buyer also needed. When that service struggled, real fans' checkouts failed and their holds ran out (4.3), and Ticketmaster had to slow the whole sale down. In Berchtold's words, "the attack required us to slow down and even pause our sales".
+
+<Callout label="Design implication">
+Every endpoint a fan touches during an on-sale is part of the on-sale, and needs the same protection as the front door: behind the waiting room's token, rate-limited, and sized for attack traffic, not just fan traffic. A code-checking service, a login service or a "check eligibility" call that can be hit without a token is the place an attacker will aim, because overloading it hurts real buyers without the attacker ever having to pass the queue.
+</Callout>
+
+With the crowd outside and the bots thinned out, the fans who are let in all want the same thing first: to see which seats are left.
+
+</Sub>
+
+<SectionHeading n="07" id="seat-map">The seat map</SectionHeading>
+
+<Sub n="7.1" title="Two kinds of data on one map">
+
+When Sofia is let in, the first thing she sees is the map, and every admitted fan reloads it every few seconds, because it's how you find out what's left. If each of those reloads asked the event owner for the state of 70,000 seats, we'd be back to a crowd in front of one process.
+
+Look at what a seat map is made of, though, and it splits into two very different kinds of data.
+
+<Picture
+  src="/images/designs/ticketmaster/busch-stadium-seating-chart-1968.jpg"
+  alt="A colour seating chart for Busch Memorial Stadium in 1968, showing numbered sections in rings around a soccer field, coloured by price, with a price key"
+  caption="A seating chart and price list for St. Louis Stars soccer games, 1968. Everything printed here, the sections, their shapes and their price colours, was the same for all 16 home games and was printed once. What changed from game to game, which seats were still for sale, was never on the paper. A web seat map has the same two layers."
+  credit="Image: Missouri Historical Society, no known copyright restrictions, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Seating_chart_and_prices_for_St._Louis_Stars_soccer_games_at_Busch_Memorial_Stadium,_1968_-_DPLA_-_89a20c45f19272fea40ceca6b9dbd5cc.jpg"
+  narrow
+/>
+
+- **The geometry**: where each section, row and seat is drawn, which price zone it's in, which seats are accessible. It's large (shapes for 70,000 seats) but it doesn't change during a sale. It can be built once, given a version number, and cached on every CDN server in the world, exactly like an image file.
+- **The availability**: which seats are available right now. It's small and it changes many times a second.
+
+Ticketmaster's interactive seat map has a history of its own. In August 2015 its engineering blog said the map was built on a Flash component, with work under way on JavaScript/SVG and HTML5 versions, an OpenGL version for mobile apps, and server-side rendering, all drawing the same venue data.
+
+</Sub>
+
+<Sub n="7.2" title="Availability as a snapshot">
+
+Availability, though, is small enough to treat as one value. Give each seat in the venue a fixed number from 0 to 69,999, and store one bit per seat: 1 if it's available, 0 if not. That's 70,000 bits, about **8.75 KB**, a **bitmap** of the whole stadium. With two bits per seat, to show "held" separately from "sold", it's about 17.5 KB, and since sold seats cluster in sections it compresses pretty well.
+
+So the event owner, which knows the true state of every seat, writes out a fresh bitmap every second or two. That snapshot is published to the CDN with a short cache lifetime, and every fan's map loads it from there. If 50,000 admitted fans each refresh every 5 seconds, that's 10,000 requests a second, all answered by the CDN; the event owner does the work of producing one snapshot per second, however many fans are looking.
+
+<SystemDiagram
+  title="Seat map reads: cached snapshots; holds: straight to the owner"
+  nodes={[
+    { id: "sofia", label: "Sofia's browser", sub: "admitted, token", kind: "laptop", col: 0, row: 1 },
+    { id: "cdn", label: "CDN", sub: "geometry + snapshot", kind: "cdn", col: 1, row: 0 },
+    { id: "geo", label: "Venue geometry", sub: "versioned, never changes in a sale", kind: "blob", col: 2, row: 0 },
+    { id: "snap", label: "Snapshot publisher", sub: "bitmap every ~1 s", kind: "service", col: 3, row: 0 },
+    { id: "sale", label: "Sale API", kind: "service", col: 1, row: 2 },
+    { id: "owner", label: "Event owner", sub: "true seat state", kind: "compute", col: 3, row: 2 },
+  ]}
+  edges={[
+    { from: "sofia", to: "cdn", label: "GET map" }, { from: "cdn", to: "geo", dashed: true },
+    { from: "cdn", to: "snap", dashed: true }, { from: "snap", to: "owner", label: "state" },
+    { from: "sofia", to: "sale", label: "hold F7+F8" }, { from: "sale", to: "owner" },
+  ]}
+  steps={[
+    { caption: "Sofia's map loads the venue geometry once. It's versioned and cached everywhere, so this is a CDN hit for almost every fan.", path: ["sofia", "cdn"], focus: ["geo"] },
+    { caption: "Every second or so, the snapshot publisher asks the event owner for the current state and writes a bitmap, about 9 KB for 70,000 seats.", path: ["owner", "snap"] },
+    { caption: "Her map polls for the latest bitmap every few seconds and colours the seats. The CDN answers; the owner never sees these requests.", path: ["sofia", "cdn"], focus: ["snap"] },
+    { caption: "When she clicks Hold, that request alone goes to the event owner, which checks the true state. The snapshot may be a second or two old; the hold decision never is.", path: ["sofia", "sale", "owner"] },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="7.3" title="When the map is wrong">
+
+A snapshot that's a second or two old will sometimes, maybe a few times a minute for a popular section, show a seat as available that somebody held a moment ago. Sofia clicks it, the hold fails, and she sees "someone beat you to it". That's the design working as intended: the map is a hint, and the hold is the decision. The alternative, a map that's never stale, would mean every view of the map going through the one process that can say for certain, and that's what we're trying to avoid.
+
+<Decision
+  q="How fresh does the seat map need to be?"
+  options={[
+    { name: "Always exact", how: "Every map load asks the event owner, or a strongly consistent replica, for current state.", good: ["No 'someone beat you to it' surprises"], bad: ["The busiest read in the sale goes to the one process that must not be overloaded", "Exact for a moment anyway: it's stale by the time she clicks"] },
+    { name: "A snapshot every second or two, cached", how: "The owner publishes a small bitmap; the CDN serves it to everyone.", good: ["Read load on the owner is constant, however many fans look", "Cheap: one tiny file per show per second"], bad: ["Some clicks hit seats that just went", "Fans may see seats flicker as holds come and go"], chosen: true },
+  ]}
+>
+What decides it is the second "bad" of the first option: even a perfect map is out of date by the time a person has moved the mouse, so exactness can't prevent the collision; only the hold can. A slightly stale map shifts some failures from "the site is down" to "pick another seat", a much better failure. To make collisions rarer, the map can grey out a seat as soon as this fan's own hold attempt on it fails, and hide sections that have sold out entirely.
+</Decision>
+
+</Sub>
+
+<Sub n="7.4" title="Let the server pick">
+
+There's another way to make collisions rarer: don't make fans pick from the map at all. With **best available**, Sofia asks for "2 seats, under $200, together" and the event owner chooses. Because one process sees the whole event, it can hand out different seats to requests that arrive together instead of letting them all collide on the same front-row pair.
+
+The 2014 "Tao of Ticketing" post explains why this search is harder than it sounds. Fans almost always buy several seats together, so the search must find a run of contiguous seats in one row, not any few seats from a bucket. It also tries not to leave single empty seats that nobody will buy, which means looking at the seats on either side of each candidate and at the ends of the row. Layers on top, price zones, production holds, seats reserved for particular deals, each add to the cost. That's part of why the post wanted one process per event, in memory: this search has to see the whole event at once.
+
+<Callout label="Design implication">
+Contention is a property of what you let people choose. If every fan can click any seat, everyone clicks the same few, and most clicks fail. If the server allocates, it can spread simultaneous requests across the venue. Many big on-sales offer both: best available by default, with the map for fans who want to choose.
+</Callout>
+
+We now have a sale that's exact, a crowd held outside, bots thinned, and reads served from cache. All of that is for one show. Ticketmaster sells many thousands of other events, and they're still running during the Eras Tour sale.
+
+</Sub>
+
+<SectionHeading n="08" id="isolation">Keeping one sale from taking down the site</SectionHeading>
+
+<Sub n="8.1" title="One hot event, a whole platform">
+
+Ticketmaster's 2022 statement estimated that "about 15% of interactions across the site experienced issues". The site, not just the Eras Tour sale. While the on-sale was happening, someone buying basketball tickets, or transferring a ticket to a friend, or logging in to check an order, could be caught up in it.
+
+That happens when the hot event shares things with everything else: the same web servers, the same login service, the same database connection pools, the same payment integration. When the hot sale saturates one of them, everything that uses it slows down, and their retries make it worse. The fix is the one ships use: a **bulkhead**, a wall that divides a hull into compartments so that a leak floods one compartment and not the whole ship. In software, a bulkhead gives a workload its own capacity, so it can exhaust only what's its own.
+
+<SystemDiagram
+  title="Bulkheads: the hot on-sale runs in its own compartment"
+  nodes={[
+    { id: "all", label: "All traffic", kind: "users", col: 0, row: 1 },
+    { id: "edge", label: "Edge", sub: "routes by event", kind: "cdn", col: 1, row: 1 },
+    { id: "wr", label: "Waiting room", sub: "event 4217", kind: "queue", col: 2, row: 0 },
+    { id: "hot", label: "Sale servers", sub: "dedicated to 4217", kind: "service", col: 3, row: 0, count: "×200" },
+    { id: "owner", label: "Event owner 4217", kind: "compute", col: 4, row: 0 },
+    { id: "rest", label: "Everything else", sub: "other events, accounts, transfers", kind: "service", col: 3, row: 2, count: "×400" },
+    { id: "inv", label: "Other event owners", kind: "compute", col: 4, row: 2 },
+  ]}
+  zones={[
+    { label: "Hot compartment: Eras Tour on-sale", nodes: ["wr", "hot", "owner"] },
+    { label: "Normal compartment", nodes: ["rest", "inv"] },
+  ]}
+  edges={[
+    { from: "all", to: "edge" }, { from: "edge", to: "wr" }, { from: "wr", to: "hot" }, { from: "hot", to: "owner" },
+    { from: "edge", to: "rest" }, { from: "rest", to: "inv" },
+  ]}
+  steps={[
+    { caption: "Every request reaches the edge, which looks at which event it's for.", path: ["all", "edge"] },
+    { caption: "Requests for the hot event go to its own waiting room and its own pool of sale servers, sized and paid for in advance.", path: ["edge", "wr", "hot", "owner"] },
+    { caption: "Everyone else's traffic, other events, account pages, ticket transfers, goes to a separate pool that the hot event can't touch.", path: ["edge", "rest", "inv"] },
+    { caption: "If the hot compartment saturates, its waiting room slows admissions. The normal compartment doesn't notice.", focus: ["wr", "hot", "owner"] },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="8.2" title="What has to be separated">
+
+Separating the obvious pieces is easy: the waiting room, the sale servers and the event owner are per event already. The hard part is the shared services that every compartment needs, because a bulkhead with a hole in it doesn't work. A few that matter:
+
+- **Login and accounts.** Every fan in the queue signs in. Give the on-sale its own login capacity, or let the waiting room's token stand in for repeated session checks inside the sale.
+- **Code validation and eligibility checks.** The 2022 weak spot. Run them at the moment of admission, inside the hot compartment, so the side door from 6.4 doesn't exist.
+- **Payment.** Card processors have their own limits, and checkouts for a huge sale can exceed them. Separate rate limits for the hot event's payments keep a burst of Eras checkouts from crowding out every other purchase.
+- **Databases.** Separate connection pools at least, so a hot event can't use every connection; separate database shards for orders if possible.
+
+Inside each compartment, **priorities** decide what to drop first when it's overloaded: the 2014 post's "prioritizing" requirement. A request that completes a sale (confirming a hold that's been paid for) is worth more than one that starts a new hold, which is worth more than a map refresh. When the system is overloaded, dropping the cheap, repeatable requests first lets the ones that turn into tickets finish.
+
+<Callout label="Common mistake" kind="warn">
+Isolating the servers but sharing a dependency. Two pools of sale servers that both call one login service, one code validator or one payment gateway are one system as far as overload is concerned. Draw every dependency of the hot path and check which ones the rest of the site also uses; each shared one needs its own limit for the hot event.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="09" id="prescaling">Getting ready before 10:00</SectionHeading>
+
+<Sub n="9.1" title="Autoscaling is too slow">
+
+Most of a cloud system's capacity is added by an **autoscaler**, a controller that watches load and starts more servers when it rises (chapter 42). It reacts in minutes: it has to see the load, decide, start machines, and wait for them to warm up. An on-sale goes from quiet to its peak in about a second. By the time the autoscaler has reacted, the first, most important minutes of the sale are over, and the system has spent them overloaded.
+
+So an on-sale is **pre-scaled**: capacity is added before 10:00, sized from a forecast. Verified Fan makes the forecast much better than a guess. Ticketmaster knew a month ahead that 3.5 million people had registered, 1.5 million had codes, and roughly 40% of those would buy. What it didn't forecast was the traffic from bots and people without codes: "unprecedented traffic", four times its previous peak. Pre-scaling has to cover the crowd you don't expect as well as the one you invited, another argument for a waiting room that can absorb almost anything at the edge.
+
+</Sub>
+
+<Sub n="9.2" title="Load testing the sale">
+
+Then the forecast becomes a test. A **load test** sends synthetic traffic at the system to see where it breaks, before real fans find out. For an on-sale it should look like the real thing, which means:
+
+- **The shape, not just the volume**: almost nothing, then everyone in the same second, then a long tail of refreshes.
+- **The contention**: thousands of synthetic fans trying to hold the *same* few hundred seats, not spread evenly over the venue. An evenly spread test misses the hot-seat problem entirely.
+- **The attackers**: bots hammering every endpoint they can reach, including the side doors from 6.4, not only the front door.
+- **The failures**: a cache node lost, a dependency slowed down, the event owner failing over, in the middle of the peak.
+- **A margin above the forecast.** A test at twice the previous peak would have passed and still missed a day at four times it.
+
+Those tests also calibrate the dials from section 5: how many active shoppers the sale servers and the event owner can take, and so how many admissions a minute the waiting room should allow.
+
+</Sub>
+
+<Sub n="9.3" title="Spreading the demand">
+
+One last tool is not technical at all. In the 2023 testimony, Berchtold said that in hindsight Ticketmaster could have done better by "staggering the sales over a longer period of time". The Eras Tour presale put many dates on sale over a short window, so many hot events peaked together and shared the same edge, login and payment capacity.
+
+<Decision
+  q="One huge on-sale, or several smaller ones?"
+  options={[
+    { name: "Everything at once", how: "All dates open at the same time.", good: ["Simple for fans to follow", "Every fan has the same chance on day one"], bad: ["Peaks add up across dates", "Fans open several tabs for several dates and multiply the load"] },
+    { name: "Staggered by region or date", how: "Groups of dates go on sale on different days or hours.", good: ["Each peak is smaller and can be pre-scaled for", "Lessons from the first wave apply to the next"], bad: ["A longer sale, and fans who miss one wave try again in the next", "Later waves can feel like second chances for scalpers too"], chosen: true },
+  ]}
+>
+When demand is far above supply, the platform can't change how many people go home without tickets; Ticketmaster's own statement said demand for the Eras Tour would have filled over 900 stadium shows. What it can change is whether the sale stays up. Splitting the sale caps each peak at something that can be tested in advance, and pre-scaling and load testing need exactly that.
+</Decision>
+
+<Picture
+  src="/images/designs/ticketmaster/black-friday-crowd-fifth-avenue-2011.jpg"
+  alt="A dense crowd of shoppers filling a Manhattan street on Black Friday, with yellow taxis behind them"
+  caption="Black Friday outside the Apple Store on Fifth Avenue, New York, in 2011. A flash sale, a sneaker drop and a stadium on-sale share this shape: a fixed amount of stock, a known start time, and a crowd that arrives all at once. Every one of them ends up with some version of a queue at the door and a limit on what each person can take."
+  credit="Photo: JoeInQueens, CC BY 2.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Black_Friday_at_the_Apple_Store_on_Fifth_Avenue,_New_York_City,_2011.jpg"
+/>
+
+<Elsewhere items={[
+  { where: "Alibaba's Singles' Day (11.11)", how: "Alibaba reported a peak of 583,000 orders a second 26 seconds after midnight on 11 November 2020. Most items are fungible stock, so inventory is a counter to decrement, not a seat map." },
+  { where: "Sneaker drops", how: "Limited releases face the same bots and the same 'everyone at 10:00' spike; many retailers moved from first-come sales to timed draws so speed stops mattering." },
+  { where: "General admission tickets", how: "A standing-room ticket is a counter, not a seat: 'decrement if greater than zero' is one atomic operation, with no search for adjacent seats. The 2014 Ticketmaster post makes exactly this comparison with Amazon's stock." },
+]} />
+
+</Sub>
+
+<SectionHeading n="10" id="whole">The whole system</SectionHeading>
+
+<Sub n="10.1" title="Every box, and why it's there">
+
+Here is Sofia's whole morning on the finished design, from her registration a month earlier to the tickets in her account.
+
+<SystemDiagram
+  title="A stadium on-sale, end to end"
+  nodes={[
+    { id: "sofia", label: "Sofia's browser", kind: "laptop", col: 0, row: 1 },
+    { id: "reg", label: "Registration", sub: "Verified Fan, codes", kind: "service", col: 1, row: 0 },
+    { id: "edge", label: "Edge / CDN", sub: "token check, rate limits, map files", kind: "cdn", col: 1, row: 1 },
+    { id: "wr", label: "Waiting room", sub: "shuffle, admit N/min", kind: "queue", col: 2, row: 0 },
+    { id: "sale", label: "Sale API", sub: "hot compartment", kind: "service", col: 2, row: 1 },
+    { id: "owner", label: "Event owner", sub: "seats + holds in memory", kind: "compute", col: 3, row: 1 },
+    { id: "orders", label: "Orders DB", sub: "durable sales", kind: "db", col: 3, row: 2 },
+    { id: "snap", label: "Snapshot publisher", sub: "bitmap ~1 s", kind: "service", col: 3, row: 0 },
+    { id: "pay", label: "Payment provider", sub: "authorize, capture", kind: "external", col: 2, row: 2 },
+  ]}
+  zones={[{ label: "Hot compartment for this on-sale", nodes: ["wr", "sale", "owner", "snap"] }]}
+  edges={[
+    { from: "sofia", to: "reg", label: "weeks before" }, { from: "sofia", to: "edge" },
+    { from: "edge", to: "wr" }, { from: "edge", to: "sale", label: "token" },
+    { from: "sale", to: "owner", label: "hold / confirm" }, { from: "owner", to: "orders" },
+    { from: "owner", to: "snap" }, { from: "snap", to: "edge", dashed: true },
+    { from: "sale", to: "pay" },
+  ]}
+  steps={[
+    { caption: "Weeks before: Sofia registers. Registrations are screened, invitations sized to expected supply, and her account is marked as allowed to queue.", path: ["sofia", "reg"] },
+    { caption: "Before 10:00 she joins the waiting room. At 10:00 everyone waiting is shuffled, one entry per account; she gets position 2,143.", path: ["sofia", "edge", "wr"] },
+    { caption: "Her turn comes and the waiting room signs her a token. From now on the edge checks it on every request, with rate limits per account.", path: ["wr", "edge", "sale"] },
+    { caption: "Her map loads geometry and a seat bitmap from the CDN; neither request reaches the event owner.", path: ["snap", "edge", "sofia"] },
+    { caption: "She holds F7 and F8: the event owner checks both are free and holds them for her cart for 8 minutes, all or nothing.", path: ["sofia", "edge", "sale", "owner"] },
+    { caption: "Checkout authorizes her card with the cart ID as the idempotency key.", path: ["sale", "pay"] },
+    { caption: "The event owner confirms the hold is still hers and in time, and records the sale durably before saying yes.", path: ["sale", "owner", "orders"] },
+    { caption: "The payment is captured and her tickets appear. The next snapshot shows F7 and F8 as sold.", path: ["sale", "pay"], focus: ["snap"] },
+  ]}
+/>
+
+| Component | What it does | Added because |
+|---|---|---|
+| Conditional writes | Change a seat only if it's still in the expected state | Check-then-act sold seats twice (§2) |
+| Holds with deadlines | Keep seats for one cart while it pays, then release automatically | Payment takes minutes; abandoned carts stranded seats (§3) |
+| Confirm-time check | Record a sale only for a hold that's still valid | Late payers bought seats that had moved on (§3.4) |
+| Event owner | One process per show holds seat state and serialises changes | Every request contends for the same seats (§3.5) |
+| Authorize, then capture | Charge only after the sale is recorded | A failed sale must not leave a charge (§4) |
+| Waiting room + tokens | Admit fans at the rate the sale can serve, in a fair order | The crowd at 10:00 would bury the event owner (§5) |
+| Verified Fan, rate limits, attestation | Make each bot session cost more than it earns | Bots win any race decided by speed or volume (§6) |
+| Cached map snapshot | Serve availability from the CDN, one small bitmap per second | Map reads would swamp the event owner (§7) |
+| Bulkheads | Give the hot sale its own capacity and dependencies | One sale degraded 15% of the whole site (§8) |
+| Pre-scaling, load tests, staggering | Have the capacity ready before the spike | Autoscalers react in minutes; the spike takes a second (§9) |
+
+</Sub>
+
+<Sub n="10.2" title="From top to bottom">
+
+| Level | The choice | Data structure or algorithm |
+|---|---|---|
+| System | Keep the crowd away from the one process that decides | Waiting room in front, CDN for reads, a single writer behind |
+| Admission | Random order among those waiting, one entry per account | Shuffle at start, then FIFO; HMAC-signed tokens checked at the edge |
+| Rate | Admit what the sale can serve | Little's law: active shoppers = admission rate × time shopping |
+| Inventory | One owner per event | In-memory seat array; requests handled one at a time |
+| Holds | Reservations that end by themselves | Deadline per seat; lazy expiry; Redis SET NX PX or a row with hold_until |
+| Multi-seat | All or nothing | A transaction, or a Lua script that checks every key before setting any |
+| Sale | Exactly once | Compare-and-set on (holder, deadline); authorize then capture with idempotency keys |
+| Seat map | Hint, not truth | Versioned geometry; availability bitmap, 1 or 2 bits per seat, about 9 to 18 KB |
+| Abuse | Make volume expensive | Token buckets per account and address; CAPTCHAs on suspicion; attestation tokens |
+
+</Sub>
+
+<SectionHeading n="11" id="breaks">What goes wrong, and what it costs</SectionHeading>
+
+<Sub n="11.1" title="Failures this design has to survive">
+
+| What happens | What the fan sees | What the design does |
+|---|---|---|
+| Two fans click the same seats at once | One gets them; the other sees "someone beat you to it" | The hold is a compare-and-set; the second fails cleanly |
+| A fan abandons the cart | Nothing; the seats reappear a few minutes later | The hold's deadline passes and the seat is available on the next request |
+| A fan pays after the hold expired | "Your time ran out", and no charge | Confirm checks the hold; the authorization is cancelled |
+| The hold store fails over and loses holds | Rarely, a hold vanishes; at worst one fan is refused at checkout | The durable sale is still a conditional write; no double sale |
+| A dependency (code check) slows down | A slower checkout, but the cart keeps its seats | Holds are extended for platform-caused delays; checks run at admission |
+| Traffic far above forecast | A longer wait in the queue | The waiting room slows admission; the sale behind it stays healthy |
+| Bots open thousands of sessions | Nothing directly | One entry per account, rate limits, verified accounts only |
+| The event owner process dies | A pause of seconds; some holds may need retrying | A standby takes over from the durable log of sales |
+| The hot sale saturates its servers | Slower sale for this event only | Bulkheads keep other events and account pages unaffected |
+
+</Sub>
+
+<Sub n="11.2" title="The tradeoffs, in one table">
+
+| Decision | Chosen | Given up | Why it was worth it |
+|---|---|---|---|
+| Where seat state lives | One owner process per event | Horizontal scaling within an event | Contention is on the same seats; sales per second are small |
+| Holds | Deadlines, lazy expiry | Seats out of circulation for minutes | Abandoned carts can't strand seats; no cleanup job needed for correctness |
+| Hold length | About 8 minutes | Faster recirculation | Real checkouts, including bank confirmation, finish in time |
+| Payment | Authorize, record sale, capture | A slightly longer checkout | A failed sale never leaves a charge |
+| Queue order | Random at start, one entry per account | The feeling that early means first | Speed and extra sessions stop winning |
+| Admission rate | Fixed, tested in advance | Shorter waits | The sale stays up and the queue tells the truth |
+| Seat map | Cached snapshot | Exact availability | Map reads don't touch the event owner |
+| Isolation | A compartment per hot sale | Shared, cheaper capacity | One sale can't degrade the whole site |
+| Sale schedule | Staggered waves | One simple day | Each peak is small enough to test |
+
+</Sub>
+
+<SectionHeading n="12" id="summary">Summary</SectionHeading>
+
+1. **The work is small and the crowd is huge**: a stadium sells about 20 seats a second, while the Eras Tour presale brought 3.5 billion requests in a day.
+2. **Check-then-act sells seats twice**: reading "available" and then writing "sold" lets every fan who read in the same instant buy the same seat.
+3. **A conditional write makes the check and the write one step**, so exactly one buyer wins each seat.
+4. **Payment takes minutes, so seats need a hold**: a reservation for one cart that ends by itself at a deadline, with lazy expiry so nothing has to clean it up on time.
+5. **A hold can be a row with a deadline or a Redis key set with NX and PX**, with a Lua script for several seats at once and an owner check before release.
+6. **The sale must check the hold when it's recorded**: without that, late payers buy seats that have moved on.
+7. **Put the sale between authorize and capture**, with idempotency keys, so a failed sale never leaves a charge.
+8. **A waiting room admits fans at the rate the sale can serve**, using signed tokens the edge can check without a database, and Little's law to pick the rate.
+9. **FIFO hands the queue to bots; a shuffle with one entry per account doesn't**, and the deduplication has to happen before the draw.
+10. **The seat map is a cached hint and the hold is the decision**: geometry cached forever, availability as a small bitmap every second.
+11. **Isolate the hot sale and get ready before it starts**: bulkheads including every dependency, pre-scaling from registrations, contention-shaped load tests, and staggered sales.
+
+<SectionHeading n="13" id="build">Build this</SectionHeading>
+
+**A one-show on-sale you can break.**
+
+- Run Redis locally. Write a small HTTP service with three endpoints: `GET /map` (returns an availability bitmap for 1,000 seats), `POST /hold` (takes a cart ID and a list of seats, uses the Lua script from 3.3 with an 8-minute expiry), and `POST /confirm` (records the sale in SQLite with the conditional update from 3.2).
+- Write a load generator that starts 5,000 simulated fans at once, all aiming at the 50 seats nearest the stage. Count confirmations and check that no seat appears twice in SQLite.
+- Remove the hold check from `/confirm` and run again. Then make 10% of fans pay after 9 minutes, and count the double sales.
+- Put a waiting room in front: a counter that hands out signed tokens (HMAC with a secret) at N per second, and have the service refuse requests without a valid token. Find the N at which `/hold` latency stays under 50 ms.
+- Serve `/map` from a file rewritten every second and put a caching proxy in front. Measure how often a fan clicks a seat the map showed as free and the hold fails.
+
+<SectionHeading n="14" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="How do you stop two people buying the same seat?">
+Never read a seat's status and then write it in a separate step, because another buyer can act in between. Make the check and the write one atomic operation: an UPDATE with a WHERE clause that requires the seat still be available (and check how many rows changed), a SET NX in Redis, or a single process per event that handles one request at a time. Whoever runs second finds the seat taken and is told so.
+</QA>
+
+<QA level="beginner" q="Why do ticket sites give you a countdown timer at checkout?">
+Because payment takes minutes and the seats must be yours while you pay, but the site can't keep them forever in case you walk away. A hold reserves the seats for your cart until a deadline. If you pay in time, the hold becomes a sale; if not, the seats become available to the next person automatically. Without the deadline, abandoned carts would keep seats off sale indefinitely.
+</QA>
+
+<QA level="intermediate" q="Design a seat hold with Redis. What can go wrong?">
+Use one key per seat per show, set with SET key cart-id NX PX ttl, so the hold succeeds only if nobody holds the seat and disappears at the deadline. For several seats, use a Lua script that checks every key before setting any, with a hash tag so the keys share a cluster slot. Release only if the value is still your cart ID, again in a script. What can go wrong: a Redis failover can lose recent holds, because replication is asynchronous, so two fans might both believe they hold a seat. That's tolerable only if the final sale is recorded in a durable store with a conditional write that checks the hold, so at worst one fan is refused at checkout, never sold a duplicate.
+</QA>
+
+<QA level="intermediate" q="How does a virtual waiting room protect the sale, and how do you decide the admission rate?">
+It's a separate, deliberately simple system in front of the sale that every visitor must pass. It serves a cached waiting page, assigns positions, and lets people in at a controlled rate by issuing signed tokens that the edge checks on every request without a database lookup, so only admitted fans reach the inventory. The rate comes from Little's law: active shoppers equal admission rate times average time spent shopping, so if the sale can handle 5,000 concurrent shoppers and checkout takes about 5 minutes, admit about 1,000 a minute, and confirm the number with load tests.
+</QA>
+
+<QA level="deep" q="FIFO or random queue order: which is fairer?">
+FIFO by arrival time rewards speed, and scripts are a hundred times faster than people, so in a simulation where bots are 9% of sessions they take the entire front of the queue. A pre-queue shuffled at the start removes the speed advantage, so bots get their share of sessions. That still rewards running many sessions, so entries must be one per account, deduplicated before the draw; keeping each account's best-placed session after the shuffle still gives bots far more than their share. After that, the contest moves to creating and verifying accounts, and registration schemes like Verified Fan address that. Whichever rule you choose, publish it, because fans judge fairness by what they can see.
+</QA>
+
+<QA level="deep" q="In 2022 Ticketmaster's front-door queue held, but the sale still had to be slowed and fans lost carted tickets. What's the lesson for the design?">
+The bots attacked the Verified Fan access code servers, a service beside the queue that every real buyer also needed, and when it struggled, code validation errors made fans lose the seats in their carts. Two lessons follow. Every endpoint touched during an on-sale must be behind the same admission control and sized for attack traffic, with checks like code validation done once at admission, not at the last step of checkout. And holds should extend when the delay is the platform's fault, so a struggling dependency doesn't spend the fans' time for them.
+</QA>
+
+<SectionHeading n="15" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Holds expire after 8 minutes, and nothing ever deletes expired holds. Why doesn't that leave seats stuck?">
+    Because expiry is lazy: every statement that takes a hold treats a seat
+    whose deadline has passed as available. The first fan to ask for the seat
+    after the deadline gets it. A sweeper may tidy up for reports and the map,
+    but correctness doesn't depend on it.
+  </Q>
+  <Q q="A fan's hold expired a minute ago and someone else now holds the seat. The fan's payment authorization just succeeded. What happens?">
+    The confirm step checks that the hold is still theirs and in time, finds it
+    isn't, and refuses. The checkout service cancels the authorization, so the
+    fan is never charged, and tells them the time ran out.
+  </Q>
+  <Q q="The waiting room admits 2,000 people a minute and each spends about 4 minutes shopping. How many are shopping at once?">
+    About 2,000 × 4 = 8,000, by Little's law. That's the load the sale and the
+    event owner must be tested for.
+  </Q>
+  <Q q="Why is the availability bitmap for a 70,000-seat stadium cheap to serve to 50,000 fans every few seconds?">
+    It's about 8.75 KB at one bit per seat, and the event owner publishes one
+    copy a second to the CDN. Every fan's refresh is a cache hit, so the owner's
+    work doesn't grow with the number of fans looking.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Taylor Swift | The Eras Tour Onsale Explained (Ticketmaster, 19 Nov 2022)">
+    Ticketmaster's own account: 3.5 million registrations, 1.5 million codes,
+    3.5 billion requests, 15% of interactions with issues, and how Verified Fan
+    was meant to work.
+  </WildCard>
+  <WildCard name="Joe Berchtold, opening statement to the Senate Judiciary Committee (24 Jan 2023)">
+    Three times the previous bot traffic, the attack on the access code servers,
+    and the lessons Live Nation drew, including staggering sales.
+  </WildCard>
+  <WildCard name="Kurt Granroth, 'The Tao of Ticketing' (Ticketmaster Technology blog, 2014)">
+    Why Ticketmaster's Inventory Core ran one event per process, in memory, and
+    why seat search can't just be sharded.
+  </WildCard>
+  <WildCard name="Redis documentation: SET">
+    NX, PX and the other options, and the pattern for a lock that releases only
+    if you still hold it.
+  </WildCard>
+  <WildCard name="Cloudflare Waiting Room documentation">
+    Total active users, new users per minute, session duration, FIFO and random
+    queueing, and pre-queues with shuffle at event start.
+  </WildCard>
+  <WildCard name="Queue-it: how Queue-it works (developer docs)">
+    Randomisation at sale start, first-come after, outflow rates, and why
+    server-side connectors make a queue unskippable.
+  </WildCard>
+  <WildCard name="Privacy Pass, RFCs 9576–9578 (IETF, 2024)">
+    The architecture and protocols behind attestation tokens that vouch for a
+    client without identifying it.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="16" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Designing Stripe">
+    Idempotency keys, authorize and capture, and token-bucket rate limits, the
+    payment half of every checkout here. [Chapter 52](/topics/52-design-stripe).
+  </WildCard>
+  <WildCard name="Transactions & Isolation">
+    Why check-then-act fails, and how row locks and isolation levels make
+    conditional updates safe. [Chapter 19](/topics/19-transactions-isolation).
+  </WildCard>
+  <WildCard name="Redis">
+    Single-threaded command execution, Lua scripts, expiry and replication,
+    everything a Redis hold store depends on. [Chapter 22](/topics/22-redis).
+  </WildCard>
+  <WildCard name="Queueing & Capacity">
+    Little's law, autoscalers and load testing, for sizing the admission rate
+    and pre-scaling. [Chapter 42](/topics/42-queueing-and-capacity).
+  </WildCard>
+  <WildCard name="Caching">
+    CDN caching and staleness, the basis of the seat-map snapshot.
+    [Chapter 25](/topics/25-caching).
+  </WildCard>
+  <WildCard name="Designing Uber">
+    Another case study that sorts its data by the cost of being wrong.
+    [Chapter 50](/topics/50-design-uber).
+  </WildCard>
+</CardGrid>
