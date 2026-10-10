@@ -1,0 +1,1084 @@
+---
+title: Designing Notion
+dek: "Asha adds a to-do to a big team wiki and drags it into a private sub-page, while Rohan has the same page open. We'll design the system behind that moment: a page stored as a tree of blocks, permissions found by walking up the tree, a Postgres database sharded in 2021 and again in 2023, a data lake fed by every edit, and a browser that keeps its own SQLite copy of your pages."
+readingTime: "~50 min"
+level: "Intermediate"
+versions: "Figures from Notion's engineering blog (2021–2026), and Apache Hudi, Debezium and Kafka docs, dated where they appear"
+prereqs: "chapter 21 (Postgres) helps, chapter 29 (partitioning) helps, the Figma case study (chapter 64) helps"
+updated: "2026-10-11"
+---
+
+Asha works at a payments company in Bengaluru with roughly 2,000 people, and on Monday morning she opens the Engineering wiki in Notion. It's a long page: to-dos for the week, links to a sub-page for every team, an embedded table of incidents. She clicks at the end of "Ship search", presses Enter and types a new to-do, "Review shard runbook". Then she grabs the six-dot handle beside it and drags it into the On-call notes sub-page, which only the SRE team can open. Across the office, Rohan has the wiki open too. On his screen the to-do appears and then vanishes again, without him reloading anything.
+
+<Picture
+  src="/images/designs/notion/tree-structure-representation.svg"
+  alt="Five ways of drawing the same tree: nested circles, an indented outline, a node-and-edge diagram, a parenthesised expression and a numbered list"
+  caption="One tree, drawn five ways. The indented outline (b) is what Asha sees on her page; the node-and-edge drawing (a) is closer to what Notion stores. Each line is a node, and indenting a line makes it a child of the line above."
+  credit="Image: Dewrys, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Tree_structure_representation.svg"
+  paper
+  narrow
+/>
+
+It looks like editing a document, and a document is the obvious way to store it. But a Notion page is an odd kind of document. Any line can be dragged anywhere, turned from a to-do into a heading, or indented under another line. A line can be a whole page, and a page can be a row in a table. A sub-page can be private while the page around it is open to everyone. And the wiki is one of hundreds of billions of such pieces, kept in a relational database that had to be split across dozens of machines while people kept typing.
+
+In this case study we'll design the system behind Asha's to-do, starting from the simplest design and fixing it each time it breaks. We'll keep returning to one question: **how do you store a page made of thousands of small, movable pieces so that every edit saves at once, shows up for everyone else, and keeps working as the pieces grow into the hundreds of billions?** Our answer runs from a tree of blocks and a walk up parent pointers, through two rounds of sharding Postgres, to a data lake and a database inside the browser.
+
+<SectionHeading n="01" id="requirements">What we're building, and how big</SectionHeading>
+
+<Sub n="1.1" title="What it has to do">
+
+Leaving aside sign-in and billing, the core of Notion is short:
+
+1. **Show a page fast**, including nested lists, tables and links to sub-pages.
+2. **Edit anything**: type, drag, indent, change a line's type, with no Save button.
+3. **Live updates**: when Asha changes the page, Rohan sees it within roughly a second.
+4. **Permissions**: a page can be shared with the company, a team or one guest, and everything inside it follows.
+5. **Databases**: tables and boards whose rows are themselves pages.
+6. **Search and AI** over everything a person may see.
+
+And the qualities it needs: an edit that appeared on screen must never be lost; a page you've seen before should open instantly; the SRE team's notes must never leak to anyone else, in a page, a search result or an AI answer; and the storage underneath must be able to grow while the product stays up.
+
+</Sub>
+
+<Sub n="1.2" title="How big is it?">
+
+Notion said in September 2024 that it had passed 100 million users the month before, up from 1 million in 2020. Its 2024 post on its data lake gives the figure that matters more for storage: the table of blocks, the small pieces every page is made of, held more than 20 billion rows at the start of 2021 and more than 200 billion by 2024. According to the same post, Notion's data was doubling every six to twelve months and had reached hundreds of terabytes, even compressed.
+
+<Think
+  q="Suppose a block row (one line of text with its ids, type, timestamps and list of children) takes roughly 1 KB in the database, indexes included. What do 200 billion of them weigh? If one database server should hold at most 10 TB, how many servers is that?"
+  hint="200 billion × 1 KB, then divide by 10 TB. Then remember the data doubles every year or so."
+>
+200 billion × 1 KB is 200 TB. (The 1 KB is an assumption; Notion doesn't publish an average row size, though "hundreds of terabytes" is the same order.) At 10 TB a server, which was the ceiling Notion set itself in 2021, that's at least 20 servers for the blocks alone, with nothing spare for growth.
+
+So the blocks can't live on one machine. Notice the shape of the work too: Asha's two changes touch three or four rows each, and edits like them arrive all day from millions of people. It's a stream of small writes to one enormous table, which relational databases handle well, as long as the table fits.
+</Think>
+
+</Sub>
+
+<SectionHeading n="02" id="v1">Version 1: a page is a document</SectionHeading>
+
+<Sub n="2.1" title="The obvious design">
+
+Most of us would first sketch a design that stores each page as one document. A `pages` table has a row per page with an id, a title, an owner, and a `body` column holding the whole page as HTML or JSON. Opening the wiki reads one row; saving writes it back.
+
+<SystemDiagram
+  title="Version 1: one row per page, the whole page in one column"
+  nodes={[
+    { id: "asha", label: "Asha's browser", kind: "laptop", col: 0, row: 0 },
+    { id: "rohan", label: "Rohan's browser", kind: "laptop", col: 0, row: 1 },
+    { id: "api", label: "API server", kind: "service", col: 1, row: 0 },
+    { id: "db", label: "pages table", sub: "id, title, body", kind: "db", col: 2, row: 0 },
+  ]}
+  edges={[
+    { from: "asha", to: "api", label: "PUT page" },
+    { from: "rohan", to: "api", label: "PUT page" },
+    { from: "api", to: "db" },
+  ]}
+  steps={[
+    { caption: "Asha opens the wiki. The server reads one row and sends the whole body, roughly a few hundred kilobytes for a long page.", path: ["asha", "api", "db"] },
+    { caption: "She adds one to-do. Her browser sends the whole page back, and the server overwrites the row.", path: ["asha", "api", "db"] },
+    { caption: "Rohan loaded the page before her change. When he ticks a box and saves, his copy, without her to-do, replaces hers.", path: ["rohan", "api", "db"] },
+  ]}
+  caption="It works for one person editing a small page. Everything that goes wrong below comes from treating the page as one indivisible thing."
+/>
+
+</Sub>
+
+<Sub n="2.2" title="Where it breaks">
+
+Monday morning breaks this design in four places.
+
+- **Every edit rewrites the page.** Asha changed one line, but hundreds of kilobytes cross the network and get written to disk, all day.
+- **Two editors overwrite each other.** Whoever saves last replaces the whole page, and the other person's work is gone.
+- **Permissions have nowhere to live.** If the On-call notes sub-page is inside the wiki's body, there's no way to hide just that part from people outside the SRE team.
+- **Pages can't nest inside other things.** Rows of the incident table open as full pages. Here a row isn't a page, so tables need a second storage system, and comments a third.
+
+Those first two are one problem: the unit of storage is much bigger than the unit of change. Points three and four say that a page is a tree of things, some of them pages, and storage should be that tree. Both point to the same fix: stop storing pages and store the pieces.
+
+</Sub>
+
+<SectionHeading n="03" id="blocks">Everything is a block</SectionHeading>
+
+<Sub n="3.1" title="A block and its five fields">
+
+Notion's answer, described by engineer Jake Teton-Landis in May 2021 in "The data model behind Notion's flexibility", is that every piece of content is a **block**: each paragraph, heading, to-do, image, page and table row. A block is one row in a database table, with five fields that matter:
+
+| Field | What it holds | Asha's new to-do |
+|---|---|---|
+| `id` | A random UUID, a 128-bit identifier the client can make up on the spot without clashing with anyone | `9f3c…` |
+| `type` | How to draw it: `text`, `header`, `to_do`, `page`, … | `to_do` |
+| `properties` | A small map of attributes, most often `title`, the text itself | `title: "Review shard runbook"` |
+| `content` | The ids of its child blocks, in order | empty |
+| `parent` | The id of the block it sits in | the wiki's id |
+
+`content` points down the tree and `parent` points up. A page's `content` lists everything on the page in order, so a line's position on the page is its position in its parent's list, and the page is just the block at the top. That's the picture at the start of this chapter: Asha sees outline (b), and Notion stores tree (a).
+
+Two things follow straight away. First, **the type is only a label**. Turning a to-do into a heading changes the `type` field and nothing else; the text and the children stay put, so Notion can switch a line between a bullet, a to-do and a toggle without losing anything. Second, **indentation is structure**. Pressing Tab moves a block into the `content` list of the block above it, and the parent's type decides how children are drawn: a bulleted list indents them, a toggle hides them until clicked, and a page shows them on a page of their own.
+
+</Sub>
+
+<Sub n="3.2" title="Pages, databases and rows are blocks too">
+
+That last rule is what lets everything nest. A **page** is a block of type `page`. On its parent it appears as one line, a link, and its children are drawn when you open it. On-call notes, the sub-page, is an entry in the wiki's `content` list, exactly like a to-do.
+
+A Notion **database**, a table or board, is a block too, and each of its rows is a page block whose properties are the table's columns: an incident's severity, date and owner, beside its title. Open the row and it's a full page with blocks inside. So the incident table, a row in it and a paragraph in that row are the same kind of record, linked by `content` and `parent`. (Something must also hold a table's column definitions. Notion's 2021 sharding post lists a `collection` table next to `block`; it probably holds those definitions, but its contents are unpublished.)
+
+<Figure caption="A slice of the Engineering wiki as Notion stores it. Each box is one row of the block table; lines down are `content` lists, and every block's `parent` points back up.">
+<Tree
+  nodeWidth={128}
+  root={{ label: "workspace", sub: "Acme", children: [
+    { label: "page", sub: "Engineering wiki", children: [
+      { label: "to_do", sub: "Ship search" },
+      { label: "to_do", sub: "Review runbook" },
+      { label: "page", sub: "On-call notes", children: [
+        { label: "text", sub: "Pager rota" }
+      ] },
+      { label: "database", sub: "Incidents", children: [
+        { label: "page", sub: "INC-142", children: [
+          { label: "text", sub: "Timeline" }
+        ] }
+      ] }
+    ] }
+  ] }}
+/>
+</Figure>
+
+<Decision
+  q="What is the unit of storage?"
+  options={[
+    { name: "One document per page", how: "The whole page as HTML or JSON in one row.", good: ["One read opens a page", "Easy to export"], bad: ["Every edit rewrites the page", "Concurrent saves overwrite each other", "Can't share or nest part of a page"] },
+    { name: "One row per block", how: "Every paragraph, page and table row is a record with a type, properties, ordered children and a parent.", good: ["An edit touches a few small rows", "Anything can nest inside anything", "Changing type keeps the content"], bad: ["Opening a page reads many rows", "Hundreds of billions of rows to store"], chosen: true },
+  ]}
+>
+Notion chose blocks, and much of this chapter is the bill: a table so large it had to be split across machines, and page loads that need many rows. In return, the product's flexibility comes from five fields, and a new kind of content is a new `type`, not a new storage system.
+</Decision>
+
+</Sub>
+
+<Sub n="3.3" title="Who can see a block? Walk up the tree">
+
+Now the permissions problem. Everyone at Acme can open the wiki, but only the SRE team can open On-call notes. When Rohan's browser asks for the line "Pager rota", the server must decide whether he may read it.
+
+Storing permissions on every block would mean copying them onto millions of rows and rewriting all of those whenever someone changes a page's sharing. So blocks **inherit** permissions instead: a block is visible to whoever may see the nearest block above it that sets permissions explicitly, with the workspace at the top as the default. So the question becomes "what is above this block?"
+
+<Why>Why not find the ancestors through the content lists?</Why>
+
+Those `content` lists already describe the tree, but Notion's post gives two reasons not to use them for this. A block can be referenced from more than one `content` list, so "the block above" would be ambiguous. And finding which lists mention an id means searching, which is slow. So each block also keeps one upward pointer, and the post says plainly that `parent` exists only for permissions. Checking access is a loop: if this block doesn't set permissions, move to its parent, and repeat.
+
+This program builds a slice of the wiki, draws pages by following `content` lists down, and answers "who can read this?" by following `parent` pointers up. Each edit is applied as a list of small operations, which section 4 explains. Watch the last line of each half.
+
+<TryIt what="A block tree: draw down the content lists, check access up the parent pointers" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+# id: (type, title, content = child ids in order, parent, permissions if set here)
+blocks = {
+    "ws":     dict(type="workspace", title="Acme", content=["eng"], parent=None,
+                   perms="everyone at Acme"),
+    "eng":    dict(type="page", title="Engineering wiki",
+                   content=["todo1", "oncall"], parent="ws"),
+    "todo1":  dict(type="to_do", title="Ship search", content=[], parent="eng"),
+    "oncall": dict(type="page", title="On-call notes", content=["p1"],
+                   parent="eng", perms="SRE team"),     # a restricted sub-page
+    "p1":     dict(type="text", title="Pager rota", content=[], parent="oncall"),
+}
+
+def render(page):
+    # follow content lists down; a sub-page shows as a link, not inline
+    print(f"== {blocks[page]['title']}: " + ", ".join(
+        ("-> " if blocks[c]["type"] == "page" else "") + blocks[c]["title"]
+        for c in blocks[page]["content"]))
+
+def who_can_read(bid):
+    # follow parent pointers up to the nearest block that sets permissions
+    path = [bid]
+    while "perms" not in blocks[path[-1]]:
+        path.append(blocks[path[-1]]["parent"])
+    return blocks[path[-1]]["perms"], " -> ".join(path)
+
+def apply(transaction):
+    for op, bid, arg in transaction:
+        if op == "create":  blocks[bid] = arg
+        if op == "set":     blocks[bid].update(arg)
+        if op == "insert":  blocks[bid]["content"].insert(arg[1], arg[0])
+        if op == "remove":  blocks[bid]["content"].remove(arg)
+
+# Asha adds a to-do after "Ship search": one transaction, two operations
+apply([("create", "todo2", dict(type="to_do", title="Review shard runbook",
+                                content=[], parent="eng")),
+       ("insert", "eng", ("todo2", 1))])
+render("eng")
+print("todo2 readable by:", *who_can_read("todo2"))
+
+# Then she drags it into the on-call page: three operations
+apply([("remove", "eng", "todo2"),
+       ("insert", "oncall", ("todo2", 1)),
+       ("set", "todo2", {"parent": "oncall"})])
+render("eng")
+render("oncall")
+print("todo2 readable by:", *who_can_read("todo2"))
+```
+<Output>
+```
+== Engineering wiki: Ship search, Review shard runbook, -> On-call notes
+todo2 readable by: everyone at Acme todo2 -> eng -> ws
+== Engineering wiki: Ship search, -> On-call notes
+== On-call notes: Pager rota, Review shard runbook
+todo2 readable by: SRE team todo2 -> oncall
+```
+</Output>
+</TryIt>
+
+After the first edit, the new to-do sits right after "Ship search", because its id was inserted at position 1 of the wiki's `content` list. Its permission walk goes `todo2 -> eng -> ws` before reaching a block that sets permissions, so everyone at Acme can read it. On the wiki, the sub-page shows as one line with an arrow, since a page's children belong on its own page.
+
+After the drag, the to-do has left the wiki's list, joined the on-call page's list, and its `parent` points at `oncall`. Now the walk stops one step up, and only the SRE team can read it. Nobody touched a permission; moving the block changed who can see it. That's why the to-do vanished from Rohan's screen in the opening, and it's the behaviour you want: a line dragged into a private page becomes private.
+
+<Callout label="Design implication">
+Inherited permissions are cheap to change (one row) and costly to evaluate (a walk up the tree per block). Anything that reads blocks in bulk, such as search, analytics or an AI index, must do the same walk or keep a precomputed copy of each block's effective permissions. Section 9 shows the data lake doing exactly that.
+</Callout>
+
+<Elsewhere items={[
+  { where: "Figma", how: "A design file is also a tree of objects with parent pointers and positions among siblings; chapter 64 covers keeping it consistent when two people move objects at once." },
+  { where: "File systems", how: "Windows NTFS lets folder permissions be inherited by everything inside, so a file created in or copied into a folder takes on who may open it from there." },
+  { where: "Confluence", how: "Atlassian's wiki stores each page as one XHTML-based document, closer to Version 1, though view restrictions still pass down from parent pages to child pages." },
+]} />
+
+</Sub>
+
+<Sub n="3.4" title="The cost: a page is many rows">
+
+You pay for blocks when you open a page. Version 1 read one row. Now the wiki is a block whose `content` lists dozens of ids, some with children of their own, plus records they depend on, like the users named in "assigned to". Notion's post describes the endpoint that fetches them, `loadPageChunk`: it starts at a block, walks down the `content` tree, and returns the blocks with their dependent records. In the worst case that takes many trips to the database, and the post says several layers of caching make up for it. Before asking the server at all, the client tries to draw the page from data it already holds, which will matter in section 10.
+
+<Zoom path={["Notion", "Page", "Block", "id · type · properties · content · parent"]} />
+
+Blocks fix the size and structure problems of Version 1. It hasn't yet said how Asha's edit reaches the server without clobbering Rohan's, or how Rohan's screen hears about it.
+
+</Sub>
+
+<SectionHeading n="04" id="transactions">Saving an edit and telling everyone</SectionHeading>
+
+<Sub n="4.1" title="Operations and transactions">
+
+When Asha presses Enter, two things must change: a new block must exist, and the wiki's `content` list must include its id. If only the first were saved, the to-do would exist but appear nowhere; if only the second, the page would point at nothing. They must succeed or fail together.
+
+So Notion's client turns every action into **operations**, each creating or updating one record, and groups an action's operations into a **transaction** that the server commits or rejects as a whole. Adding the to-do is two operations; the drag is three (remove from one list, insert into another, change `parent`). That's what `apply` did in the TryIt.
+
+Notion's client doesn't wait for the server. It applies the transaction to its own copy at once, so the to-do appears as Asha types, and stores it in a queue Notion calls the **TransactionQueue**, kept in IndexedDB in the browser or SQLite in the apps, so it survives a closed tab. Then it sends it to the server's `/saveTransactions` endpoint. On arrival, the server loads the records involved, applies the operations, checks that Asha may edit those blocks (the walk up the tree again) and that the result is coherent, and commits. Only then does the client drop the transaction from its queue.
+
+</Sub>
+
+<Sub n="4.2" title="How Rohan finds out">
+
+Rohan's browser could ask every few seconds whether the wiki changed, but that multiplies load by every open tab in the company. Instead, every Notion client keeps one long-lived **WebSocket**, a two-way connection the server can push messages down at any time, to a service called **MessageStore**, and subscribes to the records it's showing. After committing Asha's transaction, the server notifies MessageStore, which pushes a short note to each subscriber: this record is now at a new version. Rohan's client compares that with the version it holds, fetches the changed records with a call named `syncRecordValues`, and redraws.
+
+<SystemDiagram
+  title="Asha adds a to-do; Rohan sees it"
+  nodes={[
+    { id: "asha", label: "Asha's browser", sub: "applies it locally", kind: "laptop", col: 0, row: 0 },
+    { id: "queue", label: "TransactionQueue", sub: "IndexedDB", kind: "queue", col: 0, row: 1 },
+    { id: "api", label: "API server", sub: "/saveTransactions", kind: "service", col: 1, row: 0 },
+    { id: "db", label: "Postgres", sub: "block table", kind: "db", col: 2, row: 0 },
+    { id: "ms", label: "MessageStore", sub: "WebSockets", kind: "service", col: 2, row: 1 },
+    { id: "rohan", label: "Rohan's browser", sub: "subscribed to the wiki", kind: "laptop", col: 1, row: 2 },
+  ]}
+  edges={[
+    { from: "asha", to: "queue" }, { from: "asha", to: "api", label: "transaction" },
+    { from: "api", to: "db", label: "commit" }, { from: "api", to: "ms", label: "notify" },
+    { from: "ms", to: "rohan", label: "new version" }, { from: "rohan", to: "api", label: "syncRecordValues", dashed: true },
+  ]}
+  steps={[
+    { caption: "Asha presses Enter. Her browser creates the to-do and inserts it locally, so it appears at once, and saves the transaction in its queue.", path: ["asha", "queue"] },
+    { caption: "The transaction, two operations, goes to `/saveTransactions`.", path: ["asha", "api"] },
+    { caption: "The server applies the operations, checks that Asha may edit the wiki, and commits.", path: ["api", "db"] },
+    { caption: "It tells MessageStore which records changed.", path: ["api", "ms"] },
+    { caption: "MessageStore pushes a note down Rohan's WebSocket: the wiki block has a newer version.", path: ["ms", "rohan"] },
+    { caption: "Rohan's browser fetches the changed records, through the normal API and its permission checks, and redraws.", path: ["rohan", "api"] },
+  ]}
+  caption="The push says only 'this changed'. Each client fetches the data itself, so every read still passes the permission walk for that reader."
+/>
+
+<Why>Why push a version number instead of the new data?</Why>
+
+A note like this is tiny and identical for every subscriber, so MessageStore needn't know who may see what. Rohan's fetch that follows goes through the API, which checks permissions for Rohan. After Asha's drag, his fetch comes back without the to-do, because it now lives under a page he can't read.
+
+</Sub>
+
+<Sub n="4.3" title="Two people in the same line">
+
+Asha's to-do and Rohan's tick on another line touch different records, so both transactions commit. Two people typing in the same paragraph is harder, and it's the subject of most of chapter 64: operational transformation, CRDTs, and Figma's per-property last-writer-wins. Notion's 2021 post doesn't say how it merged concurrent edits to the same text. Its December 2025 post on offline mode says offline pages are migrated to a new CRDT-based data model for conflict resolution, so for text edited while disconnected, at least, Notion seems to use the CRDT family. How it orders siblings when two people insert into the same `content` list at once is unpublished.
+
+<Callout label="Common mistake" kind="warn">
+Treating "it appeared on my screen" as "it's saved". Asha's browser shows the change before the server has it. That's what makes typing feel instant, and it's only safe because the queue is stored durably on the device and retried until the server accepts or rejects it. Without that, closing the laptop lid would lose the last few seconds of work.
+</Callout>
+
+All of this has assumed a single database holding every block. In 2020 that stopped being possible.
+
+</Sub>
+
+<SectionHeading n="05" id="monolith">One Postgres, until 2020</SectionHeading>
+
+<Sub n="5.1" title="When VACUUM stalls">
+
+Every block, workspace and comment lived in one Postgres database. In October 2021 Notion's infrastructure lead, Garrett Fidalgo, wrote in "Herding elephants: lessons learned from sharding Postgres at Notion" that this monolith had served for five years and grown by four orders of magnitude, and that by mid-2020 the team expected usage to outgrow it. On-call engineers were being woken by CPU spikes, and schema changes that should have been routine had become risky.
+
+What finally broke was **VACUUM**. Postgres never overwrites a row in place (chapter 21 has the detail): an update writes a new version of the row and marks the old one dead, so transactions still reading it can finish. A background process, VACUUM, later sweeps each table to reclaim the dead versions. A block table edited all day by millions of people makes dead versions constantly, and Notion's post says VACUUM began to stall consistently, so tables bloated and queries slowed.
+
+</Sub>
+
+<Sub n="5.2" title="Transaction ID wraparound">
+
+VACUUM has a second job, and that's the one that scared the team. Postgres stamps every writing transaction with a 32-bit **transaction ID**, a counter that goes up by one each time, and compares these IDs to decide which row versions a query may see. A 32-bit counter wraps around after roughly four billion, like an odometer.
+
+<Picture
+  src="/images/designs/notion/odometer-rollover.jpg"
+  alt="A car odometer showing all zeroes after rolling over from 99,999.9 miles"
+  caption="An odometer rolled over from 99,999.9 to zero. A 32-bit transaction counter does the same after about four billion transactions, and then a new transaction's ID looks older than an old one's."
+  credit="Photo: Hellbus, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Odometer_rollover.jpg"
+  narrow
+/>
+
+After a wrap, an old row's ID would seem to come from the future, and the row would vanish from view. VACUUM prevents this by **freezing** old rows, marking them visible to everyone so their IDs stop mattering. If VACUUM can't keep up, Postgres eventually refuses all writes, to avoid losing data. Notion's post calls wraparound an existential threat to the product. A stalled VACUUM on the block table was a countdown to Notion being unable to save anything.
+
+<Decision
+  q="One database is running out of room. What next?"
+  options={[
+    { name: "A bigger machine", how: "Move to the largest instance and keep one database.", good: ["No application changes"], bad: ["A hard ceiling, with data doubling yearly", "VACUUM and schema changes get worse long before the hardware runs out"] },
+    { name: "A distributed database", how: "Citus for Postgres, or Vitess for MySQL, shards tables for you.", good: ["Someone else's sharding code", "Less to build"], bad: ["Data placement hidden inside the system", "A new system to learn under pressure"] },
+    { name: "Shard in the application", how: "Split tables across many plain Postgres databases; the application picks one per query.", good: ["Full control over where data lives", "Stays on Postgres the team knows"], bad: ["Every query must carry its shard key", "Moving data later is the team's own job"], chosen: true },
+  ]}
+>
+According to the post, vertical scaling wasn't a long-term option, because performance and upkeep degrade well before the hardware limit. Notion's team turned down Citus and Vitess because their clustering logic was opaque and it wanted control over how data was distributed. So Notion sharded in the application.
+</Decision>
+
+That leaves three questions: what to split, how, and how to move a live database into the new layout without losing an edit.
+
+</Sub>
+
+<SectionHeading n="06" id="sharding">Splitting the block table</SectionHeading>
+
+<Sub n="6.1" title="Choosing the partition key">
+
+To **shard** a table is to split its rows across several databases, so each machine's share of rows, queries and VACUUM work stays manageable (chapter 29). What matters most is the **partition key**, the value in each row that decides its shard. A good key keeps rows used together on the same shard, because a query or transaction that spans shards is slow and hard to make atomic.
+
+<Think
+  q="Asha's transaction touches the new to-do and the wiki page. Rohan's permission check walks from a block up to the workspace. Which key keeps all of that on one shard: the block id, the user id, or something else?"
+  hint="What do every block on the wiki, the wiki itself and its ancestors have in common?"
+>
+Not the block id: hashing block ids would scatter one page across every shard, so a page load or a parent walk would visit many machines. Not the user id: Asha and Rohan edit the same blocks, so no single user owns them.
+
+What they share is the workspace. Every block belongs to exactly one workspace, every parent chain ends there, and every transaction stays inside one. Key on the workspace id, and a page load, a transaction and a permission walk each need one shard.
+</Think>
+
+That's Notion's choice. Every workspace gets a UUID when it's created, and every block records its workspace (Notion's internal word for a workspace is "space", so the column is `space_id`). Notion sharded every table reachable from `block` through a foreign key, such as `space`, `discussion` and `comment`, so a workspace's blocks and comments always live together. In exchange, a workspace is the smallest unit that can be placed: the largest enterprise workspace must fit on one shard.
+
+</Sub>
+
+<Sub n="6.2" title="Logical shards and physical databases">
+
+Next, how many shards? If you pick one per machine, say 32, and route by `hash(workspace) mod 32`, the first time you add a 33rd machine almost every workspace's result changes and almost every row must move. Notion avoided this with two levels.
+
+<Picture
+  src="/images/designs/notion/card-catalogue-drawers.jpg"
+  alt="Rows of small wooden card-catalogue drawers, each with a brass label holder"
+  caption="A library card catalogue: hundreds of small labelled drawers in a few big cabinets. Moving a drawer to a new cabinet means re-sorting no cards. Logical shards are the drawers; physical databases are the cabinets."
+  credit="Photo: Carolina Prysyazhnyuk, CC BY-SA 2.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Card_catalogue_drawers.jpg"
+/>
+
+Notion splits the data into many small **logical shards**, packed onto fewer **physical databases**, the actual Postgres servers. In 2021 Notion made 480 logical shards on 32 physical databases, 15 per database. Each logical shard is a Postgres **schema**, a namespace inside a database with its own set of tables, so one server holds `schema001.block`, `schema002.block` and so on, each beside its own `space`, `comment` and other sharded tables. Notion chose separate tables over Postgres's built-in partitioning so that all routing would happen in one place, the application.
+
+Routing takes two steps. First, the workspace UUID picks the logical shard, because, as the post puts it, the UUID space can be partitioned into uniform buckets: 480 equal ranges of a 128-bit number. Second, a fixed map says which server holds that shard. When hardware changes, only the map changes. A workspace never changes logical shard, so its rows are never re-sorted, only moved as a whole schema.
+
+<Why>Why 480 and not a round 512?</Why>
+
+Because 480 is divisible by a lot of numbers, the post says. To spread shards evenly, the number of machines must divide the number of shards. With 480, the fleet can go from 32 to 40 to 48 machines, with 15, 12 and 10 shards on each. With 512, a power of two, the next even step after 32 is 64; the post notes that 512 would force doubling every time.
+
+This program routes a random workspace, checks how evenly 100,000 workspaces spread, and compares what moves when machines are added.
+
+<TryIt what="Workspace to logical shard to physical database, and why 480" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import uuid, random
+random.seed(7)
+LOGICAL = 480
+
+def logical_shard(workspace_id):
+    # split the 128-bit UUID space into 480 equal ranges
+    return workspace_id.int * LOGICAL >> 128
+
+def host(shard, hosts):
+    return shard // (LOGICAL // hosts)     # consecutive schemas share a host
+
+def schemas_on(h, hosts):
+    return [x for x in range(LOGICAL) if host(x, hosts) == h]
+
+acme = uuid.UUID(int=random.getrandbits(128))
+s = logical_shard(acme)
+on12 = schemas_on(host(s, 32), 32)
+print(f"Acme {str(acme)[:8]}... -> logical shard {s}")
+print(f"  32 hosts: host {host(s, 32)}, which holds shards {on12[0]}-{on12[-1]}")
+print(f"  96 hosts: host {host(s, 96)}")
+
+ws = [uuid.UUID(int=random.getrandbits(128)) for _ in range(100_000)]
+count = [0] * 32
+for w in ws:
+    count[host(logical_shard(w), 32)] += 1
+print(f"\n100,000 workspaces on 32 hosts: {min(count):,} to {max(count):,} each")
+
+new = sorted({host(x, 96) for x in on12})
+print(f"32 -> 96: host 12's 15 shards go to new hosts {new}, 5 each")
+
+# a smaller step: 32 -> 40 hosts. Each old host keeps 12 shards, hands on 3.
+print(f"32 -> 40 with logical shards: {32 * 3} of 480 shards move "
+      f"({32 * 3 / LOGICAL:.0%}), as whole schemas")
+moved = sum(1 for w in ws if w.int % 32 != w.int % 40)
+print(f"32 -> 40 with hash mod N:     {moved / len(ws):.0%} of workspaces move, row by row")
+
+for n in (480, 512):
+    print(f"{n} shards divide evenly over {[h for h in range(16, 200) if n % h == 0]} hosts")
+```
+<Output>
+```
+Acme 6513270e... -> logical shard 189
+  32 hosts: host 12, which holds shards 180-194
+  96 hosts: host 37
+
+100,000 workspaces on 32 hosts: 3,028 to 3,222 each
+32 -> 96: host 12's 15 shards go to new hosts [36, 37, 38], 5 each
+32 -> 40 with logical shards: 96 of 480 shards move (20%), as whole schemas
+32 -> 40 with hash mod N:     80% of workspaces move, row by row
+480 shards divide evenly over [16, 20, 24, 30, 32, 40, 48, 60, 80, 96, 120, 160] hosts
+512 shards divide evenly over [16, 32, 64, 128] hosts
+```
+</Output>
+</TryIt>
+
+Our program counts shards from 0, where Notion names its schemas from `schema001`, so Acme's shard 189 is `schema190`. Random UUIDs fill the 32 hosts evenly, within roughly 3% (real load also depends on workspace sizes, which this ignores). Look hardest at the middle lines: moving from 32 to 40 machines, each old machine keeps 12 of its 15 schemas and hands 3 on, so a fifth of the data moves, as whole tables. With `mod N`, four-fifths of the workspaces would move, picked out of every table row by row. And the 32-to-96 line previews section 8, where each old host's 15 schemas split cleanly into three groups of 5.
+
+<SystemDiagram
+  title="Routing Asha's transaction to her workspace's shard"
+  nodes={[
+    { id: "asha", label: "Asha's browser", kind: "laptop", col: 0, row: 1 },
+    { id: "api", label: "API server", sub: "shard router", kind: "service", col: 1, row: 1 },
+    { id: "map", label: "Shard map", sub: "480 → 32", kind: "registry", col: 1, row: 0 },
+    { id: "pgb", label: "PgBouncer", sub: "connection pool", kind: "lb", col: 2, row: 1 },
+    { id: "h0", label: "Host 0", sub: "schema001–015", kind: "db", col: 3, row: 0 },
+    { id: "h12", label: "Host 12", sub: "schema181–195", kind: "db", col: 3, row: 1 },
+    { id: "h31", label: "Host 31", sub: "schema466–480", kind: "db", col: 3, row: 2 },
+  ]}
+  zones={[{ label: "32 physical Postgres databases", nodes: ["h0", "h12", "h31"] }]}
+  edges={[
+    { from: "asha", to: "api" }, { from: "api", to: "map", dashed: true },
+    { from: "api", to: "pgb" }, { from: "pgb", to: "h0" }, { from: "pgb", to: "h12" }, { from: "pgb", to: "h31" },
+  ]}
+  steps={[
+    { caption: "Asha's transaction arrives. Every block in it carries Acme's workspace id.", path: ["asha", "api"] },
+    { caption: "The application maps the workspace UUID to logical shard `schema190` and looks up the host that holds it.", path: ["api", "map"] },
+    { caption: "The query goes through PgBouncer, a pool of open connections shared by many API processes.", path: ["api", "pgb"] },
+    { caption: "Host 12 runs the transaction on `schema190.block`. Everything it touches is in that one schema, so it's an ordinary single-database transaction.", path: ["pgb", "h12"] },
+  ]}
+  caption="The sharding lives in the application: a function from workspace to logical shard, and a small table from logical shard to host."
+/>
+
+A **connection pooler** like PgBouncer sits in that path because Postgres runs a separate process for every connection, so thousands of direct connections from API servers would exhaust a database's memory. A pooler holds a modest number of real connections and lends them out per query. It returns in section 8.
+
+<Elsewhere items={[
+  { where: "Instagram (2012)", how: "Several thousand logical shards, each a Postgres schema, mapped in code onto far fewer physical servers: the same drawers-and-cabinets layout, nine years earlier." },
+  { where: "Slack", how: "Sharded MySQL by workspace too, then struggled with hot spots from huge customers; by December 2020 it had moved 99% of its query load to Vitess, about 2.3 million queries a second at peak." },
+  { where: "Figma (2023–2024)", how: "Also sharded Postgres in-house, through its own query proxy, instead of adopting a distributed database, and also separated logical sharding from physical (chapter 64)." },
+]} />
+
+</Sub>
+
+<SectionHeading n="07" id="migration">Moving a live database</SectionHeading>
+
+<Sub n="7.1" title="Copy, catch up, check, switch">
+
+Now the hard part. Billions of blocks sit in the monolith, people are editing them every second, and every row must end up in the right schema on the right new host, including edits made while the copy runs, with proof that the copy is right before anyone reads from it. Notion's 2021 migration had four steps.
+
+1. **Double-write.** From a fixed moment, every write had to reach both old and new databases. Writing both from the application was judged too flaky, since one write can succeed while the other fails. Postgres's **logical replication**, which streams row changes from one database to another, couldn't keep up with the block table's write volume. So the team wrote every change to an **audit log** table, and a catch-up process replayed the log onto the new databases.
+2. **Backfill.** Copy all existing rows. This ran on one AWS m5.24xlarge machine with 96 CPUs and took roughly three days. Since catch-up was writing newer versions at the same time, the backfill compared versions and never overwrote a newer row.
+3. **Verify.** A script sampled random UUIDs and compared the rows around them in both databases. Then **dark reads**: the application read from both, served the old answer, and logged any difference. Migration and verification were written by different people, so one mistake couldn't hide in both.
+4. **Switch.** Notion took the product down for roughly five minutes of scheduled maintenance, let catch-up drain, and pointed the application at the new shards. A reverse audit log was ready to replay changes back to the monolith. It wasn't needed.
+
+<Scene
+  title="One block during the 2021 migration"
+  regions={[
+    { id: "old", label: "Monolith", sub: "still serving", col: 0, row: 0 },
+    { id: "log", label: "Audit log", sub: "writes since t", col: 1, row: 0 },
+    { id: "new", label: "Host 12", sub: "schema190.block", col: 2, row: 0 },
+    { id: "check", label: "Verification", sub: "samples, dark reads", col: 1, row: 1 },
+  ]}
+  itemWidth={120}
+  frames={[
+    { caption: "Before the migration, the \"Ship search\" block exists only in the monolith, at version 7.",
+      items: [{ id: "b", at: "old", label: "Ship search", sub: "v7" }], focus: ["old"] },
+    { caption: "Double-writing starts. Asha ticks the box: the monolith writes version 8, and the change is recorded in the **audit log**.",
+      change: [{ id: "b", sub: "v8" }], add: [{ id: "e", at: "log", label: "block v8", tone: "new" }], focus: ["old", "log"], arrow: { from: "old", to: "log", label: "log write" } },
+    { caption: "Catch-up replays the logged change onto host 12, so the new copy is at version 8.",
+      add: [{ id: "c", at: "new", label: "Ship search", sub: "v8", tone: "accent" }], change: [{ id: "e", tone: "dim" }], arrow: { from: "log", to: "new", label: "apply" } },
+    { caption: "The **backfill** reaches this block later, carrying the version-7 row it read earlier. Host 12 already has a newer version, so the backfill skips it.",
+      change: [{ id: "c", tone: "ok" }], arrow: { from: "old", to: "new", label: "v7? skip" } },
+    { caption: "Verification reads both copies and compares them. They match.",
+      add: [{ id: "v", at: "check", label: "v8 = v8", tone: "ok" }], focus: ["check"] },
+    { caption: "Switchover: after about five minutes of downtime, reads and writes go to host 12. The monolith's copy stays as the way back.",
+      change: [{ id: "b", tone: "dim" }], remove: ["e", "v"], focus: ["new"] },
+  ]}
+/>
+
+That version check in the fourth frame lets the backfill and the catch-up run at the same time. Without it, a slow backfill could overwrite a fresh edit with a stale copy.
+
+</Sub>
+
+<Sub n="7.2" title="What Notion would do differently">
+
+Notion's post ends with frank lessons:
+
+- **Shard earlier.** By the time work began, the monolith was too loaded for heavy operations, which ruled out logical replication and forced the custom audit log.
+- **Aim for zero downtime.** A five-minute window was needed for the final catch-up; if catch-up could finish in under 30 seconds, the switch could have happened at the load balancer with no window at all.
+- **Put the partition key in the primary key.** With a separate `space_id` column, any code that looked up a block by id also had to carry the workspace id to find the shard. A combined primary key would have made the shard part of each block's identity.
+
+<Callout label="Design implication">
+Choose the partition key before you need it, and make it part of every row's identity. Notion's key was obvious, since every block belongs to one workspace; the pain came from the key not being in the id.
+</Callout>
+
+Thirty-two databases gave Notion room until late 2022.
+
+</Sub>
+
+<SectionHeading n="08" id="reshard">The Great Re-shard, 2023</SectionHeading>
+
+<Sub n="8.1" title="Thirty-two hosts fill up">
+
+In July 2023 four Notion engineers wrote "The Great Re-shard: adding Postgres capacity (again) with zero downtime". Toward the end of 2022 some of the 32 databases ran above 90% CPU at peak, many were close to the disk operations per second they'd been provisioned for (their **IOPS**), and the PgBouncer layer was hitting connection limits, with a new-year traffic spike coming. So the plan was to triple the fleet from 32 machines to 96, with 5 logical shards on each instead of 15. New machines were smaller, with smaller disks, because disk space wasn't the bottleneck.
+
+This is the move logical shards were built for. No workspace changes logical shard, and each old host's 15 schemas go, five at a time, to three new hosts, as the TryIt showed.
+
+</Sub>
+
+<Sub n="8.2" title="Copying with logical replication">
+
+This time the databases had enough headroom for Postgres's own logical replication. On the source you define a **publication**, a named set of tables whose changes should be streamed out; on the target you create a **subscription** to it. A subscriber copies the existing rows, then applies every later insert, update and delete, decoded from the source's write-ahead log, Postgres's record of every change (chapter 18).
+
+Each old database got three publications of 5 schemas each, and each new database subscribed to exactly one. One trick made a big difference: the new tables were created without indexes. Copying into an indexed table updates every index for every row, while building indexes once at the end is far cheaper. Notion reported that this cut synchronisation from three days to twelve hours.
+
+<SystemDiagram
+  title="The 2023 re-shard: one old host feeding three new ones"
+  nodes={[
+    { id: "api", label: "API servers", kind: "service", col: 0, row: 1 },
+    { id: "pgb", label: "PgBouncer", sub: "4 groups × 24 DBs", kind: "lb", col: 1, row: 1 },
+    { id: "old", label: "Old host 12", sub: "schema181–195", kind: "db", col: 2, row: 0 },
+    { id: "n36", label: "New host 36", sub: "schema181–185", kind: "db", col: 3, row: 0 },
+    { id: "n37", label: "New host 37", sub: "schema186–190", kind: "db", col: 3, row: 1 },
+    { id: "n38", label: "New host 38", sub: "schema191–195", kind: "db", col: 3, row: 2 },
+  ]}
+  zones={[{ label: "96 new databases", nodes: ["n36", "n37", "n38"] }]}
+  edges={[
+    { from: "api", to: "pgb" }, { from: "pgb", to: "old" },
+    { from: "old", to: "n36", label: "pub 1", dashed: true }, { from: "old", to: "n37", label: "pub 2", dashed: true }, { from: "old", to: "n38", label: "pub 3", dashed: true },
+    { from: "pgb", to: "n37" },
+  ]}
+  steps={[
+    { caption: "Asha's workspace is still served by old host 12, through PgBouncer.", path: ["api", "pgb", "old"] },
+    { caption: "Host 12 publishes its 15 schemas as three publications of 5. Each new host subscribes to one, copies the rows without indexes, then builds them.", path: ["old", "n37"], focus: ["n36", "n38"] },
+    { caption: "From then on, every change on host 12 streams to the right new host: Asha's edits to `schema190` reach host 37.", path: ["old", "n37"] },
+    { caption: "Dark reads: for a sample of small queries, the application also reads from host 37 a second later and compares.", path: ["api", "pgb", "n37"] },
+    { caption: "Failover, one shard at a time: PgBouncer pauses traffic, the last changes arrive, PgBouncer is repointed at host 37, traffic resumes. Replication runs in reverse, so host 12 stays a way back.", path: ["pgb", "n37"] },
+  ]}
+  caption="Logical replication does the copying and catching up. Notion's own work went into verification, connection limits and the switch."
+/>
+
+</Sub>
+
+<Sub n="8.3" title="Connections, checks and the switch">
+
+Tripling the databases nearly broke the pooler. Notion ran roughly 100 PgBouncer instances, each allowed up to 6 connections to each shard, so 600 per database. By Notion's account, naively tripling the databases behind every instance would have meant up to 18 connections from each instance to each old shard during the move, three times what the old databases were sized for. So Notion split PgBouncer into 4 groups, each serving 24 of the new databases, which kept every database's connection count in bounds. It's sharding again, one layer up.
+
+<Why>Why compare only small queries in the dark reads?</Why>
+
+A dark read doubles the work of every query it checks, on a fleet already near its CPU limit. So Notion only compared queries returning up to 5 rows, for a small sample of requests, and waited a second before reading the new database so replication could deliver the latest changes. Results agreed roughly 100% of the time.
+
+Then came the switch, run 96 times, one shard at a time, as a four-step script of PgBouncer commands with a rollback point at each step, and with replication set up in reverse, new to old, so the old database kept every change. At worst, a user saw about a second of the "saving" spinner, and Notion reported no downtime users noticed. Afterwards, peak CPU and IOPS use fell to roughly 20%.
+
+<Predict
+  q="The 2023 re-shard tripled the machines. Why not also go from 480 to 1,440 logical shards at the same time?"
+  options={[
+    "Postgres limits a cluster to 480 schemas",
+    "Changing the number of logical shards changes which shard nearly every workspace maps to, so every row would have to be re-sorted",
+    "1,440 isn't divisible by 96",
+    "Logical replication can only copy whole databases",
+  ]}
+  answer={1}
+>
+A workspace's logical shard depends on its UUID and on the number 480. Change 480 and almost every workspace lands in a new bucket, so every row in every table would have to be picked out and moved: the 2021 migration all over again. Keeping 480 meant the re-shard moved whole schemas, which logical replication does table by table. (1,440 is divisible by 96, so that isn't the obstacle.)
+</Predict>
+
+<Decision
+  q="How do you move live shards to new machines?"
+  options={[
+    { name: "Audit log + custom catch-up (2021)", how: "Log every write in a table; a script replays it onto the new databases.", good: ["Works when the source is too loaded for replication", "Full control over versions"], bad: ["Custom code to write and trust", "Needed a short maintenance window"] },
+    { name: "Postgres logical replication (2023)", how: "Publications on old hosts, subscriptions on new; switch per shard through PgBouncer.", good: ["Built into Postgres", "Seconds per shard to switch", "Runs in reverse as a rollback"], bad: ["Needs a source with spare capacity", "Connections and verification still need care"], chosen: true },
+  ]}
+>
+It was the 2021 lesson, "shard earlier", that made the 2023 choice possible: moving while the databases still had headroom let Notion use Postgres's own replication, and the 480-shard layout meant whole schemas could move without re-sorting a row.
+</Decision>
+
+Sharding solved serving blocks one workspace at a time. Meanwhile analytics, search and AI needed all of them at once.
+
+</Sub>
+
+<SectionHeading n="09" id="data-lake">Every edit, for analytics and AI</SectionHeading>
+
+<Sub n="9.1" title="Why a warehouse wasn't enough">
+
+Notion's product reads a page at a time. An analyst asking how many workspaces use databases, or a job building the search and AI indexes, needs every block, joined to its workspace and its permissions. You don't run that against the production shards; you copy the data somewhere else.
+
+Notion's July 2024 post, "Building and scaling Notion's data lake", describes the 2021 setup: a vendor tool, Fivetran, read each shard's write-ahead log and loaded the changes into Snowflake, a cloud data warehouse, through 480 connectors, one per logical shard, running hourly. Three things went wrong.
+
+- **480 connectors** were a burden to run, and every re-shard or maintenance meant re-syncing them.
+- **The workload was mostly updates.** About 90% of Notion's upserts (writes that insert a row or update it if it exists) updated existing blocks, and Snowflake is built for appending, so ingesting was slow and expensive.
+- **The permission walk didn't fit SQL.** Computing who can see each block means walking up its parents to the workspace, as in section 3, and as repeated self-joins over billions of rows it timed out.
+
+<Callout label="Common mistake" kind="warn">
+Assuming analytics data means append-only events. Notion's main dataset is the current state of hundreds of billions of blocks, and nine-tenths of its changes edit rows that already exist. A store built for appending pays for every one of them.
+</Callout>
+
+</Sub>
+
+<Sub n="9.2" title="Change data capture into Kafka">
+
+Its replacement, built between spring and autumn 2022, starts with **change data capture** (CDC): reading a database's own log of committed changes and turning each into a message, so the application doesn't have to send events. Notion runs one **Debezium** connector per Postgres host. Debezium is an open-source CDC tool whose Postgres connector reads changes through logical decoding, the same machinery as logical replication.
+
+<Picture
+  src="/images/designs/notion/debezium-architecture.png"
+  alt="Debezium source connectors read from MySQL and Postgres databases and write to Apache Kafka topics; sink connectors write onward to Elasticsearch, Infinispan and a data warehouse"
+  caption="Debezium's own picture of the pattern: source connectors tail each database's change log and write row changes into Kafka topics, and other connectors carry them onward."
+  credit="Image: Debezium documentation, © Debezium authors, Apache License 2.0"
+  href="https://github.com/debezium/debezium/blob/main/documentation/modules/ROOT/assets/images/debezium-architecture.png"
+  paper
+/>
+
+Debezium writes to **Kafka**, a durable, ordered log of messages (chapter 23), with one topic per table, so all 480 shards' block changes flow into one `block` topic at tens of megabytes a second. Asha's to-do becomes a message holding the block's new values and its **log sequence number** (LSN), the position in the source's write-ahead log where the change happened.
+
+<Picture
+  src="/images/designs/notion/kafka-log-compaction.png"
+  alt="A log of key-value records with repeated keys, and below it the compacted log keeping only the latest value for each key"
+  caption="In an update-heavy stream the same key appears again and again; K1 has three values here. For a table of current state only the latest counts. Kafka can compact a topic like this, and the lake applies the same rule when it merges changes into its files."
+  credit="Image: Apache Kafka documentation, © The Apache Software Foundation, Apache License 2.0"
+  href="https://kafka.apache.org/documentation/#compaction"
+  paper
+  narrow
+/>
+
+</Sub>
+
+<Sub n="9.3" title="Hudi on S3, sorted by recency">
+
+From Kafka the changes land in Amazon S3, object storage (chapter 32), as tables managed by **Apache Hudi**, an open table format that keeps a table as many data files plus a timeline of commits and lets you apply upserts to them. Notion compared it with Apache Iceberg and Delta Lake and chose Hudi for its performance on update-heavy work and its built-in support for Debezium's messages. Hudi applies updates in one of two ways:
+
+<div className="grid gap-4 sm:grid-cols-2">
+
+<Picture
+  src="/images/designs/notion/hudi-copy-on-write.png"
+  alt="Hudi copy-on-write: an upsert at 10:10 produces new versions of the columnar files in file groups 1, 2 and 4, while file group 3 keeps its 10:05 version"
+  caption="Copy-on-write: an update rewrites each file holding a changed row as a new version. Reads are simple; writes copy whole files."
+  credit="Image: Apache Hudi documentation, Apache License 2.0"
+  href="https://hudi.apache.org/docs/table_types"
+  paper
+/>
+
+<Picture
+  src="/images/designs/notion/hudi-merge-on-read.png"
+  alt="Hudi merge-on-read: updates are appended to row-based log files next to the columnar base files and merged at query time or during compaction"
+  caption="Merge-on-read: updates go to small log files beside each base file, merged by readers or a later compaction. Writes are cheap; reads do more."
+  credit="Image: Apache Hudi documentation, Apache License 2.0"
+  href="https://hudi.apache.org/docs/table_types"
+  paper
+/>
+
+</div>
+
+Notion uses **copy-on-write**, which seems the costlier choice for updates at first sight. Its post doesn't spell out why it picked that over merge-on-read, but it describes what makes copy-on-write affordable. Its data is partitioned into the same 480 shards as Postgres, and within each, rows are sorted by the LSN of their last change, because recently changed blocks are the most likely to change again. Hudi also keeps a **Bloom filter** per file, a compact structure that can say "this key is definitely not here", so an upsert opens only files that might hold the block.
+
+Sort order is where a 90%-updates workload is won or lost. Copy-on-write rewrites every file that holds a changed row. If rows are spread across files at random, as ordering by UUID would do, one batch of edits touches nearly every file. Ordered by recency, with edits clustered on recent blocks, the same batch touches a few.
+
+<TryIt what="Copy-on-write: files rewritten by a batch of edits, by layout" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import random
+random.seed(3)
+BLOCKS, PER_FILE, CHANGES = 1_000_000, 10_000, 20_000
+
+# block i was created i-th; edits go mostly to recently created blocks
+def pick_block():
+    age = int(random.expovariate(1 / 20_000))   # most edits within ~20k newest
+    return max(0, BLOCKS - 1 - age)
+
+batch = []
+for _ in range(CHANGES):
+    if random.random() < 0.9:
+        batch.append(("update", pick_block()))
+    else:
+        batch.append(("insert", None))           # inserts go to a new file
+
+# Layout 1: files filled in UUID order, which is random with respect to age
+uuid_order = list(range(BLOCKS))
+random.shuffle(uuid_order)
+file_by_uuid = {b: pos // PER_FILE for pos, b in enumerate(uuid_order)}
+
+# Layout 2: files filled in order of age (Notion sorts by last-change LSN)
+file_by_time = {b: b // PER_FILE for b in range(BLOCKS)}
+
+for name, layout in [("by UUID", file_by_uuid), ("by recency", file_by_time)]:
+    touched = {layout[b] for op, b in batch if op == "update"}
+    rewritten = len(touched) * PER_FILE        # copy-on-write: whole files
+    print(f"{name:10}: {len(touched):3} of {BLOCKS // PER_FILE} files rewritten, "
+          f"{rewritten:,} rows copied for {CHANGES:,} changes "
+          f"({rewritten / CHANGES:.0f}x)")
+```
+<Output>
+```
+by UUID   : 100 of 100 files rewritten, 1,000,000 rows copied for 20,000 changes (50x)
+by recency:  19 of 100 files rewritten, 190,000 rows copied for 20,000 changes (10x)
+```
+</Output>
+</TryIt>
+
+Our model is one shard of a million blocks in 100 files, and a batch of 20,000 changes, 90% of them updates aimed mostly at recent blocks. (The skew is a guess standing in for Notion's observation that recent blocks change more; the real distribution is unpublished.) By UUID, the batch touches every file and copy-on-write rewrites all million rows, fifty rows written per row changed. By recency it touches 19 files, a fifth of the work. Merge-on-read would skip the rewrite entirely and pay at read time instead.
+
+</Sub>
+
+<Sub n="9.4" title="Walking the tree in Spark">
+
+With raw blocks in S3, the transformations that timed out in the warehouse run in **Apache Spark**, which spreads a computation across a cluster. Heaviest of all is the walk from section 3, run for every block to compute its effective permissions. Notion's post describes processing shards in parallel, small ones in memory and large ones by shuffling through disk. Here the workspace key pays off again: every parent chain stays inside one shard.
+
+<SystemDiagram
+  title="From a to-do in Postgres to the data lake"
+  nodes={[
+    { id: "pg", label: "Postgres hosts", sub: "480 logical shards", kind: "db", col: 0, row: 0 },
+    { id: "dbz", label: "Debezium", sub: "one per host", kind: "service", col: 1, row: 0 },
+    { id: "kafka", label: "Kafka", sub: "one topic per table", kind: "queue", col: 2, row: 0 },
+    { id: "hudi", label: "Hudi on S3", sub: "copy-on-write", kind: "blob", col: 3, row: 0 },
+    { id: "spark", label: "Spark jobs", sub: "tree walks", kind: "compute", col: 3, row: 1 },
+    { id: "out", label: "Snowflake, search, AI", sub: "cleaned outputs", kind: "external", col: 2, row: 1 },
+  ]}
+  edges={[
+    { from: "pg", to: "dbz", label: "logical decoding" }, { from: "dbz", to: "kafka" },
+    { from: "kafka", to: "hudi", label: "upserts" }, { from: "hudi", to: "spark" }, { from: "spark", to: "out" },
+  ]}
+  steps={[
+    { caption: "Asha's to-do is committed on her shard's host. Debezium, tailing that host's changes, turns the row into a message.", path: ["pg", "dbz"] },
+    { caption: "The message joins the `block` topic in Kafka, with changes from every other shard.", path: ["dbz", "kafka"] },
+    { caption: "Ingestion upserts the batch into the Hudi table for that shard, rewriting only the few recent files that hold changed rows.", path: ["kafka", "hudi"] },
+    { caption: "Spark jobs walk each block's ancestors and compute its effective permissions, the work SQL couldn't finish.", path: ["hudi", "spark"] },
+    { caption: "Only cleaned, needed data goes on to Snowflake for analysts and to product systems such as search and AI.", path: ["spark", "out"] },
+  ]}
+  caption="Raw data lands in S3 first, untouched, as the single source of truth; everything downstream is derived from it."
+/>
+
+New tables start from a snapshot: start the connector, export the Postgres tables to S3 as of time `t`, load them into Hudi, then replay Kafka from `t`, usually within 24 hours. Moving several large datasets into the lake saved over a million dollars in 2022, with more in 2023 and 2024. Data that took over a day to arrive now took minutes for small tables and up to a couple of hours for large ones, the block table included. Notion adds that the lake underpinned Notion AI's rollout in 2023 and 2024.
+
+<Decision
+  q="Where should a copy of every block live for analytics and AI?"
+  options={[
+    { name: "Warehouse only", how: "Load each shard's changes into Snowflake hourly.", good: ["Managed; SQL for everyone"], bad: ["Slow and costly for 90% updates", "Tree walks time out", "480 connectors to look after"] },
+    { name: "Data lake first, then warehouse", how: "CDC into Kafka, upsert into Hudi on S3, process in Spark, send cleaned data on.", good: ["Cheap storage, update-friendly format", "Real code for tree walks", "Minutes to hours fresh"], bad: ["Kafka, Debezium, Hudi and Spark to run", "Not for real-time product reads"], chosen: true },
+  ]}
+>
+Notion kept Snowflake for what it does well and put the lake in front of it, for offline work where minutes to hours of delay are fine. Chapter 61 covers the stream-processing ideas underneath, and chapter 24 the columnar files Hudi writes.
+</Decision>
+
+<Elsewhere items={[
+  { where: "Uber", how: "Hudi itself began at Uber in 2016, to apply a stream of updates to huge tables in a Hadoop data lake without rewriting them all." },
+  { where: "Figma", how: "Its LiveGraph service tails Postgres's replication stream to keep live queries fresh: the same 'read the database's log' idea for a different job (chapter 64)." },
+]} />
+
+</Sub>
+
+<SectionHeading n="10" id="client">A database in the browser</SectionHeading>
+
+<Sub n="10.1" title="Caching blocks on the device">
+
+Back to Asha's Monday. Loading the wiki from the server means walking the tree with several round trips, as section 3.4 showed. But if she opened it an hour ago, her device already has most of those blocks, and the fastest load reads them locally and asks the server only for what changed.
+
+Notion's desktop and mobile apps have done this for years with **RecordCache**, a local SQLite database of every record the app has seen, with the least recently used evicted. Carlo Francisco's July 2024 post "How we sped up Notion in the browser with WASM SQLite" says the Mac and Windows apps had got faster this way about three years before, and the browser hadn't, for lack of a fast, durable database in the browser.
+
+By 2024 one existed. SQLite can be compiled to **WebAssembly** (WASM), a compact instruction format browsers run at close to native speed, and browsers had added the **Origin Private File System** (OPFS), a private area of disk per website with fast file access. Together they let a web page run real SQLite on a real file. One catch: fast OPFS access only works inside a **Web Worker**, a background thread separate from the page.
+
+</Sub>
+
+<Sub n="10.2" title="Many tabs, one database file">
+
+Notion's first version gave every tab its own worker writing to SQLite. People keep Notion open in several tabs, and with several writers on one file, some users' databases were corrupted, showing wrong data such as two rows with the same id and different contents. Taking turns with the browser's **Web Locks** API, and letting only the focused tab write, made this rarer but didn't stop it. Notion's conclusion was that OPFS doesn't handle concurrency gracefully. Desktop and mobile apps never had the problem, because one process owns their database.
+
+So exactly one tab now owns the database. Notion used SQLite's "OPFS SyncAccessHandle Pool" storage variant, which works in every major browser without the cross-origin isolation headers that Notion's third-party scripts made impractical, but which allows only one tab at a time. A **SharedWorker**, a single worker shared by all of a site's tabs, chooses one tab as the active tab; that tab runs the SQLite worker, and other tabs send their queries to it through the SharedWorker. Each tab holds a Web Lock for its lifetime, so when a tab closes its lock is released, and the SharedWorker picks a new active tab. Notion credits the pattern to Roy Hashimoto, author of the wa-sqlite library, and reports no corruption since.
+
+<SystemDiagram
+  title="Opening the wiki in a second tab"
+  nodes={[
+    { id: "t1", label: "Tab 1", sub: "active tab", kind: "laptop", col: 0, row: 0 },
+    { id: "t2", label: "Tab 2", sub: "Asha's wiki", kind: "laptop", col: 0, row: 1 },
+    { id: "sw", label: "SharedWorker", sub: "picks the active tab", kind: "service", col: 1, row: 1 },
+    { id: "w", label: "SQLite worker", sub: "WASM, in tab 1", kind: "compute", col: 1, row: 0 },
+    { id: "opfs", label: "OPFS file", sub: "cached blocks", kind: "db", col: 2, row: 0 },
+    { id: "api", label: "Notion API", kind: "service", col: 2, row: 1 },
+  ]}
+  edges={[
+    { from: "t1", to: "w" }, { from: "w", to: "opfs" },
+    { from: "t2", to: "sw" }, { from: "sw", to: "w", label: "query" },
+    { from: "t2", to: "api", label: "race", dashed: true },
+  ]}
+  steps={[
+    { caption: "Asha has Notion in two tabs. Tab 1 is active and runs the only SQLite worker.", focus: ["t1", "w"] },
+    { caption: "She opens the wiki in tab 2, which never touches the file; it sends its query to the SharedWorker.", path: ["t2", "sw"] },
+    { caption: "The SharedWorker forwards it to the worker in tab 1, which reads the cached blocks from OPFS.", path: ["sw", "w", "opfs"] },
+    { caption: "Meanwhile tab 2 asks the API too. Whichever answers first is drawn.", path: ["t2", "api"] },
+    { caption: "If tab 1 closes, its Web Lock is released and the SharedWorker makes tab 2 the active tab.", focus: ["sw", "t2"] },
+  ]}
+  caption="One writer per database file, chosen by a SharedWorker; every other tab borrows it."
+/>
+
+Page navigation got roughly 20% faster in all modern browsers, and more where Notion's servers are far away: 28% in Australia, 31% in China and 33% in India, where Asha is. Two things got worse first. Downloading the SQLite library, a few hundred kilobytes, delayed the first page load until Notion loaded it in the background. And on slow devices such as older Android phones, reading the disk could lose to the network, making the slowest navigations worse; the fix was to reuse logic page loads already had, querying SQLite and the API at once and using whichever answers first: the race in the diagram.
+
+<Callout label="Design implication">
+A local cache isn't automatically faster than the network. A cheap phone's storage can lose to a nearby server, so treat the cache as one of two sources and race them.
+</Callout>
+
+</Sub>
+
+<Sub n="10.3" title="Offline: from best effort to a promise">
+
+A cache that usually has your page isn't the same as working offline. Raymond Xu's December 2025 post, "How we made Notion available offline", explains the gap: the SQLite cache was best-effort, with no promise about which records stay, which is fine online because anything missing can be fetched. Offline Mode, announced in August 2025 after years as a top request, needed a guarantee that every block of a chosen page is on the device.
+
+A page can be offline for several reasons at once: Asha switched it on, it's a favourite, she visited it recently, or it's inside a page that's offline. Notion's first design kept one set of offline pages and removed a page when its toggle went off, which wrongly removed pages that were also offline for another reason. So the client now records each reason separately, in an `offline_action` table, alongside an `offline_page` table with one row per page available offline, and a page leaves the device only when its last reason goes. That's reference counting, the same rule as a file being deleted only when its last link is removed. On reconnecting, the client compares when it last downloaded each page with when the server last changed it and fetches only newer pages, and edits made offline merge through the CRDT model from section 4.3.
+
+</Sub>
+
+<SectionHeading n="11" id="search-ai">Search and AI, briefly</SectionHeading>
+
+<Sub n="11.1" title="Finding blocks by meaning">
+
+Search and AI are the last readers of blocks. Notion's April 2026 post on multi-region data mentions a dedicated Elasticsearch cluster for EU workspaces, so keyword search runs on an inverted index (chapter 62); how the main index is kept fresh is otherwise unpublished.
+
+Notion AI's question answering, launched in November 2023, searches by meaning. Notion's February 2026 post "Two years of vector search at Notion" describes it: long pages are split into spans, a model turns each span into an **embedding**, a list of numbers placing it in a space where similar meanings land close together, and each vector is stored with metadata including permissions, so a question only searches what the asker may see. Bulk indexing runs in Spark and page edits flow through Kafka consumers, with sub-minute delay.
+
+<Picture
+  src="/images/designs/notion/word-vectors.jpg"
+  alt="Four words plotted as points: man and woman, king and queen, with parallel dashed lines joining each pair"
+  caption="Embeddings place text so that distance and direction carry meaning: the step from 'man' to 'woman' matches the step from 'king' to 'queen'. A question about 'team meeting notes' lands near a span titled 'group standup summary', with no words in common."
+  credit="Image: Singerep, CC BY-SA 4.0, via Wikimedia Commons (cropped)"
+  href="https://commons.wikimedia.org/wiki/File:Word_vector_illustration.jpg"
+  paper
+  narrow
+/>
+
+Asha's drag is a good test of this pipeline. Her to-do's text didn't change, but its permissions did. Since July 2025, Notion keeps two 64-bit xxHash hashes per span, one of the text and one of the metadata. Changed text is re-embedded; changed metadata only, like a new parent's permissions, is patched onto the stored vector without re-embedding. Notion says this cut data volume by 70%. Notion committed in late 2024 to moving its vectors to turbopuffer, which cut search spend by 60% and median query latency from 70–100 ms to 50–70 ms.
+
+</Sub>
+
+<SectionHeading n="12" id="whole">The whole system</SectionHeading>
+
+<Sub n="12.1" title="Every box, and why it's there">
+
+<SystemDiagram
+  title="Notion, end to end"
+  nodes={[
+    { id: "asha", label: "Asha's browser", sub: "SQLite in OPFS", kind: "laptop", col: 0, row: 0 },
+    { id: "rohan", label: "Rohan's app", sub: "RecordCache", kind: "laptop", col: 0, row: 2 },
+    { id: "api", label: "API servers", sub: "transactions, routing", kind: "service", col: 1, row: 0 },
+    { id: "ms", label: "MessageStore", sub: "WebSockets", kind: "service", col: 1, row: 2 },
+    { id: "pgb", label: "PgBouncer", sub: "pooled, in groups", kind: "lb", col: 2, row: 0 },
+    { id: "pg", label: "Postgres", sub: "480 shards, 96 hosts", kind: "db", col: 3, row: 0 },
+    { id: "cdc", label: "Debezium → Kafka", sub: "every row change", kind: "queue", col: 3, row: 1 },
+    { id: "lake", label: "Hudi + Spark", sub: "permissions, analytics", kind: "blob", col: 3, row: 2 },
+    { id: "search", label: "Search + vectors", sub: "Elasticsearch, turbopuffer", kind: "cache", col: 2, row: 2 },
+  ]}
+  zones={[{ label: "Derived data", nodes: ["cdc", "lake", "search"] }]}
+  edges={[
+    { from: "asha", to: "api", label: "transaction" }, { from: "api", to: "pgb" }, { from: "pgb", to: "pg" },
+    { from: "api", to: "ms" }, { from: "ms", to: "rohan", label: "changed" }, { from: "rohan", to: "api", dashed: true },
+    { from: "pg", to: "cdc" }, { from: "cdc", to: "lake" }, { from: "lake", to: "search" }, { from: "cdc", to: "search", dashed: true },
+  ]}
+  steps={[
+    { caption: "Asha opens the wiki. Her browser draws it from its local SQLite copy and asks the API for anything newer, whichever is faster.", path: ["asha", "api"] },
+    { caption: "She adds a to-do and drags it: two transactions of small operations, shown at once and queued on her device.", path: ["asha", "api"] },
+    { caption: "The API maps Acme's workspace to `schema190`, on host 37 since 2023, and commits there through PgBouncer.", path: ["api", "pgb", "pg"] },
+    { caption: "MessageStore tells Rohan's app the wiki changed; it refetches, with the permission walk applied to him, and the to-do is gone.", path: ["api", "ms", "rohan"] },
+    { caption: "Debezium reads the changed rows from host 37's log into Kafka.", path: ["pg", "cdc"] },
+    { caption: "Hudi absorbs the upserts, Spark recomputes the moved block's permissions, and the search and AI indexes are patched.", path: ["cdc", "lake", "search"] },
+  ]}
+  caption="The product path is small transactions on sharded Postgres; the derived path is every change, copied out by CDC."
+/>
+
+| Component | What it does | Added because |
+|---|---|---|
+| Blocks | Every piece of content is a row with type, properties, children and parent | A page as one document can't be edited, shared or nested in parts (§2, §3) |
+| Parent pointers | Permission checks walk up to the nearest block that sets access | Per-block permissions are unmanageable (§3.3) |
+| Transactions + durable queue | Small atomic edits, shown locally first | Edits must feel instant and never be half-applied (§4) |
+| MessageStore | Pushes "this changed" over WebSockets | Polling from every tab would swamp the servers (§4.2) |
+| 480 logical shards by workspace | Routing in the application | One Postgres hit VACUUM stalls and wraparound risk (§5, §6) |
+| Audit log, then logical replication | Moving live data between hosts | Shards had to be created, then tripled, without losing edits (§7, §8) |
+| Debezium, Kafka, Hudi, Spark | A full copy of every block | The warehouse couldn't absorb 90% updates or walk the tree (§9) |
+| WASM SQLite + SharedWorker | Pages from a local database in the browser | Fetching blocks over the network was slow, most of all far away (§10) |
+
+</Sub>
+
+<Sub n="12.2" title="From top to bottom">
+
+| Level | The choice | Data structure or algorithm |
+|---|---|---|
+| Page | A tree of blocks | Records with an ordered child list and a parent pointer |
+| Permissions | Inherit from the nearest ancestor | Walk up parent pointers; in bulk, a tree traversal per shard |
+| Edits | Small, atomic, optimistic | Operations in transactions; durable client queue; per-record versions |
+| Storage | Shard by workspace | UUID range → one of 480 Postgres schemas → host by a fixed map |
+| Growth | Move schemas, never re-sort rows | 480 for its divisors; one publication per 5 schemas |
+| Analytics | Upserts to object storage | Hudi copy-on-write files sorted by last-change LSN, Bloom filters |
+| Client | One SQLite writer per browser | WASM SQLite in OPFS; a SharedWorker elects the active tab |
+| Offline | Keep a page while any reason remains | Reference counts in `offline_page` and `offline_action` |
+| AI search | Re-embed only what changed | Per-span xxHash of text and of metadata |
+
+</Sub>
+
+<SectionHeading n="13" id="breaks">What goes wrong, and what it cost</SectionHeading>
+
+<Sub n="13.1" title="Failures and tradeoffs">
+
+| What happens | What the user sees | What the design does |
+|---|---|---|
+| Asha's laptop sleeps mid-edit | The to-do is on screen | The transaction waits in the durable queue and is sent later |
+| A block is dragged into a private page | It disappears for others | Permissions come from the new parent; derived indexes are patched |
+| A shard host runs hot | Slow saves for its workspaces | Move whole logical shards to more hosts (2023: 32 → 96) |
+| VACUUM can't keep up | Bloat, then refused writes | Smaller shards, so each table and each VACUUM is smaller |
+| Two tabs write the cache | Wrong data on a page | One active tab owns SQLite; others go through a SharedWorker |
+| The local disk is slow | Navigation slower than the network | Race SQLite against the API |
+
+| Decision | Chosen | Given up | Why it was worth it |
+|---|---|---|---|
+| Unit of storage | Blocks | One-read page loads | Small edits; anything nests; types change freely |
+| Permissions | Inherited via parents | Cheap bulk evaluation | Sharing changes touch one row; moves behave as people expect |
+| Sharding | In the application, by workspace (2021) | An off-the-shelf distributed database | Control over placement; every transaction on one shard |
+| Shard count | 480 logical on 32, then 96 hosts | A simple `mod N` | Add hosts without re-sorting rows |
+| Re-shard | Logical replication (2023) | The 2021 custom tooling | No noticeable downtime, rollback per shard |
+| Analytics | Hudi lake before the warehouse (2022) | One managed system | Cheap upserts, tree walks in Spark, over $1M saved in 2022 |
+| Browser cache | WASM SQLite, one writer (2024) | Simplicity | About 20% faster navigation, more far from servers |
+
+</Sub>
+
+<SectionHeading n="14" id="summary">Summary</SectionHeading>
+
+1. **A page as one document breaks** as soon as two people edit it, part of it is private, or it contains other pages.
+2. **Everything is a block**: an id, a type, properties, an ordered list of child ids and a parent pointer, for paragraphs, pages, databases and rows alike.
+3. **Permissions are inherited** by walking parent pointers to the nearest block that sets them, so moving a block can change who sees it.
+4. **Edits are transactions of small operations**, shown on the device first, queued durably, and committed atomically after a permission check.
+5. **Other viewers hear by push and fetch by pull**: MessageStore says "this changed", and each client fetches what it may see.
+6. **One Postgres hit VACUUM stalls and wraparound risk** in 2020, after five years and four orders of magnitude of growth.
+7. **Notion sharded in the application by workspace** in 2021, into 480 logical shards (Postgres schemas) on 32 hosts, so a transaction or permission walk needs one shard.
+8. **480 was chosen for its divisors**, and in 2023 Notion tripled to 96 hosts with logical replication and per-shard switches, with no downtime users noticed.
+9. **Every change also flows out by CDC**, through Debezium and Kafka into Hudi tables on S3 sorted by recency, where Spark walks the tree for analytics, search and AI.
+10. **The browser keeps its own SQLite database** with one writer per browser, raced against the network, and offline mode turns that cache into a reference-counted promise.
+
+<SectionHeading n="15" id="build">Build this</SectionHeading>
+
+**A tiny sharded block store.**
+
+- Grow the first TryIt into a small server with `loadPage(id)`, which walks `content` lists and drops blocks the caller can't read, and `saveTransaction(ops)`, which rejects the whole transaction if any operation fails a permission check.
+- Add a version to each block and a WebSocket that pushes "block X is at version N". Open two tabs and watch one update when the other edits.
+- Store blocks in SQLite files, one per logical shard: 12 shards on 2 "hosts" (directories), routed by workspace id.
+- Move to 3 hosts while a script keeps writing: copy whole shard files, log writes made during the copy, replay them, compare checksums, then switch. Repeat with 16 shards and count what has to move.
+- Bonus: compute every block's effective permissions in one pass by walking down from the workspace, instead of up from every block.
+
+<SectionHeading n="16" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Why does Notion store blocks instead of whole pages?">
+Because the unit of change is a line, not a page. As one document, every edit rewrites the page, two people saving at once overwrite each other, and there's nowhere to put permissions for part of a page or a table row that is itself a page. With blocks, an edit touches a few small rows, anything can nest in anything, and changing a line's type changes one field. In exchange, opening a page reads many rows, which caching on the server and the device makes up for.
+</QA>
+
+<QA level="beginner" q="How does Notion decide whether you can see a block?">
+Blocks inherit permissions. Each block stores a parent pointer, and the check walks up to the first ancestor that sets permissions, ending at the workspace. Downward content lists aren't used, because a block can appear in more than one and searching them is slow. So dragging a block into a private page makes it private without any permission being edited.
+</QA>
+
+<QA level="intermediate" q="Why shard by workspace id, and why 480 logical shards on 32 machines?">
+Everything one action touches, the blocks in a transaction, a page's blocks, and every ancestor in a permission walk, belongs to one workspace, so keying on it keeps each of those on one shard with no cross-shard joins. Logical shards separate where a workspace belongs from which machine holds it: a workspace's logical shard never changes, so adding machines moves whole schemas instead of re-sorting rows. 480 has many divisors, so the fleet can grow to 40, 48 or 96 hosts evenly; 512 would only allow doubling.
+</QA>
+
+<QA level="deep" q="How would you move a live, heavily written Postgres table to new shards without losing writes?">
+Capture every change from a fixed moment: Notion used an audit-log table in 2021, because the overloaded monolith couldn't sustain logical replication, and logical replication in 2023. Copy existing rows, comparing versions so the copy never overwrites a newer change. Verify with sampled comparisons and dark reads, ideally written by someone other than the migration's author. Then switch, with a rollback path: in 2021 a five-minute window, in 2023 a per-shard PgBouncer switch with about a second of paused saves and reverse replication ready. And start while the database still has headroom.
+</QA>
+
+<QA level="deep" q="Why didn't a data warehouse work for Notion's block data, and what replaced it?">
+About 90% of block changes update existing rows, and the warehouse was built for appends, so ingesting the stream from 480 shards was slow and costly; and computing permissions needs a walk up each block's ancestors, which timed out as SQL. Notion put a lake in front: Debezium reads each host's changes into Kafka, Hudi upserts them into copy-on-write tables on S3, partitioned like the shards and sorted by recency so updates rewrite few files, and Spark runs the tree walks. Cleaned results go on to the warehouse, search and AI.
+</QA>
+
+<SectionHeading n="17" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Asha changes a to-do into a heading. Which fields of the block change?">
+    Only `type`. The text stays in `properties`, the children in `content`,
+    and the parent is unchanged; switching back loses nothing.
+  </Q>
+  <Q q="Notion grows from 96 hosts to 120. How many logical shards per host, and does any workspace change logical shard?">
+    480 ÷ 120 = 4 per host. No workspace changes logical shard, because the
+    UUID-to-shard mapping depends only on the 480; whole schemas move between
+    hosts.
+  </Q>
+  <Q q="Why does sorting Hudi files by last-change LSN help a copy-on-write table?">
+    Copy-on-write rewrites every file containing an updated row. Recently
+    changed blocks are the most likely to change again, so sorting by recency
+    concentrates each batch's updates in a few files.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="'The data model behind Notion's flexibility' (Notion blog, May 2021)">
+    Blocks, the render tree, parent pointers, transactions, RecordCache and
+    MessageStore.
+  </WildCard>
+  <WildCard name="'Herding elephants: lessons learned from sharding Postgres at Notion' (October 2021)">
+    The stalled monolith, the 480-on-32 layout, the audit-log migration and
+    its lessons.
+  </WildCard>
+  <WildCard name="'The Great Re-shard' (Notion blog, July 2023)">
+    32 to 96 hosts with logical replication, PgBouncer groups, dark reads and
+    per-shard failover.
+  </WildCard>
+  <WildCard name="'Building and scaling Notion's data lake' (Notion blog, July 2024)">
+    Why the warehouse alone didn't fit, and the Debezium, Kafka, Hudi and Spark
+    design.
+  </WildCard>
+  <WildCard name="'How we sped up Notion in the browser with WASM SQLite' (July 2024)">
+    OPFS, multi-tab corruption, the SharedWorker fix and the regressions.
+  </WildCard>
+  <WildCard name="'How we made Notion available offline' (December 2025) and 'Two years of vector search at Notion' (February 2026)">
+    Reference-counted offline pages; spans, embeddings and hash-based
+    re-indexing for Notion AI.
+  </WildCard>
+  <WildCard name="Apache Hudi docs: table types; PostgreSQL docs: routine vacuuming, logical replication">
+    Copy-on-write versus merge-on-read; wraparound and freezing; publications
+    and subscriptions.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="18" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Designing Figma">
+    Concurrent editing of a tree, OT versus CRDTs, fractional indexing, and
+    another in-house Postgres sharding. [Chapter 64](/topics/64-design-figma).
+  </WildCard>
+  <WildCard name="PostgreSQL Deep Dive">
+    MVCC, VACUUM, freezing and the write-ahead log behind logical replication.
+    [Chapter 21](/topics/21-postgres).
+  </WildCard>
+  <WildCard name="Partitioning">
+    Partition keys, and moving data when nodes change.
+    [Chapter 29](/topics/29-partitioning).
+  </WildCard>
+  <WildCard name="Stream Processing">
+    The ideas under CDC pipelines into a lake.
+    [Chapter 61](/topics/61-stream-processing).
+  </WildCard>
+  <WildCard name="Kafka & Logs">
+    The ordered log every block change passes through. [Chapter 23](/topics/23-kafka-logs).
+  </WildCard>
+  <WildCard name="Search Engines">
+    Inverted indexes and vector search. [Chapter 62](/topics/62-search-engines).
+  </WildCard>
+</CardGrid>

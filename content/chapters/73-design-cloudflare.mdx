@@ -1,0 +1,1193 @@
+---
+title: Designing Cloudflare
+dek: "A small online shop is hit by a flood of several terabits a second while a shopper in Chennai opens its homepage, and she never notices. We'll design the network that makes that possible: one address in 330 cities, every server running every service, DDoS fingerprints pushed into the network driver, a load balancer on every machine, a Rust proxy, tiers of cache, customer code in V8 isolates, and a config store that reaches every machine in seconds, which is also how Cloudflare's worst outages spread."
+readingTime: "~60 min"
+level: "Intermediate"
+versions: "Figures from Cloudflare's engineering blog, DDoS threat reports, postmortems, docs and open-source repos, dated where they appear"
+prereqs: "chapter 35 (DNS, TLS and the edge), chapter 34 (load balancing) helps, chapter 48 (eBPF) helps, the Uber case study (chapter 50) helps"
+updated: "2026-10-11"
+---
+
+Divya is on a bus in Chennai, scrolling on her phone. A friend has sent her a link to Kaapi Kadai, a small online shop that sells brass filter-coffee sets, and she taps it. In well under a second the homepage is there: the logo, a photo of a gleaming tumbler and dabarah, a price in rupees and an estimated delivery date for her pincode. She adds a set to her cart.
+
+At that same moment, Kaapi Kadai is under attack. Somebody has rented time on a botnet, a few hundred thousand hacked home routers, cameras and cheap cloud servers scattered across the world, and pointed all of them at the shop's address. Together they're sending several terabits of junk every second. The shop itself is one small server in a Bengaluru data centre with a one-gigabit link. If even a thousandth of that flood reached it, the link would be full, and Divya's page would never load.
+
+But the flood never reaches it. Kaapi Kadai's name points at Cloudflare, which sits in front of the shop as a **reverse proxy**: a server that receives every request meant for the shop, answers what it can itself, and passes on only what it must. So the flood lands on Cloudflare instead, and so does Divya's request, and Cloudflare has to tell them apart, throw one away and serve the other quickly, all on the same machines.
+
+In this case study we'll design that system, starting from the most obvious design and fixing it where it breaks. The question we'll keep coming back to is this: **how does one network sit in front of millions of websites, soak up attacks bigger than any single data centre could carry, and still answer a shopper in Chennai in a few milliseconds?** We'll go from Cloudflare's whole network down to one server, then down through the layers of that server: the packet filter, the load balancer, the proxy, the cache and the code customers run, and finish with the system that keeps every one of those servers configured, which turns out to be both Cloudflare's greatest strength and the way its worst outages have spread.
+
+<SectionHeading n="01" id="requirements">What we're building, and how big</SectionHeading>
+
+<Sub n="1.1" title="What it has to do">
+
+Strip away the product names and Cloudflare's core job, for a site like Kaapi Kadai, comes down to a short list:
+
+1. **Answer for the site's name.** Its DNS points the name at Cloudflare's addresses instead of the shop's own server, which from now on we'll call the **origin**.
+2. **End the encrypted connection** close to the visitor, so the TLS handshake (chapter 35) costs a short round trip instead of a long one.
+3. **Drop attack traffic** before it uses up anything that matters, at every layer from raw packets up to HTTP requests.
+4. **Filter requests** with the site's security rules: the web application firewall (WAF), bot detection, rate limits.
+5. **Serve from cache** whatever can be cached, and fetch the rest from the origin efficiently.
+6. **Run the site's own code** at the edge, if it has any, such as Kaapi Kadai's delivery-date calculation.
+7. **Apply configuration changes everywhere**, quickly: when the shop's owner adds a firewall rule or the shop moves to a new server, every machine has to know.
+
+And the qualities it needs while doing that:
+
+- **Close to everyone**: a visitor's packets should reach a Cloudflare server within a few milliseconds.
+- **Bigger than any attack**: the network as a whole has to absorb floods larger than any one site, and any one data centre, could carry.
+- **Invisible when it works**: a shopper shouldn't be able to tell that the shop is under attack.
+- **Never the cause of the outage**: a service sitting in front of a fifth of the web can take a fifth of the web down with it.
+
+This list differs from our other case studies in one way that shapes everything. Uber and Discord each serve their own product. Cloudflare serves *other people's* products, millions of them, with no idea in advance which one will be attacked next or which one will suddenly get popular. Any capacity it sets aside for one customer or one job sits idle while the attack lands somewhere else.
+
+</Sub>
+
+<Sub n="1.2" title="How big is it?">
+
+Cloudflare publishes its size in its blog posts and threat reports, and it has grown quickly. In May 2019 it described its network as 180 locations. By the start of 2020 it was 200 cities, and by the end of 2024 it was 330. Its network capacity, the total traffic its links can carry, went from 35 terabits a second (Tbps) at its first DDoS report in 2020 to 321 Tbps in January 2025, 388 Tbps in July 2025 and 500 Tbps in April 2026. Its network page in October 2026 lists 335+ cities in 125+ countries and more than 13,000 interconnections with other networks.
+
+Traffic grew just as fast. Cloudflare's 2025 Year in Review reports an average of over 81 million HTTP requests a second through the year, with peaks above 129 million, and about 67 million DNS queries a second. In October 2024 it described itself as the reverse proxy for nearly 20% of all websites.
+
+Attacks kept pace. Here are the records Cloudflare has reported for floods measured in bits per second, the kind that fill links:
+
+| When reported | Peak | How long | What Cloudflare said about it |
+|---|---|---|---|
+| October 2024 | 3.8 Tbps | 65 seconds | Part of a month-long campaign; a separate attack in it hit 2.14 billion packets a second |
+| October 2024 | 4.2 Tbps | about a minute | 21 October 2024, three weeks after the 3.8 Tbps attack was disclosed |
+| January 2025 | 5.6 Tbps | 80 seconds | 29 October 2024, a Mirai-variant botnet of over 13,000 IoT devices, aimed at an ISP in East Asia |
+| June 2025 | 7.3 Tbps | 45 seconds | Mid-May 2025; 37.4 terabytes delivered; from 122,145 source addresses in 161 countries |
+| December 2025 | 29.7 Tbps | not given | Q3 2025, the Aisuru botnet, estimated at 1–4 million infected hosts |
+| February 2026 | 31.4 Tbps | 35 seconds | Q4 2025, the Aisuru-Kimwolf botnet |
+
+Cloudflare's report for the first half of 2026, published in August, gave no new record, but counted 935 network-layer attacks above 1 Tbps in those six months. Across 2025 its systems mitigated 47.1 million DDoS attacks, about 5,376 every hour. So the attack on Kaapi Kadai in our story, a few terabits, is big but no longer unusual.
+
+<Think
+  q="Kaapi Kadai's server has a 1 Gbps link. The 7.3 Tbps attack of May 2025 was detected and dropped in 293 cities. If the flood had been spread evenly across those cities, how much would each one have had to carry, and how many times over would it have filled the shop's link?"
+  hint="Convert terabits to gigabits, then divide."
+>
+7.3 Tbps is 7,300 Gbps, so aimed straight at the shop it would fill its link 7,300 times over. No server, and no single data centre, could take it.
+
+Spread over 293 cities it's roughly 25 Gbps per city. That's a number one ordinary server can almost handle by itself: Cloudflare's 2024 servers each have a dual-port 25 Gbps network card. A city with a few dozen servers barely notices. Real attacks aren't spread evenly, of course, and some cities probably got far more than their share, but the point stands: an attack that is impossible in one place becomes manageable when every place takes a share. Most of the rest of the design follows from making that sharing happen.
+</Think>
+
+</Sub>
+
+<SectionHeading n="02" id="v1">Version 1: one proxy in front of the shop</SectionHeading>
+
+<Sub n="2.1" title="The obvious design">
+
+The simplest way to protect Kaapi Kadai is to rent a big machine somewhere, say in a data centre in Virginia with a fat link to the internet, and put a reverse proxy on it. Point the shop's DNS at the proxy's address, and let it terminate TLS, check each request against some rules, keep a cache of the photos and pages that don't change, and forward everything else to the origin in Bengaluru. Attack traffic hits the proxy instead of the shop, and the proxy, with more bandwidth and CPU than the shop, throws it away.
+
+<SystemDiagram
+  title="Version 1: a single proxy in one data centre"
+  nodes={[
+    { id: "divya", label: "Divya's phone", sub: "Chennai", kind: "phone", col: 0, row: 0 },
+    { id: "bots", label: "Botnet", sub: "several Tbps", kind: "users", col: 0, row: 2 },
+    { id: "proxy", label: "Reverse proxy", sub: "one site, Virginia", kind: "lb", col: 1, row: 1 },
+    { id: "cache", label: "Cache", sub: "photos, CSS", kind: "cache", col: 2, row: 0 },
+    { id: "origin", label: "Kaapi Kadai origin", sub: "Bengaluru, 1 Gbps", kind: "service", col: 3, row: 1 },
+  ]}
+  edges={[
+    { from: "divya", to: "proxy", label: "~14,000 km" },
+    { from: "bots", to: "proxy", label: "flood" },
+    { from: "proxy", to: "cache" },
+    { from: "proxy", to: "origin", label: "misses only" },
+  ]}
+  steps={[
+    { caption: "Divya's request crosses half the planet to reach the proxy in Virginia, and every TLS round trip has to make the same journey.", path: ["divya", "proxy"] },
+    { caption: "The photo is in the proxy's cache, so it comes straight back, after another trip across the world.", path: ["proxy", "cache"] },
+    { caption: "The flood arrives at the same building. Every bot on Earth aims at one address, so all of it funnels into one site's links.", path: ["bots", "proxy"] },
+    { caption: "Once the proxy's links are full, the junk and Divya's request queue together, and her request is dropped with the junk. The origin is safe, and also unreachable.", focus: ["proxy", "origin"] },
+  ]}
+/>
+
+It breaks in two ways, and they pull in opposite directions.
+
+First, distance. Chennai to Virginia is roughly 14,000 km. Light in optical fibre covers roughly 200,000 km a second, so a round trip takes at least 140 milliseconds before any routing detours, and real paths are longer. A fresh HTTPS page load needs a TCP handshake, a TLS handshake and then the request itself, so Divya waits for several of those round trips before the first byte of the page arrives. Every visitor far from Virginia pays it.
+
+Second, the attack. A botnet's machines are everywhere, but they all aim at one address, so the internet's routing carries all of the flood to one building. That site needs links bigger than the biggest attack, and we've just seen that the biggest attacks are tens of terabits. No single site has that.
+
+<Picture
+  src="/images/designs/cloudflare/cdn-vs-single-server.png"
+  alt="Two panels: on the left one server inside a cloud serves every client over long dashed lines; on the right five edge servers spread through the cloud each serve the clients nearest them"
+  caption="Left: version 1, one site serving everyone, however far away. Right: the same content served from many sites, each near its users. Every site is also somewhere an attack can be absorbed."
+  credit="Image: Kanoha, CC BY-SA 3.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:NCDN_-_CDN.png"
+  paper
+/>
+
+So the fix for both problems is the same: be in many places at once. But "many places" raises two new questions. How does a visitor's packet find the nearest place, when Kaapi Kadai has only one address? And what goes in each place?
+
+</Sub>
+
+<SectionHeading n="03" id="every-city">One address in every city, every service on every server</SectionHeading>
+
+<Sub n="3.1" title="Anycast: the same address everywhere">
+
+The first question has an answer you've met in chapter 35: **anycast**. Every Cloudflare data centre announces the same blocks of IP addresses to the networks around it, using BGP, the protocol networks use to tell each other which addresses they can reach. Each router that hears several announcements picks the one that looks closest by its own policy. So Divya's phone, on a Chennai mobile network, reaches the Cloudflare data centre in Chennai (its airport code is MAA), while a shopper in Frankfurt reaches Frankfurt, both using the same address for Kaapi Kadai. Chapter 35 walks through how that works and what happens when a site withdraws; here we care about what it does to an attack.
+
+What it does is split the attack automatically. Bots in Brazil reach Cloudflare's São Paulo data centre, the bots in Vietnam reach Hanoi, the bots in the US reach a dozen American cities. Nobody has to decide where to send the junk; the internet's own routing spreads it out, the same way it spreads out Divya and the shopper in Frankfurt. That's exactly the sharing we needed in the Think in section 1.2, and it's why the 7.3 Tbps attack was "detected and mitigated in 477 data centers across 293 locations", in Cloudflare's words.
+
+<Picture
+  src="/images/designs/cloudflare/anycast-diagram.png"
+  alt="A red node with one arrow to the nearest of three green nodes; three yellow nodes receive nothing"
+  caption="Anycast in one picture. The green nodes all share one address; the red sender's packets go to whichever green node routing considers nearest. Swap the red node for Divya, or for one bot, and the green nodes for Cloudflare's cities."
+  credit="Image: Easyas12c, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Anycast-BM.svg"
+  paper
+  narrow
+/>
+
+For anycast to work this well, Cloudflare has to be inside or right next to the networks people use. That's why the 13,000 interconnections matter as much as the 335 cities. Many of them are made at **internet exchange points** (IXPs), buildings where dozens or hundreds of networks plug into a shared switch and swap traffic directly, without paying a transit provider in between. A Cloudflare rack at the Chennai exchange is a few metres of cable from the mobile network Divya is on.
+
+<div className="grid gap-4 sm:grid-cols-2">
+
+<Picture
+  src="/images/designs/cloudflare/internet-exchange-decix.jpg"
+  alt="Three black cabinets with perforated doors, each with the DE-CIX logo cut into it, and yellow fibre cords visible behind"
+  caption="Switch racks at DE-CIX in Frankfurt, one of the world's largest exchanges. Hundreds of networks connect to switches like these and swap traffic directly."
+  credit="Photo: Stefan Funke, CC BY-SA 2.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:DE-CIX_GERMANY_-_Switch_Rack_(6218137120).jpg"
+/>
+
+<Picture
+  src="/images/designs/cloudflare/internet-exchange-patch-panel.jpg"
+  alt="Dozens of labelled yellow fibre jumpers plugged into blue connector cassettes in a rack"
+  caption="A patch panel at AMS-IX in Amsterdam. Each yellow fibre is one network's port on the exchange, a few metres of glass between, say, a mobile operator and a CDN."
+  credit="Photo: Fabienne Serriere, CC BY-SA 3.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:AMS-IX_optical_patch_panel.jpg"
+/>
+
+</div>
+
+</Sub>
+
+<Sub n="3.2" title="What goes in each city?">
+
+The second question is less obvious. Say Cloudflare has a few dozen servers in Chennai. Which jobs should they do?
+
+A textbook answer is to specialise. Put a few machines in front as **scrubbers**, built only to filter packets. Behind them, a tier of TLS terminators. Behind those, WAF machines, then cache machines, then machines that run customer code. Each tier is sized for its job and built from the right hardware. Plenty of networks are built like this.
+
+Trouble is, each tier has to be sized for its own worst day, and their worst days don't coincide. On the day Kaapi Kadai is attacked, the scrubbers in Chennai are overwhelmed while the cache servers next to them sit at 20%. On a normal day, the scrubbers sit idle. And an attack that doesn't look like a flood, millions of perfectly valid HTTPS requests for example, lands on the TLS and WAF tiers, which were sized for normal traffic.
+
+Cloudflare made the opposite choice early. Its 2016 post on how its architecture stops large attacks says it plainly: "every server in every rack is able to answer every type of request." A 2019 post repeats it: "All software pieces are running on all the servers." Every server in Chennai runs the packet filter, the load balancer, the TLS terminator, the WAF, the cache, the Workers runtime and the DNS server. When an attack arrives, every core in the city can help drop it; when a cache-heavy day arrives, every disk in the city can help serve it.
+
+<Decision
+  q="Specialised tiers, or every service on every server?"
+  options={[
+    { name: "Specialised tiers", how: "Scrubbers, then TLS terminators, then WAF, cache and compute machines, each tier sized for its own job.", good: ["Each tier can use hardware suited to it", "Simple to reason about one tier's load", "A bug in one tier's software only affects that tier"], bad: ["Each tier must be sized for its own worst day", "Idle capacity in every tier the rest of the time", "Attacks overwhelm whichever tier they target"] },
+    { name: "Every service on every server", how: "One identical software stack on every machine; any server can handle any packet or request.", good: ["The whole city's CPU, links and disks help with whatever is busy", "One server design to buy, test and stock spares for", "Adding a city means adding the same rack again"], bad: ["Services compete for the same CPU, memory and cache", "A bad release or bad config can hit every service on every machine", "A noisy job can slow a sensitive one on the same box"], chosen: true },
+  ]}
+>
+Cloudflare has kept this choice for a decade. Its 2020 post on its tenth server generation names the alternative and rejects it: "several fragmented networks with specialized servers designed to run specific features, such as the Firewall, DDoS protection or Workers" would have "resulted in wasted idle resources." Its reference architecture in 2024 adds a second reason: because each server runs every service, "traffic is inspected in one pass and acted upon close to the end user." The cost listed in the right-hand column is real, and section 10 is about it.
+</Decision>
+
+</Sub>
+
+<Sub n="3.3" title="One server">
+
+So it's worth looking at the machine that does all of this. Cloudflare's twelfth-generation server, described in September 2024, has one AMD EPYC 9684X processor with 96 cores and 1,152 MB of on-chip cache, 384 GB of memory, 16 TB of flash storage and a dual-port 25 Gbps network card, and draws about 600 watts. It serves more than twice the requests a second of the generation before. Its thirteenth generation, announced in March 2026, moves to a 192-core AMD EPYC chip. They're ordinary servers; what makes them unusual is that thousands of them are identical, in hundreds of cities, all running the same software.
+
+<Picture
+  src="/images/designs/cloudflare/server-racks-1u.jpg"
+  alt="Several tall racks packed from top to bottom with identical thin 1U servers, their drive bays and blue status lights in rows"
+  caption="Racks of identical 1U servers (these belong to the Wikimedia Foundation). A Cloudflare city looks like this: many copies of one machine, every one able to do every job, so any of them can take a share of whatever arrives."
+  credit="Photo: Victor Grigas, CC BY-SA 3.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Wikimedia_Foundation_Servers-8055_35.jpg"
+/>
+
+<Zoom path={["Cloudflare", "One city (MAA)", "One server", "One packet"]} />
+
+Here is the path one packet takes through one of those servers, from the wire up. Each layer is a section of this chapter.
+
+| Layer | What it does | Section |
+|---|---|---|
+| XDP programs in the network driver (small programs the kernel runs on each packet as it arrives) | Drop attack packets (l4drop); pick which server in the city gets each connection (Unimog) | 4, 5 |
+| Linux TCP/IP and TLS termination | Turn packets into connections, decrypt | chapter 10, chapter 35 |
+| FL, the "brain" | Apply the site's configuration: WAF, bot score, rules, redirects | 6, 10 |
+| Pingora | Look in the cache; fetch from the origin on a miss | 6, 7 |
+| The Workers runtime | Run the site's own JavaScript in a V8 isolate | 8 |
+| Quicksilver | Hold every site's configuration, read by all of the above | 9 |
+
+The packet filter comes first, because Kaapi Kadai's flood is arriving right now, and every cycle a junk packet spends further up this stack is a cycle stolen from Divya.
+
+</Sub>
+
+<SectionHeading n="04" id="ddos">Stopping the flood</SectionHeading>
+
+<Sub n="4.1" title="What the defender sees">
+
+Let's look at the flood the way a server in Chennai sees it. Most of what arrives on its network card is ordinary: TCP packets to port 443 carrying HTTPS, some UDP packets to port 443 carrying QUIC (chapter 63), DNS queries. Mixed in, at a far higher rate, are the attack's packets. In a typical **volumetric** attack, one that aims to fill links, they're UDP packets, often with random source and destination ports so that no single port looks unusual, and their source addresses may be forged.
+
+Each one, taken alone, looks like a valid packet. What gives the flood away is what the packets have in common. A botnet runs the same program on every bot, so its packets tend to share something the program fixes: the same packet length, the same bytes in the payload, the same unusual flag combination, the same IP header options. Defenders call a description of that shared trait a **fingerprint**, for example "UDP, length 1,240 bytes". Detection means finding the fingerprint, and mitigation means dropping every packet that matches it, and nothing else, at millions of packets a second.
+
+Cloudflare's DDoS reports describe what these floods look like from the receiving end, and that's as far as this chapter goes: what a defender can see in its own traffic, and what it does about it.
+
+<Picture
+  src="/images/designs/cloudflare/botnet-diagram.png"
+  alt="A four-panel cartoon: an attacker spreads a trojan that infects PCs; the infected PCs connect to a control server; a client pays the attacker; the botnet floods a victim"
+  caption="How a botnet comes to exist and gets used: (1) malware infects many machines, (2) they report to a control server, (3) someone pays to use them, (4) they all send traffic at one victim. The defender sees only panel 4, and only the share of it that routing brings to each city."
+  credit="Image: Tom-b, CC BY-SA 3.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Botnet.svg"
+  paper
+/>
+
+</Sub>
+
+<Sub n="4.2" title="Version 1 of detection: send samples to a central brain">
+
+You can't examine every packet in detail at line rate, so the first move is **sampling**: look at a random small fraction, say one packet in every few thousand, and assume the sample looks like the whole. Cloudflare's 2018 post on its packet filter, L4Drop, describes doing exactly this inside the network driver, by comparing a random number against a threshold for each packet and copying the lucky ones into a ring buffer for analysis. What rate Cloudflare uses isn't published.
+
+Cloudflare's first automatic mitigation system, **Gatebot**, described in 2017, gathered those samples from the whole network into its core. Two large servers, with 48 cores between them, ran "streaming algorithms" over them, found attacks, and pushed rules back out to the edge. It engaged "between 30 and 1500 times a day."
+
+A central brain has an obvious weakness, and it gets worse as the network grows: the samples have to travel to the core and the rules have to travel back, which takes time, and the core sees the whole world's traffic at once, which makes it big and expensive to run. An attack aimed at one customer in Chennai doesn't need a global view to be spotted. It needs a fast look at Chennai's traffic.
+
+</Sub>
+
+<Sub n="4.3" title="Detection on every server: dosd">
+
+So in mid-2019 Cloudflare moved detection to the edge. Its 2021 deep dive describes **dosd** (the DoS daemon): "This system runs on every single server in all our edge data centers." The 2021 post credits it with detecting 98.6% of network-layer attacks; Gatebot stayed in the core for the large, slow-building ones.
+
+Cloudflare's 2025 post on the 7.3 Tbps attack spells out what dosd does with its samples. It "looks for patterns in the packet samples, such as finding commonality in the packet header fields," then generates many permutations of those fingerprints to find the most accurate one. It counts how many samples match each permutation, "and using a data streaming algorithm, we bubble up the fingerprint with the most hits." When thresholds are exceeded, the fingerprint is compiled into a rule that drops matching packets, in the form of a small **eBPF** program, code the Linux kernel checks for safety and then runs on every packet (chapter 48). And "each server gossips (multicasts) the top fingerprint permutations within a data center, and globally," so a fingerprint found in Chennai protects Mumbai and Frankfurt too. Cloudflare's documentation gives the time from the start of an attack to mitigation as "up to three seconds on average."
+
+<SystemDiagram
+  title="From a sampled packet to a dropped flood"
+  nodes={[
+    { id: "wire", label: "Network card", sub: "flood + shoppers", kind: "users", col: 0, row: 1 },
+    { id: "xdp", label: "XDP: l4drop", sub: "sample, then drop", kind: "lb", col: 1, row: 1 },
+    { id: "dosd", label: "dosd", sub: "fingerprints, counts", kind: "compute", col: 2, row: 0 },
+    { id: "stack", label: "TCP, TLS, proxy", sub: "Divya's request", kind: "service", col: 2, row: 2 },
+    { id: "peers", label: "Other servers", sub: "this city", kind: "service", col: 3, row: 0, count: "×n" },
+    { id: "world", label: "Other cities", sub: "330+", kind: "cdn", col: 3, row: 1 },
+  ]}
+  edges={[
+    { from: "wire", to: "xdp" }, { from: "xdp", to: "dosd", label: "samples", dashed: true },
+    { from: "dosd", to: "xdp", label: "eBPF rule" }, { from: "xdp", to: "stack", label: "pass" },
+    { from: "dosd", to: "peers", label: "gossip" }, { from: "dosd", to: "world", label: "gossip" },
+  ]}
+  steps={[
+    { caption: "Packets reach the network driver, where an XDP program runs on every one before the kernel builds anything for it. A small random fraction is copied out as samples.", path: ["wire", "xdp", "dosd"] },
+    { caption: "dosd builds candidate fingerprints from combinations of header fields and counts how many samples match each one. One combination, UDP with length 1,240, matches most of them.", focus: ["dosd"] },
+    { caption: "Thresholds are crossed. dosd compiles the fingerprint into a small eBPF program and loads it into the XDP stage, which now drops every matching packet in the driver.", path: ["dosd", "xdp"] },
+    { caption: "Divya's TCP packets don't match, so they pass up the stack to the TLS terminator and proxy as normal.", path: ["wire", "xdp", "stack"] },
+    { caption: "dosd multicasts its best fingerprints to the other servers in Chennai and to other cities, so they can drop the same flood before their own counts catch up.", path: ["dosd", "peers"], focus: ["world"] },
+  ]}
+/>
+
+<Callout label="Design implication">
+Detection moved to where the packets are. Every server that receives a share of the flood has enough samples to recognise it, so there's no round trip to a central brain and no single place for the defence to fail. Gatebot didn't disappear; it was moved to the job a global view is good at, slow and widespread attacks.
+</Callout>
+
+</Sub>
+
+<Sub n="4.4" title="Counting fingerprints in a small space">
+
+<Zoom path={["Cloudflare", "One server", "dosd", "Fingerprint counts"]} />
+
+Look at what dosd is counting. Each sampled packet has many header fields, and a fingerprint is any combination of them with their values: "UDP", "length 1,240", "UDP and length 1,240", "destination port 37,112 and TTL 50", and so on. With five fields there are 31 combinations per packet, and most of them, the ones that include a random port, are unique to that packet. Counting each one exactly means a hash table entry for every combination ever seen, hundreds of thousands of entries for a few seconds of samples, almost all of them counting to 1. We only care about the few that count very high, the **heavy hitters**.
+
+Cloudflare's posts say only "a data streaming algorithm"; which one dosd uses is unpublished. But a standard answer to "find the heavy hitters in a stream using little memory" is a structure Cloudflare does document elsewhere: its Pingora proxy counts requests per key for rate limiting with a **count-min sketch**, as its 2023 post "How Pingora keeps count" describes. Here's how one works.
+
+A count-min sketch is a small grid of counters, a few rows deep and a few thousand wide, with one hash function per row. To count a key, hash it once per row and add one to the counter it lands on in each row. To read a key's count, hash it the same way and take the *smallest* of the counters it lands on. Many keys share each counter, so every counter holds the key's own count plus whatever else collided there. That means the estimate can be too high, never too low. Taking the minimum across rows picks the row where the key was luckiest with its collisions. With *w* counters per row, the error is at most a small multiple of the total count divided by *w*, with high probability; more rows make "high probability" higher.
+
+For our purpose that error doesn't matter. A fingerprint that matches 80% of the samples stands far above the noise, and a fingerprint that matches one packet can't be pushed anywhere near it by collisions.
+
+This program puts it together. It simulates 2,000,000 packets reaching one server, 80% of them from a flood that randomises ports and TTL (the "time to live" hop counter) but always sends 1,240-byte UDP packets, and 20% from shoppers using HTTPS and QUIC. It samples 1 in 100, counts every combination of fields in a count-min sketch of 4 rows by 4,096 counters, and lists the fingerprints that match more than half the samples, most specific first. Both the `matches` function and the ground-truth labels are there only to check the answer; a real server never knows which packets are which.
+
+<TryIt what="Find the flood's fingerprint with a count-min sketch" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import random, hashlib
+from itertools import combinations
+random.seed(7)
+
+FIELDS = ["proto", "dst_port", "src_port", "length", "ttl"]
+
+def shop_packet():                      # shoppers: HTTPS over TCP, some QUIC over UDP
+    proto = random.choice(["tcp", "tcp", "tcp", "udp"])
+    return (proto, 443, random.randint(1024, 65535),
+            random.randint(60, 1500), random.choice([52, 56, 64, 116, 128]))
+
+def attack_packet():                    # the flood: ports and TTL vary, the size never does
+    return ("udp", random.randint(1, 65535), random.randint(1024, 65535),
+            1240, random.randint(40, 64))
+
+class CountMin:
+    def __init__(self, width, depth):
+        self.w, self.d = width, depth
+        self.rows = [[0] * width for _ in range(depth)]
+    def _cells(self, key):              # one independent hash per row
+        for r in range(self.d):
+            h = hashlib.blake2b(key.encode(), digest_size=8, salt=bytes([r]) * 16)
+            yield r, int.from_bytes(h.digest(), "little") % self.w
+    def add(self, key):
+        for r, c in self._cells(key):
+            self.rows[r][c] += 1
+    def estimate(self, key):            # the smallest counter: never below the truth
+        return min(self.rows[r][c] for r, c in self._cells(key))
+
+def fingerprints(pkt):                  # every combination of 1 to 5 header fields
+    for k in range(1, len(FIELDS) + 1):
+        for idx in combinations(range(len(FIELDS)), k):
+            yield " & ".join(f"{FIELDS[i]}={pkt[i]}" for i in idx)
+
+def matches(fp, pkt):
+    return all(str(pkt[FIELDS.index(part.split("=")[0])]) == part.split("=")[1]
+               for part in fp.split(" & "))
+
+# 2,000,000 packets arrive; the server looks at 1 in 100 of them.
+sketch, candidates, seen = CountMin(width=4096, depth=4), set(), []
+for _ in range(2_000_000 // 100):
+    is_attack = random.random() < 0.8
+    pkt = attack_packet() if is_attack else shop_packet()
+    seen.append((pkt, is_attack))
+    for fp in fingerprints(pkt):
+        sketch.add(fp)
+        if sketch.estimate(fp) >= 1000:  # remember anything that gets busy
+            candidates.add(fp)
+
+flood = [p for p, a in seen if a]       # the truth, which the server never gets to see
+shop = [p for p, a in seen if not a]
+distinct = len({fp for p, _ in seen for fp in fingerprints(p)})
+print(f"sampled packets: {len(seen):,}")
+print(f"distinct fingerprints: {distinct:,}   sketch counters: {4 * 4096:,}")
+print("fingerprints seen in over half the samples, most specific first:")
+heavy = sorted((fp for fp in candidates if sketch.estimate(fp) > len(seen) / 2),
+               key=lambda fp: (-fp.count("&"), -sketch.estimate(fp)))
+for fp in heavy:
+    true = sum(matches(fp, p) for p, _ in seen)
+    hit = lambda group: sum(matches(fp, p) for p in group) / len(group)
+    print(f"  {fp:24} estimate {sketch.estimate(fp):>6,}  true {true:>6,}"
+          f"  drops {hit(flood):6.1%} of flood, {hit(shop):5.1%} of shoppers")
+```
+<Output>
+```
+sampled packets: 20,000
+distinct fingerprints: 451,170   sketch counters: 16,384
+fingerprints seen in over half the samples, most specific first:
+  proto=udp & length=1240  estimate 16,176  true 16,074  drops 100.0% of flood,  0.0% of shoppers
+  proto=udp                estimate 17,221  true 17,105  drops 100.0% of flood, 26.3% of shoppers
+  length=1240              estimate 16,202  true 16,074  drops 100.0% of flood,  0.0% of shoppers
+```
+</Output>
+</TryIt>
+
+The first two lines are the point of the data structure: there were over 450,000 distinct fingerprints in the samples, and the sketch kept 16,384 counters, about 28 times fewer, while still finding the three that matter. Compare each estimate with the true count next to it. Every estimate is a bit high, by roughly 100 to 130, which is the collision noise, and never low.
+
+Those three heavy fingerprints are where the choice gets interesting. "proto=udp" matches the whole flood, and also 26% of the shoppers, because QUIC runs over UDP. Dropping it would block every shopper whose browser uses HTTP/3. "proto=udp & length=1240" matches the whole flood and none of the shoppers. That's why the search prefers the most specific fingerprint that still covers the flood, and why dosd tries many permutations: the best rule is the narrowest one that catches the attack.
+
+<Elsewhere items={[
+  { where: "Network monitoring", how: "Routers and monitoring tools find the top talkers on a link with sketches and Space-Saving counters, because exact per-flow tables don't fit in their memory at line rate." },
+  { where: "Redis", how: "RedisBloom's CMS commands give you a count-min sketch as a data type, for counting popular items in a stream without a key per item." },
+]} />
+
+</Sub>
+
+<Sub n="4.5" title="Dropping it in the driver: l4drop">
+
+Once dosd has a fingerprint, the cheapest place to act on it is the earliest one: the network driver, before the kernel spends anything on the packet. Chapter 48 explains **XDP**, the hook that runs an eBPF program on each packet as the driver receives it and lets it return a verdict such as drop or pass. Cloudflare's XDP filter is **l4drop**. Its 2018 post describes the pipeline: rules are turned into a C program, compiled to eBPF with Clang, and loaded into the driver. In that post one server dropped over 8 million packets a second during an attack with its overall CPU use up by only about 10%.
+
+Cloudflare's 2020 post on its load balancer adds how the pieces fit on one machine: the l4drop code "is dynamically generated by xdpd based on information it receives from attack detection systems", where xdpd is a daemon that chains several XDP programs, l4drop first and then the load balancer of the next section, on every server.
+
+So for Kaapi Kadai's flood the sequence is: the first packets of the flood reach the Chennai servers and pass, because there's no rule yet; within seconds dosd has counted enough samples, compiled the rule and loaded it; from then on each junk packet is thrown away in the driver, before the kernel has spent anything on it. Divya's packets, which don't match, go up the stack.
+
+<Decision
+  q="Where should detection and mitigation run?"
+  options={[
+    { name: "Dedicated scrubbing centres", how: "Divert an attacked customer's traffic to a few big filtering sites, then send the clean traffic on.", good: ["Specialised, well-understood hardware", "Used only when needed"], bad: ["Traffic detours to the scrubbing site", "Each site must carry its share of the whole attack", "Diverting takes time"] },
+    { name: "Central analysis, edge enforcement (Gatebot, 2017)", how: "Edge servers send samples to the core; the core finds attacks and pushes rules out.", good: ["A global view of every attack", "One place to improve the logic"], bad: ["Round trip from edge to core and back", "The core is a large system to scale and a single point of failure"] },
+    { name: "Detection and enforcement on every server (dosd, 2019)", how: "Each server samples, fingerprints and drops on its own, and gossips what it finds.", good: ["Reacts in seconds where the packets are", "Scales with the network automatically", "No single point of failure"], bad: ["Each server sees only its share; slow, spread-out attacks are harder", "Detection logic runs on thousands of machines and must be updated on all of them"], chosen: true },
+  ]}
+>
+Cloudflare kept both of the last two: dosd on every edge server for speed, Gatebot in the core for the attacks that only a global view catches. Anycast does the job a scrubbing centre would do, steering the flood to many sites, without anyone deciding to divert anything.
+</Decision>
+
+Floods of packets are only one kind of attack. What about floods that aren't junk packets? The 201-million-requests-a-second "HTTP/2 Rapid Reset" attack of August 2023 came from roughly 20,000 machines making valid-looking HTTPS requests and cancelling them at once. Packets like those pass l4drop, because they're real TCP connections carrying real TLS. Those are caught higher up, by the same idea, fingerprinting and rules on every server, applied to HTTP requests in the proxy. To get there, the packets first have to reach a server that can handle their connection, and in a city with many servers, that is its own problem.
+
+</Sub>
+
+<SectionHeading n="05" id="unimog">Inside one city: a load balancer on every server</SectionHeading>
+
+<Sub n="5.1" title="Spreading packets across the servers">
+
+Divya's packets have reached the Chennai data centre, which has many servers. Which one gets her connection?
+
+A router at the front of the data centre can spread packets itself, with **ECMP** (equal-cost multipath, chapter 34): it hashes each packet's addresses and ports and picks one of the servers by the hash, so every packet of one connection lands on the same server. Cloudflare relied on ECMP alone until 2020, and its post that year lists the problems. When a server is added or removed, routers often **rehash**, which can send existing connections to the wrong server and break them. Routers limit how many servers can be in one ECMP group. And ECMP can't balance by load: it splits connections evenly, even if one server is busy with an expensive customer and another is idle.
+
+So Cloudflare built **Unimog**, its own layer-4 load balancer, described in September 2020. Chapter 34 compares it with Google's Maglev, Facebook's Katran and GitHub's GLB, and covers the general problem of keeping connections alive while the set of servers changes. Here we'll look at what makes Unimog unusual, and at the trick it uses for that problem.
+
+What makes it unusual is that there's no load-balancer tier. "Unimog makes every server into a load balancer." The router sprays packets across the servers with ECMP, and on every server, an XDP program running right after l4drop decides which server should handle each packet. If that's this server, the packet goes up the stack. If not, it's wrapped in a small UDP header (GUE, the same encapsulation GitHub's GLB uses) and sent across the data centre's internal network to the right one. It doesn't matter which server the router picked, because every server makes the same decision.
+
+</Sub>
+
+<Sub n="5.2" title="A table of buckets, and the second hop">
+
+The decision uses a **forwarding table**: an array of buckets, each holding the address of a server. Unimog hashes a packet's addresses and ports to pick a bucket, and the bucket names the server. Unimog's table has many more buckets than servers, "more than 100 times the number of servers", tens of thousands of buckets in a big city, so that load can be shifted in small steps by reassigning a few buckets at a time.
+
+Reassigning a bucket is where the trouble starts. Suppose the bucket for Divya's connection moves from server s3 to server s10, which has just joined. Her next packet goes to s10, which has never heard of her connection, and has no choice but to reset it. Her page load fails halfway.
+
+Unimog's answer, borrowed from a 2018 research system called Beamer, is to give each bucket two slots: the new server and the previous one. In the post's words, the second slot keeps the previous server so that a packet can be "forwarded again on a second hop when necessary." A new connection's first packet, the SYN, always goes to the first server, so new connections start on s10. Any other packet goes to s10 too, but if s10 has no socket for that connection, it forwards the packet to the server in the second slot, s3, which does. Cloudflare calls this **daisy chaining**. Old connections finish on their old server, new ones start on the new one, and nobody is reset.
+
+<Scene
+  title="A bucket moves from s3 to s10, and Divya's connection survives"
+  regions={[
+    { id: "router", label: "Router", sub: "ECMP", col: 0, row: 0 },
+    { id: "s7", label: "Server s7", sub: "any server", col: 1, row: 0 },
+    { id: "s10", label: "Server s10", sub: "bucket's new owner", col: 2, row: 0 },
+    { id: "s3", label: "Server s3", sub: "bucket's old owner", col: 2, row: 1 },
+    { id: "table", label: "Bucket 4,117", sub: "first · second", col: 0, row: 1, span: 2 },
+  ]}
+  itemWidth={124}
+  frames={[
+    { caption: "Divya's connection lives on **s3**. Her bucket in the forwarding table says first: s3, with no second slot yet.",
+      items: [
+        { id: "b", at: "table", label: "s3 · —", tone: "default" },
+        { id: "conn", at: "s3", label: "Divya's conn", sub: "socket", tone: "ok" },
+      ], focus: ["table"] },
+    { caption: "s10 joins. The control plane moves bucket 4,117 to it, and keeps s3 in the **second slot**.",
+      change: [{ id: "b", label: "s10 · s3", tone: "accent" }], focus: ["table"] },
+    { caption: "Divya's next packet arrives. The router happens to hand it to s7. s7 looks up the bucket and forwards the packet to the first slot, s10.",
+      add: [{ id: "pkt", at: "s7", label: "her packet", tone: "new" }], arrow: { from: "router", to: "s7", label: "ECMP" } },
+    { caption: "s10 has no socket for this connection, and it isn't a SYN, so s10 sends it on to the **second hop**, s3.",
+      change: [{ id: "pkt", at: "s10", tone: "accent" }], arrow: { from: "s7", to: "s10", label: "GUE" } },
+    { caption: "s3 has the socket. The packet is delivered and Divya's page keeps loading. Cloudflare says that usually fewer than 1% of packets take this second hop.",
+      change: [{ id: "pkt", at: "s3", tone: "ok" }], arrow: { from: "s10", to: "s3", label: "2nd hop" } },
+    { caption: "A new shopper's **SYN** in the same bucket always stops at s10, so new connections start there, and s3 drains as old ones finish.",
+      add: [{ id: "syn", at: "s10", label: "new SYN", tone: "new" }], remove: ["pkt"], focus: ["s10"] },
+  ]}
+/>
+
+This program measures what the second slot buys. Ten servers share a table of 1,024 buckets and hold 20,000 open connections. An eleventh server joins and takes 1/11 of the buckets. We count how many connections would end up on a server that doesn't have them, three ways: with no table at all, picking a server as the hash modulo the number of servers; with the bucket table but only its first slot; and with Unimog's second hop.
+
+<TryIt what="A server joins: connections reset with and without a second hop" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import random, hashlib
+random.seed(3)
+
+BUCKETS = 1024                           # about 100 buckets per server, as in Unimog
+
+def h(conn):                             # hash of the connection's addresses and ports
+    return int.from_bytes(hashlib.blake2b(conn.encode(), digest_size=8).digest(), "little")
+
+# 10 servers share the table round-robin; 20,000 shoppers' connections are open.
+servers = [f"s{i}" for i in range(10)]
+table = [servers[b % 10] for b in range(BUCKETS)]
+conns = [f"203.0.113.{random.randint(1, 254)}:{random.randint(1024, 65535)}"
+         for _ in range(20_000)]
+owner = {c: table[h(c) % BUCKETS] for c in conns}   # the server holding each connection
+sockets = {s: {c for c in conns if owner[c] == s} for s in servers + ["s10"]}
+
+# Server s10 joins. Hand it 1/11 of the buckets, taken evenly from the others.
+new = list(table)
+moved = random.sample(range(BUCKETS), BUCKETS // 11)
+for b in moved:
+    new[b] = "s10"
+
+def hash_mod_n(c):                       # no table: hash mod the number of servers
+    return (servers + ["s10"])[h(c) % 11]
+
+def first_hop_only(c):                   # the new table, nothing else
+    return new[h(c) % BUCKETS]
+
+def with_second_hop(c):                  # Unimog: new owner first; if it has no socket
+    first = new[h(c) % BUCKETS]          # for this connection, pass it to the old owner
+    return first if c in sockets[first] else table[h(c) % BUCKETS]
+
+print(f"open connections: {len(conns):,}, buckets moved to s10: {len(moved)}")
+for route in (hash_mod_n, first_hop_only, with_second_hop):
+    broken = sum(route(c) != owner[c] for c in conns)
+    print(f"{route.__name__:16} {broken:>6,} connections reset ({broken / len(conns):.1%})")
+```
+<Output>
+```
+open connections: 20,000, buckets moved to s10: 93
+hash_mod_n       18,212 connections reset (91.1%)
+first_hop_only    1,833 connections reset (9.2%)
+with_second_hop       0 connections reset (0.0%)
+```
+</Output>
+</TryIt>
+
+Hash modulo N moves almost every connection when N changes from 10 to 11, 91% of them, because nearly every hash gives a different remainder. With the bucket table, only the connections in the 93 reassigned buckets move, about 9%, the share we handed to the new server. And the second hop saves even those: none are reset.
+
+There are two limits. First, the chain is only two long, so a bucket that changes twice while a connection is open can still break it; Unimog prefers to move "the least-recently modified buckets" for that reason. And it all depends on the server checking for a socket, which is cheap for TCP but needs a different arrangement for UDP, where for Unimog "new flows go to the second-hop server."
+
+</Sub>
+
+<Sub n="5.3" title="Balancing by load">
+
+The table also lets Unimog do what ECMP couldn't, balance by how busy each server is. One server in each data centre runs the **conductor**, with standbys ready to take over. It reads each server's processor use from Prometheus, Cloudflare's metrics system, and shifts buckets away from busy servers towards idle ones, with "adjustments made to the forwarding table … proportional to the deviation from the average." Cloudflare reported that Unimog costs under 1% of processor time and its core is about 1,000 lines of C.
+
+That completes the trip through the network layers: Divya's packet has survived the flood, been picked by a server that's not overloaded, and been handed to that server's TCP stack. TLS terminates there, as in chapter 35. Now an HTTP request has to be answered, and that's the proxy's job.
+
+</Sub>
+
+<SectionHeading n="06" id="proxy">The proxy: from NGINX to Pingora</SectionHeading>
+
+<Sub n="6.1" title="What the proxy does with Divya's request">
+
+Divya's request is `GET /` for Kaapi Kadai's homepage, plus requests for its CSS, scripts and the tumbler photo. For each one, the proxy has to look up Kaapi Kadai's configuration, run the WAF rules and bot scoring, decide whether the response can come from cache, and if not, fetch it from the origin in Bengaluru and pass it back.
+
+For most of Cloudflare's history that was done by **NGINX**, the open-source web server, extended with Lua scripts through the OpenResty framework. Its core, which Cloudflare calls **FL** and its 2025 post calls "the brain of Cloudflare", was "built more than 15 years ago". In front of the origin sat a second NGINX-based service that handled the cache lookups and origin fetches.
+
+NGINX is a fine proxy for one website. It has a weakness that only shows at Cloudflare's scale, and it's about connections to the origin.
+
+</Sub>
+
+<Sub n="6.2" title="The connection pool that didn't share">
+
+Opening a new connection to an origin costs a TCP handshake and a TLS handshake, two or more round trips, plus CPU on both ends. So a proxy keeps a pool of open connections to each origin and reuses them. If Divya's request can go down a connection that's already open to the Bengaluru server, it skips all that.
+
+NGINX runs as several separate **worker processes**, typically one per CPU core, and each worker keeps its own pool. Cloudflare's 2022 post explains what that meant: "When a request lands on a certain worker, it can only reuse the connections within that worker. When we add more NGINX workers to scale up, our connection reuse ratio gets worse because the connections are scattered across more isolated pools."
+
+<Predict
+  q="A server has 96 cores and runs one NGINX worker per core. Kaapi Kadai's origin gets a request every second or so through that server. Each request lands on a random worker. How often will the request find an idle connection to the origin already open in its worker's pool?"
+  options={["Almost always: connections stay open for minutes", "About half the time", "Rarely: each worker sees Kaapi Kadai once every minute or two", "Never: NGINX can't reuse origin connections"]}
+  answer={2}
+>
+With 96 separate pools, a given worker sees a request for Kaapi Kadai only roughly once every 96 seconds. Idle connections to origins are closed after a timeout, so by the time the same worker sees the shop again, its connection is often gone, and it opens a new one. A single pool shared by all 96 cores would see a request every second and keep one connection warm. A small site spread thin across a big server suffers most, and Cloudflare is made of big servers serving small sites.
+</Predict>
+
+There was a second cost. In NGINX each request is served start to finish by one worker, so one slow or expensive request ties up its worker's core while the others may be idle, which is uneven load across the cores. And there was safety: NGINX is written in C, which isn't memory safe, and the Lua on top was safer but slower and untyped.
+
+</Sub>
+
+<Sub n="6.3" title="Pingora">
+
+In 2022 Cloudflare described its replacement for the origin-facing proxy, **Pingora**, written in Rust. Its key choice was threads instead of processes, to "share resources, especially connection pools, easily." Pingora runs on the Tokio async runtime with **work stealing**, so a core that's idle can take queued tasks from a busy one, and every thread in the process can reuse every pooled connection.
+
+Here's what that September 2022 post reported:
+
+- Across all customers, Pingora made a third as many new origin connections per second. For one large customer the reuse ratio went from 87.1% to 99.92%, "160x" fewer new connections.
+- Median time to first byte fell by 5 ms and the 95th percentile by 80 ms, which the post credits to the shared connections and not to faster code.
+- It used about 70% less CPU and 67% less memory than the old service for the same traffic.
+- It served over a trillion requests a day, and in its first few hundred trillion requests, it hadn't crashed because of its own code.
+
+In February 2024 Cloudflare released Pingora as open source under the Apache 2.0 licence, as a Rust framework for building proxies (it's a library you build your own proxy with, not a ready-made binary). By then, the post says, it had handled "nearly a quadrillion" requests.
+
+Then the same idea reached the brain. In July 2024 Cloudflare started rewriting FL in Rust as **FL2**, built on its Rust proxy framework Oxy, with each feature as a module in a strict order checked at compile time. Its September 2025 post reports FL2 using less than half the CPU of FL1 and responding about 10 ms faster at the median; by March 2026 Cloudflare said it had "migrated from FL1 to FL2." Hold on to FL2, though. Section 10 has a story in which a single line of it matters.
+
+<Decision
+  q="One process per core, or one process with many threads?"
+  options={[
+    { name: "Process per core (NGINX)", how: "Independent worker processes, each with its own memory, pool and event loop.", good: ["A crash kills one worker, not the server", "No shared-memory concurrency bugs"], bad: ["Connection pools split N ways: poor reuse", "A request is stuck on its worker's core", "Sharing state needs locks and plain strings in shared memory"] },
+    { name: "Threads with work stealing (Pingora)", how: "One process, a pool of threads, async tasks that any idle thread can pick up.", good: ["One connection pool shared by every core", "Load spreads across cores per task", "Shared data through reference-counted pointers"], bad: ["A crash can take the whole process down", "Shared-memory concurrency must be got right, which is where Rust helps"], chosen: true },
+  ]}
+>
+Rust made the right-hand column safer to choose: the compiler rejects most data races and memory errors that would make a shared-memory, multithreaded C proxy risky. Cloudflare's reasons for Rust were exactly that, "it can do what C can do in a memory safe way without compromising performance."
+</Decision>
+
+<Elsewhere items={[
+  { where: "Envoy", how: "Also a multithreaded proxy, but each worker thread keeps its own connection pools, which is the NGINX trade in a threaded program." },
+  { where: "Databases (chapter 21)", how: "Postgres's process-per-connection model and the connection poolers built around it face the same split-pool problem from the other side." },
+]} />
+
+The proxy now decides what to do with Divya's request. For the tumbler photo, the answer is almost always "it's in the cache." The interesting question is which cache.
+
+</Sub>
+
+<SectionHeading n="07" id="cache">Caching across 330 cities</SectionHeading>
+
+<Sub n="7.1" title="One city, one cache">
+
+Chapter 35 covers what a CDN cache stores and how a cache key is built from the URL and some headers. Here the problem is where the copies live.
+
+Inside the Chennai data centre, it would be wasteful for every server to keep its own copy of the tumbler photo. Instead, Cloudflare's 2025 post on Workers cold starts states the rule plainly: "Each data center contains one logical HTTP cache, and that cache is sharded across every server in the data center." The server that handles Divya's request hashes the cache key onto a **consistent hash ring** of the servers in the city (chapter 29) and asks the server that owns that key. So the city holds one copy of each object, and adding a server moves only a small share of the keys.
+
+</Sub>
+
+<Sub n="7.2" title="When Chennai doesn't have it">
+
+Now suppose the photo isn't in Chennai's cache. Maybe Divya is the first shopper in Chennai to load it today. What happens then? The naive answer is that Chennai fetches it from the origin.
+
+That's fine for one city. But Kaapi Kadai's link is a share of Divya's friend group, and it's been forwarded around. Shoppers in 300 cities might each be the first in their city. Each city misses independently, and the origin, a one-gigabit server in Bengaluru, gets 300 requests for the same photo, which is close to the problem caching was supposed to solve.
+
+The fix is **tiered caching**: misses in a small, "lower-tier" data centre go to a larger "upper-tier" data centre, and only upper tiers may go to the origin. Cloudflare's 2021 post on Smart Tiered Cache Topology describes how the upper tier is picked for each origin: Cloudflare's data centres measure their latency to the origin, as the time to complete a TCP handshake, and the one with the lowest median over 24 hours wins, with the runner-up as a fallback, re-run every hour. For Kaapi Kadai, the winner is probably Bengaluru, or maybe Chennai itself. Now 300 misses become one request to the origin, and 299 requests between Cloudflare data centres. Since September 2021, tiered caching has been free on all plans.
+
+Cloudflare later added two more layers. **Regional Tiered Cache** (2023) puts an extra tier in each region for sites whose upper tiers are far away. And **Cache Reserve** (announced May 2022, generally available October 2023) is "a large, persistent data store that is implemented on top of R2", Cloudflare's object storage. Ordinary caches evict whatever was least recently used when they need space, so a rarely-viewed product photo falls out within hours or days. Cache Reserve keeps an object for 30 days after its last request, and each request resets the clock. It only takes objects with a freshness lifetime of at least 10 hours.
+
+<SystemDiagram
+  title="Where the tumbler photo comes from"
+  nodes={[
+    { id: "divya", label: "Divya's phone", sub: "Chennai", kind: "phone", col: 0, row: 1 },
+    { id: "maa", label: "Chennai (MAA)", sub: "lower tier", kind: "cdn", col: 1, row: 1 },
+    { id: "shard", label: "Cache shard", sub: "owner of the key", kind: "cache", col: 1, row: 0 },
+    { id: "upper", label: "Upper tier", sub: "lowest latency to origin", kind: "cdn", col: 2, row: 1 },
+    { id: "reserve", label: "Cache Reserve", sub: "R2, 30-day retention", kind: "blob", col: 2, row: 2 },
+    { id: "origin", label: "Kaapi Kadai origin", sub: "Bengaluru", kind: "service", col: 3, row: 1 },
+  ]}
+  zones={[{ label: "One data centre", nodes: ["maa", "shard"] }]}
+  edges={[
+    { from: "divya", to: "maa" }, { from: "maa", to: "shard", label: "hash ring" },
+    { from: "maa", to: "upper", label: "miss" }, { from: "upper", to: "reserve", label: "miss" },
+    { from: "reserve", to: "origin", label: "miss", dashed: true },
+  ]}
+  steps={[
+    { caption: "Divya's request reaches a server in Chennai. It hashes the cache key onto the city's ring and asks the server that owns that key. Most of the time the photo is there, and it's served in a few milliseconds.", path: ["divya", "maa", "shard"] },
+    { caption: "A miss in Chennai goes to the upper tier chosen for this origin, the data centre with the lowest measured latency to Bengaluru. Every other lower tier sends its misses there too.", path: ["maa", "upper"] },
+    { caption: "A miss in the upper tier checks Cache Reserve, the persistent store that keeps objects for 30 days after their last request.", path: ["upper", "reserve"] },
+    { caption: "Only if every layer misses does the request reach the origin, and only from the upper tier, so the shop sees one request instead of one per city.", path: ["reserve", "origin"] },
+    { caption: "On the way back the photo is written into Cache Reserve, then the upper tier, then Chennai, so the next shopper anywhere finds it closer.", path: ["origin", "reserve", "upper", "maa", "divya"] },
+  ]}
+/>
+
+<Decision
+  q="On a miss, go straight to the origin, or through another Cloudflare tier?"
+  options={[
+    { name: "Every city goes to the origin", how: "Each data centre fetches its own misses directly.", good: ["One fewer hop on a miss", "Nothing to choose or configure"], bad: ["The origin sees one miss per city per object", "Small, rarely-requested objects miss almost everywhere"] },
+    { name: "Tiered: lower → upper → (Cache Reserve) → origin", how: "Small data centres ask a chosen upper tier; only upper tiers reach the origin.", good: ["Far fewer requests reach the origin", "A hit in the upper tier is still faster than the origin", "Long-tail objects survive in Cache Reserve"], bad: ["An extra hop between data centres on a miss", "The upper tier's choice must track the origin's location"], chosen: true },
+  ]}
+>
+The extra hop is usually cheap, because Cloudflare's data centres talk over well-connected paths, and the upper tier is chosen to be near the origin anyway. For a one-server shop the difference is between surviving a viral link and not. Cache Reserve trades storage cost for fewer origin requests; Docker has reported that a 2% better hit ratio from it removed about two-thirds of its S3 egress.
+</Decision>
+
+<Elsewhere items={[
+  { where: "AWS CloudFront", how: "Puts 15 regional edge caches between its 750+ points of presence and the origin, plus an optional Origin Shield in one region, which is the same layering." },
+  { where: "CPU caches (chapter 2)", how: "L1, L2 and L3 are tiers of the same idea: a miss in a small, close cache asks a bigger, further one, and only the last level goes to memory." },
+]} />
+
+The HTML of Kaapi Kadai's homepage is different: it carries the delivery date for Divya's pincode, so it can't be the same for everyone, and can't be cached as is. Kaapi Kadai could compute it at the origin, in Bengaluru, for every visitor. Or it could compute it in Chennai, next to Divya, if Cloudflare will run the shop's code.
+
+</Sub>
+
+<SectionHeading n="08" id="workers">Running customers' code: Workers and V8 isolates</SectionHeading>
+
+<Sub n="8.1" title="Containers are too heavy">
+
+Kaapi Kadai's owner has written a short JavaScript function: read the visitor's pincode from a cookie, look up the delivery estimate, put it in the cached HTML, return the page. Cloudflare's product for running code like this is **Workers**. But what runs it?
+
+In the late 2010s the obvious answer was a container or a lightweight VM per customer (chapters 11 and 47), the way AWS Lambda works. Cloudflare's 2018 post "Cloud Computing without Containers" explains why that doesn't fit an edge network. Count what it costs. A basic Node.js Lambda function doing nothing used about 35 MB of memory. Cold starts, launching a new one, took "between 500 milliseconds and 10 seconds". Now remember that every server runs every service, and every customer's code may need to run in every city. Thousands of customers times 35 MB each, on every server, in 330 cities, doesn't fit, and a half-second cold start would cost Divya far more than the round trip to Bengaluru it was meant to save.
+
+</Sub>
+
+<Sub n="8.2" title="Isolates">
+
+The idea Cloudflare used comes from the browser. Chrome's JavaScript engine, **V8**, can run many separate programs in one process, each in its own **isolate**: a separate heap and a separate set of global objects, so code in one isolate can't see or touch another's objects. Chrome uses this to keep tabs apart (alongside separate processes, as chapter 44 discusses). Workers uses it to keep customers apart.
+
+Cloudflare's 2018 post gives the numbers. One process "can run hundreds or thousands of Isolates." Sharing the runtime between isolates brings the per-function memory "around 3 MB" instead of 35. And "Isolates start in 5 milliseconds." Switching between isolates in one process also avoids the cost of switching between processes, which the post put at up to 100 microseconds.
+
+Five milliseconds is a pretty small cost, and Cloudflare then hid it completely. Its 2020 post on cold starts describes the trick: the first message of a TLS handshake, the ClientHello, names the site the visitor wants (the SNI field, chapter 35). As soon as Chennai's server sees `kaapikadai.in` in Divya's ClientHello, it tells the Workers runtime to start loading the shop's Worker. The handshake still has a round trip to go, and the Worker is ready before the HTTP request arrives.
+
+<StepSequence
+  title="Loading the Worker during the handshake"
+  actors={["Divya's phone", "Chennai server", "Workers runtime"]}
+  messages={[
+    { from: 0, to: 1, label: "ClientHello (SNI kaapikadai.in)", note: "The first packet of TLS names the site." },
+    { from: 1, to: 2, label: "warm up kaapikadai.in", note: "The server hints the runtime straight away." },
+    { from: 1, to: 0, label: "ServerHello … Finished", note: "The handshake continues; the runtime loads the isolate meanwhile, in about 5 ms." },
+    { from: 0, to: 1, label: "GET /", note: "The request arrives over the finished connection." },
+    { from: 1, to: 2, label: "run fetch handler", note: "The isolate is already warm: no cold start." },
+  ]}
+/>
+
+That works when Chennai's servers have room to keep the Worker loaded. With hundreds of servers in a big city and a small site, they often don't: Cloudflare's 2025 post on cold starts works through an example in which a Worker's requests, spread across a city of 300 servers, reach each server about once every five hours, so it's evicted between requests and every request is a cold start. Its fix is the one from the cache: send that Worker's requests to one server in the city, chosen with the same kind of consistent hash ring. Cloudflare reported that forwarding a request this way adds under a millisecond, only about 4% of enterprise requests needed it, and the share of cold requests fell from 0.1% to 0.01%.
+
+Today's limits, from the Workers documentation in October 2026: 128 MB of memory per isolate, 10 ms of CPU time per request on the free plan and up to five minutes on paid plans, and the average Worker uses about 2.2 ms of CPU per request.
+
+</Sub>
+
+<Sub n="8.3" title="Thousands of strangers in one process">
+
+Isolates buy their efficiency by putting many customers' code in the same operating-system process, and Cloudflare's 2026 post on Spectre says the number can be "tens of thousands of tenants." That's a much thinner wall than a VM or even a process, and chapter 44 explains why thin walls worry people: **Spectre** lets code read memory it shouldn't by measuring tiny timing differences after the CPU guesses wrong, without any bug in the software.
+
+Cloudflare's 2020 post on the Workers security model lists its layers of defence, and they read like a checklist of what Spectre needs:
+
+| Spectre needs | Workers' answer |
+|---|---|
+| A precise clock, to measure cache timing | `Date.now()` is frozen while a Worker runs: it returns the time the request arrived and doesn't move until the Worker does I/O |
+| A second thread, to build a home-made timer | No threads and no shared memory between them |
+| Native code with full control of the CPU | Only JavaScript and WebAssembly, compiled by V8 |
+| Time to attack a target | Suspicious Workers, identified by hardware performance counters, are moved into their own process ("dynamic process isolation", built with TU Graz) |
+| A valuable neighbour | Customers are grouped into **cordons** by trust; free-plan code never shares a process with an enterprise customer's |
+| An unpatched V8 bug | V8 security patches deployed within 24 hours, against about 15 days for Chrome at the time |
+
+Under all of that, the whole runtime runs in a Linux sandbox with namespaces and seccomp, no filesystem and no network access except through the supervising process. And in September 2025 Cloudflare added hardware help: **memory protection keys** (MPK), a feature of recent x86 processors, let a process tag pages of its memory with one of a handful of keys (up to 15 available on a modern x86-64 processor, about 12 usable here) and switch which keys are readable in a single instruction. Each isolate gets a random key, so a stray read into another isolate's memory hits a hardware trap, in "92% of cases" according to Cloudflare's 2025 post. A 2026 follow-up described an internal attack that leaked about 12 bits a second against an older setup, and said it had been fixed.
+
+<Callout label="Design implication">
+An isolate is a much cheaper wall than a VM, and a thinner one, made acceptable by taking away the tools an attacker needs. That trade only works because the platform controls what code can run: JavaScript and WebAssembly through one engine, with no clock, no threads and no native code. A platform that ran arbitrary binaries couldn't make it.
+</Callout>
+
+<Elsewhere items={[
+  { where: "AWS Lambda", how: "Runs each function in a Firecracker microVM: a stronger, hardware-enforced wall, and cold starts in the hundreds of milliseconds instead of a few." },
+  { where: "Deno Deploy and Vercel's edge runtime", how: "Also run JavaScript in V8 isolates at the edge, for the same start-up and memory reasons." },
+  { where: "Cloudflare's own workerd", how: "The Workers runtime, open-sourced in September 2022 under Apache 2.0; Cloudflare notes it isn't, on its own, a secure sandbox for untrusted code." },
+]} />
+
+Kaapi Kadai's Worker runs, the page comes back with Divya's delivery date, and her page is done. But the Worker had to exist on that Chennai server first, along with the shop's WAF rules, its cache settings and its DNS records. Every one of those changes whenever the owner clicks a button, and the change has to reach every server in every city.
+
+</Sub>
+
+<SectionHeading n="09" id="quicksilver">Configuration everywhere in seconds: Quicksilver</SectionHeading>
+
+<Sub n="9.1" title="Pushing a change to every machine">
+
+The flood has made Kaapi Kadai's owner nervous, so she logs into the dashboard and adds a firewall rule: block requests from a country she doesn't ship to. Cloudflare's 2025 Code Orange post describes the expectation: a new security rule "reaches 90% of servers on the network within seconds." How?
+
+One naive answer is to have every server ask a central database for each site's configuration when a request arrives. That puts a round trip to the core on every request, and makes the core a single point of failure for the whole network. Another is a cache on every server, filled from the core. That works until you ask how stale it may be: a firewall rule that takes ten minutes to arrive is ten minutes of attack.
+
+So the design that's needed is the opposite of a request-time lookup: every server holds a complete, local copy of all the configuration it might need, and changes are pushed to every copy as they happen. Reads are then local and take microseconds, and the hard part is the pushing.
+
+</Sub>
+
+<Sub n="9.2" title="Quicksilver">
+
+Cloudflare's store for this is **Quicksilver**, described in March 2020. Its predecessor was Kyoto Tycoon, an open-source key-value store, and the post lists why it was replaced: in 2015 Cloudflare ran eight instances holding 100 million key-value pairs with about 200 changes a second; writes blocked reads, and in Cloudflare's tests two writers pushed 99.9th-percentile read latency over a second; running without fsync for speed corrupted databases "multiple times a day"; and the project's last release was in 2012. Keeping it running took 48 hours of engineers' time a week.
+
+Quicksilver kept the shape and replaced the parts:
+
+- **Storage is LMDB**, an embedded database that keeps its file memory-mapped and never overwrites data in place, so readers never wait for writers and a crash can't leave a half-written page.
+- **All writes go through one place.** Changes are collected in one core data centre and given increasing sequence numbers, so the configuration history is a log.
+- **Distribution is a tree.** Servers replicate from main nodes, which replicate from top mains, which read the log at the root. Each replica asks for "everything after sequence number N", so a machine that was offline catches up by replaying what it missed, and secondary mains keep a week of history for that.
+- **Everything is checksummed.** Each value has a CRC, logs carry a running hash, and each database has a unique ID, so a corrupted or mixed-up copy is detected instead of served.
+
+<SystemDiagram
+  title="A firewall rule travels from the dashboard to every server"
+  nodes={[
+    { id: "owner", label: "Shop owner", sub: "dashboard / API", kind: "laptop", col: 0, row: 1 },
+    { id: "api", label: "Config API", sub: "core", kind: "service", col: 1, row: 1 },
+    { id: "root", label: "Quicksilver root", sub: "the log, seq numbers", kind: "db", col: 2, row: 1 },
+    { id: "main1", label: "Main node", sub: "near Chennai", kind: "db", col: 3, row: 0 },
+    { id: "main2", label: "Main node", sub: "near Frankfurt", kind: "db", col: 3, row: 2 },
+    { id: "maa", label: "Chennai servers", sub: "local copy", kind: "cache", col: 4, row: 0, count: "×n" },
+    { id: "fra", label: "Frankfurt servers", sub: "local copy", kind: "cache", col: 4, row: 2, count: "×n" },
+  ]}
+  edges={[
+    { from: "owner", to: "api" }, { from: "api", to: "root", label: "write" },
+    { from: "root", to: "main1" }, { from: "root", to: "main2" },
+    { from: "main1", to: "maa" }, { from: "main2", to: "fra" },
+  ]}
+  steps={[
+    { caption: "The owner adds a firewall rule. The API validates it and writes it to Quicksilver's root, where it gets the next sequence number in the log.", path: ["owner", "api", "root"] },
+    { caption: "Main nodes are always asking the root for everything after the last sequence number they have, so they pick it up within moments.", path: ["root", "main1"], focus: ["main2"] },
+    { caption: "Every server in Chennai does the same against its main, and writes the change into its local database. In 2019, 99% of changes reached every machine worldwide within 2.29 seconds.", path: ["main1", "maa"] },
+    { caption: "Frankfurt gets the same change by the same route. Nothing at request time ever waits for the core: the proxy reads the rule from its own server's copy, in microseconds.", path: ["root", "main2", "fra"] },
+  ]}
+/>
+
+Quicksilver has grown a lot since. In 2020 Quicksilver served 2.5 trillion reads a day on 90,000 database instances. Its two-part 2025 update describes a store of over five billion key-value pairs, 1.6 TB in total and growing by half in a year, serving over three billion key lookups a second, with 90% of reads in under a millisecond. That growth forced a change of shape: 1.6 TB on every server, in ten instances for different products, stopped fitting. Quicksilver v2 keeps the full data set only on a few servers with large disks. Each data centre holds a cache sharded across its servers, by now a familiar pattern: 1,024 logical shards grouped onto servers, with a local cache in front. Most lookups for keys that don't exist, ten times more common than lookups for keys that do, are answered by Bloom filters, and the worst instance's cache hit rate is above 99.99%.
+
+<Why>Why not use a consensus system like etcd for this?</Why>
+
+Because the problem is the opposite shape. Consensus (chapter 27) is about a few replicas agreeing on each write before it counts, which costs round trips between them on every write and limits how many replicas there can be. Quicksilver has one writer, the root, and so needs no agreement; it has an enormous number of readers, and needs every one of them to catch up quickly and read locally. A single ordered log, copied down a tree, gives that.
+
+<Callout label="Design implication">
+Fast, global configuration is how Cloudflare fights attacks: a WAF rule for a new exploit can be everywhere before the exploit is. It's also a path by which one bad change can reach every server in seconds. That same 2.29 seconds that protects Kaapi Kadai from a new attack can deliver a broken rule to every machine on Earth before anyone notices, and that's the next section.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="10" id="failures">When the fast path is the failure</SectionHeading>
+
+<Sub n="10.1" title="2 July 2019: one regular expression">
+
+At 13:42 UTC on 2 July 2019, a Cloudflare engineer deployed a small change to the WAF's rules for detecting cross-site scripting. It was meant to be harmless: the new rule was in "simulate" mode, logging matches and blocking nothing. But even in simulate mode, as the postmortem notes, a rule still has to run on every request. Within seconds the CPUs serving HTTP traffic on machines all over the world were at nearly 100%, and visitors to Cloudflare sites got 502 errors. Traffic fell by about 80%. It lasted 27 minutes.
+
+The rule contained this regular expression:
+
+```
+(?:(?:\"|'|\]|\}|\\|\d|(?:nan|infinity|true|false|null|undefined|symbol|math)|\`|\-|\+)+[)]*;?((?:\s|-|~|!|{}|\|\||\+)*.*(?:.*=.*)))
+```
+
+Cloudflare's postmortem points at the part that mattered: `.*(?:.*=.*)`, which behaves like `.*.*=.*`. Read it as "anything, then anything, then an equals sign, then anything." The WAF ran it with PCRE, a **backtracking** regex engine, the same kind used by Perl, Python and JavaScript. A backtracking engine tries to match greedily and, when it fails, backs up and tries the next possibility. For `.*.*=.*` on text without an `=`, it tries every way of splitting the text between the two `.*`s, and each one fails at the `=`. Then, since the pattern isn't anchored, it starts again one character later. That's a number of steps that grows with the cube of the input's length. A request with a long header that happened to have no `=` sent the CPU into a loop that would take longer than anyone would wait.
+
+What the postmortem committed to was an engine with "run-time guarantees": RE2 or Rust's regex crate. Those compile the pattern into an automaton and track all the positions the pattern could be in at once, reading each character only once. This program counts the work both ways for `.*.*=.*` on texts of `x`s with no `=`:
+
+<TryIt what="Backtracking against an automaton for .*.*=.*" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+# The heart of the July 2019 WAF rule was .*(?:.*=.*), which is the same as .*.*=.*
+# Two ways to run it on text that contains no '=' at all (so it can never match).
+PATTERN = [(".", True), (".", True), ("=", False), (".", True)]   # .* .* = .*
+
+def backtracking(text):
+    """How Perl, PCRE, Python and JavaScript engines work: try, then back up."""
+    steps = 0
+    def match(t, i):                       # pattern token t, text position i
+        nonlocal steps
+        steps += 1
+        if t == len(PATTERN):
+            return True
+        ch, star = PATTERN[t]
+        ok = lambda c: ch == "." or ch == c
+        if star:                           # greedy: take as much as possible, then give back
+            k = i
+            while k < len(text) and ok(text[k]):
+                k += 1
+            for j in range(k, i - 1, -1):
+                if match(t + 1, j):
+                    return True
+            return False
+        return i < len(text) and ok(text[i]) and match(t + 1, i + 1)
+    found = any(match(0, start) for start in range(len(text) + 1))
+    return found, steps
+
+def automaton(text):
+    """How RE2 and Rust's regex crate work: track every possible state at once."""
+    def close(states):                     # a starred token may also be skipped
+        out = set(states)
+        for t in sorted(states):
+            u = t
+            while u < len(PATTERN) and PATTERN[u][1]:
+                u += 1
+                out.add(u)
+        return out
+    steps, states = 0, close({0})
+    for c in text:
+        nxt = set()
+        for t in states:
+            steps += 1
+            if t < len(PATTERN):
+                ch, star = PATTERN[t]
+                if ch == "." or ch == c:
+                    nxt.add(t if star else t + 1)
+        states = close(nxt | {0})          # a match may also start at the next char
+    return len(PATTERN) in states, steps
+
+print(f"{'chars':>6} {'backtracking steps':>19} {'automaton steps':>16}")
+for n in (10, 20, 40, 80, 160, 320):
+    text = "x" * n
+    (f1, b), (f2, a) = backtracking(text), automaton(text)
+    assert f1 == f2 == False
+    print(f"{n:>6} {b:>19,} {a:>16,}")
+```
+<Output>
+```
+ chars  backtracking steps  automaton steps
+    10                 363               30
+    20               2,023               60
+    40              13,243              120
+    80              95,283              240
+   160             721,763              480
+   320           5,616,323              960
+```
+</Output>
+</TryIt>
+
+<Picture
+  src="/images/designs/cloudflare/thompson-nfa.png"
+  alt="A diagram of a small automaton: a start state q, an empty-string branch along the top to a final state f, and a lower branch with a loop on a followed by b, with nested coloured regions grouping the parts"
+  caption="Thompson's construction, the 1968 idea behind RE2 and Rust's regex crate, turning the pattern ε|a*b into states joined by arrows. Each coloured region is the automaton for one piece of the pattern. A matcher keeps a set of current states and moves all of them on each character, so it never backs up."
+  credit="Image: Arthur MILCHIOR, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Small-thompson-example.svg"
+  paper
+/>
+
+Read down the columns. Each time the input doubles, the backtracking count goes up about eight times: 2,023, then 13,243, then 95,283. That's the cube. Meanwhile the automaton's count just doubles, three steps per character. At 320 characters the gap is already more than 5,000 times, and an HTTP request can carry several kilobytes of headers and body. Cloudflare's own appendix counts the steps differently and gets different numbers, but the same shape: thousands of steps for 20 characters.
+
+But the regex was only the trigger. Why did one regex take down everything? The postmortem lists four reasons:
+
+- **No staged rollout.** Cloudflare's software went out in stages, first to a data centre that only employees' traffic passes through, then to a small number of customers in an isolated location, then to many customers, then everywhere. WAF rules skipped all of that and went out through Quicksilver, "because of the need to respond rapidly to threats." So a rule reached every machine in about the time it takes to read this sentence.
+- **A missing guard.** A protection against a single rule using too much CPU had been "removed by mistake during a refactoring of the WAF weeks prior."
+- **An engine without limits.** PCRE has no bound on backtracking work.
+- **Every server, every service.** The WAF ran on the same CPUs as everything else on every server, so a WAF problem became an everything problem.
+
+It ended with a **global kill switch**: at 14:07 an engineer ran a "global terminate" that turned the WAF off on every machine, and traffic recovered within two minutes. Cloudflare committed to switching the WAF to RE2 or Rust's regex engine, brought back the CPU guard, added performance tests for rules, and changed the procedure so that rule changes roll out in stages like software, keeping emergency global pushes for active attacks.
+
+<Predict
+  q="Which single change, had it been in place on 2 July 2019, would have limited the outage to a few data centres?"
+  options={["A faster regex engine on every server", "A staged rollout of rule changes, with automatic checks between stages", "More CPU on every server", "A larger WAF test suite"]}
+  answer={1}
+>
+The regex engine and the tests would have stopped this particular rule; the next bad change would have been something else. A staged rollout limits the damage of any bad change: the first stage's servers would have pinned their CPUs, the checks would have halted the rollout, and everyone else would have kept working. That's why it's the lesson Cloudflare kept coming back to, as the next two incidents show. Extra CPU just gives a cubic loop a little longer to run.
+</Predict>
+
+</Sub>
+
+<Sub n="10.2" title="18 November 2025: a file that doubled">
+
+Six years later the trigger was different and the shape was the same. Cloudflare's postmortem of 18 November 2025 calls it the company's "worst outage since 2019."
+
+Cloudflare's bot detection uses a machine-learning model that reads a **feature file**, a list of the properties it scores requests on. A query against a ClickHouse database regenerated that file every five minutes and pushed it to every server. At 11:05 UTC a change to the database's permissions made the query start returning each column twice, once from each of two databases, because the query never said which database it meant. So the file doubled in size, past 200 features.
+
+Proxy code that loaded the file had a limit of 200 features, "well above our current use of ~60", because it preallocated memory for them. In FL2, the new Rust proxy, that limit was checked, the check returned an error, and the code called `unwrap()` on the result: a Rust shortcut that means "I'm sure this worked; if it didn't, crash." It hadn't worked, so the proxy thread crashed: `thread fl2_worker_thread panicked: called Result::unwrap() on an Err value`. Sites on FL2 returned 5xx errors. Sites still on the old FL1 didn't crash, but every request got a bot score of zero, which blocked legitimate visitors for any customer with rules on bot scores.
+
+What made it confusing was the five-minute cycle. ClickHouse was being updated gradually, so each run of the query might hit an updated node or an old one, and the network flipped between broken and fine every few minutes, which seemed to the engineers on call more like an attack than a bug. By coincidence, Cloudflare's status page, hosted elsewhere, went down at the same time. Core traffic recovered at 14:30, after engineers stopped the file's generation and pushed a known-good copy by hand, and everything was normal by 17:06 UTC.
+
+Cloudflare's lessons are general ones: treat configuration files generated inside the company with the same suspicion as user input; have more global kill switches; and don't let a component crash on bad data when it could keep using the last good data.
+
+</Sub>
+
+<Sub n="10.3" title="Code Orange: fail small">
+
+Then, on 5 December 2025, it happened again, smaller. An engineer turned off an internal WAF testing tool through the global configuration system, which, the postmortem says, "does not perform gradual rollouts, but rather propagates changes within seconds to the entire fleet." A latent bug in FL1's Lua code, `attempt to index field 'execute' (a nil value)`, made about 28% of Cloudflare's HTTP traffic fail for 25 minutes. In FL2, the Rust rewrite, the same case didn't fail.
+
+Two weeks later Cloudflare announced "Code Orange: Fail Small", a company-wide priority to make configuration behave like software. Its May 2026 completion post describes what changed:
+
+- **Every configuration change rolls out in stages.** A new system called Snapstone packages configuration changes, including generated data files like the November feature file and flags like the December one, and releases them gradually with health checks, the way software already was.
+- **Health-mediated deployment everywhere.** Each team defines the metrics that mean a change is healthy; Cloudflare's deployment system watches them at each stage and rolls back automatically.
+- **Fail stale.** A component that receives bad configuration keeps using the last good one where it can, and fails open or closed by explicit choice where it can't.
+- **Cohorts.** Systems such as the Workers runtime now run separate copies for different groups of customers, and releases go to the free-plan copy first, reaching the most critical ones last.
+- **Break glass.** Backup ways in for 18 key services, so engineers aren't locked out of the tools they need by the outage they're fixing, which happened in 2019 too.
+
+| Incident | What changed | How it spread | Lesson |
+|---|---|---|---|
+| 2 July 2019, 27 min | A WAF rule with a backtracking regex | Quicksilver, globally, in seconds | Stage rule changes; bound CPU per rule; use linear-time regex |
+| 21 June 2022, about 75 min | A BGP policy change in 19 large data centres | A staged rollout whose stages were too coarse | 4% of locations carried 50% of requests; make stages smaller |
+| 18 Nov 2025, core traffic 11:20–14:30 UTC | A generated feature file that doubled | Pushed to every server every 5 minutes | Treat internal config as untrusted input; fail stale |
+| 5 Dec 2025, 25 min | A killswitch flag | The global config system, no stages | Every config change gets stages and health checks |
+
+<Callout label="Common mistake" kind="warn">
+Treating "configuration" as safer than "code". A feature file, a firewall rule or a flag changes what every server does, just as a binary release does, and it often reaches more servers faster. If code goes through canaries and automatic rollbacks and configuration doesn't, configuration is where the next global outage will come from. Cloudflare's 2019, November 2025 and December 2025 outages all came through that gap.
+</Callout>
+
+<Elsewhere items={[
+  { where: "Akamai (2010)", how: "Its paper describes configuration rollouts that are 'automatically phased, with health checks performed at each step, to protect the network', the lesson Cloudflare's postmortems kept arriving at." },
+  { where: "Google's Espresso (SIGCOMM 2017)", how: "Its edge peering controller canaries each change on a subset of packet processors and fails static, keeping the last valid configuration, if a new one fails validation." },
+  { where: "Fastly, 8 June 2021", how: "A valid configuration change by one customer triggered a latent bug and 85% of Fastly's network returned errors; 95% recovered within 49 minutes. The same pattern: a change that reaches everything quickly meets a bug that was waiting." },
+]} />
+
+</Sub>
+
+<SectionHeading n="11" id="whole">The whole system</SectionHeading>
+
+<Sub n="11.1" title="Divya's request, end to end">
+
+<SystemDiagram
+  title="Kaapi Kadai behind Cloudflare, during the attack"
+  nodes={[
+    { id: "divya", label: "Divya's phone", sub: "Chennai", kind: "phone", col: 0, row: 0 },
+    { id: "bots", label: "Botnet", sub: "Tbps, worldwide", kind: "users", col: 0, row: 2 },
+    { id: "edge", label: "Chennai (MAA)", sub: "anycast, ECMP", kind: "cdn", col: 1, row: 1 },
+    { id: "xdp", label: "XDP", sub: "l4drop + Unimog", kind: "lb", col: 2, row: 1 },
+    { id: "proxy", label: "FL2 + Pingora", sub: "WAF, bots, cache", kind: "service", col: 3, row: 1 },
+    { id: "worker", label: "Worker isolate", sub: "delivery date", kind: "compute", col: 3, row: 0 },
+    { id: "qs", label: "Quicksilver", sub: "local config", kind: "db", col: 2, row: 0 },
+    { id: "tier", label: "Upper tier", sub: "+ Cache Reserve", kind: "cdn", col: 3, row: 2 },
+    { id: "origin", label: "Origin", sub: "Bengaluru", kind: "service", col: 4, row: 2 },
+  ]}
+  zones={[{ label: "Every server in the city runs all of this", nodes: ["xdp", "proxy", "worker", "qs"] }]}
+  edges={[
+    { from: "divya", to: "edge" }, { from: "bots", to: "edge", label: "share of flood" },
+    { from: "edge", to: "xdp" }, { from: "xdp", to: "proxy" },
+    { from: "proxy", to: "worker" }, { from: "qs", to: "proxy", dashed: true }, { from: "qs", to: "xdp", dashed: true },
+    { from: "proxy", to: "tier", label: "miss" }, { from: "tier", to: "origin", label: "miss" },
+  ]}
+  steps={[
+    { caption: "Divya's phone and the bots near Chennai both reach Chennai's data centre, because every city announces the same addresses. Bots elsewhere reach their own nearest cities.", path: ["divya", "edge"], focus: ["bots"] },
+    { caption: "On whichever server the router picks, XDP runs first. l4drop drops packets that match dosd's fingerprint; Divya's pass. Unimog forwards her connection to the server that owns its bucket.", path: ["edge", "xdp"] },
+    { caption: "TLS terminates. FL2 reads Kaapi Kadai's rules from the server's local Quicksilver copy and runs the WAF and bot checks.", path: ["xdp", "proxy"], focus: ["qs"] },
+    { caption: "The homepage's Worker, warmed during the handshake, computes the delivery date for her pincode.", path: ["proxy", "worker"] },
+    { caption: "Pingora finds the tumbler photo in the city's sharded cache. A miss would go to the upper tier and Cache Reserve, and only then to the origin.", path: ["proxy", "tier"] },
+    { caption: "Only clean, uncached requests from one upper tier ever reach the shop's server, which sees a normal day.", path: ["tier", "origin"] },
+  ]}
+/>
+
+| Component | What it does | Added because |
+|---|---|---|
+| Anycast in 330+ cities | Every city announces the same addresses | One site is too far and too small for attacks (§2, §3) |
+| Identical servers | Every server runs every service | Specialised tiers sit idle while the attack overwhelms one (§3) |
+| dosd + l4drop | Sample, fingerprint, drop in the driver | Junk must die before it costs anything (§4) |
+| Unimog | Every server balances load in XDP, with a second hop | ECMP breaks connections and can't balance by load (§5) |
+| Pingora / FL2 | Multithreaded Rust proxy with shared pools | Per-worker pools wasted origin connections (§6) |
+| Tiered cache + Cache Reserve | Misses go through an upper tier, then persistent storage | Every city missing separately floods the origin (§7) |
+| Workers | Customer code in V8 isolates | Containers were too big and too slow to start everywhere (§8) |
+| Quicksilver | A local copy of all config on every server | Request-time lookups are slow and fragile (§9) |
+| Staged config releases | Snapstone, health checks, fail stale | Fast global pushes spread bad changes too (§10) |
+
+</Sub>
+
+<Sub n="11.2" title="From top to bottom">
+
+| Level | The choice | Data structure or algorithm |
+|---|---|---|
+| Network | Be in every city with one address | Anycast BGP announcements |
+| Server | Run everything everywhere | One identical software stack |
+| Packets | Detect where the packets are | Sampling; fingerprint permutations; a streaming heavy-hitter count (a count-min sketch is one way); eBPF in XDP |
+| Load balancing | Every server decides, consistently | Forwarding table of buckets, each with a first and second hop |
+| Proxy | Share everything across cores | Async tasks with work stealing; one connection pool per process |
+| Cache | One copy per city; tiers between cities | Consistent hash ring of servers; latency-ranked upper tiers; LRU plus a 30-day store |
+| Code | Many tenants in one process | V8 isolates; frozen clocks; memory protection keys |
+| Config | One writer, many readers | An ordered log copied down a tree; LMDB, then RocksDB with sharded caches and Bloom filters |
+| Safety | Make big changes small first | Staged cohorts with health checks; fail stale |
+
+</Sub>
+
+<SectionHeading n="12" id="elsewhere">Other ways to build an edge</SectionHeading>
+
+<Sub n="12.1" title="Akamai, Fastly, CloudFront and Google">
+
+Cloudflare's design is one answer. Other big edge networks made different choices about the same questions, and the comparison shows which parts are forced and which are taste.
+
+**Akamai** is the oldest. Its 2010 paper describes 61,000 servers in nearly 1,000 networks in 70 countries, and explains why so many: "Even the largest network has only about 5% of Internet access traffic," and it takes "well over 650 networks to reach 90%." So Akamai put servers *inside* ISPs, deeper than anycast at exchange points reaches. Its site in 2026 lists 4,400+ points of presence in 130+ countries. That paper also describes phased configuration rollouts with health checks at each step, sixteen years before Cloudflare's Code Orange made them universal.
+
+**Fastly** went the other way, "placing fewer, more powerful POPs at strategic markets," in its network page's words (June 2026), with 622 Tbps of capacity. Fewer, bigger sites probably mean higher cache hit rates per site, at the cost of more distance to some users. Its cache servers run a fork of Varnish, programmed in Varnish's configuration language (VCL).
+
+**AWS CloudFront** has the tiered-cache layering of section 7 (see the table). **Google's front end** faces the same problem for Google's own services: each one that faces the internet registers with the Google Front End (GFE), which terminates TLS and reports to a central DoS service, with Maglev (2016) balancing at layer 4 beneath it and Espresso (2017) steering traffic out of Google's edge.
+
+| | Cloudflare | Akamai | Fastly | CloudFront | Google edge |
+|---|---|---|---|---|---|
+| Footprint | 335+ cities, anycast | 4,400+ PoPs, many inside ISPs | Fewer, larger PoPs | 750+ PoPs + 1,140+ embedded | Google's own edge sites |
+| Servers | Identical; every service on each | Unpublished | Cache servers running a Varnish fork | Unpublished | GFE, Maglev, Espresso as separate systems |
+| Customer code | V8 isolates (Workers) | EdgeWorkers (JavaScript) | WebAssembly (Compute) | CloudFront Functions, Lambda@Edge | Not offered |
+| Cache tiers | Lower → upper → Cache Reserve | Tiered distribution | Shielding | Regional edge caches, Origin Shield | Internal |
+
+</Sub>
+
+<SectionHeading n="13" id="breaks">What goes wrong, and what it cost</SectionHeading>
+
+<Sub n="13.1" title="Failures this design has to survive">
+
+| What happens | What the user sees | What the design does |
+|---|---|---|
+| A multi-terabit flood at one site | Nothing | Anycast spreads it over hundreds of cities; dosd fingerprints it; l4drop drops it in the driver |
+| A flood of valid HTTPS requests | Nothing, or a challenge page | Fingerprinting and rate limits in the proxy, counted per key |
+| A server is added or fails | Nothing | Unimog moves its buckets; the second hop keeps open connections alive |
+| A popular link to a small shop | A fast page | Tiered caching turns hundreds of city misses into one origin request |
+| A Worker on a quiet site | No cold start | Warmed during the TLS handshake; requests sent to one server in the city |
+| A data centre fails | A slightly longer trip | It stops announcing its routes; anycast sends visitors to the next city (chapter 35) |
+| A bad configuration change | Errors everywhere, before 2026 | Now: staged rollout, health checks, automatic rollback, fail stale |
+
+</Sub>
+
+<Sub n="13.2" title="The tradeoffs, in one table">
+
+| Decision | Chosen | Given up | Why it was worth it |
+|---|---|---|---|
+| Where to be | Hundreds of cities, one address | Simplicity of a few big sites | Low latency and an attack split many ways |
+| What each server runs | Everything | Isolation between services | No idle capacity; every core fights every attack |
+| Where to detect attacks | On every server (plus the core) | A single global view per decision | Seconds to mitigate, no central bottleneck |
+| How to balance within a city | Every server, in XDP | A dedicated, simpler LB tier | No extra tier; balancing by real load; connections survive changes |
+| Proxy model | Threads with shared pools, in Rust | Crash isolation between workers | Far better origin connection reuse; a third of the CPU |
+| How to cache | One copy per city, tiers between cities | An extra hop on a miss | Origins see one request instead of hundreds |
+| How to run customer code | V8 isolates | The hardware wall of a VM | Milliseconds to start, a few MB each, thousands per process |
+| How to ship config | Seconds, everywhere (until 2025) → staged | A few minutes of speed for most changes | One bad change no longer reaches every server at once |
+
+</Sub>
+
+<SectionHeading n="14" id="summary">Summary</SectionHeading>
+
+1. **Cloudflare sits in front of other people's sites** as a reverse proxy, so it must absorb attacks aimed at any of them, with no warning of which.
+2. **One site is both too far and too small**: Chennai to Virginia costs at least 140 ms a round trip, and the largest attacks, 31.4 Tbps by early 2026, exceed any one data centre.
+3. **Anycast in 330+ cities splits both problems**: visitors reach a nearby city, and an attack from bots everywhere lands in hundreds of places.
+4. **Every server runs every service**, so no capacity sits idle in a tier the attack isn't using.
+5. **dosd on every server samples packets, counts fingerprint permutations and picks the narrowest one that covers the flood**; a heavy-hitter structure such as a count-min sketch counts them in a small, fixed space.
+6. **l4drop drops matching packets in XDP**, inside the network driver, so each junk packet costs almost nothing, and fingerprints are gossiped to other servers and cities.
+7. **Unimog makes every server a load balancer**, with a forwarding table of buckets and a second hop that keeps open connections alive when buckets move.
+8. **Pingora replaced per-worker NGINX pools with one shared pool across threads**, raising origin connection reuse and cutting CPU by about 70%; FL2 did the same for the proxy's core.
+9. **Tiered caching sends misses through an upper tier and Cache Reserve**, so a small origin sees one request instead of one per city.
+10. **Workers run customer code in V8 isolates**, about 3 MB and 5 ms each, with timers frozen, no threads and memory protection keys to make thousands of tenants per process acceptable.
+11. **Quicksilver gives every server a local copy of all configuration**, pushed down a tree from one log in seconds, and that speed is also how the 2019 and 2025 outages reached every server; configuration now ships in stages like code.
+
+<SectionHeading n="15" id="build">Build this</SectionHeading>
+
+**A one-server DDoS filter and a staged config push.**
+
+- Write an XDP program (chapter 48 has a template) that reads a fingerprint from a BPF map, a protocol and a packet length, and drops packets that match. Load it on a virtual interface, send it a mix of normal traffic and a flood with `iperf3` or a packet generator you control, and count drops and passes from the map.
+- Write a small user-space daemon that samples packets with the `bpf_get_prandom_u32()` approach, counts fingerprint permutations in a count-min sketch like the TryIt in section 4.4, and writes the best one into the map when it crosses a threshold. Measure how many seconds pass between the flood starting and drops beginning.
+- Add a config file the daemon reloads. Write a "rollout" script that changes it on one of three test machines (or containers), checks the drop and error rates, and only then changes the others. Ship a deliberately bad config, a fingerprint that matches everything, and watch the script stop at the first stage.
+- Bonus: replace the regex in a toy WAF with `.*.*=.*` and send it longer and longer headers, once with Python's `re` and once with the `google-re2` package.
+
+<SectionHeading n="16" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="How does a CDN protect a small website from a DDoS attack bigger than the site's whole connection?">
+The site's DNS points at the CDN, so all traffic, the attack included, arrives at the CDN instead of the site. If the CDN uses anycast, every one of its data centres announces the same addresses, so attack traffic from bots around the world is split across many data centres by ordinary internet routing. Each one drops the junk locally, ideally in the network driver, and passes only clean, uncacheable requests on to the site.
+</QA>
+
+<QA level="beginner" q="Why does Cloudflare run every service on every server instead of using specialised machines?">
+Specialised tiers each have to be sized for their own worst day, and their worst days don't coincide: an attack overwhelms the scrubbers while the cache servers sit idle, and vice versa. Running one identical stack on every server means every core in a data centre can help with whatever is busy, and there's one server design to buy and manage. The price is weaker isolation: a bad change or a CPU-hungry bug can affect every service on every machine, as the 2019 regex outage did.
+</QA>
+
+<QA level="intermediate" q="How would you detect a volumetric attack's signature on each server, cheaply?">
+Sample a small random fraction of packets in the driver. For each sample, build candidate fingerprints from combinations of header fields and count them in a heavy-hitter structure such as a count-min sketch, which uses a fixed number of counters and never underestimates. Pick the most specific fingerprint that matches most of the samples, so that it covers the flood without matching normal traffic like QUIC, compile it into an XDP program that drops matching packets, and share it with other servers. Cloudflare's dosd works this way; which streaming algorithm it uses is unpublished.
+</QA>
+
+<QA level="intermediate" q="A load balancer's forwarding table changes. How do you keep existing TCP connections alive?">
+Use a table with many more buckets than servers, so changes move a few buckets instead of rehashing everything. When a bucket moves, keep the old server in a second slot. New connections, identified by their SYN, go to the new server; other packets go there too, but if it has no socket for the connection it forwards the packet to the old server. That's Unimog's daisy chaining, from the Beamer paper. Its limit is that a bucket that changes twice during a connection can still break it, so move the least recently changed buckets first.
+</QA>
+
+<QA level="deep" q="Why did moving from NGINX to a multithreaded proxy improve origin performance at Cloudflare?">
+NGINX workers are separate processes with separate connection pools, so with one worker per core a site's requests are spread over dozens of pools, each seeing the site too rarely to keep a connection open. Every miss means a new TCP and TLS handshake to the origin. Pingora runs as threads in one process sharing one pool, with work stealing across cores, so a site's requests find a warm connection. Cloudflare reported a third as many new connections, reuse for one customer going from 87.1% to 99.92%, lower tail latency to first byte, and about 70% less CPU.
+</QA>
+
+<QA level="deep" q="What do Cloudflare's July 2019 and November 2025 outages have in common, and what's the fix?">
+Both were changes that weren't code releases, a WAF rule in 2019 and a generated feature file in 2025, delivered to every server in seconds by the configuration system, which skipped the staged rollout that software went through. Each met a latent problem, a backtracking regex with no CPU guard, and a hard limit followed by an `unwrap()` that crashed the proxy. The specific fixes were a linear-time regex engine and better error handling, but the general fix is to treat configuration like code: roll it out in stages with health checks and automatic rollback, validate generated data like user input, and fall back to the last good configuration instead of crashing.
+</QA>
+
+<SectionHeading n="17" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Why does anycast help against a DDoS attack even before any filtering?">
+    The bots are spread around the world and each one's packets go to its
+    nearest Cloudflare city, so the flood is split across hundreds of data
+    centres by ordinary routing. Each city carries only its share, which is
+    small enough to drop locally.
+  </Q>
+  <Q q="A count-min sketch reports that a fingerprint was seen 16,176 times. What can you say about the true count?">
+    It's at most 16,176. Each counter holds the true count plus collisions
+    from other keys, so the estimate (the smallest of the counters) can only
+    be too high, and with enough width it's only a little too high.
+  </Q>
+  <Q q="In Unimog, which server handles a new connection's SYN when its bucket has just moved?">
+    The first-hop server, the bucket's new owner. Only packets for
+    connections that the first-hop server doesn't know are forwarded to the
+    second hop, the old owner.
+  </Q>
+  <Q q="Why does .*.*=.* take cubic time in a backtracking engine on text without '='?">
+    For each starting position, the engine tries every way of dividing the
+    rest of the text between the two .* groups, and each attempt fails at
+    the '='. That's quadratic work per start and a linear number of starts.
+    An automaton tracks all the possibilities at once and reads each
+    character once.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="'Cloudflare architecture and how BPF eats the world' (2019) and 'Gen 12 servers' (2024)">
+    Every service on every server, the path of a packet through XDP, iptables
+    and the proxy, and the hardware it runs on.
+  </WildCard>
+  <WildCard name="'A deep-dive into Cloudflare's autonomous edge DDoS protection' (2021) and the 7.3 Tbps post (2025)">
+    dosd, fingerprint permutations, gossip, and what the largest attacks look
+    like to the defender. The quarterly DDoS threat reports carry the records.
+  </WildCard>
+  <WildCard name="'L4Drop: XDP DDoS Mitigations' (2018) and 'Unimog' (2020)">
+    Sampling and dropping in the driver, and the load balancer on every server
+    with its daisy-chained forwarding table.
+  </WildCard>
+  <WildCard name="'How we built Pingora' (2022), the Pingora repo, and the FL2 post (2025)">
+    Why per-worker connection pools hurt, the threaded Rust design, and the
+    rewrite of the core proxy. The code is Apache 2.0 on GitHub.
+  </WildCard>
+  <WildCard name="'Cloud Computing without Containers' (2018) and the Workers security model (2020)">
+    Isolates instead of containers, and the layered defence against Spectre;
+    the 2025 cold-starts and sandbox-hardening posts bring it up to date.
+  </WildCard>
+  <WildCard name="'Introducing Quicksilver' (2020) and 'Quicksilver v2' (2025)">
+    Configuration on every machine, from Kyoto Tycoon to LMDB to a sharded
+    cache over a few large stores.
+  </WildCard>
+  <WildCard name="Postmortems: 2 July 2019, 18 November 2025, 5 December 2025, and 'Code Orange: Fail Small' (2025–2026)">
+    How global configuration pushes caused Cloudflare's worst outages, and
+    what changed afterwards.
+  </WildCard>
+  <WildCard name="Nygren, Sitaraman and Sun, 'The Akamai Network' (2010)">
+    The other classic design: servers inside a thousand networks, and phased
+    configuration rollouts with health checks.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="18" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="DNS, TLS & the Edge">
+    Anycast, the TLS handshake and CDN cache keys, which this chapter builds
+    on. [Chapter 35](/topics/35-dns-tls-edge).
+  </WildCard>
+  <WildCard name="Load Balancing">
+    ECMP, Maglev and the other layer-4 designs Unimog is compared with.
+    [Chapter 34](/topics/34-load-balancing).
+  </WildCard>
+  <WildCard name="eBPF">
+    How XDP programs are written, checked by the kernel and attached, the machinery
+    under l4drop and Unimog. [Chapter 48](/topics/48-ebpf).
+  </WildCard>
+  <WildCard name="Speculative Execution & Spectre">
+    The attack that shapes the Workers security model.
+    [Chapter 44](/topics/44-speculative-execution).
+  </WildCard>
+  <WildCard name="RPC, gRPC & QUIC">
+    HTTP/2 and QUIC, the protocols the proxy speaks and the Rapid Reset
+    attack abused. [Chapter 63](/topics/63-rpc-grpc-quic).
+  </WildCard>
+  <WildCard name="Designing JioHotstar">
+    Another edge story: request collapsing and multi-CDN steering for live
+    cricket. [Chapter 69](/topics/69-design-jiohotstar).
+  </WildCard>
+</CardGrid>

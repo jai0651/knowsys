@@ -1,0 +1,1199 @@
+---
+title: "Designing Zerodha and the Stock Exchange"
+dek: "At 9:15 in the morning Meera taps Buy on Kite for 10 shares, and a fraction of a second later she owns them. We'll follow that order from her phone through Zerodha's risk checks and leased lines into NSE's matching engine and back, down to the order book, the opening auction, a single-threaded sequencer and the bytes of a live price, and look at what broke along the way."
+readingTime: "~55 min"
+level: "Intermediate"
+versions: "Figures from zerodha.tech, Zerodha bulletins, the Kite Connect docs, NSE pages and annual reports, SEBI orders and press releases, and Martin Fowler's LMAX article, dated where they appear"
+prereqs: "chapter 23 (Kafka and logs) helps, chapter 27 (consensus) helps, chapter 16 (tail latency) helps"
+updated: "2026-10-11"
+---
+
+It's a weekday morning and Meera is at her desk in Kochi with Kite, Zerodha's trading app, open on her phone. She has been watching one stock since nine o'clock: one of the biggest companies listed on the National Stock Exchange, trading around ₹1,500. (Which company doesn't matter, so we'll leave it unnamed, and every price in this chapter is illustrative.) The clock on her screen turns 9:15:00, the market opens, and she places a **limit buy**: 10 shares, at no more than ₹1,500 each. Under a second later the app says *Complete*. She owns 10 shares, bought at an average of ₹1,499.80.
+
+<Picture
+  src="/images/designs/zerodha/nse-exchange-plaza.jpg"
+  alt="The NSE building in Mumbai, a glass-fronted office block with a large NSE logo, seen through palm trees"
+  caption="Exchange Plaza in Bandra Kurla Complex, Mumbai, the headquarters of the National Stock Exchange. Nobody trades on a floor here any more: the market is a program that keeps a list of buyers and sellers for each stock, and Meera's order is one more entry in it."
+  credit="Photo: Ganesh Dhamodkar, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:National_Stock_Exchange_NSE_India.jpg"
+/>
+
+That second hides a lot. At the moment she tapped, a large share of Zerodha's millions of users were doing something similar, because 9:15 is when the Indian market opens and everyone who decided overnight to buy or sell acts at once. Every one of those orders has to be checked against the customer's money before it leaves Zerodha, carried to NSE over dedicated lines, and placed in a strict order against the orders of every other broker in the country, so that whoever offered the best price first gets served first. And all the while, the prices on Meera's screen keep moving, which means the result of every trade has to be pushed back out to millions of phones within a fraction of a second.
+
+Two very different organisations do this work. Zerodha is a broker: it holds Meera's account and money and talks to the exchange on her behalf, and in 2020 it ran all of this with a technology team of 30 people. NSE is the exchange: it runs the program that pairs buyers with sellers. In this case study we'll design both halves, the way an engineer would, starting with the most obvious design and fixing it where it breaks. The question we'll keep returning to is this: **when Meera taps Buy at 9:15:00, how does her order get checked, placed in line fairly against everyone else's and matched, and how does the new price reach millions of screens, in well under a second?** Along the way we'll go from boxes on a diagram down to the order book data structure, an auction algorithm, a single-threaded sequencer and the byte layout of a price update.
+
+<Callout label="A note on scope">
+This chapter is about how trading systems are built. Nothing in it is advice about what to buy or sell, and the stock, prices and quantities in the examples are made up.
+</Callout>
+
+<SectionHeading n="01" id="requirements">What we're building, and how big</SectionHeading>
+
+<Sub n="1.1" title="What it has to do">
+
+Let's write down what the two halves must do for Meera's order. The broker, Zerodha, has to:
+
+1. **Take the order** from the app and give it an ID Meera can track.
+2. **Check it against her account** before anything leaves the building: does she have ₹15,000 available, is the price sensible, is she allowed to trade this stock?
+3. **Send it to the exchange** over a connection the exchange trusts, and track what the exchange says back.
+4. **Show her live prices** for everything on her watchlist, and update her orders, positions and money as trades happen.
+
+The exchange, NSE, has to:
+
+1. **Keep a list of every waiting buy and sell order** for each stock.
+2. **Match** a new order against the waiting ones by a published rule, and report the resulting trades to both sides.
+3. **Set a fair opening price** each morning, after a night's worth of news.
+4. **Publish every change** to everyone at the same time.
+5. **Hand the trades to a clearing corporation**, which makes sure money and shares change hands afterwards.
+
+And the qualities that matter, roughly in order:
+
+- **Fair**: the rule that decides who trades first must be applied exactly, the same for everyone. If two brokers send orders at the same price, the one that arrived first must be filled first, and nobody may see prices before anyone else.
+- **Correct**: Meera must never be able to spend the same ₹15,000 twice, and a trade the exchange reports must never be lost or reported twice.
+- **Fast and predictable**: answers in milliseconds at the broker and far less at the exchange, with no long pauses, because a pause during a busy minute means orders queued behind it all trade at stale prices.
+- **Able to take the burst at 9:15**, when traffic jumps many times over in a few seconds.
+
+Notice how different this is from the other case studies so far. A ride-hailing app or a video service can be slightly wrong or slightly late and nobody notices. Here, "slightly wrong" means somebody's money went to somebody else, and the rules for who is first are written down by a regulator.
+
+</Sub>
+
+<Sub n="1.2" title="How big is it?">
+
+Zerodha publishes its engineering on its blog, zerodha.tech, and the figures are dated. In April 2020 the company had about a million users active each day, handled 15 to 20% of daily retail trading in India, and broadcast about 16 million market ticks a second (a **tick** is one update to a price or quantity) to hundreds of thousands of concurrent users. By July 2021 it had over 6 million users, was handling over 12 million retail trades on a busy day, up from about 2 million in January 2020, and had "way more than a million" people connected to Kite at any moment. When Kite launched in 2015 it had barely a thousand concurrent users. Between 2020 and 2021 the technology team went from 30 people to 31.
+
+NSE's numbers are larger again. Its annual report for the year to March 2024 says its trading platforms processed an average of over 14 billion messages a day (a message is any order, change or cancellation sent by a broker), across about 2 lakh (200,000) trading terminals, with capacity for over 5 million messages a second.
+
+What matters as much as the size is the shape of the load. A 2020 post on zerodha.tech says it plainly: "A 10x burst in traffic over a period of 10 seconds is quite common on a trading platform." The busiest of those bursts is at 9:15.
+
+<Think
+  q="Suppose a million people have Kite open, each looking at a watchlist of 20 stocks, and each stock's price changes about once a second. Zerodha sends each update to each person watching it as a small binary packet of 44 bytes. How many packets a second leave Zerodha, and how much bandwidth is that?"
+  hint="Multiply people by stocks by updates per second, then by packet size."
+>
+A million people times 20 stocks times one update a second is 20 million packets a second. At 44 bytes each that's roughly 880 megabytes a second, or roughly 7 gigabits a second, before any network overhead. (The million and the twenty are illustrations; Zerodha doesn't publish watchlist sizes. The 44 bytes is the real size of one "quote" packet in Kite's documented format, which section 7 takes apart.)
+
+That lines up with Zerodha's own 2021 description of its ticker streaming "tens of millions of real time market data packets every second". So market data, the prices flowing *out*, is a far bigger job than orders flowing *in*. Each order is a few hundred bytes once; each price change is copied to everyone who is watching.
+</Think>
+
+</Sub>
+
+<SectionHeading n="02" id="v1">Version 1: an exchange in a database</SectionHeading>
+
+<Sub n="2.1" title="The obvious design">
+
+Suppose we had to build a small exchange from scratch this afternoon. Most people would start with a web application in front of a database. There's an `orders` table with one row per waiting order: the stock, buy or sell, price, quantity and the time it arrived. When a new buy order comes in, a server asks the database for the cheapest waiting sell order for that stock, oldest first among equal prices, and if its price is at or below the buyer's limit, it records a trade and reduces both quantities. Many servers run in parallel to handle the traffic, and the apps talk to them over HTTPS.
+
+<SystemDiagram
+  title="Version 1: many servers matching orders in one table"
+  nodes={[
+    { id: "apps", label: "Traders' apps", sub: "HTTPS", kind: "users", col: 0, row: 0 },
+    { id: "lb", label: "Load balancer", kind: "lb", col: 1, row: 0 },
+    { id: "api", label: "Order servers", sub: "match in SQL", kind: "service", col: 2, row: 0, count: "×20" },
+    { id: "db", label: "orders table", sub: "stock, side, price, qty, time", kind: "db", col: 2, row: 1 },
+  ]}
+  edges={[
+    { from: "apps", to: "lb" }, { from: "lb", to: "api" }, { from: "api", to: "db", label: "SELECT … FOR UPDATE" },
+  ]}
+  steps={[
+    { caption: "Meera's buy order reaches one of twenty order servers through the load balancer.", path: ["apps", "lb", "api"] },
+    { caption: "The server asks the table for the best waiting sell order for her stock and locks that row so no other server can sell the same shares twice.", path: ["api", "db"] },
+    { caption: "At 9:15, thousands of orders for this one stock arrive at once. They all want the same few rows at the top of the list, so the twenty servers queue on the same lock. Adding servers adds waiting, not throughput.", focus: ["api", "db"] },
+  ]}
+  caption="Simple, and wrong in two ways at once: every order for a popular stock fights over the same rows, and 'oldest first' depends on timestamps taken on twenty different machines."
+/>
+
+Start with the lock. Every buy order for Meera's stock wants the same thing, the cheapest waiting sell order, so every one of them reaches for the same row. Only one transaction at a time can hold it, and the rest wait. So however many servers we add, orders for one stock are processed one after another anyway, plus the cost of all the waiting and retrying. Chapter 16 has a name for this: the servers are contending for one resource, and contention turns into long, unpredictable waits at the tail.
+
+</Sub>
+
+<Sub n="2.2" title="Who was first?">
+
+A second problem is subtler, and for an exchange it matters most. Our rule says "among equal prices, oldest first". But "oldest" according to whom? Each of the twenty servers stamps the arrival time from its own clock, and clocks on different machines disagree by microseconds to milliseconds even when they're synchronised (chapter 26 explains why). If Meera's order lands on server 3 and another broker's order at the same price lands on server 11 a hundred microseconds later, server 11's clock might be running slightly behind and stamp its order as earlier. Then the other broker jumps the queue, and nobody can even tell it happened.
+
+<Picture
+  src="/images/designs/zerodha/nyse-trading-floor.jpg"
+  alt="A crowded stock exchange trading floor with traders gathered around trading posts under banks of screens"
+  caption="The New York Stock Exchange floor, with numbered trading posts. For most of the twentieth century, matching happened here in person: a specialist at each post kept the book for a few stocks and decided who traded with whom. Fair ordering came from one person keeping one list for each stock, and electronic exchanges kept that idea."
+  credit="Photo: Carol M. Highsmith, Library of Congress, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:No_Known_Restrictions_Trading_Floor,_New_York_Stock_Exchange_(Highsmith_LOC)_(6718386525).jpg"
+  narrow
+/>
+
+Exchanges solved this long before computers, and the photo shows how: for each stock, one place keeps one list, and everybody's order goes into that list in the order it physically arrived. There's no question of whose clock is right, because there's only one queue. Electronic exchanges use the same idea. Every order for a given stock passes through one point that gives it a position in line, and the position, not a clock reading, decides who is first. NSE's own description of its trading system says it in one line: orders are "first numbered and time-stamped on receipt and then immediately processed for potential match."
+
+So the exchange half needs a single, ordered queue per stock, and a program that works through it one order at a time. That's sections 4 to 6. But before the order reaches the exchange at all, there's a question version 1 skipped.
+
+</Sub>
+
+<Sub n="2.3" title="Why there's a broker in the middle">
+
+In version 1, Meera's app talks to the exchange directly. Real exchanges don't allow that. Only **members**, brokers approved by the exchange and the regulator, may connect, and each member is responsible for every order it sends. If Meera buys ₹15,000 of shares and doesn't pay, the exchange's side of the trade still settles; it's the broker who owes the money.
+
+That responsibility is why the broker checks every order *before* sending it. Zerodha has to know, at the instant Meera taps Buy, whether she has the money, and it has to reserve that money so that a second order a millisecond later can't spend it again. It also has to keep its own connections to the exchange alive and fast, and show Meera what happened. That's the broker half of our design, and it's where the order goes first.
+
+</Sub>
+
+<SectionHeading n="03" id="broker">The broker: Kite, the OMS and the risk check</SectionHeading>
+
+<Sub n="3.1" title="The path of Meera's order through Zerodha">
+
+When Meera taps Buy, the app sends the order to Zerodha's servers, and it passes through three stages before it leaves for NSE. Each stage has a name used across the industry.
+
+The **order management system (OMS)** is the part that owns orders: it gives each one an ID, records every change to it, routes it to the right exchange and keeps track of what the exchange says back. The **risk management system (RMS)** is the gatekeeper inside the OMS's path: it checks each order against the customer's account and the rules, and rejects it if it fails. And the **exchange gateway** holds the actual connections to the exchange.
+
+Zerodha's public API for developers, Kite Connect, documents this path in an unusual amount of detail, because an order placed through the API passes through visible intermediate states. Meera's order goes through the same ones:
+
+| Status | What it means |
+|---|---|
+| `PUT ORDER REQ RECEIVED` | Zerodha's backend has the request. |
+| `VALIDATION PENDING` | Waiting for the RMS to check it. |
+| `OPEN PENDING` | Passed the checks, waiting for the exchange to accept it. |
+| `OPEN` | The exchange has it, and it's waiting in the order book. |
+| `COMPLETE` | Fully filled. |
+| `REJECTED` / `CANCELLED` | Refused by the RMS or the exchange, or cancelled. |
+
+A warning in the documentation tells you a lot about the design: when the API returns an order ID, that means the order was registered with the OMS, and "this does not guarantee the order's receipt at the exchange." The broker answers Meera's tap at once and finds out what the exchange did later. Her order also gets a second ID, `exchange_order_id`, which only exists once NSE has accepted it.
+
+<SystemDiagram
+  title="Meera's order inside Zerodha"
+  nodes={[
+    { id: "meera", label: "Meera's phone", sub: "Kite app", kind: "phone", col: 0, row: 1 },
+    { id: "kite", label: "Kite API", sub: "Go", kind: "lb", col: 1, row: 1 },
+    { id: "cache", label: "Hot cache", sub: "Redis: orders, positions", kind: "cache", col: 1, row: 0 },
+    { id: "oms", label: "OMS", sub: "vendor engine", kind: "service", col: 2, row: 1 },
+    { id: "rms", label: "RMS", sub: "margin, limits", kind: "compute", col: 2, row: 0 },
+    { id: "gw", label: "Exchange gateways", sub: "CTCL, leased lines", kind: "lb", col: 3, row: 1 },
+    { id: "nse", label: "NSE", sub: "trading system", kind: "external", col: 3, row: 2 },
+  ]}
+  edges={[
+    { from: "meera", to: "kite" }, { from: "kite", to: "oms" }, { from: "oms", to: "rms" },
+    { from: "oms", to: "gw" }, { from: "gw", to: "nse" }, { from: "oms", to: "cache", dashed: true }, { from: "kite", to: "cache" },
+  ]}
+  steps={[
+    { caption: "Meera taps Buy: 10 shares, limit ₹1,500. Kite's API checks her session and passes the order on. Status: **PUT ORDER REQ RECEIVED**.", path: ["meera", "kite", "oms"] },
+    { caption: "The OMS asks the RMS. It checks that ₹15,000 is free in her account, that ₹1,500 is inside the stock's allowed price band, and that she may trade it, then blocks the ₹15,000. Status: **VALIDATION PENDING**, then passed.", path: ["oms", "rms"] },
+    { caption: "The OMS sends the order out over one of Zerodha's exchange connections. Status: **OPEN PENDING** until NSE answers.", path: ["oms", "gw", "nse"] },
+    { caption: "NSE accepts it and matches it at once. The confirmation and the trades come back the same way, and the OMS records them.", path: ["nse", "gw", "oms"] },
+    { caption: "The new state is written to the hot cache that every Kite screen reads from, and Meera's app shows **COMPLETE**.", path: ["oms", "cache", "kite", "meera"] },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="3.2" title="The risk check has to be fast and exact">
+
+Correctness at the broker lives in the RMS, so let's look at what it does with Meera's order. A broker's pre-trade checks typically include:
+
+- **Margin**: does the account have enough money? Meera is buying for delivery, to hold the shares, so that's the full ₹15,000. For intraday or derivatives trades it's a fraction set by the exchange's margin rules. Since 2020, SEBI, India's market regulator, has required brokers to collect these margins upfront, before the trade, with the full peak-margin rule in force from September 2021, which turns this check from a nicety into an obligation.
+- **Price**: is ₹1,500 inside the price band the exchange allows for this stock today? An order outside it would be rejected by the exchange anyway, and catching it early saves a round trip.
+- **Quantity and value limits**: a single order can't exceed the exchange's per-order limits or the broker's own, which catch fat-finger mistakes like 10,000 shares instead of 10.
+- **Eligibility**: is this stock tradable today, and is this account allowed to trade it?
+
+Most of these are lookups. Of these, the margin check is the hard one, because it's a read followed by a write that must happen as one step. Picture Meera with exactly ₹15,000 free, tapping Buy twice by accident within a few milliseconds. If both orders read "₹15,000 free" before either subtracts, both pass, and she has committed ₹30,000 she doesn't have. That's the classic lost-update race from chapter 19, and here it means the broker is lending money it never agreed to lend.
+
+<Why>Why not just run the margin check as a database transaction?</Why>
+
+You could, and for a small broker it would work. Trouble comes from the shape of the load at 9:15. Every order needs this check, it must finish in milliseconds, and the burst arrives all at once. A transaction against a disk-backed database for every order puts the database's commit latency, and its tail, directly on the order path at the worst possible moment. So pre-trade risk systems generally keep each account's available balance in memory and serialise the updates for one account: all of Meera's orders go through the same place, one after another, so check-and-block is a single step with nobody else touching her balance in between. Different accounts are independent, so the work splits across many machines by account. A durable record of what was blocked is written alongside, so that a crash doesn't forget it.
+
+How Zerodha's RMS is built internally isn't published. What *is* published is its consequence: the `VALIDATION PENDING` state, which tells you the check is a separate step the order waits for, and Zerodha's statement in 2020 that "every bit of data that is shown on Kite", orders, positions and holdings, comes from an in-memory Redis cache, with disk persistence turned off on those instances; the records that must survive live in the systems behind it.
+
+<Decision
+  q="Where should the pre-trade margin check keep each account's balance?"
+  options={[
+    { name: "In the database, checked per order", how: "A transaction reads the balance, checks it and blocks the amount.", good: ["Simple, and correct by construction", "Survives any crash"], bad: ["Commit latency and lock waits land on every order", "The 9:15 burst hits the database hardest exactly when it matters"] },
+    { name: "In memory, one owner per account", how: "Each account's balance lives on one process that applies its orders one at a time, logging each block durably.", good: ["Microseconds per check", "No locks: one writer per account", "Scales out by splitting accounts"], bad: ["Must rebuild state after a crash from the log and the systems of record", "Routing must send every order for an account to its owner"], chosen: true },
+  ]}
+>
+In trading systems the second shape is probably the more common answer, and it's the same "one writer per piece of state" idea that the exchange uses for its order books in section 6. Zerodha's RMS lives inside a vendor OMS, so its exact mechanism is the vendor's and isn't public; the requirement it has to meet, an atomic check-and-block in the order path, is the same whoever builds it.
+</Decision>
+
+</Sub>
+
+<Sub n="3.3" title="What Zerodha built, and what it bought">
+
+Here's a choice that surprises engineers: Zerodha didn't write its own OMS. Its 2021 post on zerodha.tech describes the original setup. The OMS was a vendor product with "SOAP-like HTTP/XML APIs" on top of the engine, and Zerodha wrote a middleware layer in Python that wrapped those APIs in clean HTTP and JSON. Kite was built on that layer: version 1 in Python in 2015, a refactor in 2016, and a full rewrite in 2017, with the backend later rewritten in Go. It doesn't name the vendor.
+
+Everything around the OMS, Zerodha built. In April 2020 its blog listed the stack: "All of our performance-critical, high throughput services are written in Go"; Python for back-office systems that crunch data; self-managed Postgres (with MySQL in places) as the databases; Redis in the hot paths; and Kafka for real-time events. A 2021 post added that it self-hosts Postgres, MySQL, ClickHouse, Redis, Kafka and more, instead of paying for managed versions, and that its reporting system, Console, works over "hundreds of billions of rows" of financial data.
+
+<Decision
+  q="Should a fast-growing broker write its own order management system?"
+  options={[
+    { name: "Build the OMS", how: "Write order routing, risk and exchange connectivity in-house.", good: ["Full control of latency and features", "No vendor limits"], bad: ["Exchange certification for every connection and change", "Years of work before the first order", "Mistakes here lose real money"] },
+    { name: "Buy the OMS, build around it", how: "License an exchange-certified engine; build the apps, APIs, caches and data systems around it.", good: ["Certified exchange connectivity from day one", "A small team can focus on the product"], bad: ["The vendor's APIs and performance limit the platform", "Workarounds pile up in middleware"], chosen: true },
+  ]}
+>
+With a team of about 30, Zerodha spent its effort where customers see it: Kite, the APIs, the ticker and the back office. Parts that need exchange certification stay in the vendor engine. You can see the cost in the 2021 post's description of wrapping XML APIs in a middleware layer, and in the fact that so much of Kite reads from Zerodha's own Redis cache instead of the OMS directly.
+</Decision>
+
+</Sub>
+
+<Sub n="3.4" title="Getting to the exchange: leased lines and co-location">
+
+Now the order has to physically reach NSE, which is in Mumbai. Brokers connect to NSE's trading system through a facility the exchange calls **CTCL**, for computer-to-computer link: the broker's own trading software, certified by the exchange, talking to NSE's systems over a dedicated connection. Those connections are usually **leased lines**, private circuits rented from a telecom company that run between two fixed points and carry nothing else, so the latency is steady and the traffic never touches the public internet.
+
+Zerodha's 2020 description of its infrastructure is one line: "Hybrid infra. Physical racks where numerous exchange leased lines terminate + AWS." The racks are the part that has to be physical, because that's where the exchange's lines arrive. Its next line explains a lot of Indian trading-app outages: "Sometimes, these leased lines go down when the civic body in Mumbai digs up roads."
+
+<Picture
+  src="/images/designs/zerodha/datacenter-rack.jpg"
+  alt="The back of a server rack: a stack of servers, each with network cables running to a switch at the top"
+  caption="The back of one rack of servers, with a network switch at the top and a cable from each server to it. A broker's exchange connectivity lives in racks like this, in the room where the leased lines from the exchange come in. Co-location means renting racks like this inside the exchange's own data centre."
+  credit="Photo: Derrick Coetzee, CC0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Rear_of_rack_at_NERSC_data_center_-_closeup.jpg"
+  narrow
+/>
+
+For the fastest traders, even a leased line across Mumbai is a bit too slow. Since 2010 NSE has offered **co-location**: a member can rent rack space inside the exchange's own data centre and put its servers a short cable away from the matching engine. That matters for firms whose strategies depend on reacting within microseconds, and it's how the most detailed market data is delivered, as section 7 shows. For a retail order from Kochi, a few milliseconds over a leased line is probably lost in the time it takes Meera's phone to reach Zerodha at all.
+
+What happens when a line fails? Zerodha published a postmortem in April 2018 that walks through it. Its orders go to NSE through several CTCLs, used in round robin, each with a primary leased line and one backup. At about 12:12 pm on 12 April 2018 the primary line on one CTCL went down and the backup took over, as designed. Then the backup started **flapping**: going up and down, not once but many times over the next hour.
+
+<StepSequence
+  title="12 April 2018: one CTCL's backup line flaps"
+  actors={["OMS", "One CTCL", "Backup leased line", "NSE"]}
+  messages={[
+    { from: 0, to: 1, label: "order (round robin)", note: "**1.** Orders are spread across several CTCLs. Around 12:12 pm, one CTCL's primary line fails and the backup takes over." },
+    { from: 1, to: 2, label: "send", note: "**2.** The backup is up, so the CTCL sends orders over it." },
+    { from: 2, to: 3, label: "lost as line drops", note: "**3.** The line drops and comes back, again and again. Orders sent in the gaps never reach NSE, and nothing tells the OMS they're lost." },
+    { from: 0, to: 0, label: "OPEN PENDING …", note: "**4.** Those orders sit in **open pending**, **validation pending** or **modify pending**, waiting for an answer that will never come." },
+    { from: 0, to: 1, label: "shut that CTCL", note: "**5.** Zerodha shuts that CTCL entirely, so new orders use the others, and reconciles the stuck orders against the exchange's records." },
+  ]}
+/>
+
+Under 0.3% of that day's orders and about 1.5% of the clients who traded were affected. Worst hit were bracket and cover orders, which place an exit order automatically after the entry: the exit legs were never placed, leaving positions customers couldn't close the usual way. About the lines themselves, the postmortem was blunt. Each CTCL is allowed only one backup line, and there was little more it could do about their reliability.
+
+<Callout label="Design implication">
+A connection that's cleanly down is easy: fail over. A connection that's *partly* up is far worse, because every health check passes some of the time and the failover never fires. Design for flapping explicitly: treat a link that has dropped several times in a minute as dead, take it out of rotation, and give every order sent into the gap a way to be reconciled against the other side's records. Chapter 30 covers why failure detection is hard in exactly this way.
+</Callout>
+
+Meera's order went out over a healthy line, so it's now at NSE. It's time to look at what the exchange does with it.
+
+</Sub>
+
+<SectionHeading n="04" id="order-book">The order book</SectionHeading>
+
+<Sub n="4.1" title="A queue at every price">
+
+Section 2 ended with the requirement that every order for one stock goes into one list, in the order it arrived. Let's make that list precise, because it's the most important data structure in this chapter.
+
+Start with what's waiting. A buy order that hasn't traded yet is called a **bid**: "I'll pay up to ₹1,499 for 8 shares." A waiting sell order is an **ask** (or offer): "I'll sell 4 shares for no less than ₹1,499.50." Collect all the bids and asks for one stock and you have its **order book**. The highest bid and the lowest ask are the best prices on each side, and the gap between them is the **spread**. If the best bid were ever at or above the best ask, those two orders would trade immediately, so in a resting book the bids are always below the asks.
+
+NSE's rule for which order goes first is published, and it's the same rule almost every stock exchange uses. Its trading system page says orders are stored "in price-time priority": "Price priority means that if two orders are entered into the system, the order having the best price gets the higher priority. Time priority means if two orders having the same price are entered, the order that is entered first gets the higher priority."
+
+So the book is organised as a list of **price levels**, and each level holds a **first-in, first-out (FIFO) queue** of the orders at that price. Here's Meera's stock at 9:15:00, just before her order arrives:
+
+| Side | Price | Queue at this price (oldest first) |
+|---|---|---|
+| ask | ₹1,501.00 | s5: 30 |
+| ask | ₹1,500.00 | s2: 5, s3: 10, s4: 5 |
+| ask | ₹1,499.50 | s1: 4 |
+| bid | ₹1,499.00 | b1: 8 |
+| bid | ₹1,498.50 | b2: 12 |
+
+The best ask is ₹1,499.50 and the best bid ₹1,499.00, so the spread is 50 paise. Three different sellers are waiting at ₹1,500, and s2 got there first.
+
+</Sub>
+
+<Sub n="4.2" title="Matching Meera's order">
+
+Meera's order is a buy of 10 at up to ₹1,500. For a buy, the matching engine takes the best ask and asks one question: is its price within her limit? If so, trade as much as possible with the order at the front of that level's queue, and repeat until her order is filled or the next best ask is above her limit. Two more rules from NSE's page decide the details. An order "may match partially with another order resulting in multiple trades." And "orders are always matched at the passive order price", meaning the price of the order that was already waiting. NSE calls waiting orders **passive** and the incoming one **active**.
+
+<Scene
+  title="Meera's limit buy, 10 shares at ₹1,500, against the book"
+  regions={[
+    { id: "a1501", label: "Ask ₹1,501.00", col: 0, row: 0, span: 2 },
+    { id: "a1500", label: "Ask ₹1,500.00", sub: "FIFO queue", col: 0, row: 1, span: 2 },
+    { id: "a14995", label: "Ask ₹1,499.50", col: 0, row: 2, span: 2 },
+    { id: "in", label: "Incoming", col: 2, row: 0 },
+    { id: "trades", label: "Trades", col: 2, row: 1, span: 1 },
+    { id: "bids", label: "Bids ₹1,499.00 and below", col: 0, row: 3, span: 2 },
+  ]}
+  itemWidth={92}
+  frames={[
+    { caption: "The book at 9:15:00. At ₹1,500 three sell orders wait in the order they arrived: s2, then s3, then s4.",
+      items: [
+        { id: "s5", at: "a1501", label: "s5: 30" },
+        { id: "s2", at: "a1500", label: "s2: 5" }, { id: "s3", at: "a1500", label: "s3: 10" }, { id: "s4", at: "a1500", label: "s4: 5" },
+        { id: "s1", at: "a14995", label: "s1: 4" },
+        { id: "b1", at: "bids", label: "b1: 8" }, { id: "b2", at: "bids", label: "b2: 12" },
+      ], focus: ["a1500", "a14995"] },
+    { caption: "Meera's order arrives: buy 10, limit ₹1,500. It's **active**; everything in the book is **passive**.",
+      add: [{ id: "m", at: "in", label: "Meera: 10", tone: "new" }], focus: ["in"] },
+    { caption: "The best ask, ₹1,499.50, is within her limit. s1's 4 shares trade at ₹1,499.50, the passive order's price, so Meera pays less than her limit. s1 is gone, and so is that level.",
+      change: [{ id: "s1", at: "trades", label: "4 @ 1,499.50", tone: "ok" }, { id: "m", label: "Meera: 6" }], arrow: { from: "in", to: "a14995" }, focus: ["a14995", "trades"] },
+    { caption: "Next best ask is ₹1,500, still within her limit. The front of that queue is s2, the oldest: its 5 shares trade.",
+      change: [{ id: "s2", at: "trades", label: "5 @ 1,500.00", tone: "ok" }, { id: "m", label: "Meera: 1" }], arrow: { from: "in", to: "a1500" }, focus: ["a1500", "trades"] },
+    { caption: "s3 is now at the front. Meera needs one more share, so s3 trades 1 and stays at the front of the queue with 9 left. That's a **partial fill**. s4, who arrived later, gets nothing.",
+      add: [{ id: "t3", at: "trades", label: "1 @ 1,500.00", tone: "ok" }], change: [{ id: "s3", label: "s3: 9", tone: "dirty" }, { id: "m", label: "Meera: 0", tone: "ok" }], focus: ["a1500", "trades"] },
+    { caption: "Meera is filled: 10 shares for ₹14,998, an average of ₹1,499.80. The best ask is now ₹1,500 with 14 shares in two orders, and the exchange publishes the three trades and the new book to everyone.",
+      remove: ["m"], focus: ["a1500", "trades"] },
+  ]}
+/>
+
+Notice what the rule achieves. Meera set a limit of ₹1,500 and paid less on part of her order, because the ₹1,499.50 seller was already waiting and passive orders set the price. And s2, s3 and s4 all offered ₹1,500, but s2 was served first and s4 not at all, purely because of the order they arrived in. Neither outcome depended on anyone's clock.
+
+</Sub>
+
+<Sub n="4.3" title="Build one">
+
+All of this fits in a short program. This one keeps, for each side, a dictionary from price to a `deque` (a double-ended queue: Python's FIFO queue, with fast removal from the front). Prices are stored as whole numbers of paise, so ₹1,499.50 is `149950`; integer prices avoid the rounding errors of floating point, and as section 7 shows, that's how real feeds carry them too. The `submit` method is the matching loop from the scene. A **market order**, one with no limit price that takes whatever the book offers, is a buy or sell with `price=None`; it never rests in the book.
+
+<TryIt what="Price-time priority matching on a small book" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+from collections import deque
+from dataclasses import dataclass
+
+@dataclass
+class Order:
+    id: str
+    side: str      # "B" buy or "S" sell
+    qty: int
+    price: int     # in paise; None for a market order
+
+class Book:
+    def __init__(self):
+        self.levels = {"B": {}, "S": {}}   # price -> FIFO queue of resting orders
+        self.trades = []
+
+    def best(self, side):
+        prices = self.levels[side]
+        if not prices:
+            return None
+        return max(prices) if side == "B" else min(prices)   # a real engine keeps these sorted
+
+    def submit(self, o):
+        other = "S" if o.side == "B" else "B"
+        while o.qty > 0:
+            p = self.best(other)
+            if p is None:
+                break
+            if o.price is not None:                      # a limit stops at its price
+                if (o.side == "B" and p > o.price) or (o.side == "S" and p < o.price):
+                    break
+            queue = self.levels[other][p]
+            rest = queue[0]                              # oldest order at the best price
+            n = min(o.qty, rest.qty)
+            self.trades.append((o.id, rest.id, n, p))    # trade at the resting price
+            o.qty -= n
+            rest.qty -= n
+            if rest.qty == 0:
+                queue.popleft()
+                if not queue:
+                    del self.levels[other][p]
+        if o.qty > 0 and o.price is not None:            # what's left of a limit rests
+            self.levels[o.side].setdefault(o.price, deque()).append(o)
+
+    def show(self):
+        for p in sorted(self.levels["S"], reverse=True):
+            print(f"   ask {p/100:9.2f}  " + " ".join(f"{x.id}:{x.qty}" for x in self.levels["S"][p]))
+        print("   " + "-" * 30)
+        for p in sorted(self.levels["B"], reverse=True):
+            print(f"   bid {p/100:9.2f}  " + " ".join(f"{x.id}:{x.qty}" for x in self.levels["B"][p]))
+
+book = Book()
+for o in [Order("s1", "S", 4, 149950), Order("s2", "S", 5, 150000),
+          Order("s3", "S", 10, 150000), Order("s4", "S", 5, 150000),
+          Order("s5", "S", 30, 150100), Order("b1", "B", 8, 149900),
+          Order("b2", "B", 12, 149850)]:
+    book.submit(o)
+print("book at 09:15:00")
+book.show()
+
+book.submit(Order("meera", "B", 10, 150000))     # limit buy, 10 shares at ₹1,500.00
+print("\nMeera's limit buy, 10 @ 1500.00")
+for t in book.trades:
+    print(f"   trade {t[0]} buys {t[2]:2} from {t[1]} at {t[3]/100:.2f}")
+book.show()
+
+book.trades.clear()
+book.submit(Order("ravi", "S", 15, None))        # market sell, 15 shares
+print("\nRavi's market sell, 15 shares")
+for t in book.trades:
+    print(f"   trade {t[1]} buys {t[2]:2} from {t[0]} at {t[3]/100:.2f}")
+book.show()
+```
+<Output>
+```
+book at 09:15:00
+   ask   1501.00  s5:30
+   ask   1500.00  s2:5 s3:10 s4:5
+   ask   1499.50  s1:4
+   ------------------------------
+   bid   1499.00  b1:8
+   bid   1498.50  b2:12
+
+Meera's limit buy, 10 @ 1500.00
+   trade meera buys  4 from s1 at 1499.50
+   trade meera buys  5 from s2 at 1500.00
+   trade meera buys  1 from s3 at 1500.00
+   ask   1501.00  s5:30
+   ask   1500.00  s3:9 s4:5
+   ------------------------------
+   bid   1499.00  b1:8
+   bid   1498.50  b2:12
+
+Ravi's market sell, 15 shares
+   trade b1 buys  8 from ravi at 1499.00
+   trade b2 buys  7 from ravi at 1498.50
+   ask   1501.00  s5:30
+   ask   1500.00  s3:9 s4:5
+   ------------------------------
+   bid   1498.50  b2:5
+```
+</Output>
+</TryIt>
+
+Building the starting book is itself matching: the seven orders arrive one by one and none of them cross, so they all rest. Meera's three trades are exactly the ones in the scene, and s3 is left at the front of the ₹1,500 queue with 9 shares. Then Ravi sends a market sell for 15. It takes b1's 8 shares at ₹1,499 and then 7 of b2's at ₹1,498.50, a lower price, because a market order keeps walking down the book until it's filled. That's the danger of market orders when the book is thin, and it's why Kite Connect's order API has a `market_protection` setting that turns a market order into a limit a chosen percentage away from the current price.
+
+</Sub>
+
+<Sub n="4.4" title="The data structure inside a real engine">
+
+<Zoom path={["NSE", "Matching engine", "Order book", "Price level", "FIFO queue"]} />
+
+This toy works, but look at what each operation costs. `best()` scans every price in a dictionary, which is fine for five levels and hopeless for thousands. A real engine needs four operations to be fast, and each one shapes the structure:
+
+| Operation | How often | What makes it fast |
+|---|---|---|
+| Find the best bid or ask | Every incoming order | Keep the levels sorted, or keep a pointer to the best level |
+| Add an order to the back of a level | Every order that rests | A linked list or queue per level, with a tail pointer |
+| Remove from the front of a level | Every fill | The same queue's head pointer |
+| Cancel an order from the middle of a queue | Constantly; most orders are cancelled, not filled | A hash map from order ID to its node in a doubly linked list, so it unlinks in constant time |
+
+So the usual design is a sorted map from price to level (a balanced tree such as a red-black tree, or a skip list), where each level is a doubly linked list of orders, plus a hash map from order ID to the order's list node. Adding at a new price costs a logarithmic tree insert; everything at an existing price is constant time.
+
+Exchanges have one advantage that general-purpose code doesn't: prices can't be just anything. They move in fixed steps called **ticks** (a few paise for most stocks), and NSE sets a price band around each stock's previous close outside which orders are rejected (for some stocks the band can widen during the day). So the number of possible prices in a day is bounded and known in advance, and an engine can replace the tree with a plain array indexed by price: slot *i* holds the level for the band's lowest price plus *i* ticks. Finding a level becomes a single array access, and the best price is tracked with an index that moves as levels empty and fill. NSE doesn't publish which structure its engine uses, so treat this as the design space, not a description.
+
+<Picture
+  src="/images/designs/zerodha/order-book-depth-chart.png"
+  alt="Left, an order book table with ten bid prices and sizes and ten ask prices and sizes. Right, a depth chart with a green staircase of cumulative bids falling to the left and a red staircase of cumulative asks rising to the right"
+  caption="An order book for a fictional stock (left) and its depth chart (right). Each step on the chart is one price level; its height is the total quantity available at that price or better. The gap between the green and red staircases at the dashed line is the spread. A market order to buy walks up the red staircase until it's filled."
+  credit="Image: Markm131, CC0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Level_2_order_book_and_market_depth_chart.png"
+/>
+
+<Decision
+  q="How should a matching engine store the price levels of one book?"
+  options={[
+    { name: "Sorted tree (or skip list)", how: "A balanced tree keyed by price; each node holds a FIFO list.", good: ["Works for any price range", "Memory grows only with levels in use"], bad: ["Logarithmic insert at a new price", "Pointer chasing is unfriendly to CPU caches"] },
+    { name: "Array indexed by tick", how: "One slot per possible price between the day's band limits.", good: ["Constant-time access to any level", "Contiguous memory suits the cache"], bad: ["Needs a bounded price range", "Wastes memory when the band is wide and the book sparse"] },
+    { name: "Binary heap of prices", how: "A heap gives the best price on top.", good: ["Easy to write"], bad: ["Removing an emptied level from the middle is slow", "No fast way to find a given price"] },
+  ]}
+>
+Both of the first two are used in practice, and the choice depends on the market. Price bands, as NSE has, make the array practical; markets with unbounded prices, or crypto pairs with tiny ticks, lean on trees. A heap, probably the first structure most people reach for, is the weakest of the three, because order books need fast access to arbitrary prices, not only the top.
+</Decision>
+
+<Elsewhere items={[
+  { where: "Nasdaq, the London Stock Exchange and most equity markets", how: "Continuous matching by price-time priority on a central limit order book, the same rule NSE publishes." },
+  { where: "Some futures markets", how: "Some contracts at CME allocate fills at a price level pro rata, in proportion to order size, instead of strictly first-come-first-served." },
+  { where: "Crypto exchanges", how: "Coinbase, Binance and others run central limit order books with price-time priority, and publish the book as a stream of level updates." },
+  { where: "Ad exchanges and auctions", how: "Real-time bidding ranks bids by price within milliseconds, the same 'best price wins' structure with a single item for sale." },
+]} />
+
+</Sub>
+
+<SectionHeading n="05" id="pre-open">Before 9:15: the opening auction</SectionHeading>
+
+<Sub n="5.1" title="Why not just start matching at 9:15?">
+
+Back in section 4, the book was already full of orders at 9:15:00, at prices close to each other. Where did they come from? Think about what the book looks like the moment trading starts after a night of news. Results came out overnight, a foreign market fell, and thousands of people placed orders in the last few minutes. If continuous matching started cold, the first sell order to arrive would trade against whatever bid happened to be waiting, perhaps a stale one far from where the market will settle, and the "opening price" would be an accident of who clicked first. A few small orders at strange prices would set the tone for the whole day.
+
+So NSE doesn't start continuous trading cold. From 9:00 to 9:15 it runs a **pre-open session**, and in it a different kind of matching called a **call auction**: collect orders for a while without trading, then find the single price at which the most shares can change hands, and trade everything that can trade at that one price, all at once.
+
+</Sub>
+
+<Sub n="5.2" title="Finding the equilibrium price">
+
+NSE calls the price the auction picks the **equilibrium price**. NSE's pre-open page defines it: "The equilibrium price is the price at which the maximum volume is executable." If several prices tie on volume, it picks the one with the smallest **order imbalance**, the unmatched quantity left over on one side. If that still ties, it picks the price closest to the previous day's close.
+
+Here's how to compute it. At each candidate price *p*, the **demand** is the total quantity of buy orders willing to pay *p* or more, and the **supply** is the total of sell orders willing to accept *p* or less. The number of shares that can trade at *p* is the smaller of the two. As *p* rises, demand falls and supply grows, and the equilibrium is where they cross, the same picture as in an economics textbook.
+
+<Picture
+  src="/images/designs/zerodha/supply-demand-equilibrium.png"
+  alt="A graph with price on the vertical axis and quantity on the horizontal axis, a falling red demand curve and a rising blue supply curve crossing at a point labelled equilibrium"
+  caption="Demand falls as the price rises; supply rises. The auction's equilibrium price is where they cross, because that's where the smaller of the two, the quantity that can trade, is largest. In a real book the curves are staircases, one step per order."
+  credit="Image: SilverStar at English Wikipedia, CC BY 2.5, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Supply-demand-equilibrium.svg"
+  paper
+  narrow
+/>
+
+NSE's page includes a worked example, and this program reproduces it from the individual orders. It builds the demand and supply schedule, then picks the equilibrium with the three rules in order. Python's `max` with a tuple key does the tie-breaking: first the most tradable shares, then the smallest imbalance (negated, so smaller is better), then the smallest distance from yesterday's close. A second run adds one large late buyer to show what happens when the first two rules both tie.
+
+<TryIt what="Compute the opening price of a call auction" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+# Orders collected in the pre-open window: (limit price in rupees, quantity)
+# These reproduce the worked example on NSE's pre-open page.
+buys  = [(103, 13500), (104, 9500), (105, 12000), (106, 6500), (107, 5000), (108, 4000)]
+sells = [(103, 11500), (104, 9800), (105, 15000), (106, 12000), (107, 12500), (108, 8500)]
+prev_close = 104.40
+
+def equilibrium(buys, sells, prev_close):
+    rows = []
+    for p in sorted({price for price, _ in buys + sells}):
+        demand = sum(q for price, q in buys if price >= p)   # buyers willing to pay p or more
+        supply = sum(q for price, q in sells if price <= p)  # sellers willing to take p or less
+        rows.append((p, demand, supply, min(demand, supply), abs(demand - supply)))
+    print(" price  demand  supply  tradable  imbalance")
+    for p, d, s, t, imb in rows:
+        print(f"{p:6} {d:7,} {s:7,} {t:9,} {imb:10,}")
+    # 1. most shares traded, 2. smallest imbalance, 3. closest to yesterday's close
+    best = max(rows, key=lambda r: (r[3], -r[4], -abs(r[0] - prev_close)))
+    return best[0], best[3]
+
+price, qty = equilibrium(buys, sells, prev_close)
+print(f"opening price {price}, {qty:,} shares trade at it")
+
+print("\na late buyer adds 20,800 shares at 106")
+price, qty = equilibrium(buys + [(106, 20800)], sells, prev_close)
+print(f"opening price {price}, {qty:,} shares trade at it")
+```
+<Output>
+```
+ price  demand  supply  tradable  imbalance
+   103  50,500  11,500    11,500     39,000
+   104  37,000  21,300    21,300     15,700
+   105  27,500  36,300    27,500      8,800
+   106  15,500  48,300    15,500     32,800
+   107   9,000  60,800     9,000     51,800
+   108   4,000  69,300     4,000     65,300
+opening price 105, 27,500 shares trade at it
+
+a late buyer adds 20,800 shares at 106
+ price  demand  supply  tradable  imbalance
+   103  71,300  11,500    11,500     59,800
+   104  57,800  21,300    21,300     36,500
+   105  48,300  36,300    36,300     12,000
+   106  36,300  48,300    36,300     12,000
+   107   9,000  60,800     9,000     51,800
+   108   4,000  69,300     4,000     65,300
+opening price 105, 36,300 shares trade at it
+```
+</Output>
+</TryIt>
+
+NSE's published example matches the first table line for line: demand falls from 50,500 to 4,000 as the price rises, supply climbs, and the most shares, 27,500, can trade at ₹105. That's the opening price. In the second run, the big buyer at ₹106 makes ₹105 and ₹106 tie at 36,300 shares, and they tie on imbalance too, 12,000 each. The third rule breaks it: ₹105 is closer to the previous close of ₹104.40.
+
+Everyone who trades in the auction gets the same price, however early or high they bid, so there's no race to be first. Within the auction NSE's page sets the matching order: market orders first, in time priority, then market orders against limit orders, then limit against limit, both in price-time priority. Orders that don't trade aren't thrown away. They move into the normal continuous book "retaining the original time stamp", which is why Meera's stock had a full book at 9:15:00, and why her order, arriving at 9:15:00, joined each queue *behind* orders placed at 9:01.
+
+</Sub>
+
+<Sub n="5.3" title="The random close">
+
+One more detail shows how much thought goes into fairness. If order entry closed at a known moment, a trader could wait until the last instant, watch the indicative price that the exchange publishes during the session, and place an order designed to move it. So the end of order entry is random. Until September 2026, order entry closed at a random moment between the seventh and eighth minute. From 7 September 2026, NSE's revised session runs like this:
+
+| Time | What happens |
+|---|---|
+| 9:00 to 9:05 | Enter, change and cancel both limit and market orders |
+| 9:05 to about 9:10 | Limit orders only; entry closes at a random moment in the last two minutes |
+| about 9:10 to 9:12 | Equilibrium price computed; orders matched and trades confirmed |
+| 9:12 to 9:15 | Buffer: the book moves over to continuous trading |
+| 9:15 | Continuous matching by price-time priority begins |
+
+During the session, NSE publishes the indicative equilibrium price, the quantity that would trade at it, and the imbalance, updated as orders arrive. That's the price Meera was watching from 9:00.
+
+<Elsewhere items={[
+  { where: "Opening and closing auctions on Nasdaq, NYSE and the LSE", how: "Most large exchanges open and close with a call auction that maximises traded volume, with similar imbalance and reference-price tie-breaks." },
+  { where: "NSE's closing auction", how: "SEBI's January 2026 circular introduced a closing auction session in India, and the September 2026 pre-open changes were made to align the two." },
+  { where: "IPO listing day", how: "A newly listed stock's first price is found by a call auction, because there's no previous close to start from." },
+]} />
+
+</Sub>
+
+<SectionHeading n="06" id="sequencer">One thread per book</SectionHeading>
+
+<Sub n="6.1" title="Two threads, one book">
+
+We now know what the matching engine computes. Next comes the question of running it on real hardware at millions of messages a second, and the obvious move is parallelism: give the engine many threads and let them process orders concurrently. Let's see what happens when two threads touch the same book.
+
+<Predict
+  q="At the same instant, the engine receives a market buy for 9 shares and a cancel of s3's remaining 9 shares at ₹1,500. Thread A handles the buy and thread B the cancel. Which outcome is correct?"
+  options={[
+    "The buy fills against s3, because buys matter more than cancels",
+    "The cancel wins, and the buy fills against s4 and then the next level",
+    "Either, depending on which message the exchange accepted first; but every copy of the book must agree on which",
+  ]}
+  answer={2}
+>
+Both outcomes are legitimate. If the cancel arrived first, s3 is gone and the buy fills 5 from s4 and 4 from the ₹1,501 level. If the buy arrived first, s3's owner has sold 9 shares they were trying to withdraw. What isn't acceptable is the exchange being unsure which happened, or two copies of the book disagreeing. The order of the two messages *is* the outcome, so it has to be decided once, at one place, and everything downstream has to follow that decision.
+</Predict>
+
+If the two threads run in parallel, they need a lock on the book, and with a lock only one of them runs at a time anyway, plus the cost of taking and handing over the lock. That's version 1's problem again, moved from the database into memory. Worse, which thread wins the lock depends on timing inside the machine, so the result of the same two messages could differ from run to run.
+
+Exchanges give up parallelism *within* a book and keep it *between* books instead. One thread owns each book (or each group of books) and processes its messages one at a time, in a fixed order. There's no lock, because nobody else touches that book. Different stocks have nothing to do with each other, so thousands of books run on many cores and machines side by side: the work is partitioned by instrument, exactly as chapter 29 partitions data by key.
+
+</Sub>
+
+<Sub n="6.2" title="The sequencer and the journal">
+
+One thread per book settles the order *inside* the engine. Something has to decide the order in which messages reach it, and make that order permanent. That job belongs to the **sequencer**: a component in front of the engine that gives every incoming message the next number in a strictly increasing sequence. Once a message has a sequence number, its place in history is fixed.
+
+Before the engine acts on a message, the sequenced message is written to a **journal**, an append-only log on durable storage, and copied to standby machines. Meanwhile the engine keeps the book entirely in memory. That's enough to recover from anything, because of one property of the matching logic: it's **deterministic**. Given the same starting book and the same messages in the same order, it always produces the same trades and the same final book. There's no randomness, no reading of the clock inside the logic, and no dependence on thread timing. So:
+
+- **After a crash**, a new engine starts from a recent snapshot of the book and replays the journal from that point. It arrives at exactly the state the old one had.
+- **A standby engine** reads the same sequenced messages and processes them in step. If the primary dies, the standby already holds the same book and can take over almost at once.
+- **Auditing** a disputed trade means replaying the journal to that moment and watching it happen again.
+
+<SystemDiagram
+  title="Inside the exchange: one ordered stream per book"
+  nodes={[
+    { id: "brokers", label: "Brokers' CTCLs", sub: "Zerodha and others", kind: "users", col: 0, row: 1 },
+    { id: "gw", label: "Gateways", sub: "validate, throttle", kind: "lb", col: 1, row: 1 },
+    { id: "seq", label: "Sequencer", sub: "number every message", kind: "service", col: 2, row: 1 },
+    { id: "jrnl", label: "Journal", sub: "append-only, replicated", kind: "db", col: 2, row: 0 },
+    { id: "standby", label: "Standby engine", sub: "same input, same state", kind: "compute", col: 3, row: 0 },
+    { id: "me", label: "Matching engine", sub: "one thread per book", kind: "compute", col: 3, row: 1 },
+    { id: "post", label: "Post-trade", sub: "trades → clearing", kind: "service", col: 3, row: 2 },
+    { id: "md", label: "Market data", sub: "numbered ticks", kind: "queue", col: 2, row: 2 },
+  ]}
+  edges={[
+    { from: "brokers", to: "gw" }, { from: "gw", to: "seq" }, { from: "seq", to: "jrnl" }, { from: "jrnl", to: "standby", dashed: true },
+    { from: "seq", to: "me" }, { from: "me", to: "post" }, { from: "me", to: "md" }, { from: "post", to: "brokers", label: "confirmations" },
+  ]}
+  steps={[
+    { caption: "Meera's order arrives from one of Zerodha's CTCLs. A gateway checks the format and the member's permissions and message rate.", path: ["brokers", "gw"] },
+    { caption: "The sequencer gives it the next number for its book. From now on its place in line is fixed.", path: ["gw", "seq"] },
+    { caption: "The numbered message is written to the journal and copied to the standby, which processes the same stream and holds the same book.", path: ["seq", "jrnl", "standby"] },
+    { caption: "The matching engine's thread for this stock takes the message, matches it against the in-memory book and produces three trades.", path: ["seq", "me"] },
+    { caption: "The trades go to post-trade processing, which confirms them to both brokers and hands them to the clearing corporation.", path: ["me", "post", "brokers"] },
+    { caption: "Every change to the book, each with its own sequence number, goes out on the market data feed (section 7).", path: ["me", "md"] },
+  ]}
+/>
+
+How much of this NSE does is partly public. A 2019 SEBI order, in a case about NSE's market data, describes the flow from the exchange's own documents: orders go from a "Communication Gateway to the Matching Engine (which matches data based on price–time priority)", then to the trading system's post-trade stage, and on to the data centres that publish market data, with every tick carrying "a uniquely identified 'tick sequence number'". NSE's technology pages say it uses in-memory databases in its trading layers for low latency. The internal threading model, journalling and failover of NSE's engine aren't published, so the diagram above shows what a design needs, not NSE's actual boxes.
+
+</Sub>
+
+<Sub n="6.3" title="How fast can one thread go?">
+
+A single thread sounds like a bottleneck. Probably the best-known public answer to "how fast can it go?" comes from LMAX, a London trading venue, whose architecture Martin Fowler described in 2011. LMAX's core, which Fowler called the Business Logic Processor, ran on one thread, entirely in memory, with no database. Fowler's article reports that it could handle 6 million orders a second on that single thread.
+
+Around it sits the design from 6.2. Input messages land in a large ring buffer (LMAX's open-source library for this is called the Disruptor). Before the business logic sees a message, separate consumers of the same buffer write it to a journal on disk, send it to replica machines, and decode it from wire format. The business logic is deterministic, so its state can always be rebuilt by replaying the journal; LMAX took a snapshot nightly and could restart in under a minute by loading it and replaying the day's input. Fowler records that an earlier, more conventional prototype with explicit concurrency spent "more time managing queues than doing the real logic of the application."
+
+<Picture
+  src="/images/designs/zerodha/circular-buffer.png"
+  alt="A ring divided into 24 equal slots"
+  caption="A ring buffer: a fixed array of slots used as a circle. The writer and each reader keep their own position and wrap back to slot 0 after the last one, so nothing is allocated or freed per message and each slot is written by one thread only. LMAX's input buffer had 20 million slots; the Disruptor uses a power of two so a position wraps with a cheap bit mask."
+  credit="Image: Cburnett, CC BY-SA 3.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Circular_buffer.svg"
+  paper
+  narrow
+/>
+
+Why is one thread so fast? Because everything it touches is in memory and in the CPU's caches, it never waits for a disk or a lock, and it never pays to hand data between cores. Fowler calls the mindset, borrowing Martin Thompson's term, **mechanical sympathy**: knowing how the hardware behaves and writing code that goes with it.
+
+<Decision
+  q="How should the engine use the machine's cores?"
+  options={[
+    { name: "Many threads, locks on each book", how: "Any thread can process any order; a lock protects each book.", good: ["Feels like it uses all the cores"], bad: ["Orders for a busy book serialise on its lock anyway", "Result can depend on thread timing", "Hard to replay or replicate exactly"] },
+    { name: "One thread per book, sequenced input", how: "A sequencer orders all input; one thread owns each book; books are spread across cores and machines.", good: ["No locks; cache-friendly", "Deterministic: replay and replicas give identical state", "Fairness comes from the sequence, not clocks"], bad: ["One very busy instrument is limited to one core", "Anything slow in the thread stalls the whole book"], chosen: true },
+  ]}
+>
+Determinism is the deciding property. A matching engine has to produce the same answer on the primary, the standby and the replay, because those are its recovery and its audit trail. A single thread consuming a sequenced log gives that for free. In exchange, the thread must never block: no disk writes, no garbage-collection pauses, no network calls inside the loop. Chapter 16's lesson about tail latency applies at its most extreme here, since one 50-millisecond pause holds up every order for that stock.
+</Decision>
+
+<Elsewhere items={[
+  { where: "Kafka partitions", how: "A totally ordered, append-only log per partition, consumed in order and replayable from any offset: the sequencer and journal as a general-purpose service (chapter 23)." },
+  { where: "Raft and Paxos", how: "State machine replication: agree on the order of commands in a log, then apply them deterministically on every replica (chapter 27)." },
+  { where: "Redis", how: "Executes commands on one thread, so each command is atomic without locks, and rebuilds state by replaying its append-only file." },
+  { where: "Database write-ahead logs", how: "Write the change to a sequential log before applying it, and recover by replaying the log (chapter 18)." },
+]} />
+
+</Sub>
+
+<SectionHeading n="07" id="market-data">Getting prices out to a million screens</SectionHeading>
+
+<Sub n="7.1" title="Two feeds from the exchange">
+
+Meera's trades changed the book: s1 is gone, s2 is gone, s3 shrank, and the last traded price is ₹1,500. Everyone watching the stock needs to know, at the same moment. Section 1's estimate already showed that this outbound flow is the bigger job, so let's follow it.
+
+NSE's two price feeds are described in the same 2019 SEBI order. One is a **limited-depth broadcast**, a summary of each stock's best few price levels and last trade, sent as a UDP stream and available over VSAT satellite links and leased lines. The other is **tick-by-tick (TBT)**, which "reflects every change in the order book": every new order, change, cancellation and trade. TBT is so large that NSE offers it only inside co-location.
+
+</Sub>
+
+<Sub n="7.2" title="One by one is unfair: multicast">
+
+How you deliver a feed to many receivers turns out to be a fairness question. From 2010, NSE delivered TBT over TCP. TCP is a connection between exactly two machines, so sending the same tick to a hundred members means sending it a hundred times, one after another. In the SEBI order's words, TBT "was earlier disseminated over TCP/IP wherein the information is delivered one-by-one."
+
+One by one means somebody is always first. SEBI found that a member who logged in first to the first port of the server that connected first to NSE's data centre "would be disseminated data ahead of other TMs in the same Port throughout the day", and that the port with the shortest queue had an advantage over the rest. NSE's setup lacked a load balancer and a randomiser that might have evened this out, and SEBI held that NSE hadn't exercised due diligence in setting it up. In its April 2019 orders SEBI directed NSE to pay ₹624.89 crore plus interest. On appeal in January 2023 the Securities Appellate Tribunal set that aside and ordered ₹100 crore instead, and in 2026 NSE settled the co-location and related cases with SEBI, after which the Supreme Court closed SEBI's appeals in September 2026.
+
+<Picture
+  src="/images/designs/zerodha/multicast.png"
+  alt="A red sender node with one line that branches to three green receiver nodes; three yellow nodes that haven't joined the group receive nothing"
+  caption="Multicast: the sender transmits each packet once to a group address, and the network copies it to every receiver that has joined (green). Nobody is served first by the sender, and an exchange feed needs exactly that."
+  credit="Image: public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Multicast.svg"
+  paper
+  narrow
+/>
+
+The fix is **multicast**: the sender transmits each packet once, to a group address, and the network switches copy it to every receiver that has joined the group (chapter 10 covers how the kernel joins a group). NSE introduced multicast TBT in April 2014 for derivatives and in November 2014 for the cash market. Multicast runs over UDP, which means packets can be lost and nobody resends them automatically. So every packet carries a sequence number, the receiver checks that each number is one more than the last, and if a number is missing it asks a separate recovery service for the gap. That's the same sequence number the exchange's sequencer assigned in section 6, now doing a second job.
+
+</Sub>
+
+<Sub n="7.3" title="Zerodha's ticker">
+
+Zerodha receives the exchange feed in its racks where the leased lines land, and has to send it on to more than a million phones and browsers. Phones can't join a multicast group across the internet, so this last step is a **fan-out**: one incoming stream, copied to every connected client that cares about each instrument.
+
+Kite's prices travel over a **WebSocket**, a long-lived, two-way connection that starts as an HTTP request and then stays open, so the server can push updates the moment they happen. At the other end sits Zerodha's **ticker**. Zerodha's 2020 post describes it as "a single binary program" in Go that "serves hundreds of thousands of concurrent WebSocket connections broadcasting millions of market quotes every second." The 2021 post adds its history: rewritten at least five times in six years, with the messaging underneath it moving from a custom TCP protocol to ZeroMQ, then nanomsg, then NATS, a lightweight publish-subscribe system.
+
+<SystemDiagram
+  title="From the matching engine to Meera's watchlist"
+  nodes={[
+    { id: "me", label: "NSE matching engine", kind: "compute", col: 0, row: 0 },
+    { id: "feed", label: "Exchange feed", sub: "UDP, numbered", kind: "queue", col: 1, row: 0 },
+    { id: "fh", label: "Feed handlers", sub: "Zerodha's racks", kind: "service", col: 2, row: 0 },
+    { id: "bus", label: "Pub-sub bus", sub: "NATS", kind: "queue", col: 2, row: 1 },
+    { id: "ticker", label: "Ticker", sub: "Go, WebSockets", kind: "service", col: 3, row: 1, count: "×N" },
+    { id: "meera", label: "Meera's phone", sub: "watching 20 stocks", kind: "phone", col: 3, row: 2 },
+    { id: "others", label: "~1M other clients", kind: "users", col: 2, row: 2 },
+  ]}
+  edges={[
+    { from: "me", to: "feed" }, { from: "feed", to: "fh" }, { from: "fh", to: "bus" }, { from: "bus", to: "ticker" },
+    { from: "ticker", to: "meera" }, { from: "ticker", to: "others" },
+  ]}
+  steps={[
+    { caption: "Meera's trades change the book. The exchange publishes the change once, with a sequence number, on its feed.", path: ["me", "feed"] },
+    { caption: "Zerodha's feed handlers receive it in the racks where the exchange lines land, check the sequence for gaps, and turn it into Zerodha's own quote format.", path: ["feed", "fh"] },
+    { caption: "The quote is published on an internal bus under the instrument's token.", path: ["fh", "bus"] },
+    { caption: "Every ticker process subscribed to that token receives it. Each holds tens of thousands of WebSocket connections and knows which of them are watching which instruments.", path: ["bus", "ticker"] },
+    { caption: "Each ticker writes a small binary packet to every connection watching this stock, Meera's included. Her watchlist shows ₹1,500.00.", path: ["ticker", "meera"], focus: ["others"] },
+  ]}
+/>
+
+What a fan-out server must handle is clear even where Zerodha's internals aren't published. Each connection subscribes to specific instruments, so the ticker keeps a map from instrument to the set of connections watching it, and each incoming quote touches only those. Some phones are on bad mobile networks and can't keep up; a server that queued every update for them would run out of memory, so a sane design keeps only the latest quote per instrument for a slow client and drops the ones it has been overtaken by, since a price that's been replaced is worthless. How Zerodha's ticker handles slow clients isn't documented.
+
+</Sub>
+
+<Sub n="7.4" title="The packet format">
+
+<Zoom path={["Zerodha", "Ticker", "WebSocket frame", "184-byte quote"]} />
+
+Zerodha documents the ticker's wire format in the Kite Connect docs, because developers connect to the same service. It's a compact binary format, and it's our second data structure. Clients choose one of three **modes** per instrument, which decides how much they receive:
+
+| Mode | What's in it | Bytes per packet |
+|---|---|---|
+| `ltp` | Instrument token and last traded price | 8 |
+| `quote` | Adds last quantity, average price, volume, total buy and sell quantity, open, high, low, close | 44 |
+| `full` | Adds timestamps, open interest, and five levels of market depth on each side | 184 |
+
+A WebSocket message can carry many packets. Its first two bytes are the number of packets; then each packet is preceded by two bytes giving its length. Every field is a 4-byte integer, and prices are in paise, so a client divides by 100 for rupees, the same integer trick as the TryIt in section 4. The `full` packet's depth section, bytes 64 to 184, is ten 12-byte entries, five bids then five asks, each a quantity (4 bytes), a price (4 bytes), a count of orders (2 bytes) and 2 bytes of padding. Even the instrument token carries information: its lowest byte says which exchange segment the instrument belongs to, 1 for NSE equities. Zerodha's official clients read every field as big-endian, the network byte order.
+
+This program packs the book just after Meera's trades into a `full` packet, sends it alongside an 8-byte `ltp` packet for another stock in one frame, and decodes it the way a client would. `struct.pack(">16i", ...)` writes sixteen big-endian 4-byte integers; `">iih2x"` is one depth entry: two integers, a 2-byte short and two padding bytes.
+
+<TryIt what="Pack and decode a Kite ticker frame" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import json, struct
+
+# --- the server side: pack one "full" quote, 184 bytes, prices in paise ---
+# (the book just after Meera's order in the first experiment, plus deeper levels)
+token = 1234433                     # illustrative; the low byte, 1, means an NSE equity
+quote = [token, 150000, 1, 149987, 231_450, 61_200, 58_900,   # ltp, ltq, avg, volume, buy qty, sell qty
+         149800, 150300, 149500, 149620,                        # open, high, low, close
+         1791776700, 0, 0, 0, 1791776700]                       # last trade time, OI x3, exchange time
+bids = [(8, 149900, 1), (12, 149850, 1), (40, 149800, 5), (25, 149750, 3), (60, 149700, 7)]
+asks = [(14, 150000, 2), (30, 150100, 1), (18, 150150, 1), (75, 150200, 6), (40, 150250, 3)]
+full = struct.pack(">16i", *quote)
+for qty, price, orders in bids + asks:
+    full += struct.pack(">iih2x", qty, price, orders)           # 12 bytes per depth entry
+
+ltp = struct.pack(">ii", 7654145, 224510)                       # an 8-byte "ltp" packet
+message = struct.pack(">h", 2)                                  # how many packets follow
+for pkt in (ltp, full):
+    message += struct.pack(">h", len(pkt)) + pkt
+print(f"one WebSocket frame: {len(message)} bytes, packets of {len(ltp)} and {len(full)} bytes")
+
+# --- the client side: walk the frame and decode by packet length ---
+n, = struct.unpack_from(">h", message, 0)
+off = 2
+for _ in range(n):
+    size, = struct.unpack_from(">h", message, off); off += 2
+    pkt = message[off:off + size]; off += size
+    tok, last = struct.unpack_from(">ii", pkt, 0)
+    print(f"\ntoken {tok} (segment {tok & 0xff}): {size}-byte packet, last price ₹{last / 100:,.2f}")
+    if size == 184:
+        f = struct.unpack_from(">16i", pkt, 0)
+        print(f"  volume {f[4]:,}  open {f[7]/100:.2f}  high {f[8]/100:.2f}  low {f[9]/100:.2f}")
+        for i in range(5):
+            bq, bp, bo = struct.unpack_from(">iih", pkt, 64 + 12 * i)
+            aq, ap, ao = struct.unpack_from(">iih", pkt, 124 + 12 * i)
+            print(f"  bid {bq:3} @ {bp/100:8.2f} ({bo})    ask {aq:3} @ {ap/100:8.2f} ({ao})")
+
+as_json = json.dumps({"instrument_token": token, "last_price": 1500.0, "last_quantity": 1,
+    "average_price": 1499.87, "volume": 231450, "buy_quantity": 61200, "sell_quantity": 58900,
+    "ohlc": {"open": 1498.0, "high": 1503.0, "low": 1495.0, "close": 1496.2},
+    "depth": {"buy": [{"quantity": q, "price": p / 100, "orders": o} for q, p, o in bids],
+              "sell": [{"quantity": q, "price": p / 100, "orders": o} for q, p, o in asks]}})
+print(f"\nthe same quote as JSON: {len(as_json)} bytes")
+```
+<Output>
+```
+one WebSocket frame: 198 bytes, packets of 8 and 184 bytes
+
+token 7654145 (segment 1): 8-byte packet, last price ₹2,245.10
+
+token 1234433 (segment 1): 184-byte packet, last price ₹1,500.00
+  volume 231,450  open 1498.00  high 1503.00  low 1495.00
+  bid   8 @  1499.00 (1)    ask  14 @  1500.00 (2)
+  bid  12 @  1498.50 (1)    ask  30 @  1501.00 (1)
+  bid  40 @  1498.00 (5)    ask  18 @  1501.50 (1)
+  bid  25 @  1497.50 (3)    ask  75 @  1502.00 (6)
+  bid  60 @  1497.00 (7)    ask  40 @  1502.50 (3)
+
+the same quote as JSON: 745 bytes
+```
+</Output>
+</TryIt>
+
+This frame is 198 bytes: 2 for the count, then 2 + 8 for the first packet and 2 + 184 for the second. A client doesn't need a field telling it which mode each packet is in; the length says so, 8, 44 or 184. At the top of the depth is the book from section 4 after Meera's order: 14 shares at ₹1,500 from two orders (s3's 9 and s4's 5), 30 at ₹1,501 from s5, and b1 and b2 on the bid side. As JSON, with the fields a client would need, the same quote comes to 745 bytes, roughly four times larger.
+
+Four times matters at this scale. Section 1's estimate of 20 million quote packets a second was roughly 7 gigabits a second in binary. In JSON, with depth, it would be several times that, and every byte also costs CPU time to encode on the server and to parse on a cheap phone. Binary fields at fixed offsets can be read without parsing at all.
+
+<Decision
+  q="What format should a quote feed to millions of clients use?"
+  options={[
+    { name: "JSON", how: "Self-describing text, one object per update.", good: ["Readable, easy to debug", "Every language parses it"], bad: ["Several times larger", "Costs CPU to encode and parse on every update"] },
+    { name: "Fixed-layout binary", how: "Integers at known offsets; the packet length tells the client the mode.", good: ["Small: 8, 44 or 184 bytes", "No parsing: read fields at fixed offsets", "Integer paise avoid rounding errors"], bad: ["Needs documentation and client libraries", "Changing the layout breaks old clients"], chosen: true },
+  ]}
+>
+Kite uses binary for market data and JSON text messages, on the same WebSocket, for the rarer things: order updates, errors and broker messages. That split follows the traffic. Prices are millions of tiny, frequent updates where size dominates; order updates are few and benefit from being readable and extensible.
+</Decision>
+
+<Elsewhere items={[
+  { where: "Nasdaq TotalView-ITCH", how: "A binary feed of every order book event, carried over UDP multicast with MoldUDP64, which numbers each message and offers a re-request server for gaps." },
+  { where: "Coinbase Exchange WebSocket feed", how: "Messages carry per-product sequence numbers, and the docs tell clients to watch for gaps because messages can be dropped even over TCP." },
+  { where: "Online games", how: "Game servers send state updates to many players as compact binary snapshots and drop stale ones for slow clients, the same trade as a ticker." },
+]} />
+
+</Sub>
+
+<SectionHeading n="08" id="burst">9:15:00: bursts, rate limits and throttles</SectionHeading>
+
+<Sub n="8.1" title="When everyone arrives at once">
+
+We've followed one order and one price update. Now multiply by everyone at 9:15. Zerodha's 2020 description of a 10x burst within 10 seconds means that a system comfortably sized for the average minute is badly undersized for the first ten seconds of the day, and that burst is when the most money is at stake.
+
+Zerodha's 2 May 2018 bulletin is a good lesson in how a burst turns a small fault into a big one. From 9:03 that morning, clients had severe trouble logging in to Kite on web and mobile, and it took almost two hours to fix. Its cause was leased lines between Zerodha's own Mumbai data centres, suspected to have been damaged by Metro construction, which were flapping. Login depended on a call across those lines. Then the burst made it worse: because it happened at market open, over 3.5 lakh (350,000) clients kept retrying, building up a huge queue of login requests over the already failing lines. Users already logged in, and those on desktop applications, were mostly unaffected. The fix Zerodha announced was structural: "completely remove such over-the-network dependencies" between data centres for login, and rebuild the login system, replacing security questions with a PIN.
+
+<Callout label="Common mistake" kind="warn">
+Letting clients retry immediately and forever. At market open, a hundred thousand apps retrying every second turn a half-working system into a fully broken one, because the retries become most of the load. It seems obvious once said, but clients should back off exponentially with random jitter, servers should reject quickly when overloaded instead of queueing, and a critical path like login shouldn't depend on a network hop that can flap. Chapter 40 covers back-off and load shedding in general.
+</Callout>
+
+</Sub>
+
+<Sub n="8.2" title="Rate limits, at every layer">
+
+Handling a burst also means refusing work the system can't do. Every layer of this design limits how fast each client may send, and the limits are published.
+
+Kite Connect's documentation, for programs that trade through Zerodha's API:
+
+| Limit | Value |
+|---|---|
+| Order placement | 10 requests a second |
+| Orders per minute | 400 |
+| Orders per day, per user or API key | 5,000 |
+| Modifications of one order | 25, then cancel and place a new one |
+| Quote requests | 1 a second |
+| Historical data | 3 requests a second |
+| WebSocket instruments per connection | 3,000 |
+| WebSocket connections per API key | 3 |
+
+SEBI, the regulator, sets a limit too. Under SEBI's February 2025 circular on algorithmic trading by retail investors, and NSE's May 2025 implementation standards, a client's program that sends more than 10 orders a second to an exchange has to be registered with the exchange as an algorithm; below that it needn't be. The exchange, in turn, caps how many messages each member connection may send per second, so one broker's runaway program can't flood the sequencer that everyone shares.
+
+<Why>Why limit per client instead of just adding capacity?</Why>
+
+Because the bottleneck at the exchange can't be scaled out. Each book is one thread consuming one sequenced stream, by design, so a single client sending ten thousand messages a second for one stock would delay every other participant's orders in that stock. A per-client limit, usually a **token bucket** (each client earns tokens at a fixed rate up to a small maximum, and each message spends one), keeps any one sender from taking more than its share while still allowing short bursts. Rate limits are also how the broker protects its own systems and customers: Kite's 10 orders a second sits right at the regulator's algo threshold, and the 25-modification limit stops a program from rewriting one order thousands of times.
+
+<Predict
+  q="Kite's ticker allows 3,000 instruments per WebSocket connection and 3 connections per API key. Why would a broker cap subscriptions this way, when sending more data costs it only bandwidth?"
+  options={[
+    "Bandwidth is the only cost, so it's to save money on the network",
+    "Each subscription adds work to every quote for that instrument, and the cap bounds how much fan-out one client can demand",
+    "The exchange forbids redistributing more than 9,000 instruments",
+  ]}
+  answer={1}
+>
+Every subscription is an entry in the ticker's instrument-to-connections map, and every quote for that instrument means one more packet to build and write. A client watching 9,000 instruments in full mode, each ticking several times a second, can demand tens of thousands of packets a second, megabytes of writes, from one ticker process. A cap bounds the worst case per client, so capacity planning can be done on numbers instead of hope.
+</Predict>
+
+</Sub>
+
+<SectionHeading n="09" id="halt">When the exchange stops: 24 February 2021</SectionHeading>
+
+<Sub n="9.1" title="What happened">
+
+Everything so far assumed the exchange keeps running. On 24 February 2021, NSE stopped. SEBI's press release of 25 February and NSE's own statement give this account:
+
+| Time (24 Feb 2021) | What happened |
+|---|---|
+| about 10:08 | Prices on NSE stopped updating, as reported at the time |
+| about 11:30 | NSE told SEBI it had told the market that trading would halt from 11:40, due to "issues with the links with telecom service providers" |
+| 11:40 | Trading halted (derivatives at 11:40, cash market at 11:43, as reported) |
+| 15:17 | NSE told members trading would resume from 15:30 |
+| 15:30 to 17:00 | Trading resumed, with market hours at NSE, BSE and MSEI extended to 5 pm |
+
+NSE's statement explained the cause. It had multiple telecom links with two different providers, for redundancy, and both providers reported that all of their links were unstable. That instability hit the online **risk management system** of NSE Clearing, NSE's clearing subsidiary, which was set up in a high-availability configuration. NSE said the trading system itself was not affected. But without the risk system, NSE said, the market couldn't function normally, so trading had to be shut down.
+
+</Sub>
+
+<Sub n="9.2" title="Why a broken risk system stops a working exchange">
+
+Pause on this for a moment, because the matching engine was fine. Why stop it? Remember section 3: the broker checks Meera's margin before her order leaves Zerodha. The clearing corporation runs the same kind of check one level up, on each broker's positions across all its clients, in real time during the day, because the clearing corporation guarantees every trade and needs to know at every moment that no member has run up more risk than its collateral covers. If that system can't see positions, nothing stops a member from building a position it can't pay for, and the guarantee behind every trade on the exchange has a hole in it.
+
+So the exchange chose to **fail closed**: when the safety check is unavailable, stop the action it protects, instead of carrying on without it. For a trading system that's the right default. A halted market is painful and visible; a market running without risk controls can fail in ways that cost far more and are discovered only later.
+
+<Picture
+  src="/images/designs/zerodha/bse-building.jpg"
+  alt="The tall Phiroze Jeejeebhoy Towers of the Bombay Stock Exchange in Mumbai seen from the street"
+  caption="Phiroze Jeejeebhoy Towers, home of BSE, on Dalal Street across Mumbai from NSE. On 24 February 2021 traders who could moved their trading here: BSE's equity turnover that day was ₹40,600 crore, against a recent daily average of about ₹5,200 crore."
+  credit="Photo: Niyantha Shekhar, CC BY 2.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:BSE_-_Bombay_Stock_Exchange_Building.jpg"
+  narrow
+/>
+
+</Sub>
+
+<Sub n="9.3" title="The questions afterwards">
+
+SEBI's press release asked NSE two things: a detailed root cause analysis, and an explanation of "the reasons for trading not migrating to the disaster recovery site." That second question is the design question. SEBI's rules already required exchanges to run live trading from their disaster recovery site for two consecutive days every six months and to hold quarterly drills, so the site existed and was meant to be exercised regularly. Yet the halt lasted roughly four hours instead of a failover of minutes. In June 2023 NSE and NSE Clearing settled the proceedings with SEBI, paying ₹49.76 crore and ₹22.88 crore respectively, as reported at the time, without admitting or denying the findings.
+
+SEBI's release also pointed out what limited the damage. Under SEBI's **interoperability** framework, the clearing corporations of India's exchanges settle with each other, so a participant can trade on one exchange and square off on another. So traders with open positions in stocks could close them on BSE, and they did: BSE's turnover jumped nearly eightfold that day.
+
+<Callout label="Design implication">
+Redundancy that shares a failure mode isn't redundancy. NSE had two telecom providers, and both reported instability on all their links at once. A dependency that the whole system must have, here the clearing corporation's risk system, needs a failover path that's been exercised under the same conditions that would trigger it, and someone empowered to take it quickly. Partial failures, like the flapping lines in Zerodha's 2018 incidents, are the hardest case, because the system isn't clearly down and the decision to fail over has to be made by a person under pressure.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="10" id="settlement">After the trade: clearing and T+1</SectionHeading>
+
+<Sub n="10.1" title="From a trade to shares in Meera's account">
+
+Meera's order said *Complete* at 9:15, but at that moment she owns a promise, not shares. Three trades were matched, with three different sellers, possibly at three different brokers. Turning them into shares in her account and money in theirs is a separate system, and we'll only sketch it.
+
+The trades go from the exchange to its **clearing corporation**, NSE Clearing. It becomes the buyer to every seller and the seller to every buyer, a role called **central counterparty**, so Meera's broker owes money to the clearing corporation and not to three strangers, and if one seller's broker fails, the clearing corporation still delivers. It nets each broker's trades for the day down to one obligation per stock, collects money and shares, and passes them on.
+
+How long that takes is the **settlement cycle**, written T+*n*: trade day plus *n* business days. SEBI's circular of September 2021 let exchanges move stocks from T+2 to T+1. Exchanges started with the smallest 100 stocks on 25 February 2022, continued in monthly batches, and finished on 27 January 2023, when India became one of the first major markets on T+1 for all stocks. So Meera's shares arrive in her demat account, the electronic account at a depository that holds her securities, the next business day.
+
+Settlement runs on batch systems and end-of-day files, nothing like the microsecond world of the matching engine, and that's fine, because it has a whole day to do its work. Zerodha's 2021 post says it schedules such end-of-day jobs with slack precisely because corporate actions, such as stock splits and dividends, "regularly break systems."
+
+</Sub>
+
+<SectionHeading n="11" id="whole">The whole system</SectionHeading>
+
+<Sub n="11.1" title="Every box, and why it's there">
+
+<SystemDiagram
+  title="Meera's order and price, end to end"
+  nodes={[
+    { id: "meera", label: "Meera's phone", sub: "Kite", kind: "phone", col: 0, row: 1 },
+    { id: "kite", label: "Kite API + cache", sub: "Go, Redis", kind: "service", col: 1, row: 0 },
+    { id: "oms", label: "OMS + RMS", sub: "margin check", kind: "service", col: 1, row: 1 },
+    { id: "ticker", label: "Ticker", sub: "WebSockets", kind: "service", col: 1, row: 2 },
+    { id: "gw", label: "Exchange gateways", sub: "leased lines", kind: "lb", col: 2, row: 1 },
+    { id: "seq", label: "NSE sequencer", sub: "+ journal", kind: "queue", col: 2, row: 0 },
+    { id: "me", label: "Matching engine", sub: "book per stock", kind: "compute", col: 3, row: 0 },
+    { id: "feed", label: "Market data feed", sub: "multicast", kind: "queue", col: 3, row: 2 },
+    { id: "clear", label: "NSE Clearing", sub: "risk, T+1", kind: "db", col: 3, row: 1 },
+  ]}
+  zones={[{ label: "Zerodha", nodes: ["kite", "oms", "ticker"] }, { label: "NSE", nodes: ["seq", "me", "feed", "clear"] }]}
+  edges={[
+    { from: "meera", to: "kite" }, { from: "kite", to: "oms" }, { from: "oms", to: "gw" }, { from: "gw", to: "seq" },
+    { from: "seq", to: "me" }, { from: "me", to: "clear", label: "trades" }, { from: "me", to: "feed" },
+    { from: "feed", to: "ticker" }, { from: "ticker", to: "meera" },
+  ]}
+  steps={[
+    { caption: "From 9:00, the pre-open auction collects orders; at about 9:10 the equilibrium price is set and leftover orders move to the continuous book with their original time stamps.", focus: ["me"] },
+    { caption: "At 9:15:00 Meera taps Buy. Kite passes the order to the OMS; the RMS checks and blocks ₹15,000.", path: ["meera", "kite", "oms"] },
+    { caption: "The OMS sends it over a leased line to NSE, where the sequencer numbers it and journals it.", path: ["oms", "gw", "seq"] },
+    { caption: "The stock's matching thread fills it with three trades by price-time priority.", path: ["seq", "me"] },
+    { caption: "The trades go to NSE Clearing, which guarantees them and settles them on T+1. Confirmations return to Zerodha.", path: ["me", "clear"] },
+    { caption: "The book change goes out on the multicast feed, through Zerodha's ticker, to Meera and a million other screens.", path: ["me", "feed", "ticker", "meera"] },
+  ]}
+/>
+
+| Component | What it does | Added because |
+|---|---|---|
+| OMS and RMS | Track orders; check and block margin before sending | The broker is liable for every order; one balance can't be spent twice (§2.3, §3) |
+| Exchange gateways | CTCL connections over leased lines, several in rotation | Exchanges accept only members' certified links; lines fail and flap (§3.4) |
+| Order book | Price levels, each a FIFO queue | Price-time priority must be applied exactly (§4) |
+| Pre-open auction | One equilibrium price for the opening | Continuous matching at open makes prices an accident of timing (§5) |
+| Sequencer and journal | Number every message; log before acting | Fairness can't depend on clocks; recovery needs replay (§2.2, §6) |
+| One thread per book | Deterministic matching, no locks | Locks serialise anyway; replicas and replay must agree (§6) |
+| Multicast feed | Every change, sent once to all | One-by-one delivery made someone first (§7.2) |
+| Ticker | Fans quotes out over WebSockets in a binary format | A million clients, tens of millions of packets a second (§1.2, §7) |
+| Rate limits | Per-client caps at broker, regulator and exchange | The busiest point can't scale out; bursts at 9:15 (§8) |
+| Clearing corporation | Real-time risk; guarantees and settles trades | Strangers must be able to trade safely; it can halt the market if it fails (§9, §10) |
+
+</Sub>
+
+<Sub n="11.2" title="From top to bottom">
+
+| Level | The choice | Data structure or algorithm |
+|---|---|---|
+| System | Broker checks money; exchange decides order | Two organisations, each with its own risk check |
+| Broker risk | One owner per account, in memory | Per-account serial queue; atomic check-and-block |
+| Exchange input | One place decides who is first | Sequencer: strictly increasing numbers; append-only journal |
+| Matching | One thread per book, deterministic | Price levels (tree or tick-indexed array) of FIFO doubly linked lists, plus an order-ID hash map |
+| Opening | Call auction | Cumulative demand and supply schedule; max volume, min imbalance, nearest to previous close |
+| Recovery | Replay, standby in lockstep | Snapshot plus journal replay; state machine replication |
+| Exchange data | Send once, to everyone | UDP multicast with sequence numbers and gap recovery |
+| Broker data | Fan out to subscribers | Instrument → connections map; 8/44/184-byte big-endian packets, prices in paise |
+| Overload | Bound each client | Token buckets; exponential back-off with jitter |
+
+</Sub>
+
+<SectionHeading n="12" id="breaks">What goes wrong, and what it cost</SectionHeading>
+
+<Sub n="12.1" title="Failures this design has to survive">
+
+| What happens | What the user sees | What the design does |
+|---|---|---|
+| Meera taps Buy twice | Second order rejected for insufficient margin | The RMS checks and blocks in one step per account |
+| A leased line to the exchange fails | Nothing | Orders move to another CTCL's line |
+| A line flaps instead of failing (April 2018) | Orders stuck in *open pending* | Take the link out of rotation; reconcile orders against the exchange |
+| Login depends on a flapping inter-DC link at open (May 2018) | Can't log in for two hours | Remove the cross-DC dependency; back off retries |
+| A matching engine host dies | A brief pause | The standby, fed the same sequenced input, already has the same books |
+| UDP market data packet lost | A quote missing for a moment | The sequence gap is detected and fetched from a recovery service |
+| A slow phone can't keep up | Prices skip ahead | Keep only the latest quote per instrument for that client |
+| The clearing corporation's risk system loses its links (Feb 2021) | Market halted for about four hours | Fail closed; traders close positions on another exchange |
+
+</Sub>
+
+<Sub n="12.2" title="The tradeoffs, in one table">
+
+| Decision | Chosen | Given up | Why it was worth it |
+|---|---|---|---|
+| Pre-trade margin | In memory, one owner per account | Simplicity of one database transaction | Microsecond checks during the 9:15 burst |
+| OMS | Bought a certified engine (Zerodha) | Control over the core | A 30-person team could build everything else |
+| Who is first | A sequencer's number | Parallel intake | Fairness without trusting clocks |
+| Matching | One thread per book | Using many cores for one hot stock | Determinism: replay, replicas and audit agree exactly |
+| Opening | Call auction | Trading from 9:00 | One fair price after overnight news |
+| Feed delivery | Multicast (since 2014) | TCP's built-in retransmission | Nobody is served first |
+| Broker feed | Binary packets | Readability | About a quarter of the bytes of JSON |
+| Risk system down | Halt the market | Four hours of trading | No trading without the guarantee behind it |
+
+</Sub>
+
+<SectionHeading n="13" id="summary">Summary</SectionHeading>
+
+1. **Two organisations share the work**: the broker checks Meera's money and carries her order; the exchange decides its place in line and matches it.
+2. **The broker's risk check must be atomic and fast**: check and block margin in one step per account, before the order leaves, during a burst that can be 10x in 10 seconds.
+3. **Brokers reach the exchange over certified links on leased lines**, and a flapping line is worse than a dead one because failover never fires.
+4. **An order book is price levels of FIFO queues**, and price-time priority means best price first, then first arrival, with trades at the waiting order's price.
+5. **A real book needs fast best-price, append, pop and cancel**, which means sorted levels or a tick-indexed array, linked lists, and a map from order ID to node.
+6. **The opening price comes from a call auction**: the price with the most tradable volume, then the smallest imbalance, then nearest the previous close, with a random close to stop timing games.
+7. **Fairness comes from a sequencer, not clocks**: every message gets a number, is journalled, and is processed in that order.
+8. **One deterministic thread per book** removes locks and makes replay, standby replicas and audits produce identical results; LMAX showed one thread can handle millions of orders a second.
+9. **Market data must reach everyone at once**: NSE's one-by-one TCP feed favoured whoever connected first, and multicast with sequence numbers, introduced in 2014, fixed that.
+10. **Zerodha's ticker fans out tens of millions of packets a second** in an 8, 44 or 184-byte binary format with prices in paise.
+11. **Rate limits at every layer** protect a bottleneck that can't scale out, and an exchange whose risk system fails should fail closed, as NSE did on 24 February 2021.
+
+<SectionHeading n="14" id="build">Build this</SectionHeading>
+
+**A tiny exchange with a sequencer and replay.**
+
+- Extend the matching program from section 4.3 so that every incoming message (new order, cancel, modify) first gets a sequence number and is appended to a journal file as one JSON line, before the book changes.
+- Add cancel by order ID in constant time: keep a dictionary from ID to the order, and store each level as a doubly linked list instead of a `deque`.
+- Generate 100,000 random orders and cancels around a price, run them, and print a hash of the final book and the list of trades.
+- Delete the in-memory book, replay the journal from the start, and check the hash and trades are identical. Then take a snapshot halfway, and replay only from there.
+- Run the same messages through two threads with a lock and a random sleep, and watch the hash change between runs. That's the bug a sequencer prevents.
+- Add the pre-open auction from section 5.2 in front: collect orders for a fixed number of messages, compute the equilibrium, trade, and move the rest into the continuous book with their original sequence numbers.
+
+<SectionHeading n="15" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="What is price-time priority?">
+It's the rule that decides which waiting order trades first. Orders at a better price go first: for buyers the highest price, for sellers the lowest. Among orders at the same price, the one that arrived first goes first. NSE publishes this rule for its trading system, and trades happen at the price of the order that was already waiting. In practice the book is a set of price levels, each with a first-in, first-out queue.
+</QA>
+
+<QA level="beginner" q="What's the difference between a limit order and a market order?">
+A limit order states the worst price you'll accept, such as "buy 10 at no more than ₹1,500"; whatever doesn't trade immediately waits in the book. A market order has no price and trades against whatever the book offers until it's filled, walking to worse prices if the best level runs out. That's why brokers offer market protection, which turns a market order into a limit some percentage away from the current price.
+</QA>
+
+<QA level="intermediate" q="Why is a matching engine usually single-threaded per instrument?">
+All orders for one stock compete for the same best prices, so concurrent threads would need a lock on the book and would run one at a time anyway, with the outcome depending on thread timing. One thread per book, consuming a sequenced input stream, needs no locks, keeps the book in cache, and is deterministic: the same input always gives the same trades. Determinism lets a standby engine stay in lockstep, lets the exchange recover by replaying a journal, and makes every trade auditable. Parallelism comes from running many books at once.
+</QA>
+
+<QA level="intermediate" q="How does a call auction find the opening price?">
+Collect orders without trading. For each candidate price, compute demand (buy quantity at that price or higher) and supply (sell quantity at that price or lower); the tradable quantity is the smaller. Choose the price with the most tradable quantity; break ties by the smallest imbalance, then by closeness to the previous close. Everyone trades at that one price, and unmatched orders move to the continuous book. NSE closes order entry at a random moment so nobody can time an order to move the indicative price.
+</QA>
+
+<QA level="deep" q="A broker sends the same market data to a million clients. How do you design it?">
+Receive the exchange's feed once, check its sequence numbers for gaps, and publish quotes internally by instrument. Run many fan-out servers, each holding many WebSocket connections and a map from instrument to the connections subscribed to it. Use a compact binary format with fixed offsets and integer prices, like Kite's 8, 44 and 184-byte packets, and let clients choose how much detail they need per instrument. Cap subscriptions per connection, and for slow clients keep only the latest quote per instrument instead of an unbounded queue.
+</QA>
+
+<QA level="deep" q="NSE's trading system was working on 24 February 2021, yet it halted trading. Was that the right call, and what would you change?">
+Its clearing subsidiary's real-time risk system lost connectivity when links from both telecom providers became unstable. That system tracks members' positions against their collateral, and the clearing corporation guarantees every trade, so trading without it would remove the safety net under every trade; failing closed was right. The open question, which SEBI asked, is why trading didn't move to the disaster recovery site. A design answer is independent network paths whose failures aren't correlated, a failover that's been exercised under realistic partial failures, clear criteria for invoking it, and interoperability so participants can manage risk elsewhere in the meantime.
+</QA>
+
+<SectionHeading n="16" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="In the section 4 book, a new sell order for 3 shares at ₹1,499 arrives. Who trades, and at what price?">
+    It's a sell, so it matches against the best bid, b1 at ₹1,499. Its limit
+    of ₹1,499 is met, so 3 shares trade at ₹1,499, the price of the waiting
+    order. b1 stays at the front of its level with 5 shares left.
+  </Q>
+  <Q q="Why did NSE replace its TCP tick-by-tick feed with multicast?">
+    TCP sends a separate copy to each receiver, one after another, so some
+    members always got each tick first, depending on when and where they
+    connected. Multicast sends each packet once and the network copies it to
+    all receivers, so nobody is served first by the sender.
+  </Q>
+  <Q q="A Kite WebSocket frame contains packets of lengths 8, 184 and 44. What modes are they?">
+    ltp, full and quote. The client knows the mode from the length alone,
+    and that's why each packet is preceded by its two-byte length.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="zerodha.tech: Hello, World! (2020), Scaling with common sense (2020) and #2 (2021)">
+    Zerodha's own account of its team, stack, ticker, Redis cache, the 10x
+    burst, and how Kite and the ticker were rebuilt over six years.
+  </WildCard>
+  <WildCard name="Kite Connect v3 docs: Orders and WebSocket streaming">
+    Order varieties and statuses from PUT ORDER REQ RECEIVED to COMPLETE, the
+    rate limits, and the byte layout of the ltp, quote and full packets.
+  </WildCard>
+  <WildCard name="NSE: Equity market trading system and Pre-open session pages">
+    The exchange's own statement of price-time priority, passive-price matching,
+    the order books, and the equilibrium price rules with a worked example.
+  </WildCard>
+  <WildCard name="SEBI final order in the matter of OPG Securities (April 2019)">
+    How NSE's TCP tick-by-tick feed worked, why it favoured whoever connected
+    first, and when multicast replaced it.
+  </WildCard>
+  <WildCard name="SEBI press release 9/2021: Trading halt at NSE on February 24, 2021">
+    The timeline, the telecom links, interoperability with BSE, and the
+    disaster-recovery norms SEBI asked NSE to explain.
+  </WildCard>
+  <WildCard name="Martin Fowler, 'The LMAX Architecture' (2011)">
+    A single-threaded, in-memory business logic processor fed by journalled,
+    replicated input through ring buffers, at 6 million orders a second.
+  </WildCard>
+  <WildCard name="Zerodha bulletins: postmortem of 12 April 2018, and Kite downtime of 2 May 2018">
+    A flapping backup leased line leaving orders open pending, and a login
+    pile-up at market open over flapping links between data centres.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="17" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Kafka & the Log as a Primitive">
+    The sequenced, append-only, replayable log behind the exchange's journal.
+    [Chapter 23](/topics/23-kafka-logs).
+  </WildCard>
+  <WildCard name="Consensus">
+    State machine replication: agree on a log's order, then apply it
+    deterministically everywhere. [Chapter 27](/topics/27-consensus).
+  </WildCard>
+  <WildCard name="Contention, Queueing & Tail Latency">
+    Why locks on a hot row serialise everything, and why one long pause in the
+    matching thread hurts every order behind it. [Chapter 16](/topics/16-contention-tail-latency).
+  </WildCard>
+  <WildCard name="Time & Ordering">
+    Why timestamps from different machines can't decide who was first.
+    [Chapter 26](/topics/26-time-and-ordering).
+  </WildCard>
+  <WildCard name="Designing Stripe">
+    Money that must never be double-spent, from the payments side.
+    [Chapter 52](/topics/52-design-stripe).
+  </WildCard>
+</CardGrid>

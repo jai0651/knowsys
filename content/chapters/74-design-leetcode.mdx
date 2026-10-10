@@ -1,0 +1,1117 @@
+---
+title: "Designing LeetCode"
+dek: "Two minutes before the end of a weekly contest, Kavya submits a C++ solution, and so do thousands of other people. We'll design the judge that compiles a stranger's code, runs it against hidden tests without letting it touch anything it shouldn't, times it fairly, and ranks everyone, from queues and sandboxes down to seccomp filters, CPU timing noise, sorted sets and the winnowing algorithm that catches copied code."
+readingTime: "~60 min"
+level: "Intermediate"
+versions: "Figures from the isolate and Firecracker papers, Mareš's timing study, gVisor, nsjail, Judge0 and testlib sources, Codeforces posts and LeetCode's help centre, dated where they appear"
+prereqs: "chapter 11 (containers), chapter 56 (job scheduler) helps, chapter 22 (Redis) helps"
+updated: "2026-10-11"
+---
+
+It's Sunday morning, and Kavya is eighty-eight minutes into a ninety-minute LeetCode weekly contest. She has solved the first two problems and has been stuck on the fourth for most of an hour. Then she sees it: the answer is a sliding window over a sorted array, with a heap to track the largest values. She types it in C++, runs the two sample cases, and with two minutes left she presses Submit. A spinner appears. A few seconds later the page says **Accepted**, and her name jumps up the leaderboard.
+
+<Picture
+  src="/images/designs/leetcode/ioi-2006-competition-room.jpg"
+  alt="A large hall full of rows of tables with computer monitors, with contestants working at them"
+  caption="The competition hall at the 2006 International Olympiad in Informatics. A contest like this has a few hundred people in one room; an online weekly contest has tens of thousands at home. Either way, every program they submit has to be compiled, run and judged by machines the contestants never see."
+  credit="Photo: Lasse Andersen, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:IOI_2006_competition_room.png"
+/>
+
+That spinner hides a strange job. LeetCode just took a program written by someone it has never met and ran it on its own servers. It could have been any program at all. It could have tried to read the file that holds the expected answers, start processes until the machine fell over, open a network connection to a friend, or try one of the kernel bugs that let a process escape its box. And even if Kavya's program is perfectly innocent, the judge still has to decide something delicate: whether it ran in under the time limit, on a machine where thousands of other programs are running at the same moment. If it measures badly, Kavya gets "Time Limit Exceeded" for a correct solution, and her contest is over.
+
+In this case study we'll design that judge the way an engineer would: start with the obvious design, see exactly where it breaks, and fix it, one step at a time. The question we'll keep coming back to is this: **when Kavya presses Submit, how does the judge run a stranger's program safely, time it fairly and give a verdict in seconds, while everyone else in the contest is submitting too?** LeetCode publishes almost nothing about its own judge, so we'll lean on systems that do publish: the IOI's isolate sandbox and its paper, Codeforces, the open-source Judge0, Google's gVisor, nsjail, and AWS's Firecracker.
+
+<SectionHeading n="01" id="requirements">What we're building, and how big</SectionHeading>
+
+<Sub n="1.1" title="What it has to do">
+
+An online judge, the system behind LeetCode, Codeforces or the IOI, comes down to a short list:
+
+1. **Accept a submission**: source code, a language and a problem.
+2. **Compile it**, if the language needs compiling, and report a compile error if it fails.
+3. **Run it against hidden tests**: inputs the contestant never sees, each with a time and a memory limit.
+4. **Decide a verdict**: did every test produce a correct answer, in time, within memory?
+5. **Show the verdict** in the browser within seconds.
+6. **Rank contestants** on a live leaderboard, with penalties for wrong attempts.
+7. **Catch cheating**, above all people submitting copies of each other's code.
+
+Every competitive programmer knows the verdicts by their short names:
+
+| Verdict | Meaning | What usually caused it |
+|---|---|---|
+| **AC**, Accepted | Every test passed | A correct, fast enough program |
+| **WA**, Wrong Answer | Some test's output was wrong | A bug, or a missed edge case |
+| **TLE**, Time Limit Exceeded | A test ran longer than the limit | An algorithm that's too slow, or an infinite loop |
+| **MLE**, Memory Limit Exceeded | A test used more memory than allowed | Arrays that are too big, or runaway recursion |
+| **RE**, Runtime Error | The program crashed or exited with an error | Reading past an array, dividing by zero, an uncaught exception |
+| **CE**, Compile Error | The code didn't compile | A syntax error, or the wrong language selected |
+
+And the qualities it needs while doing all that:
+
+- **Safe**: nothing a submission does can harm the judge, read the answers, reach the network, or affect other submissions.
+- **Fair**: the same program on the same test gets the same verdict, whenever it's submitted and whatever else is running.
+- **Fast**: a verdict in a few seconds, even in the last minutes of a contest.
+- **Correct**: the checker that compares outputs must accept every right answer and reject every wrong one.
+
+This list is unusual among system designs. Most systems protect themselves from bad *requests*; a judge's whole job is to execute bad *programs*, on purpose, thousands of times a minute. Most of this case study is about doing that safely and fairly.
+
+</Sub>
+
+<Sub n="1.2" title="How big is it?">
+
+LeetCode doesn't publish how many people take a weekly contest, how many submissions it judges, or what machines it judges them on. So we'll reason with round numbers and say plainly that they're assumptions. Suppose 30,000 people take the contest, which has four problems and lasts ninety minutes; the real number is probably of that order, but LeetCode doesn't say.
+
+<Think
+  q="Suppose 30,000 contestants each make about five submissions over 90 minutes, and a C++ submission takes about a second to compile and about a second of CPU time to run against all its hidden tests. On average, how many CPU cores does the judge need? And what happens if a third of all submissions arrive in the last ten minutes?"
+  hint="Count submissions per second first, then multiply by CPU-seconds per submission."
+>
+Five submissions each is 150,000 submissions in 5,400 seconds, roughly 28 a second. At roughly 2 CPU-seconds each, that's about 56 seconds of CPU work arriving every second, so on average roughly 60 busy cores.
+
+That average hides the shape. If a third of the submissions, 50,000 of them, arrive in the last 600 seconds, that's about 83 a second, three times the average, needing about 170 cores just to keep up. And it lands exactly when contestants care most about a fast verdict: Kavya's submission at minute 88 is one of them. (These numbers are illustrations. What's real is the shape: a judge's load during a contest is lumpy, and the biggest lump comes right at the end.)
+</Think>
+
+Two things stand out. First, the compute is small by the standards of large web services: a few hundred cores at the peak. A judge is not hard because of its size. Second, each unit of work is unusual: it's somebody else's program, and we have to run it with less trust than we'd give a web request, but measure it with more precision than we'd give almost anything else.
+
+</Sub>
+
+<SectionHeading n="02" id="v1">Version 1: run it on the web server</SectionHeading>
+
+<Sub n="2.1" title="The obvious design">
+
+Our first design takes Kavya's code in the web request, writes it to a file, and runs the compiler and then the program right there, on the web server:
+
+```python
+# Version 1: inside the HTTP handler. Please don't.
+open("/tmp/sol.cpp", "w").write(code)
+subprocess.run(["g++", "-O2", "/tmp/sol.cpp", "-o", "/tmp/sol"])
+for test in problem.tests:
+    out = subprocess.run(["/tmp/sol"], input=test.input, capture_output=True).stdout
+    if out != test.expected:
+        return "Wrong Answer"
+return "Accepted"
+```
+
+<SystemDiagram
+  title="Version 1: the web server compiles and runs the code itself"
+  nodes={[
+    { id: "kavya", label: "Kavya's browser", kind: "laptop", col: 0, row: 0 },
+    { id: "web", label: "Web server", sub: "compiles + runs code", kind: "service", col: 1, row: 0 },
+    { id: "tests", label: "Hidden tests", sub: "inputs + answers", kind: "db", col: 2, row: 0 },
+    { id: "db", label: "Submissions DB", kind: "db", col: 1, row: 1 },
+  ]}
+  edges={[
+    { from: "kavya", to: "web", label: "POST /submit" },
+    { from: "web", to: "tests" },
+    { from: "web", to: "db" },
+  ]}
+  steps={[
+    { caption: "Kavya presses Submit. Her C++ code arrives in an HTTP request at a web server.", path: ["kavya", "web"] },
+    { caption: "The web server writes it to a file and runs `g++`. For a second or more, this request holds a server thread.", focus: ["web"] },
+    { caption: "It runs her program on each hidden test and compares outputs. The answers sit on the same disk the program is running on.", path: ["web", "tests"] },
+    { caption: "It stores the verdict and replies. If her program had looped forever, this request would never have replied at all.", path: ["web", "db", "kavya"] },
+  ]}
+/>
+
+This breaks in two quite different ways, and the rest of the design is about fixing them.
+
+One is about time. Compiling C++ takes roughly a second, and running the tests another second or more, so each submission ties up a web server thread for several seconds. An infinite loop ties it up forever, since nothing stops it. During the last ten minutes of the contest, with eighty-odd submissions arriving a second, the web servers would spend all their time compiling and running strangers' code, and nobody could even load the problem page.
+
+The other is far worse. The program runs as the web server's user, on the web server's machine, with the web server's permissions. It can open `/srv/problems/4/expected_output.txt` and print it. It can open a socket and send the test inputs to a friend. It can call `fork()` in a loop until the machine can't start another process, which takes down the web server along with it. It can delete files. It can read the database password from the environment. None of that needs cleverness; each one is a few lines of C++.
+
+So we need two things: a way to run submissions somewhere other than the web server, at their own pace, and a box to run each one in that it can't get out of. Running submissions elsewhere is a familiar pattern. Building the box is the heart of this case study, and it starts in section 3.
+
+</Sub>
+
+<Sub n="2.2" title="A queue and judge workers">
+
+Our first fix is the pattern that chapter 56 builds in detail: the web server doesn't do the work, it records that the work needs doing. When Kavya submits, the API stores her code with status "In Queue", puts the submission's ID on a **queue**, and replies straight away with that ID. A fleet of separate machines, the **judge workers**, take submissions from the queue one at a time, judge them, and write back the verdict.
+
+<SystemDiagram
+  title="Version 2: a queue in front of a fleet of judge workers"
+  nodes={[
+    { id: "kavya", label: "Kavya's browser", kind: "laptop", col: 0, row: 1 },
+    { id: "api", label: "Submit API", kind: "service", col: 1, row: 1 },
+    { id: "db", label: "Submissions DB", sub: "code, status, verdict", kind: "db", col: 1, row: 0 },
+    { id: "q", label: "Judge queue", kind: "queue", col: 2, row: 1 },
+    { id: "workers", label: "Judge workers", sub: "compile, run, check", kind: "compute", count: "×200", col: 3, row: 1 },
+    { id: "tests", label: "Test data", sub: "per problem", kind: "blob", col: 3, row: 0 },
+    { id: "push", label: "Verdict push", sub: "WebSocket", kind: "service", col: 2, row: 2 },
+  ]}
+  edges={[
+    { from: "kavya", to: "api" }, { from: "api", to: "db" }, { from: "api", to: "q" },
+    { from: "q", to: "workers" }, { from: "workers", to: "tests" }, { from: "workers", to: "db" },
+    { from: "workers", to: "push" }, { from: "push", to: "kavya" },
+  ]}
+  steps={[
+    { caption: "Kavya submits. The API stores her code with status **In Queue** and returns a submission ID at once.", path: ["kavya", "api", "db"] },
+    { caption: "The API puts the submission ID on the judge queue. Nothing on the web tier runs her code.", path: ["api", "q"] },
+    { caption: "A free judge worker takes the ID, loads the code, and fetches problem 4's hidden tests (usually from a local cache).", path: ["q", "workers", "tests"] },
+    { caption: "The worker compiles, runs each test and checks each output, then writes the verdict to the database.", path: ["workers", "db"] },
+    { caption: "The verdict is pushed to Kavya's open page, which swaps the spinner for **Accepted**.", path: ["workers", "push", "kavya"] },
+  ]}
+/>
+
+This solves the time problem. Web servers stay fast whatever the judges are doing, because submitting is now just a database write and a queue push. A slow or looping program ties up one worker, and only until its time limit kills it. When submissions arrive faster than workers can judge them, the queue grows, and verdicts get slower, but nothing falls over. And because workers are separate machines, we can add more of them before a contest starts; section 6 comes back to that.
+
+Kavya's browser needs to learn the verdict somehow. It can poll ("is submission 81723 done yet?") every second, which is simple and costs a request a second per waiting contestant, or keep a WebSocket open and be told. Codeforces's status page shows verdicts changing live in the same way. Either works at this scale; what matters is that the browser never waits on an open HTTP request for the whole judging time.
+
+These queues and workers are exactly chapter 56's design, with leases so that a worker that dies mid-judgement doesn't lose the submission, and retries for the same reason. Judging is naturally safe to retry: running the same code on the same tests again gives the same verdict (if timing is fair, which is section 4's problem), so at-least-once delivery from the queue is fine as long as the verdict write is idempotent, meaning that writing it twice leaves the same result as writing it once.
+
+</Sub>
+
+<Sub n="2.3" title="Inside one judge worker">
+
+Now let's follow Kavya's submission inside the worker, because everything that follows happens here.
+
+<SystemDiagram
+  title="One submission inside a judge worker"
+  nodes={[
+    { id: "q", label: "Judge queue", kind: "queue", col: 0, row: 0 },
+    { id: "ctl", label: "Worker controller", sub: "trusted", kind: "service", col: 1, row: 0 },
+    { id: "cc", label: "Compile sandbox", sub: "g++ -O2, 10 s limit", kind: "compute", col: 2, row: 0 },
+    { id: "run", label: "Run sandbox", sub: "1 s CPU, 256 MB", kind: "compute", col: 2, row: 1 },
+    { id: "chk", label: "Checker", sub: "compares outputs", kind: "service", col: 1, row: 1 },
+    { id: "tests", label: "Test cache", sub: "inputs + answers", kind: "blob", col: 0, row: 1 },
+  ]}
+  zones={[{ label: "Untrusted code runs only here", nodes: ["cc", "run"] }]}
+  edges={[
+    { from: "q", to: "ctl" }, { from: "ctl", to: "cc" }, { from: "ctl", to: "run" },
+    { from: "run", to: "chk", label: "output" }, { from: "tests", to: "chk", label: "answer" },
+    { from: "tests", to: "run", label: "input only" },
+  ]}
+  steps={[
+    { caption: "The controller, the only trusted program on the worker, takes Kavya's submission from the queue.", path: ["q", "ctl"] },
+    { caption: "It compiles her code **inside a sandbox**, with its own time limit. The compiler is handed untrusted input too, so it gets no more trust than her program does.", path: ["ctl", "cc"] },
+    { caption: "Test 1: the run sandbox gets the compiled binary and test 1's *input*, never its answer, and runs it under the time and memory limits.", path: ["tests", "run"] },
+    { caption: "The program's output goes to the checker, outside the sandbox, which compares it with the expected answer. Tests continue until one fails or all pass.", path: ["run", "chk"], focus: ["tests"] },
+    { caption: "The controller turns the results into one verdict, **Accepted** here, and reports it with the worst running time and memory.", focus: ["ctl"] },
+  ]}
+/>
+
+Three details in that picture are deliberate.
+
+Compiling happens in a sandbox. A compiler is a big program processing input written by a stranger, and that input can attack it. A classic trick is `#include "/etc/passwd"` or `#include "/srv/problems/4/answer.txt"`: the compiler obligingly reads the file and prints its first lines in the compile error. Templates can also be written to make a compiler use gigabytes of memory or run for minutes. So compiling gets the same box, with limits on time, memory and output size, as running does. Mareš and Blackham point this out about their sandbox in 2012: it "can be easily used to isolate execution of compilers and graders", and Judge0 compiles inside the same sandbox it runs submissions in.
+
+Sandboxes see inputs, never answers. Expected outputs live where only the checker, a trusted program outside the box, can read them.
+
+Judging stops at the first failing test. If test 7 of 60 gives a wrong answer, the verdict is WA whatever the other 53 would do, so there's no point running them. LeetCode's result page shows exactly this when you practise: "37 / 60 testcases passed" and the failing input. During contests its rules say some test cases stay hidden, and a wrong submission doesn't reveal them, so nobody can collect the hidden tests by failing on purpose.
+
+LeetCode adds one twist that most judges don't have. You don't write a whole program; you write a method in a class, such as `Solution::maxSum(vector<int>&, int)`. So the judge must wrap that method in a **driver**: hidden code that reads each test's input, builds the `vector`, calls the method and prints its return value. LeetCode's drivers aren't published, but they're probably much like this, and the consequence is clear: the driver is compiled into the same binary as Kavya's code and runs in the same process, so it's no more trustworthy than her code is. Her method can overwrite the driver's memory or call `exit(0)` after printing an answer of its choosing. Only what runs outside the sandbox can be trusted, and that's the checker, so the comparison happens there.
+
+So now the shape is settled: untrusted code only ever runs inside a sandbox, on a worker, fed from a queue. Next we need to work out what that sandbox has to be.
+
+</Sub>
+
+<SectionHeading n="03" id="sandbox">Running a stranger's code safely</SectionHeading>
+
+<Sub n="3.1" title="What a submission can try">
+
+Every way a program can affect the world outside itself goes through the kernel, by making a **system call** (or syscall): a request to the operating system to open a file, allocate memory, start a process, send a packet. Chapter 7 shows what one looks like up close. That gives us a clean way to list the dangers, and it's exactly how Mareš and Blackham's 2012 paper on contest sandboxes, "A New Contest Sandbox", lists them: go through the groups of syscalls and ask what each could be used for.
+
+| What the program tries | The syscalls | What it would achieve |
+|---|---|---|
+| Read the expected answers | `open`, `read` | Print the right output without solving anything |
+| Write files everywhere | `open`, `write` | Fill the disk, or plant a file the next submission reads |
+| Grab all the memory | `brk`, `mmap` | Starve the judge and every other submission on the machine |
+| Start processes in a loop | `fork`, `clone` | Exhaust the process table so nothing else can start |
+| Hide CPU time in children | `fork`, `clone` | Do the work in several processes on several cores |
+| Kill or signal other processes | `kill` | Stop the judge, or another contestant's program |
+| Talk to another process | `shmget`, `msgget` | Pass answers between two submissions running at once |
+| Use the network | `socket`, `connect` | Send test data out, or fetch an answer in |
+| Run another program | `execve` | Hand big-number arithmetic to `python` or `bc` |
+| Sleep forever | `pause`, `nanosleep` | Hold a judge slot without using any CPU time |
+| Exploit a kernel bug | any | Escape the sandbox entirely |
+
+Starting processes in a loop has a famous form, the **fork bomb**: a program whose only job is to copy itself, so that each copy copies itself, and the number of processes doubles every step. In bash it fits in thirteen characters, `:(){ :|:& };:`. A machine with no limit on processes per user locks up within seconds.
+
+<Picture
+  src="/images/designs/leetcode/fork-bomb.png"
+  alt="A binary tree of boxes, each with a lit bomb icon labelled fork, each box splitting into two children"
+  caption="A fork bomb: every process forks two more, so after n generations there are 2ⁿ of them. Twenty generations is about a million processes, far more than any machine's process table holds."
+  credit="Image: Dake, CC BY-SA 3.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Fork_bomb.svg"
+  paper
+  narrow
+/>
+
+From the table we can read off what the sandbox has to do. Some rows need things *hidden* (the answers, the network, other processes). Some need things *limited* (memory, CPU time, number of processes, disk). And the last row says that hiding and limiting are only as strong as the kernel doing them.
+
+</Sub>
+
+<Sub n="3.2" title="The old way: watch every system call">
+
+Early contest sandboxes took the most direct approach. They used **ptrace**, the system call debuggers use, to ask the kernel to stop the submitted program every time it was about to make a syscall. A supervising process looked at the call and its arguments, and either let it continue or killed the program. Time and memory were limited with **rlimits**, per-process resource limits the kernel enforces, set with `setrlimit`. Mareš and Blackham describe this "tracing sandbox" as by far the most common kind in 2012.
+
+It had three problems, and their paper measures the first. Every syscall now takes two trips to the supervisor, so a program making many of them slows down. They measured the overhead at 5.6 µs per syscall: a program making a million syscalls took 9.26 seconds under ptrace against 3.56 seconds without, a 160% slowdown. Most batch tasks make at most around 10,000 syscalls, for which that's negligible, but interactive tasks, where the program talks to a judge process line by line, could easily make a million. The second problem was threads. A ptrace sandbox follows one process; it can't reliably follow several. That rules out Java, C# and Erlang, whose runtimes start service threads before your code runs. And the third was that the supervisor needs a table of allowed syscalls for each CPU architecture, and on 64-bit x86 a program can even use 32-bit syscall numbers, so the table has to cover both.
+
+</Sub>
+
+<Sub n="3.3" title="isolate: namespaces and cgroups">
+
+Mareš and Blackham's answer, a sandbox called **isolate**, stopped watching syscalls and used two kernel features instead. Both are the subject of chapter 11, so here we only need what each one does for a judge.
+
+**Namespaces** change what a process can *see*. Isolate starts the submission in a new, empty set of them:
+
+- a **PID namespace**, where it is process 1 and can see and signal no other process. A useful extra property, in the paper's words: when the first process of a namespace exits, all the others in it are killed, and "without this feature, reliably terminating a hierarchy of possibly malicious processes is almost impossible."
+- a **network namespace** with no network devices, apart from a loopback interface private to the box. The program can create a socket, but there's nowhere for it to go.
+- a **mount namespace** whose root directory is a small RAM disk containing only what the run needs: read-only copies of `/bin`, `/lib` and `/usr` so the program can load its libraries, and one writable working directory, limited by a disk quota.
+- an **IPC namespace**, so shared memory and message queues created inside can't be found from outside.
+
+**Control groups**, cgroups, change what a group of processes can *use*. Isolate puts the submission's processes in one cgroup and sets limits on it: total memory, counted across every process and thread and including memory the kernel allocates on their behalf; total CPU time, summed across all processes, so splitting the work over cores doesn't escape the limit; and, through its `-p` option, the number of processes, the limit that defuses a fork bomb. (Isolate enforces that one with a per-box process rlimit, since each box runs as its own user; container tools use the cgroup's `pids.max` setting for the same job.)
+
+<Scene
+  title="A fork bomb inside a sandbox with a process limit of 4"
+  regions={[
+    { id: "box", label: "The sandbox's cgroup", sub: "pids.max = 4", col: 0, row: 0, span: 2 },
+    { id: "kernel", label: "Kernel", sub: "counts processes per cgroup", col: 2, row: 0 },
+    { id: "host", label: "Rest of the worker", sub: "judge, other sandboxes", col: 0, row: 1, span: 3 },
+  ]}
+  itemWidth={104}
+  frames={[
+    { caption: "A malicious submission starts as one process inside the sandbox. The cgroup allows at most 4 processes, counting threads.",
+      items: [
+        { id: "p1", at: "box", label: "bomb #1", tone: "accent" },
+        { id: "j", at: "host", label: "judge", tone: "ok" },
+        { id: "o", at: "host", label: "Kavya's run", tone: "ok" },
+      ], focus: ["box"] },
+    { caption: "It calls `fork()`. The kernel checks the cgroup's count, 1 of 4, and allows it.",
+      add: [{ id: "p2", at: "box", label: "bomb #2", tone: "new" }], arrow: { from: "box", to: "kernel", label: "fork()" } },
+    { caption: "Both copies fork again. The count reaches 4 of 4.",
+      add: [{ id: "p3", at: "box", label: "bomb #3", tone: "new" }, { id: "p4", at: "box", label: "bomb #4", tone: "new" }], change: [{ id: "p2", tone: "accent" }] },
+    { caption: "The next `fork()` fails with `EAGAIN`, \"try again\". The bomb can't grow, and the processes outside the box never notice.",
+      change: [{ id: "p1", tone: "bad" }, { id: "p2", tone: "bad" }, { id: "p3", tone: "bad" }, { id: "p4", tone: "bad" }], arrow: { from: "kernel", to: "box", label: "EAGAIN" }, focus: ["kernel"] },
+    { caption: "Meanwhile the copies spin and burn CPU. The cgroup sums their CPU time, so the time limit is reached four times sooner, and the sandbox kills every process in it.",
+      remove: ["p2", "p3", "p4"], change: [{ id: "p1", label: "killed", sub: "TLE", tone: "dim" }] },
+    { caption: "The verdict is Time Limit Exceeded (or Runtime Error), and the worker carries on judging. Kavya's run never slowed down.",
+      change: [{ id: "o", label: "Kavya: AC", tone: "ok" }], focus: ["host"] },
+  ]}
+/>
+
+Because all of this is enforced inside the kernel by its normal mechanisms, it adds nothing to each syscall. Their measurement: the same million-syscall program took 3.56 seconds in isolate, exactly as long as with no sandbox, with standard deviations under 0.5% of the mean. And it works for any number of threads and on any CPU architecture Linux supports.
+
+Isolate is still the IOI's sandbox; its code lives in the IOI's GitHub organisation. It's what CMS, the contest system used at recent IOIs, runs submissions in, and it's what Judge0, an open-source code execution service in use since 2017 and described in a 2020 MIPRO paper by Došilović and Mekterović, wraps for every compile and run. A Judge0 run is one `isolate --run` command, and its flags read like the threat table: `-t` and `-w` for CPU and wall-clock time, `-p` for the process limit, `--cg-mem` for memory, `-f` for the largest file the program may write, `-d /etc:noexec` for a read-only directory nothing can be executed from, and no `--share-net`, so no network.
+
+Isolate's manual also lists the places where namespaces have gaps. A few kernel objects aren't namespaced at all, so two sandboxes running side by side can use them to pass data: kernel keyrings, `AF_VSOCK` sockets, file locks on files both can see (a shared read-only `/usr` is enough), and `io_uring`, an asynchronous I/O interface that can create sockets of any kind. Isolate blocks the system calls for each of these. That's a small sign of the bigger problem in section 3.5: the kernel is huge, and "everything is namespaced" is never quite true.
+
+</Sub>
+
+<Sub n="3.4" title="seccomp-bpf: a filter on every system call">
+
+Our second tool is the one ptrace sandboxes wanted to be. **seccomp-bpf** lets a process install a small filter program in the kernel, written in the classic BPF instruction set (a tiny virtual machine inside the kernel, the ancestor of chapter 48's eBPF), that runs on every system call the process makes from then on. The filter sees the syscall number and its arguments, and returns a decision: allow it, make it fail with an error, or kill the process. Chapter 11 installs a one-rule filter by hand. The difference from ptrace is that the check runs inside the kernel, in a few instructions, with no trip to another process, and that the filter is inherited by every child and thread and can never be removed.
+
+A filter like this shrinks how much of the kernel a submission can reach. A judge can allow only what a compiled C++ program needs to read stdin, write stdout, allocate memory and exit, perhaps a few dozen syscalls, and refuse the other few hundred. That matters because a bug in a syscall nobody calls is still a bug an attacker can call. Firecracker's paper makes the same argument, citing work showing that the Linux kernel has more bugs in less-used syscalls.
+
+**nsjail**, an open-source sandboxing tool published on Google's GitHub (though not an official Google product), puts all three ideas together: namespaces, resource limits and cgroups, and seccomp-bpf filters written in a small policy language called Kafel. Its documented uses are hosting capture-the-flag security challenges, where the people connecting are trying to break out, re-running crashing programs, and isolating untrusted GUI applications. For a judge, nsjail and isolate do much the same job from slightly different starting points.
+
+Seccomp has a cost, and it's compatibility. The narrower the allowed list, the more legitimate programs break. Firecracker's paper notes that a trivial Linux program needs about 15 distinct syscalls, while a typical Ubuntu installation, according to a study it cites, uses 224 syscalls and 52 distinct `ioctl` calls. A judge that supports twenty languages, each runtime with its own habits, ends up with a long allowlist, and every entry is more kernel exposed.
+
+</Sub>
+
+<Sub n="3.5" title="One shared kernel">
+
+Everything in sections 3.3 and 3.4 shares one weakness: the submission's system calls are still handled by the same Linux kernel as the judge's. Namespaces, cgroups and seccomp are all features *of* that kernel. If the submission can find a bug in it, it can get past all of them at once.
+
+That isn't hypothetical. Dirty COW, a race condition in how Linux handled copy-on-write memory, disclosed in 2016 as CVE-2016-5195, let an unprivileged process write to files it could only read, including system binaries, and so become root. It had been in the kernel for about nine years. A program that triggered it from inside a namespace sandbox was running exploit code against the very kernel that drew the sandbox's walls. Mareš and Blackham were candid about this in 2012: isolate "is not completely secure with respect to new kernel versions", since new kernels add new kinds of kernel object that may not belong to any namespace.
+
+How much this matters depends on what's at stake. For a contest judge, the prize for escaping is the test data of a weekly contest, and perhaps a foothold in the judge fleet. For a company that runs untrusted code from strangers all day, as LeetCode does even outside contests, a foothold in the fleet is something to defend against seriously. There are two well-known ways to stop sharing a kernel with the submission.
+
+**gVisor** puts a second kernel in between, written in Go and running as an ordinary process. Google calls it an application kernel. Its main component, the **Sentry**, implements Linux's system calls itself: when the sandboxed program makes a syscall, gVisor's platform redirects it to the Sentry instead of the host kernel. The default platform since mid-2023, systrap, does this with seccomp's `SECCOMP_RET_TRAP` action; another uses the CPU's virtualisation support through KVM. The Sentry in turn may only make a small, explicitly listed set of host syscalls: per gVisor's security docs, things like duplicating and closing file descriptors, synchronisation, timers and signals. It "is not permitted to open new files, create new sockets" on the host. File access goes through a separate process, the **Gofer**.
+
+<Picture
+  src="/images/designs/leetcode/gvisor-sentry-gofer.png"
+  alt="A layer diagram: Application at the top, then a line labelled System calls, then Sentry and Gofer side by side joined by a 9P arrow, then a red line under Sentry labelled Limited system calls, then Host Kernel and Hardware"
+  caption="gVisor's architecture. The application's system calls go to the Sentry, a kernel written in Go that runs as a normal process. Only the Sentry's own short list of syscalls (the red line) reaches the host kernel. Files are fetched by the Gofer, a separate process that talks to the Sentry over the 9P file protocol."
+  credit="Image: the gVisor Authors, Apache License 2.0, from the gVisor documentation"
+  href="https://github.com/google/gvisor/blob/master/g3doc/Sentry-Gofer.svg"
+  paper
+/>
+
+A Dirty COW exploit inside gVisor attacks the Sentry's implementation of memory, which is different code from Linux's; to reach the host kernel it would first need a bug in the Sentry, then a bug reachable through the Sentry's short list of host syscalls. Its price, in gVisor's own words, is "higher per-system call overhead" and possible "poor performance for system call heavy workloads", plus reduced compatibility, because gVisor doesn't implement every syscall, `/proc` file or `/sys` file.
+
+**Firecracker** goes the rest of the way, to a real virtual machine. Each sandbox gets its own guest Linux kernel, and the CPU's hardware virtualisation keeps that kernel apart from the host (chapter 47 covers how). Firecracker is a **virtual machine monitor**, the program on the host that creates the VM and emulates its few devices, written by AWS in Rust and described in an NSDI 2020 paper by Agache and colleagues. Its trick is to be small enough that VMs become cheap: with a minimal guest kernel, the paper reports under 5 MB of memory overhead per VM, booting to application code in under 125 ms, and up to 150 new microVMs per second per host. For comparison, the paper notes that QEMU, the usual VMM, is over 1.4 million lines of code.
+
+<Picture
+  src="/images/designs/leetcode/firecracker-threat-containment.png"
+  alt="Nested zones: a Host Zone containing a Firecracker Zone with API, VMM, device emulation and IO emulation, containing a red Customer Zone; KVM and IO in host kernel space; legend entries Jailer Barrier and Virtualization Barriers"
+  caption="Firecracker's two walls. The untrusted code (Customer Zone) runs inside a VM, behind the virtualisation barrier enforced by KVM and the CPU. The Firecracker process itself is then locked in by the jailer: seccomp, cgroups, chroot and namespaces. An attacker has to break both."
+  credit="Image: Firecracker project documentation, © Amazon.com, Inc. or its affiliates, Apache License 2.0"
+  href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/images/firecracker_threat_containment.png"
+  paper
+/>
+
+Firecracker doesn't trust itself either. Its **jailer** starts each Firecracker process in a chroot, in its own PID and network namespaces, with privileges dropped and a seccomp-bpf profile that, in the 2020 paper, allows 24 syscalls, each with argument filtering, and 30 `ioctl`s, 22 of which KVM's API needs. So a guest that broke out of the VM would land in a process that can do almost nothing. That's the same layering a judge wants: one wall the attacker must break, then another.
+
+<Decision
+  q="What should a judge run each submission in?"
+  options={[
+    { name: "Namespaces + cgroups + seccomp (isolate, nsjail)", how: "One kernel, with the submission's view and resources narrowed.", good: ["No measurable per-syscall overhead", "Starts in milliseconds", "Timing as precise as running natively"], bad: ["A kernel bug reachable from inside breaks every wall at once"] },
+    { name: "A user-space kernel (gVisor)", how: "The Sentry implements syscalls; only a few reach the host.", good: ["A host kernel bug is much harder to reach", "Still container-like to run"], bad: ["Extra cost on every syscall, which distorts timing for I/O-heavy programs", "Not every syscall or /proc file is implemented"] },
+    { name: "A microVM per submission (Firecracker)", how: "A guest kernel per sandbox, behind hardware virtualisation and a jailer.", good: ["The strongest wall of the three", "Arbitrary binaries and languages work"], bad: ["About 125 ms to boot and a few MB per VM", "A virtual CPU adds its own timing noise"] },
+    { name: "Layered: isolate inside a disposable VM", how: "Each judge worker is a VM that holds nothing but test data; isolate sandboxes each run inside it.", good: ["Precise timing from isolate", "An escape lands in a throwaway VM with nothing valuable in it"], bad: ["Two layers to operate", "Test data inside the VM is still exposed to a full escape"], chosen: true },
+  ]}
+>
+LeetCode hasn't published how it sandboxes code, so this is a judgement, not a report, and LeetCode may well do something different. Contest judges have historically chosen the first option, because a judge's other job, fair timing, wants the submission as close to the bare hardware as possible: Mareš and Blackham rejected virtual machines in 2012 because their overhead was "very high and suffers from a large variance". MicroVMs have made VMs far cheaper since, so a reasonable modern design keeps isolate's precision for each run and puts the whole worker in a VM, rebuilt often, that holds nothing worth stealing except the tests it's currently using. If one contest's test data leaks, that's bad; if the database of every user's code leaks, that's much worse, and the VM wall makes sure an escape can't reach it.
+</Decision>
+
+<Elsewhere items={[
+  { where: "AWS Lambda", how: "Every function runs in a Firecracker microVM; Lambda has used Firecracker in production since 2018, where by 2020 it ran millions of workloads and trillions of requests a month." },
+  { where: "GitHub Actions", how: "Each GitHub-hosted runner, apart from single-CPU ones, is a new virtual machine, so one repository's CI job can't see another's." },
+  { where: "AI code execution", how: "gVisor's users page lists Anthropic (for code execution in claude.ai), OpenAI (for higher-risk tasks such as code execution) and Modal; E2B's open-source runtime gives each agent sandbox its own Firecracker microVM." },
+  { where: "Google Colab and Cloud Run", how: "Colab runs your notebook in a virtual machine private to your account; gVisor powers Cloud Run, App Engine and GKE Sandbox." },
+]} />
+
+<Callout label="Common mistake" kind="warn">
+Treating the sandbox as the whole security story. In April 2024 Judge0 published three advisories (CVE-2024-28185, CVE-2024-28189 and CVE-2024-29021), two rated 10.0 out of 10, for full escapes. isolate itself wasn't broken. Judge0's own Ruby code, running outside the sandbox, wrote a `run` script into the sandbox's directory, and a submission could plant a symbolic link at that path first, so the trusted code wrote wherever the attacker pointed. Everything that touches the sandbox's files from outside is part of the sandbox, and has to treat those files as hostile.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="04" id="timing">Measuring time fairly</SectionHeading>
+
+<Sub n="4.1" title="CPU time and wall-clock time">
+
+Kavya's program is now safely boxed. The judge runs it on test 1 and must decide whether it ran within the problem's one-second limit. Which clock should it read?
+
+There are two candidates. **Wall-clock time** is what a stopwatch would show, from start to exit. **CPU time** is how long a processor spent running the program's instructions, which leaves out any time the program spent waiting: for the disk, for a lock, or for its turn on a CPU while something else ran. On an idle machine, for a program that only computes, the two are nearly equal. On a busy one, wall time grows while CPU time ideally doesn't, because the program is only waiting more.
+
+So judges limit CPU time: it's the one that measures the program and not its neighbours. But they keep a wall-clock limit too, set much higher, because a program can use no CPU at all: one that calls `sleep(1000000)` or waits forever to read input that never comes would sit in its slot indefinitely under a CPU-only limit. Isolate's 2012 paper lists "sleeping" syscalls among the dangers for exactly this reason, and isolate's manual recommends using `--time` as the main limit, with `--wall-time` set "to a much higher value as a precaution against sleeping programs". It also has `--extra-time`: when the CPU limit is exceeded, keep the program running a little longer before killing it, so the judge can report how long it would have taken, "1.03 s", and not just "over".
+
+Isolate gets CPU time from the cgroup's CPU accounting, which the 2012 paper notes works from the scheduler's own nanosecond timestamps of context switches, more precise than the older sampled per-process timers. That precision raises a better question: if the measurement is exact, does the same program always take the same time?
+
+</Sub>
+
+<Sub n="4.2" title="Why the same program takes different times">
+
+It doesn't. In a 2011 study, "Fairness of Time Constraints", Mareš took real contestants' submissions from IOI 2009 and ran them over and over on four different machines. Even with only one program running, the times spread out like a bell curve, and the spread grew in proportion to the running time: a little error added throughout the whole run. He listed where it comes from, and every item is a way the hardware or kernel makes the common case faster at the cost of predictability:
+
+- **Context switches.** Even on an idle machine, the kernel briefly runs its own background work on the same core, and short interruptions are charged to whoever was running.
+- **Caches.** A CPU keeps recently used data in small fast memories, the caches. How well a program's data fits depends on exactly where it lands in memory, and anything else that runs on the core evicts some of it.
+- **Several cores.** When the scheduler moves a program to another core, it leaves its warm cache behind.
+- **Power management.** An idle core runs at a lower frequency, or sleeps, and takes time to speed up again.
+- **System management mode**, where the machine's firmware quietly takes over the CPU, and the time is billed to whatever program was running.
+
+On a judge fleet there's a bigger source than any of these: other submissions. Two programs on two cores of one chip share roughly everything outside the cores: the last level of cache and the path to memory. Two programs on the two hardware threads of one core, with **simultaneous multithreading** (Intel calls it Hyper-Threading), share far more: the core's execution units themselves, so each one's instructions wait for slots the other is using. Both programs' CPU time goes up, even though neither is waiting in the usual sense.
+
+<Picture
+  src="/images/designs/leetcode/hyper-threaded-cpu.png"
+  alt="A diagram of instructions in four colours flowing from RAM into a CPU, where red and yellow instructions from two threads are interleaved in the same execution pipeline"
+  caption="Two hardware threads on one core. Instructions from two programs (red and yellow) are interleaved into the same execution units. Each runs faster than it would if the core switched between them, but slower than it would alone, so a submission's CPU time depends on what its sibling thread is doing."
+  credit="Image: Hellis, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Hyper-threaded_CPU.png"
+  narrow
+/>
+
+Frequency is the last piece. Modern chips raise their clock speed above the rated base when only a few cores are busy and there's thermal headroom; Intel calls this Turbo Boost. A program judged on a quiet machine runs at the boosted frequency and finishes sooner; the same program judged during the contest rush, with every core busy, runs at a lower one. Nothing about the program changed.
+
+This program shows the effect. It times a fixed piece of work eight times on a quiet machine, then again while one busy-looping neighbour process runs for every CPU on the machine, and reports both clocks each time. `time.perf_counter()` reads the wall clock and `time.process_time()` reads this process's CPU time. Then it sets a limit 10% above the quiet run's CPU time, as a strict judge might, and counts how many runs exceed it.
+
+<TryIt what="Timing the same work alone and with busy neighbours" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import multiprocessing as mp, os, statistics, time
+
+def solution():                      # stands in for a contestant's program
+    total = 0
+    for i in range(3_000_000):
+        total += i * i % 7
+    return total
+
+def judge(runs=8):
+    walls, cpus = [], []
+    for _ in range(runs):
+        w0, c0 = time.perf_counter(), time.process_time()
+        solution()
+        walls.append(time.perf_counter() - w0)
+        cpus.append(time.process_time() - c0)
+    return walls, cpus
+
+def spin():                          # a noisy neighbour: burns CPU forever
+    while True:
+        pass
+
+def show(label, walls, cpus):
+    ms = lambda xs: f"{min(xs)*1000:4.0f} / {statistics.median(xs)*1000:4.0f} / {max(xs)*1000:4.0f} ms"
+    print(f"{label:22} wall {ms(walls)}   cpu {ms(cpus)}")
+
+if __name__ == "__main__":
+    alone = judge()
+    show("alone", *alone)
+
+    hogs = [mp.Process(target=spin, daemon=True) for _ in range(os.cpu_count())]
+    for h in hogs: h.start()
+    busy = judge()
+    for h in hogs: h.terminate()
+    show(f"{len(hogs)} busy neighbours", *busy)
+
+    limit = statistics.median(alone[1]) * 1.10   # a limit 10% above the quiet run
+    print(f"limit {limit*1000:.0f} ms of CPU time")
+    for label, (walls, cpus) in [("alone", alone), ("busy", busy)]:
+        tle = sum(c > limit for c in cpus)
+        print(f"{label:5}: {tle} of {len(cpus)} runs over the limit")
+```
+<Output>
+```
+alone                  wall   88 /   89 /   90 ms   cpu   88 /   89 /   90 ms
+10 busy neighbours     wall  151 /  180 /  204 ms   cpu  118 /  148 /  168 ms
+limit 98 ms of CPU time
+alone: 0 of 8 runs over the limit
+busy : 8 of 8 runs over the limit
+```
+</Output>
+</TryIt>
+
+Each row shows the minimum, median and maximum of eight runs. Alone, the two clocks agree and barely move: 88 to 90 ms. With ten busy neighbours, wall time roughly doubles, which is expected, since the program now waits for its turn on a CPU. CPU time is the surprise. CPU time was supposed to leave the waiting out, and it does, but it still rose by about 60%, and it now varies by 50 ms from run to run. That seems to be the shared caches, shared memory bandwidth, and on this kind of laptop chip, the scheduler placing the program on a slower efficiency core (many laptop chips mix fast cores with power-saving ones) or on a core running at a lower frequency. Every one of the eight busy runs would have been Time Limit Exceeded against a limit the quiet runs passed easily. (The exact numbers change from run to run and machine to machine; the gap doesn't.)
+
+That's the unfairness in its plainest form: the verdict depends on when you submitted. Kavya, at minute 88, is submitting at the busiest moment of the contest.
+
+</Sub>
+
+<Sub n="4.3" title="Making timing fair">
+
+Each fix follows from a cause, and isolate's manual lists them under "Reproducibility" (as of 2026):
+
+- **Fix the frequency.** Set the CPU frequency governor to `performance` so cores don't slow down when idle, and turn off boost (`intel_pstate/no_turbo` on Intel, `cpufreq/boost` elsewhere), so a run's speed doesn't depend on how many other cores are busy.
+- **Use identical cores.** On chips with a mix of fast and efficient cores, pin the sandbox to one kind only.
+- **Pin each run to a CPU**, so the scheduler doesn't move it between cores mid-run.
+- **Turn off address space randomisation**, which can change timing, memory use and even the behaviour of programs with memory bugs. Mareš and Blackham's paper adds this one for a fairness reason: a buggy program shouldn't pass on one run and crash on the next.
+- **Disable transparent huge pages and swap**, both of which make memory access times vary with the system's state.
+
+And beyond the manual, the fleet design follows. Run one submission per physical core and leave its sibling hardware thread idle, or turn simultaneous multithreading off. Mareš's 2011 measurements show why: four submissions judged in parallel on a four-core machine had a mean time almost 20% higher than one at a time, with much larger variance. Keep the whole fleet on one hardware model for the whole contest, so a time limit means the same thing on every worker. Codeforces is a worked example: in October 2018 Mike Mirzayanov announced that all its judging had moved to new servers with Intel i3-8100 processors, more of them "which means fewer queues during rounds", and noted that single-core performance was close enough to the old servers that "the time limits in all problems remain the same." The i3-8100 is a four-core chip without Turbo Boost or Hyper-Threading, so two of the noise sources above don't exist on it at all.
+
+One recommendation changed over time, and it's instructive to see why. In 2011, Mareš found that pinning processes to cores and giving them real-time priority made variance *worse* on the kernels he tested, and concluded the default scheduler did its job well. Isolate's manual today recommends pinning to a single CPU. Both are probably right: the 2011 tests ran one submission at a time on otherwise idle machines, where the scheduler had nothing to fight over, while a busy judge runs many at once.
+
+Even with all of this, timing remains a measurement with an error. So the last fix is in how the judge uses the measurement.
+
+<Predict
+  q="Kavya's program is measured at 1.03 s of CPU time on one test, against a 1 s limit. On the other 59 tests it's well under. What should a fair judge do?"
+  options={["Give TLE: the limit is the limit", "Give AC: 3% is within the noise", "Run that test again, a few times, and judge on the best time", "Raise the problem's time limit for everyone"]}
+  answer={2}
+>
+Mareš's 2011 paper suggests exactly this, among other options: since timing errors cluster tightly around the mean, rerun only the measurements that land near the limit, and use the minimum or the mean of the repeats. Rerunning everything would make judging several times slower; rerunning the few runs within, say, 10% of the limit costs very little. The minimum is the natural choice, because noise only ever adds time: nothing makes a program run faster than its true speed. Judge0 has a version of this built in: its `number_of_runs` setting runs a submission several times and reports the average.
+</Predict>
+
+This is where the verdict for Kavya's fourth problem is decided. Suppose her heap-based solution runs test 41 in 0.97 s on a busy worker. Under the rules above, the run was pinned to a quiet core at a fixed frequency, so 0.97 s is close to its true time, and it passes. If a noisy measurement had said 1.02 s, the judge would have rerun it and taken the fastest time. What we want is a verdict that doesn't depend on whether she submitted at minute 10 or minute 88.
+
+<Callout label="Design implication">
+A time limit is only meaningful on the hardware it was set on. Problem setters choose limits by running the reference solution on the judge's machines, so the limit and the fleet are one decision. Changing CPU model, turning boost on, or packing two submissions per core all silently change every problem's limit, and need a re-check of every reference solution before the next contest.
+</Callout>
+
+</Sub>
+
+<Sub n="4.4" title="Memory, and the other limits">
+
+Memory has its own measurement question. Isolate offers two kinds of limit. Without cgroups, `--mem` limits the program's **address space**, the total virtual memory it has reserved, so `malloc` fails when it's reached. With cgroups, `--cg-mem` limits the memory in use by every process in the box, including what the kernel allocated on their behalf; exceeding it usually gets the program killed by the kernel's out-of-memory killer, which isolate reports as `cg-oom-killed`. The address-space limit is a poor fit for languages like Java and Go, whose runtimes reserve large ranges of virtual memory they never touch, so for them only the cgroup limit is meaningful.
+
+Each of the remaining limits is small but closes a hole from the threat table: a maximum file size (`-f`), so a program can't fill the disk with output; a disk quota on the working directory; a stack limit; and no core dumps, so a crashing program doesn't write a copy of its memory to disk. The sandbox reports what happened in a short metadata file: `time`, `time-wall`, `max-rss` or `cg-mem`, an `exitcode` or the `exitsig` that killed it, and a two-letter `status`, `TO` (timed out), `SG` (died on a signal), `RE` (non-zero exit) or `XX` (the sandbox itself failed). From those, the worker derives the verdicts from section 1. Judge0's `determine_status` is a small function that does exactly this mapping.
+
+So now the judge knows, fairly, whether Kavya's program finished in time and within memory. Whether its *answer* was right is a separate question, and a surprisingly fiddly one.
+
+</Sub>
+
+<SectionHeading n="05" id="checking">Deciding whether the answer is right</SectionHeading>
+
+<Sub n="5.1" title="Comparing bytes isn't enough">
+
+Version 1 compared the program's output with the expected output byte for byte. On test 1 of Kavya's problem the expected output is `42\n`, and her program prints `42 \n`, with a trailing space left over from a loop that prints a space after every number. Byte for byte, that's Wrong Answer. Almost no contestant would call it wrong.
+
+So the usual comparison works on **tokens**, the runs of non-space characters, and ignores how much whitespace sits between them, including trailing spaces, blank lines and Windows-style `\r\n` line endings. Codeforces's checker library, testlib, written by Mike Mirzayanov and open-sourced under the MIT licence, has this as its standard checker, `wcmp`, "compare sequences of tokens". It reads one token from the expected answer and one from the contestant's output, compares them, and repeats; it reports Wrong Answer with the position of the first difference, or if either side has tokens left over at the end.
+
+LeetCode sidesteps part of this, since your method returns a value and the driver prints it, so whitespace is the driver's problem, not yours. But the next two problems apply to every judge.
+
+</Sub>
+
+<Sub n="5.2" title="Floating point">
+
+Suppose the answer is a distance, and the expected output is `0.3`. Kavya computes it as `0.1 + 0.2` and prints `0.30000000000000004`. Her answer is right, and the bytes are wrong.
+
+That happens because a computer stores a real number in a **floating-point** format: a fixed number of bits for the digits and a few more for where the decimal point goes. The standard 64-bit format, IEEE 754 double precision, has 52 bits for the digits, about 16 significant decimal digits. Most decimal fractions, 0.1 among them, have no exact binary representation, so each is rounded to the nearest one available, and the rounding errors add up as you calculate.
+
+<Picture
+  src="/images/designs/leetcode/ieee754-double.png"
+  alt="A strip of 64 cells: 1 sign bit, 11 exponent bits and 52 fraction bits, with bit positions 63, 52 and 0 marked"
+  caption="An IEEE 754 double: 1 sign bit, an 11-bit exponent that places the binary point, and a 52-bit fraction that holds the digits. Anything that needs more than those 52 bits is rounded, so two correct programs that add the same numbers in a different order can print different last digits."
+  credit="Image: Codekaizen, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:IEEE_754_Double_Floating_Point_Format.svg"
+  paper
+/>
+
+So problems with real-valued answers say how close is close enough. LeetCode's "Average of Levels in Binary Tree", for example, says "Answers within 10<sup>-5</sup> of the actual answer will be accepted." The checker then reads both values as numbers and accepts the contestant's if it's within a tolerance either **absolutely** (the difference is at most ε) or **relatively** (the difference is at most ε times the expected value). testlib's `doubleCompare` does both: it accepts if `|result - expected| <= ε`, or if the result lies between `expected × (1 - ε)` and `expected × (1 + ε)`. It also handles the special values explicitly: an expected NaN matches only a NaN, an expected infinity only an infinity of the same sign, and a NaN or infinity where a number was expected is always wrong. Absolute error suits small answers, where relative error would be too strict near zero; relative error suits huge ones, where an absolute 10<sup>-6</sup> would demand more digits than a double holds.
+
+</Sub>
+
+<Sub n="5.3" title="Many right answers: special checkers">
+
+LeetCode's first problem, Two Sum, says "You can return the answer in any order." So `[0, 1]` and `[1, 0]` are both correct, and no comparison against one stored answer can accept both. Plenty of problems are like this: print any shortest path, any valid arrangement, any subset with the given sum.
+
+For these, the problem setter writes a **special checker**: a small program that reads the test's input, the contestant's output and, if useful, the reference answer, and decides whether the output is *a* correct answer. For "any shortest path", it checks that the path is a real path in the graph, that it starts and ends in the right places, and that its length equals the reference answer's length. testlib exists largely to make these checkers easy to write and hard to get wrong.
+
+A checker is trusted code, since it runs outside the sandbox, but it reads untrusted input: the contestant's output can be anything. It might be 2 GB of digits, a number with a thousand digits where an `int` was expected, or binary garbage. A checker that crashes or misreads that input gives a wrong verdict, and one with a bug might accept wrong answers. That's why testlib's readers fail cleanly on malformed output, with a message like `Expected integer, but "abc" found`, and why the sandbox's file-size limit also protects the checker.
+
+The hardest variant is the **interactive problem**, where the program and a judge process talk to each other: the judge asks a question, the program answers, the judge asks the next. Here the timing problem from section 4 comes back sharply. Every exchange is a pair of context switches between two processes, and Mareš found in 2011 that interactive runs were much slower than the same work done in batch, whatever the sandbox. His advice was to avoid interactive tasks with a separate judge process whenever the number of queries is large.
+
+<Elsewhere items={[
+  { where: "Unit test frameworks", how: "assertAlmostEqual in Python, assertEquals(expected, actual, delta) in JUnit: the same tolerance check, for the same floating-point reason." },
+  { where: "Property-based testing", how: "Libraries like Hypothesis check that an output has the right properties, not that it equals one stored answer. A special checker does the same." },
+  { where: "Autograders for courses", how: "Gradescope-style autograders run student code in containers and compare outputs with exactly these whitespace and tolerance rules." },
+]} />
+
+</Sub>
+
+<SectionHeading n="06" id="burst">The last ten minutes</SectionHeading>
+
+<Sub n="6.1" title="The queue at minute 88">
+
+Now we can come back to the moment Kavya pressed Submit, and ask what the whole fleet was doing. In section 1's illustration, submissions in the last ten minutes arrive at about 83 a second, three times the contest's average, and the judge needs about 170 busy cores just to keep pace. Suppose it has 120 in use. Then the queue grows by roughly 25 submissions every second, and after ten minutes it's 15,000 deep. Kavya's submission, near the back, waits several minutes for a worker.
+
+The queue grows that fast because of a simple fact about queues, which chapter 42 works through: once work arrives faster than it's served, the queue doesn't settle at a longer wait; it grows without limit for as long as the overload lasts. Near 100% utilisation, even a small burst makes waits explode. And this isn't hypothetical either. In July 2017, Codeforces's judging stopped for over 13 hours and more than 5,000 submissions piled up "In Queue", as a contestant recorded at the time. In May 2020 Mirzayanov postponed Codeforces Round 639 by three days, because a database problem had appeared that "can dramatically increase judging time (and leads to a huge queue)", and he didn't want to risk the round.
+
+LeetCode's contest rules (last updated in September 2024) set out what happens when the site struggles: if it's slow or down, or Submit stops working, for 15 minutes or less, no action is taken; for longer, the contest is unrated. So the judge has a concrete target: a burst must never turn into a quarter-hour outage.
+
+There's a subtler point in LeetCode's rules that makes a slow queue less harmful than it looks. Finish time is measured to the moment you *submit* the accepted solution, "the time it took you to first correctly submit", not to the moment the verdict comes back. So if Kavya's submission waits three minutes in the queue and is judged after the contest has ended, it still counts at 88:00. A slow queue costs contestants information (they don't know whether to keep trying) but not rank. Any judge should copy that decision: never let the judge's load leak into the scores.
+
+</Sub>
+
+<Sub n="6.2" title="Scaling before the crowd arrives">
+
+Rising load is usually met with an autoscaler: measure queue depth or CPU use, and add workers when it climbs. For a judge, that's too slow to help at the moment it matters. A new worker has to boot, start the judging service, and fetch the test data for the contest's problems before it can judge anything, which probably takes minutes, and the end-of-contest burst lasts about ten. A reactive autoscaler would add most of its capacity just as the burst ends.
+
+But a contest is the easiest load spike there is to predict: its start and end times are published days in advance. So the judge should scale on the calendar. Before the contest starts, bring the fleet up to the size the last few contests needed at their peak, plus headroom; warm each worker by loading every contest problem's tests and compiling each language's driver once; then shrink back after the queue drains, well after the contest ends. Reactive autoscaling stays on as a backstop for surprises.
+
+<SystemDiagram
+  title="The last ten minutes: separate queues, and a fleet sized in advance"
+  nodes={[
+    { id: "users", label: "30,000 contestants", sub: "+ practice users", kind: "users", col: 0, row: 1 },
+    { id: "api", label: "Submit API", kind: "service", col: 1, row: 1 },
+    { id: "cq", label: "Contest queue", sub: "high priority", kind: "queue", col: 2, row: 0 },
+    { id: "pq", label: "Practice queue", sub: "low priority", kind: "queue", col: 2, row: 2 },
+    { id: "workers", label: "Judge workers", sub: "pre-scaled, tests warm", kind: "compute", count: "×300", col: 3, row: 1 },
+    { id: "sched", label: "Capacity planner", sub: "contest calendar", kind: "registry", col: 3, row: 0 },
+    { id: "rank", label: "Leaderboard", kind: "cache", col: 4, row: 1 },
+  ]}
+  edges={[
+    { from: "users", to: "api" }, { from: "api", to: "cq" }, { from: "api", to: "pq" },
+    { from: "cq", to: "workers" }, { from: "pq", to: "workers", dashed: true },
+    { from: "sched", to: "workers", dashed: true, label: "scale up at T-30 min" }, { from: "workers", to: "rank" },
+  ]}
+  steps={[
+    { caption: "Half an hour before the contest, the capacity planner, reading the contest calendar, grows the fleet to the size past contests needed at their peak. New workers load all four problems' tests.", path: ["sched", "workers"] },
+    { caption: "Kavya submits at minute 88. Contest submissions go to their own queue; people practising old problems go to another.", path: ["users", "api", "cq"] },
+    { caption: "Workers always take from the contest queue first, and only take practice submissions when it's empty. Practice verdicts slow down for ten minutes; contest verdicts don't.", path: ["cq", "workers"], focus: ["pq"] },
+    { caption: "Each verdict updates the leaderboard. A submission judged after the contest ends still counts at the time it was submitted.", path: ["workers", "rank"] },
+  ]}
+/>
+
+Inside the contest queue there's one more fairness question. If one contestant submits forty times in a minute, should their submissions sit ahead of Kavya's single one? A plain first-in, first-out queue says yes. Taking submissions **round-robin by contestant**, one from each contestant with work waiting in turn, means a heavy submitter only delays themselves. Codeforces has a related habit that shows the trade-off: during a round, it judges submissions on a small set of "pretests" quickly, and runs the full test set on every final submission only after the round ends, in the "system testing" phase. That moves most of the judging work to after the burst, at the cost of contestants not knowing their final verdict until later.
+
+<Decision
+  q="How should the judge share workers during a contest?"
+  options={[
+    { name: "One FIFO queue for everything", how: "Contest and practice submissions in arrival order.", good: ["Simplest to build", "Nobody is ever starved"], bad: ["A practice spike slows contest verdicts", "A contestant who spams submissions delays everyone else"] },
+    { name: "Priority by queue, round-robin by contestant", how: "Contest work first; within it, one submission per contestant in turn.", good: ["Contest verdicts stay fast", "Spamming only delays the spammer"], bad: ["Practice users wait during contests", "More bookkeeping per dequeue"], chosen: true },
+    { name: "Pretests now, full tests after (Codeforces)", how: "Judge a small subset during the round; system-test everything after.", good: ["Most judging moves out of the burst"], bad: ["A solution can pass pretests and fail later", "Verdicts during the round are provisional"] },
+  ]}
+>
+LeetCode's rules point to the second option being enough for it: verdicts during the contest are meant to be final. The rules allow for the rare mistake, telling users who see a wrong answer judged as accepted to keep submitting correct code, because "LeetCode will calculate the final ranking based on the final judgment." Priority plus pre-scaling keeps verdicts quick without making them provisional. Codeforces's pretest model makes sense for its rules, where contestants can also "hack" each other's solutions with new tests during the round, so the final test set isn't even known until it ends.
+</Decision>
+
+<Elsewhere items={[
+  { where: "Ticketmaster and flash sales", how: "On-sale times are published in advance, so capacity is raised ahead of time and a virtual queue meters people in (chapter 67)." },
+  { where: "JioHotstar", how: "Cricket match schedules drive scaling ahead of the crowd, because autoscaling can't add capacity fast enough once millions arrive (chapter 69)." },
+  { where: "CI systems", how: "Hosted CI caps how many jobs one account can run at once, so one busy repository can't starve everyone else's builds, the same reason a judge goes round-robin by contestant." },
+]} />
+
+</Sub>
+
+<SectionHeading n="07" id="leaderboard">The leaderboard</SectionHeading>
+
+<Sub n="7.1" title="How LeetCode ranks">
+
+Kavya's Accepted verdict moves her up the leaderboard. To build that leaderboard we need the exact rule, and LeetCode's help centre spells it out (as of 2026). Each problem has a score, harder problems more. Contestants are ranked by total score, and ties are broken by **finish time**: the time from the start of the contest to your first accepted submission of the last problem you solved, plus **penalty time**, 5 minutes for every incorrect submission on a problem you eventually solved. Wrong answers on problems you never solve don't count, and nor do Compile Error, Internal Error or "Timeout" verdicts. Resubmitting a problem you've already solved changes nothing.
+
+The ICPC, the long-running university contest, uses the same idea with different numbers: its 2013 World Finals rules gave 20 penalty minutes per rejected run, and added up the time of every solved problem, where LeetCode takes only the time of the last one. That difference changes strategy. Under ICPC rules, solving an easy problem late costs you; under LeetCode's, only your final solve time matters.
+
+Penalties decide a lot under this rule. Two contestants who solve the same problems are ordered by finish time, and one wrong attempt costs five minutes, which in a big contest is hundreds of places.
+
+</Sub>
+
+<Sub n="7.2" title="Ranking with one sorted number">
+
+The leaderboard needs two reads to be fast: "show me the top 25" on the contest page, and "what's my rank?" for each of 30,000 people. And it needs one write: when a verdict arrives, update that contestant. Sorting 30,000 rows on every page view would be wasteful when only a few rows change per second.
+
+Our trick is to turn the two-part rule, score high first and then finish time low, into a single number that sorts the same way. If finish times are always under 10,000,000 seconds, then `score × 10,000,000 − finish_seconds` does it: any extra point outweighs any difference in time, and among equal scores, an earlier finish gives a larger number. Then the leaderboard is a structure that keeps contestants ordered by one number and can answer "how many are above this one?" quickly.
+
+This program computes LeetCode's standings from a log of submissions, builds that key for each contestant, and then does a rank lookup by binary search over the sorted keys:
+
+<TryIt what="LeetCode-style standings, and a rank query on one sorted key" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import bisect
+
+POINTS = {"A": 3, "B": 4, "C": 5, "D": 6}
+PENALTY = 5 * 60                      # 5 minutes per wrong try, in seconds
+
+# (user, problem, seconds from the start, verdict)
+log = [
+    ("asha",  "A",  310, "AC"), ("asha",  "B", 1100, "WA"), ("asha",  "B", 1580, "AC"),
+    ("ben",   "A",  280, "AC"), ("ben",   "B", 1300, "AC"), ("ben",   "C", 4100, "WA"),
+    ("chen",  "A",  610, "AC"), ("chen",  "B", 1700, "AC"),
+    ("dev",   "A",  200, "AC"), ("dev",   "C", 3000, "TLE"), ("dev",  "C", 4900, "AC"),
+    ("kavya", "A",  400, "AC"), ("kavya", "B", 2100, "AC"), ("kavya", "D", 5280, "AC"),
+]
+
+def standings(log):
+    best = {}
+    for user, prob, t, verdict in sorted(log, key=lambda s: s[2]):
+        u = best.setdefault(user, {"solved": {}, "wrong": {}})
+        if prob in u["solved"]:
+            continue                                  # resubmits after AC don't count
+        if verdict == "AC":
+            u["solved"][prob] = t
+        elif verdict != "CE":
+            u["wrong"][prob] = u["wrong"].get(prob, 0) + 1
+    rows = []
+    for user, u in best.items():
+        score = sum(POINTS[p] for p in u["solved"])
+        last = max(u["solved"].values(), default=0)
+        pen = sum(u["wrong"].get(p, 0) for p in u["solved"]) * PENALTY
+        rows.append((user, score, last + pen))
+    return rows
+
+def key(score, finish):               # one number that sorts like (score desc, finish asc)
+    return score * 10**7 - finish
+
+rows = standings(log)
+rows.sort(key=lambda r: -key(r[1], r[2]))
+for rank, (user, score, finish) in enumerate(rows, 1):
+    print(f"{rank}. {user:5} score {score:2}  finish {finish//60:3}m{finish%60:02}s  key {key(score, finish)}")
+
+# what a sorted set does for a rank query: binary search over keys kept in order
+keys = sorted(key(s, f) for _, s, f in rows)
+mine = key(7, 1500)                   # 7 points, finishing at 25m00s
+print("7 points at 25m00s would rank", len(keys) - bisect.bisect_right(keys, mine) + 1)
+```
+<Output>
+```
+1. kavya score 13  finish  88m00s  key 129994720
+2. dev   score  8  finish  86m40s  key 79994800
+3. ben   score  7  finish  21m40s  key 69998700
+4. chen  score  7  finish  28m20s  key 69998300
+5. asha  score  7  finish  31m20s  key 69998120
+7 points at 25m00s would rank 4
+```
+</Output>
+</TryIt>
+
+Look at Asha and Chen. Both solved A and B for 7 points. Asha's last accepted submission came at 26m20s and Chen's at 28m20s, so Asha was faster, but her one wrong answer on B adds 5 minutes, putting her at 31m20s and below Chen. Ben's wrong answer on C costs him nothing, because he never solved C. Dev's TLE on C does count, because he solved C later. And Kavya's last-minute submission at 88m00s is what puts her first: 6 points for problem D outweighs any amount of time.
+
+Its last line is the rank query. Because the keys are kept in sorted order, finding how many contestants are above a given key is a binary search, about log₂ 30,000 ≈ 15 comparisons, with no sorting at query time.
+
+</Sub>
+
+<Sub n="7.3" title="A sorted set in Redis">
+
+<Zoom path={["LeetCode", "Leaderboard", "Sorted set", "Skip list"]} />
+
+A Python list kept sorted by `bisect` works until there are many updates, because inserting into the middle of a list moves everything after it. The structure built for exactly this job is the **sorted set** in Redis, which chapter 22 covers: members, each with a numeric score, kept in score order. `ZADD contest:412 129994720 kavya` sets Kavya's key, replacing any previous one. `ZREVRANK contest:412 kavya` returns her position counting from the top, and `ZREVRANGE contest:412 0 24` returns the top 25. Each takes time proportional to log *n*.
+
+Inside, a large sorted set is a hash table from member to score, plus a **skip list**: a linked list in score order with extra "express lane" pointers on a random subset of nodes, so a search can skip most of the list. Redis's skip list also stores, on each pointer, how many nodes it jumps over, and adding those up along the search path is how it computes a rank without walking the whole list.
+
+<Picture
+  src="/images/designs/leetcode/skip-list.png"
+  alt="A skip list of keys 1 to 10 with four levels of pointers; higher levels skip over more nodes, and every level ends at NIL"
+  caption="A skip list. The bottom level links every key in order; each level above links a random subset, so a search starts at the top, moves right while the next key is smaller, and drops down a level otherwise. That takes about log n steps. Redis keeps a span count on each pointer, which turns the same search into a rank."
+  credit="Image: Wojciech Muła, public domain, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Skip_list.svg"
+  paper
+/>
+
+Two details make it correct in practice. The first is that the sorted set isn't the source of truth. The submission log is. LeetCode's rules describe **rejudging** in detail: if weak tests let wrong solutions through, it adds test cases and rejudges every Accepted submission to that problem; if a wrong test rejected correct ones, it rejudges the Wrong Answers; after a rejudge, the first Accepted submission counts and earlier Wrong Answer or TLE submissions count towards penalty time; and if more than 10% of submissions change result, the contest is unrated. Every one of those outcomes is computed by replaying the log through the ranking rule, exactly as the TryIt does, and writing fresh keys. The sorted set is a fast view of a computation we can always redo. The second is ties. Two contestants with the same score and the same finish time to the second have equal keys, and Redis then orders them by member name (in reverse alphabetical order, for `ZREVRANGE` and `ZREVRANK`). If the rules say equal contestants share a rank, the page has to compute that from the scores and not just print positions.
+
+<Elsewhere items={[
+  { where: "Game leaderboards", how: "The classic sorted-set use case: ZADD on every match result, ZREVRANK for 'you are #4,512 worldwide'." },
+  { where: "Rate limiters and schedulers", how: "Sorted sets keyed by timestamp hold the next due item or the requests in a sliding window (chapter 56)." },
+  { where: "Database indexes", how: "A B-tree index on (score DESC, finish ASC) answers the same rank and range queries from disk, with the same composite-key idea." },
+]} />
+
+</Sub>
+
+<SectionHeading n="08" id="plagiarism">Catching copied code</SectionHeading>
+
+<Sub n="8.1" title="Why comparing every pair doesn't work">
+
+After the contest, there's one more job. LeetCode's rules list as a violation "multiple accounts submitting similar code for the same problem", alongside one user submitting from several accounts and posting solutions publicly before the end. Since September 2024 the same list also bans code-generation tools and any outside help. The penalties are serious: on a first violation, the user's contest score and LeetCoins are reset to zero and they're banned from contests and discussion for a month; a second means permanent deactivation without appeal. So somewhere, a program has to find submissions that are copies of each other, even when the copier has renamed every variable and added a few lines.
+
+Suppose 20,000 people solved problem 2. An obvious approach compares every pair, with a diff tool. That's 20,000 × 19,999 ÷ 2, about 200 million pairs, for one problem in one contest. Worse, a diff is fooled by trivial edits: rename `nums` to `a` and every line differs.
+
+We need two things: a representation of a program that survives renaming and reformatting, and a way to find similar programs without comparing all pairs. The best-known answer to both is the algorithm inside **MOSS**, "Measure Of Software Similarity", a plagiarism detection system Alex Aiken developed in 1994 and still runs as a service for programming courses. Schleimer, Wilkerson and Aiken described its core, **winnowing**, at SIGMOD 2003.
+
+</Sub>
+
+<Sub n="8.2" title="Normalise, then hash every k-gram">
+
+Step one removes differences that don't matter. MOSS's architecture has a front end for each language that strips them out before any matching happens: in the paper's words, "whitespace and punctuation are removed, all letters are converted to lower case, or all variable names are replaced by the identifier 'V'." For C++ we drop comments and whitespace, and replace every identifier that isn't a keyword with `V`. Kavya's loop header `for (int i = 0; i < nums.size(); i++)` becomes `for(intV=0;V<V.V();V++)`, and so does a copier's `for (int idx = 0; idx < a.size(); idx++)`.
+
+Step two cuts the normalised text into overlapping pieces. A **k-gram** is a run of *k* consecutive characters; a text of length *n* has *n − k + 1* of them, starting at every position. Each k-gram is hashed to a number. Two programs that share a stretch of at least *k* characters share the hashes of the k-grams inside it, and *k* is the **noise threshold**: matches shorter than *k* aren't counted, because short matches like `for(intV=0;` happen by coincidence in every program.
+
+Keeping every hash would work, but it's a lot: one per character. Picking a subset is the obvious fix, and the obvious subsets break. Keep every hash that's 0 mod 4, say, and a long run of shared code might happen to contain none of them, so a real copy is missed.
+
+</Sub>
+
+<Sub n="8.3" title="Winnowing">
+
+<Zoom path={["LeetCode", "Plagiarism check", "Fingerprints", "Winnowing"]} />
+
+Winnowing picks the subset with a guarantee. Slide a window of *w* consecutive hashes along the sequence. In each window, select the **minimum** hash, and if the minimum appears more than once, the **rightmost** one. The selected hashes are the document's **fingerprints**.
+
+Two properties follow. First, every window contributes at least one fingerprint, so any shared stretch long enough to contain a whole window of shared hashes, *w + k − 1* characters, is guaranteed to share a fingerprint. That length is the **guarantee threshold**, *t*. Choose *k* and *t*, and *w = t − k + 1* follows. Second, neighbouring windows overlap in all but one hash, so the minimum of one window is usually still the minimum of the next, and many windows select the same fingerprint. The paper proves that on random data, winnowing keeps a fraction of about 2/(*w* + 1) of the hashes, and that no algorithm of this kind, one that decides from each window's contents alone, can keep fewer than 1.5/(*w* + 1). So winnowing is within 33% of the best possible.
+
+Similarity between two programs is then a question about their fingerprint sets. A natural measure is the **Jaccard index**: the number of fingerprints they share divided by the number in either one.
+
+<Picture
+  src="/images/designs/leetcode/jaccard-intersection-over-union.png"
+  alt="A visual equation: two overlapping squares with only the overlap shaded, divided by the same two squares with the whole union shaded"
+  caption="The Jaccard index as a picture: the overlap divided by the union. For plagiarism, the two shapes are two programs' sets of fingerprints: 1.0 means identical sets, 0 means nothing shared."
+  credit="Image: Adrian Rosebrock, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Intersection_over_Union_-_visual_equation.png"
+  narrow
+/>
+
+This program does all three steps on Kavya's sliding-window solution to problem 2, a copy with every name changed and a comment added, a copy that also has a pointless variable woven in, and an independent solution that uses prefix sums. It uses *k* = 12 and *w* = 8, so any shared stretch of 19 normalised characters is guaranteed to be caught. `zlib.crc32` is a quick standard hash.
+
+<TryIt what="Winnowing three suspect solutions" lang="python" toolchain="Python 3.14, macOS 26.5.1">
+```python
+import re, zlib
+
+KEYWORDS = {"int", "long", "for", "while", "if", "else", "return", "vector",
+            "auto", "const", "using", "namespace", "std", "include", "cin", "cout"}
+
+def normalise(src):
+    src = re.sub(r"//[^\n]*|/\*.*?\*/", "", src, flags=re.S)        # drop comments
+    tokens = re.findall(r"[A-Za-z_]\w*|\d+|\S", src)            # split into tokens
+    # every identifier that isn't a keyword becomes "V", so renaming doesn't help
+    return "".join(t if t in KEYWORDS or not t[0].isalpha() and t[0] != "_" else "V"
+                   for t in tokens)
+
+def fingerprints(src, k=12, w=8):
+    text = normalise(src)
+    hashes = [zlib.crc32(text[i:i + k].encode()) for i in range(len(text) - k + 1)]
+    picked = set()
+    for i in range(len(hashes) - w + 1):                        # every window of w hashes
+        window = hashes[i:i + w]
+        m = min(window)
+        j = max(p for p, h in enumerate(window) if h == m)      # rightmost minimum
+        picked.add((i + j, m))
+    return {h for _, h in picked}, len(hashes)
+
+def similarity(a, b):
+    fa, _ = fingerprints(a); fb, _ = fingerprints(b)
+    return len(fa & fb) / len(fa | fb)
+
+original = """
+long long maxSum(vector<int>& nums, int k) {
+    long long best = 0, cur = 0;
+    for (int i = 0; i < nums.size(); i++) {
+        cur += nums[i];
+        if (i >= k) cur -= nums[i - k];
+        if (i >= k - 1) best = max(best, cur);
+    }
+    return best;
+}"""
+
+renamed = """
+// my own solution!!
+long long maxSum(vector<int>& a, int len) {
+    long long answer = 0, window = 0;
+    for (int idx = 0; idx < a.size(); idx++) {
+        window += a[idx];
+        if (idx >= len) window -= a[idx - len];
+        if (idx >= len - 1) answer = max(answer, window);
+    }
+    return answer;
+}"""
+
+padded = """
+long long maxSum(vector<int>& a, int len) {
+    long long answer = 0, window = 0;
+    int unused = 42;
+    for (int idx = 0; idx < a.size(); idx++) {
+        window += a[idx];
+        if (idx >= len) window -= a[idx - len];
+        unused++;
+        if (idx >= len - 1) answer = max(answer, window);
+    }
+    return answer;
+}"""
+
+independent = """
+long long maxSum(vector<int>& nums, int k) {
+    vector<long long> pre(nums.size() + 1, 0);
+    for (int i = 0; i < nums.size(); i++) pre[i + 1] = pre[i] + nums[i];
+    long long best = 0;
+    for (int r = k; r <= nums.size(); r++) best = max(best, pre[r] - pre[r - k]);
+    return best;
+}"""
+
+print("normalised:", normalise(original)[:60] + "...")
+fp, n = fingerprints(original)
+print(f"original: {n} hashed 12-grams, {len(fp)} kept as fingerprints")
+print(f"original vs renamed copy:     {similarity(original, renamed):.2f}")
+print(f"original vs padded copy:      {similarity(original, padded):.2f}")
+print(f"original vs independent work: {similarity(original, independent):.2f}")
+```
+<Output>
+```
+normalised: longlongV(vector<int>&V,intV){longlongV=0,V=0;for(intV=0;V<V...
+original: 114 hashed 12-grams, 22 kept as fingerprints
+original vs renamed copy:     1.00
+original vs padded copy:      0.57
+original vs independent work: 0.10
+```
+</Output>
+</TryIt>
+
+Line one shows the normalised text: the names are gone, and only the shape of the code is left. Line two shows winnowing's thinning: 114 hashes, 22 kept, about 19%, close to the 2/(*w* + 1) = 22% the paper predicts. Then the scores. The renamed copy, comment and all, scores 1.00: after normalisation it's the same text. The padded copy scores 0.57, because the inserted lines break up some windows, but every stretch of 19 unchanged characters still shares a fingerprint, so most of the copy is still caught. An independent solution scores 0.10, from fragments every solution to this problem shares, such as the function signature.
+
+</Sub>
+
+<Sub n="8.4" title="From pairs to an index">
+
+Fingerprints also solve the all-pairs problem. Build an **inverted index**, a map from each fingerprint to the list of submissions that contain it, the same structure a search engine uses for words (chapter 62). Then, for each submission, look up its fingerprints and count how often each other submission appears in their lists. Only pairs that share at least one fingerprint are ever compared, and for most problems that's a tiny fraction of the 200 million.
+
+That 0.10 in the TryIt hints at the real difficulty, and it would probably be higher on an easier problem. A short problem has few ways to solve it, and many correct solutions look alike after normalisation: the same function signature, the same `for` loop, the same standard algorithm. So a judge's plagiarism check has to discount common code. Fingerprints that appear in a large share of all submissions to a problem carry no evidence and are best ignored, as is anything in the provided starter code. What's left, a long run of uncommon fingerprints shared by two submissions from two accounts, is strong evidence. The 2003 paper reports that across MOSS's several thousand users, false positives "appear to be non-existent". In MOSS's setting, though, a person reads every flagged pair before anything happens, and a contest judge should do the same: the algorithm ranks suspicious pairs, and people decide.
+
+<Callout label="Design implication">
+Keep the format-specific work in a front end and the matching engine generic. The MOSS authors report that this split, a normaliser per language feeding one fingerprinting engine that knows nothing about languages, was "essential" to supporting many formats, and that it is "very tempting" to put language rules into the matching code and always better not to. A judge with twenty languages needs twenty normalisers and one winnowing engine.
+</Callout>
+
+<Elsewhere items={[
+  { where: "Near-duplicate web pages", how: "The winnowing paper's own experiments fingerprint 500,000 web pages; search engines use the same k-gram fingerprinting to drop near-duplicate pages from results." },
+  { where: "Deduplicating storage and rsync", how: "Content-defined chunking picks chunk boundaries from local hash values, the same 'decide from a window's contents' idea, so an insertion only changes nearby chunks (chapter 66)." },
+  { where: "Genome search", how: "Minimizers in bioinformatics keep the smallest k-mer in each window of a DNA sequence, a close cousin of winnowing, and are used to index reads against a genome." },
+]} />
+
+</Sub>
+
+<SectionHeading n="09" id="whole">The whole system</SectionHeading>
+
+<Sub n="9.1" title="Every box, and why it's there">
+
+<SystemDiagram
+  title="An online judge, end to end"
+  nodes={[
+    { id: "kavya", label: "Kavya's browser", kind: "laptop", col: 0, row: 1 },
+    { id: "api", label: "Submit API", sub: "+ verdict push", kind: "service", col: 1, row: 1 },
+    { id: "db", label: "Submissions DB", sub: "code, log, verdicts", kind: "db", col: 1, row: 0 },
+    { id: "q", label: "Judge queues", sub: "contest > practice", kind: "queue", col: 2, row: 1 },
+    { id: "plan", label: "Capacity planner", sub: "contest calendar", kind: "registry", col: 2, row: 2 },
+    { id: "workers", label: "Judge workers (VMs)", sub: "isolate per run", kind: "compute", count: "×300", col: 3, row: 1 },
+    { id: "tests", label: "Test data", sub: "inputs, answers, checkers", kind: "blob", col: 3, row: 0 },
+    { id: "rank", label: "Leaderboard", sub: "Redis sorted set", kind: "cache", col: 4, row: 1 },
+    { id: "moss", label: "Plagiarism job", sub: "winnowing, after contest", kind: "compute", col: 4, row: 0 },
+  ]}
+  zones={[{ label: "Untrusted code runs only here", nodes: ["workers"] }]}
+  edges={[
+    { from: "kavya", to: "api" }, { from: "api", to: "db" }, { from: "api", to: "q" },
+    { from: "q", to: "workers" }, { from: "tests", to: "workers" }, { from: "workers", to: "db" },
+    { from: "workers", to: "rank" }, { from: "plan", to: "workers", dashed: true },
+    { from: "db", to: "moss", dashed: true }, { from: "rank", to: "kavya", dashed: true },
+  ]}
+  steps={[
+    { caption: "Before the contest, the capacity planner grows the worker fleet and each worker warms its cache of the contest's tests and checkers.", path: ["plan", "workers"], focus: ["tests"] },
+    { caption: "At minute 88, Kavya submits. The API stores her code and its submission time, and puts it on the high-priority contest queue.", path: ["kavya", "api", "db"] },
+    { caption: "A worker takes it, compiles it in a sandbox, and runs each hidden test in an isolate sandbox pinned to a quiet core, rerunning any test that lands near the limit.", path: ["api", "q", "workers"] },
+    { caption: "The trusted checker compares each output with the answer, by tokens and with a float tolerance or a special checker where the problem needs one.", path: ["tests", "workers"] },
+    { caption: "The verdict, Accepted, is written to the database, and Kavya's key in the sorted set is updated with her new score and finish time.", path: ["workers", "db"], focus: ["rank"] },
+    { caption: "Her browser hears the verdict and reads her new rank. After the contest, a winnowing job compares every accepted submission for copies.", path: ["workers", "rank", "kavya"], focus: ["moss"] },
+  ]}
+/>
+
+| Component | What it does | Added because |
+|---|---|---|
+| Queue + judge workers | Judges submissions away from the web tier | Compiling and running in the request blocked everything (§2) |
+| Compile and run sandboxes | Namespaces, cgroups, seccomp per run | A submission can read answers, fork-bomb, use the network (§3) |
+| Disposable worker VMs | A second wall around every sandbox | One kernel bug breaks every namespace wall at once (§3.5) |
+| Quiet, pinned, fixed-frequency cores | One run per physical core, boost off | CPU time varies with neighbours and frequency (§4) |
+| Rerun near the limit | Repeats close calls, keeps the best | Timing is a measurement with noise (§4.3) |
+| Trusted checker | Tokens, tolerances, special checkers | Byte comparison rejects right answers (§5) |
+| Priority queues + calendar scaling | Contest work first, fleet sized in advance | The last ten minutes triple the load (§6) |
+| Sorted set | Rank and top-N in log time | Re-sorting 30,000 rows per page view is wasteful (§7) |
+| Winnowing job | Fingerprints, inverted index, human review | All-pairs diff is 200 million comparisons and fooled by renaming (§8) |
+
+</Sub>
+
+<Sub n="9.2" title="From top to bottom">
+
+| Level | The choice | Data structure or algorithm |
+|---|---|---|
+| System | Separate trusted and untrusted code everywhere | Untrusted code only inside sandboxes; checkers and controllers outside |
+| Work distribution | Queue, priorities, round-robin by contestant | Durable queue with leases; per-contestant fair dequeue |
+| Isolation | Hide, then limit, then filter | PID/net/mount/IPC namespaces; cgroup memory, CPU and pids limits; seccomp-bpf allowlist |
+| Kernel boundary | Don't share the host kernel with strangers | gVisor's Sentry, or Firecracker microVMs with a jailer |
+| Timing | Measure CPU time, guard with wall time | cgroup CPU accounting; minimum of reruns near the limit |
+| Checking | Compare meaning, not bytes | Token comparison; absolute-or-relative ε; special checker programs |
+| Ranking | One number per contestant | score × 10⁷ − finish; skip list with span counts (ZREVRANK) |
+| Plagiarism | Fingerprint, index, review | Normalisation, k-gram hashes, winnowing (rightmost minimum per window), inverted index, Jaccard |
+
+</Sub>
+
+<SectionHeading n="10" id="breaks">What goes wrong, and what it costs</SectionHeading>
+
+<Sub n="10.1" title="Failures this design has to survive">
+
+| What happens | What the contestant sees | What the design does |
+|---|---|---|
+| A submission fork-bombs | Their own TLE or RE | The pids limit stops it at a few processes; summed CPU time kills it quickly |
+| A submission sleeps or waits on input forever | TLE | The wall-clock limit kills it, even though it uses no CPU |
+| A submission prints gigabytes | WA or RE | The file-size limit stops the write; the checker never reads it all |
+| A judge worker dies mid-run | A slightly slower verdict | The queue lease expires and another worker rejudges it |
+| A kernel exploit escapes a sandbox | Nothing, if it works | The attacker lands in a throwaway VM holding only current test data; the VM is rebuilt |
+| A test case is wrong | Verdicts change after the contest | Every submission to that problem is rejudged; the leaderboard is rebuilt from the log |
+| The queue backs up at the end | Verdicts take minutes | Rank uses submission time, so nobody loses places; capacity was raised in advance |
+| Two accounts submit the same code | Nothing during the contest | Winnowing flags the pair afterwards; a person reviews it |
+
+</Sub>
+
+<Sub n="10.2" title="The tradeoffs, in one table">
+
+| Decision | Chosen | Given up | Why it was worth it |
+|---|---|---|---|
+| Where code runs | Separate workers, fed by a queue | Instant verdicts under overload | The site stays up whatever submissions do |
+| Sandbox | isolate-style per run, inside disposable VMs | Simplicity of one layer | Native-speed timing, plus a second wall against kernel bugs |
+| Which clock | CPU time, with a generous wall limit | Simple stopwatch timing | Waiting for a CPU isn't the program's fault |
+| Fleet setup | One run per core, boost off, one CPU model | Throughput per machine | The same program gets the same time |
+| Close calls | Rerun near the limit, keep the minimum | A little extra judging | Noise only ever adds time |
+| Burst handling | Scale on the calendar, contest queue first | Practice users' speed for ten minutes | Contest verdicts stay quick at minute 88 |
+| Ranking | Sorted set as a view of the log | Strong consistency of the view | Fast reads, and rejudges rebuild it exactly |
+| Plagiarism | Winnowing plus human review | Fully automatic bans | Short problems have honest look-alikes |
+
+</Sub>
+
+<SectionHeading n="11" id="summary">Summary</SectionHeading>
+
+1. **A judge runs hostile programs on purpose**, so every design choice starts from the line between trusted code (controller, checker) and untrusted code (the submission, its compiler and LeetCode's driver).
+2. **Submissions go through a queue to separate judge workers**, so a slow or looping program ties up one worker until its limit, never the web tier.
+3. **A sandbox hides, limits and filters**: namespaces hide files, processes and the network; cgroups cap memory, total CPU time and process count, which defuses a fork bomb; seccomp-bpf narrows which syscalls reach the kernel.
+4. **isolate replaced ptrace sandboxes** by moving the checks into the kernel's own mechanisms: in 2012, no measurable overhead against ptrace's 160% on a syscall-heavy program, and support for threads.
+5. **Every container-style wall shares one kernel**, so a kernel bug breaks them all; gVisor answers with a user-space kernel, Firecracker with a microVM under 5 MB that boots in under 125 ms.
+6. **Judges limit CPU time, with a much larger wall-clock limit** to catch programs that sleep.
+7. **CPU time still varies with neighbours, caches, hyper-threading and turbo frequency**, so fair judges fix the frequency, run one submission per physical core, keep one CPU model, and rerun close calls, keeping the fastest.
+8. **Checkers compare meaning, not bytes**: tokens instead of whitespace, a tolerance for floating point, and special checker programs for problems with many right answers.
+9. **The end-of-contest burst is known in advance**, so the fleet is scaled on the calendar, contest work goes first, and rank uses submission time so a slow queue costs no places.
+10. **A leaderboard is one sorted number per contestant**, score × 10⁷ − finish time, in a sorted set whose skip list answers rank queries in log time, rebuilt from the submission log after any rejudge.
+11. **Winnowing finds copied code**: normalise, hash every k-gram, keep the rightmost minimum of each window, and every shared stretch of *w + k − 1* characters is guaranteed to share a fingerprint.
+
+<SectionHeading n="12" id="build">Build this</SectionHeading>
+
+**A tiny online judge.**
+
+- On a Linux machine or VM, install isolate from the IOI's GitHub repository and run `isolate --init`. Copy a compiled C++ program into the box directory and run it with `isolate --run -t 1 -w 3 -p1 --cg --cg-mem=262144 -M meta.txt -- ./sol`. Read `meta.txt`.
+- Write four hostile programs: a fork bomb, one that allocates memory in a loop, one that tries `open("/etc/shadow")` and `connect()` to a public address, and one that calls `sleep(100)`. Check which limit catches each, and what `status` each gets in the metadata.
+- Write a judge loop in Python: for each test, run in isolate, compare outputs by tokens, and stop at the first failure. Add a float checker with an absolute-or-relative tolerance.
+- Run one CPU-bound submission 50 times alone, then with a busy loop on every other core, then with boost disabled through `/sys/devices/system/cpu/intel_pstate/no_turbo`. Plot the CPU times and decide where you'd set a "rerun if within X%" threshold.
+- Put a Redis sorted set behind it: replay a fake contest log, update keys on every Accepted, and serve "top 10" and "my rank".
+- Run the winnowing TryIt over a folder of submissions to one problem, build the inverted index, and print the ten most similar pairs. Then ignore fingerprints that appear in more than 10% of submissions and see how the list changes.
+
+<SectionHeading n="13" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Why can't an online judge just run submitted code on its web servers?">
+Two reasons. Judging takes seconds, and an infinite loop takes forever, so judging in the request would tie up web servers and take the site down during a contest; a queue and separate workers fix that. More seriously, the code would run with the web server's permissions, so it could read the expected answers, use the network, delete files or fork until the machine fails. Untrusted code has to run in a sandbox on machines that hold nothing else of value.
+</QA>
+
+<QA level="beginner" q="What's the difference between CPU time and wall-clock time, and which should a judge limit?">
+Wall-clock time is elapsed real time from start to exit. CPU time is the time a processor spent running the program's instructions, which leaves out waiting for a CPU, for I/O or for a sleep to end. Judges limit CPU time, because it measures the program and not how busy the machine was, but also set a much larger wall-clock limit, so a program that sleeps or blocks forever, using no CPU, still gets killed.
+</QA>
+
+<QA level="intermediate" q="How would you stop a fork bomb, a program that reads the expected output, and a program that sends test data over the network?">
+Put each run in its own namespaces and cgroup. A PID-count limit in the cgroup makes fork fail with EAGAIN after a few processes, and summing CPU time across the group means the copies hit the time limit sooner. A mount namespace whose root holds only read-only libraries and a working directory with the input file means the answers aren't there to read. A network namespace with no devices means a socket has nowhere to go. A seccomp-bpf allowlist then refuses system calls the program has no reason to make.
+</QA>
+
+<QA level="intermediate" q="The same solution gets Accepted at minute 10 and TLE at minute 88. What's going on, and how do you fix it?">
+At minute 88 the judge machines are full. Neighbouring runs share caches and memory bandwidth, two runs on sibling hyper-threads share a core's execution units, and with more cores busy turbo frequency drops, so even CPU time goes up. Fix the frequency (performance governor, boost off), run one submission per physical core with its sibling idle, pin runs to cores, keep one CPU model across the fleet, and rerun any measurement close to the limit, taking the minimum, since noise only adds time.
+</QA>
+
+<QA level="intermediate" q="Design a contest leaderboard for 30,000 people that updates live.">
+Rank by score descending, then finish time ascending, where finish time is the last first-accepted time plus 5 minutes per wrong try on solved problems. Encode that as one number, score × 10⁷ − finish seconds, and keep it in a Redis sorted set: ZADD on each Accepted, ZREVRANGE for the top of the page, ZREVRANK for "my rank", each in log time. Treat the submission log as the source of truth, so a rejudge rebuilds the set by replaying the log, and handle equal keys explicitly, since Redis breaks ties by member name.
+</QA>
+
+<QA level="deep" q="Containers, gVisor or Firecracker: which would you use to run untrusted code, and why?">
+Containers (namespaces, cgroups, seccomp, as in isolate or nsjail) have no per-syscall overhead and the most precise timing, but share the host kernel, so one kernel bug breaks every wall. gVisor's Sentry implements syscalls in a user-space kernel and only passes a short list to the host, which makes kernel bugs much harder to reach, at a cost on every syscall and some compatibility. Firecracker gives each sandbox a guest kernel behind hardware virtualisation and a jailed VMM, in a few MB and about 125 ms. For a judge, a good answer layers them: isolate per run for timing, inside disposable VMs that hold nothing worth stealing.
+</QA>
+
+<QA level="deep" q="How does MOSS detect copied code when the copier renamed every variable?">
+A per-language front end normalises the code first, removing comments and whitespace and replacing every identifier with one placeholder, so renaming changes nothing. Then it hashes every k-gram of the result and winnows: in each window of w consecutive hashes it keeps the rightmost minimum. Any shared stretch of w + k − 1 characters is guaranteed to share a fingerprint, while only about 2/(w + 1) of the hashes are kept. An inverted index from fingerprints to submissions finds candidate pairs without comparing all pairs, and pairs are ranked by shared fingerprints for a person to review.
+</QA>
+
+<SectionHeading n="14" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="A submission calls sleep(1000) and nothing else. Which limit stops it, and why not the other one?">
+    The wall-clock limit. Sleeping uses no CPU, so the CPU-time limit would
+    never be reached; that's exactly why judges set a wall-clock limit too,
+    larger than the CPU limit so that waiting for a busy CPU isn't punished.
+  </Q>
+  <Q q="Winnowing with k = 12 and w = 8: what's the shortest copied stretch that's guaranteed to be detected?">
+    w + k − 1 = 19 normalised characters. Any such stretch contains a whole
+    window of 8 hashes, and every window contributes a fingerprint.
+  </Q>
+  <Q q="Asha solves A and B with one wrong answer on B; Chen solves A and B with none, finishing two minutes later. Who ranks higher on LeetCode?">
+    Chen, unless Asha finished more than five minutes earlier. Her wrong answer
+    on a problem she later solved adds a 5-minute penalty to her finish time.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Mareš and Blackham, 'A New Contest Sandbox' (Olympiads in Informatics, 2012)">
+    The threat list by syscall group, why ptrace sandboxes were replaced, and
+    isolate's design on namespaces and cgroups, with its overhead measurement.
+  </WildCard>
+  <WildCard name="Mareš, 'Fairness of Time Constraints' (Olympiads in Informatics, 2011)">
+    Real IOI 2009 submissions timed again and again: where the noise comes
+    from, what parallel grading does to it, and why to rerun near the limit.
+  </WildCard>
+  <WildCard name="Agache et al., 'Firecracker: Lightweight Virtualization for Serverless Applications' (NSDI 2020)">
+    Why AWS built a new VMM for Lambda, the jailer, and the measurements behind
+    under 5 MB and under 125 ms.
+  </WildCard>
+  <WildCard name="gVisor documentation: architecture and security model">
+    The Sentry, the Gofer, the platforms, and which host syscalls the Sentry is
+    allowed to make.
+  </WildCard>
+  <WildCard name="Schleimer, Wilkerson and Aiken, 'Winnowing: Local Algorithms for Document Fingerprinting' (SIGMOD 2003)">
+    The algorithm, the 2/(w + 1) density and the lower bound, and experience
+    running MOSS.
+  </WildCard>
+  <WildCard name="isolate's manual, nsjail's README, Judge0 and testlib on GitHub">
+    The flags and metadata a real judge uses, a seccomp-based alternative, an
+    open-source judge built on isolate (and its 2024 advisories), and the
+    checker library behind Codeforces.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="15" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Containers from Scratch">
+    Namespaces, cgroups, overlayfs and a seccomp filter built by hand.
+    [Chapter 11](/topics/11-containers).
+  </WildCard>
+  <WildCard name="Virtualization, Hypervisors & microVMs">
+    How KVM and Firecracker give a guest its own kernel, and what that costs.
+    [Chapter 47](/topics/47-virtualization).
+  </WildCard>
+  <WildCard name="Designing a Distributed Job Scheduler">
+    Queues, workers, leases and retries, the machinery under the judge queue.
+    [Chapter 56](/topics/56-design-job-scheduler).
+  </WildCard>
+  <WildCard name="Redis Internals">
+    How Redis stores sorted sets, and when it switches to a skip list.
+    [Chapter 22](/topics/22-redis#value-layout).
+  </WildCard>
+  <WildCard name="Queueing & Capacity">
+    Why a queue near full utilisation explodes, and how autoscalers decide.
+    [Chapter 42](/topics/42-queueing-and-capacity).
+  </WildCard>
+  <WildCard name="System Calls & the Kernel Boundary">
+    What a system call is. Every sandbox in this case study filters them.
+    [Chapter 7](/topics/07-syscalls-kernel-boundary).
+  </WildCard>
+</CardGrid>
