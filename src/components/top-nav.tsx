@@ -3,6 +3,7 @@ import { Search } from "./search";
 import { ThemeToggle } from "./theme-toggle";
 import { MobileMenu } from "./mobile-menu";
 import { ProgressPill } from "./progress-pill";
+import { StreakPill } from "./streak";
 import { Logo } from "./logo";
 import { groups, livePages } from "@/lib/manifest";
 
@@ -31,6 +32,7 @@ export function TopNav() {
         </nav>
         <div className="flex-1" />
         <Search />
+        <StreakPill />
         <ProgressPill total={livePages.filter((p) => p.kind === "topic").length} />
         <ThemeToggle />
       </div>

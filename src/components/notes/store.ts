@@ -15,6 +15,8 @@ export interface Highlight {
   start: number;
   end: number;
   created: number;
+  /** last time the note text changed */
+  edited?: number;
 }
 
 export interface PageNotes {
@@ -30,7 +32,9 @@ export function read(path: string): PageNotes {
     const raw = localStorage.getItem(key(path));
     if (!raw) return EMPTY;
     const v = JSON.parse(raw);
-    return { freeNotes: v.freeNotes ?? "", highlights: v.highlights ?? [] };
+    /* The old "Note" button saved a single space as a placeholder note. */
+    const highlights = (v.highlights ?? []).map((h: Highlight) => (h.note?.trim() ? h : { ...h, note: undefined }));
+    return { freeNotes: v.freeNotes ?? "", highlights };
   } catch {
     return EMPTY;
   }
@@ -87,4 +91,14 @@ export function toMarkdown(title: string, url: string, n: PageNotes): string {
     lines.push("## Notes", "", n.freeNotes.trim(), "");
   }
   return lines.join("\n");
+}
+
+/** "just now", "12 min ago", "yesterday", then a date. */
+export function ago(t: number): string {
+  const s = (Date.now() - t) / 1000;
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  if (s < 172800) return "yesterday";
+  return new Date(t).toLocaleDateString(undefined, { day: "numeric", month: "short", year: s > 31536000 ? "numeric" : undefined });
 }
