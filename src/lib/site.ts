@@ -1,6 +1,6 @@
 /* One place for the facts every page's metadata repeats. */
 export const SITE = {
-  url: "https://knowsys.vercel.app",
+  url: "https://knowsys.tech",
   name: "KnowSys",
   title: "KnowSys: learn how computers really run your code",
   description:

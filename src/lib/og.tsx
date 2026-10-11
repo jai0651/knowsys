@@ -36,7 +36,7 @@ export function ogImage({ kicker, title, dek }: { kicker: string; title: string;
           {dek && <div style={{ fontSize: 28, lineHeight: 1.4, color: "#a3c2c0", maxWidth: 1000 }}>{dek.length > 150 ? dek.slice(0, 147).replace(/\s+\S*$/, "") + "…" : dek}</div>}
         </div>
         <div style={{ display: "flex", justifyContent: "space-between", fontSize: 22, color: "#6f8f8e" }}>
-          <span>knowsys.vercel.app</span>
+          <span>knowsys.tech</span>
           <span style={{ display: "flex", width: 220, height: 6, borderRadius: 3, background: "linear-gradient(90deg,#2dd4bf,#38bdf8)" }} />
         </div>
       </div>
