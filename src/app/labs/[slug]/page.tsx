@@ -5,6 +5,8 @@ import { TopNav } from "@/components/top-nav";
 import { Sidebar } from "@/components/sidebar";
 import { Panel } from "@/components/terminal-frame";
 import { labs, pageBySlug } from "@/lib/manifest";
+import { Mdx } from "@/components/mdx";
+import { readDoc } from "@/lib/mdx";
 
 export function generateStaticParams() {
   return labs.map((p) => ({ slug: p.slug }));
@@ -18,13 +20,15 @@ export async function generateMetadata({
   const { slug } = await params;
   const page = pageBySlug(slug);
   if (!page) return {};
-  return { title: page.title, description: page.hook };
+  const description = readDoc("labs", slug)?.frontmatter.dek ?? page.hook;
+  return { title: page.title, description, alternates: { canonical: page.href } };
 }
 
 export default async function LabPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
   const page = pageBySlug(slug);
   if (!page || page.kind !== "lab") notFound();
+  const doc = readDoc("labs", slug);
 
   return (
     <>
@@ -44,24 +48,31 @@ export default async function LabPage({ params }: { params: Promise<{ slug: stri
             <h1 className="mb-4 text-[34px] font-bold leading-[1.15] tracking-tight text-ink sm:text-[42px]">
               {page.title}
             </h1>
-            <p className="mb-8 text-[17px] leading-relaxed text-muted">{page.hook}</p>
+            <p className="mb-8 text-[17px] leading-relaxed text-muted">{doc?.frontmatter.dek ?? page.hook}</p>
 
-            <Panel
-              label={`${slug} — not built yet`}
-              right={<span className="font-mono text-[10px] text-faint">stub</span>}
-            >
-              <div className="grid min-h-[260px] place-items-center text-center">
-                <div>
-                  <div className="prompt mb-2 font-mono text-[13px] text-accent-dim">
-                    ./{slug} --step
+            {doc ? (
+              /* A built lab is an MDX page: a short guide around its widget. */
+              <article className="prose" id="chapter-body">
+                <Mdx source={doc.body} />
+              </article>
+            ) : (
+              <Panel
+                label={`${slug} — not built yet`}
+                right={<span className="font-mono text-[10px] text-faint">stub</span>}
+              >
+                <div className="grid min-h-[260px] place-items-center text-center">
+                  <div>
+                    <div className="prompt mb-2 font-mono text-[13px] text-accent-dim">
+                      ./{slug} --step
+                    </div>
+                    <p className="text-[14px] text-faint">
+                      The lab runs in the browser, one step at a time, on an example small
+                      enough to check by hand.
+                    </p>
                   </div>
-                  <p className="text-[14px] text-faint">
-                    The lab runs in the browser, one step at a time, on an example small
-                    enough to check by hand.
-                  </p>
                 </div>
-              </div>
-            </Panel>
+              </Panel>
+            )}
           </div>
         </main>
       </div>

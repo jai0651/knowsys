@@ -6,6 +6,10 @@ import { ImageResponse } from "next/og";
    has only one weight, so titles came out regular without these. */
 const font = (w: number) => fs.readFileSync(path.join(process.cwd(), "src/lib/og-fonts", `jakarta-${w}.woff`));
 const FONTS = [400, 600, 800].map((w) => ({ name: "Jakarta", data: font(w), weight: w as 400 | 600 | 800, style: "normal" as const }));
+/* Jakarta has no ₹, which the UPI and Zerodha cards need. Noto Sans's
+   latin-ext subset (OFL) covers the currency signs and is used only for
+   glyphs Jakarta lacks. */
+FONTS.push({ name: "Noto Sans", data: fs.readFileSync(path.join(process.cwd(), "src/lib/og-fonts", "noto-sans-latin-ext-400.woff")), weight: 400, style: "normal" });
 
 export const OG_SIZE = { width: 1200, height: 630 };
 

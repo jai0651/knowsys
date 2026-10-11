@@ -8,6 +8,14 @@ import { SystemDiagram } from "./system-diagram";
 import { Think, Decision, Elsewhere, Zoom, Picture } from "./design";
 import { Predict } from "./predict";
 import { RaceLab } from "./labs/race-lab";
+import { LockLab } from "./labs/lock-lab";
+import { QueueingLab } from "./labs/queueing-lab";
+import { RaftLab } from "./labs/raft-lab";
+import { StorageLab } from "./labs/storage-lab";
+import { HashingLab } from "./labs/hashing-lab";
+import { CacheLab } from "./labs/cache-lab";
+import { MvccLab } from "./labs/mvcc-lab";
+import { PacketLab } from "./labs/packet-lab";
 import { Milestone } from "./milestone";
 import { Sub, Approach, Estimate, Figure, Quiz, Q, Compare } from "./scaffold";
 import { MemoryLayout, Flow, Sequence, Tree, Cells, Plot } from "./diagrams";
@@ -37,6 +45,14 @@ export const mdxComponents: MDXComponents = {
   Picture,
   Predict,
   RaceLab,
+  LockLab,
+  QueueingLab,
+  RaftLab,
+  StorageLab,
+  HashingLab,
+  CacheLab,
+  MvccLab,
+  PacketLab,
   Milestone,
   Panel,
   Sub,

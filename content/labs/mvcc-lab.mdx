@@ -1,0 +1,96 @@
+---
+title: "MVCC Lab"
+dek: "Step two Postgres transactions through any interleaving you like, watch each one's snapshot pick which row versions it sees, and find the orders that break a rule. Then raise the isolation level and see which breakages it stops, and how."
+---
+
+A hospital has a rule: at least one doctor must be on call. Alice and Bob are both on call, both feel ill, and both open the rota app at the same moment. Each app runs the same careful transaction: count the doctors on call, and if there are at least two, take yourself off. Each transaction is correct on its own. Run them at the same time on Postgres at repeatable read, and the hospital can end up with nobody on call, without a single error.
+
+The reason is how Postgres lets transactions run side by side. It never overwrites a row. An `UPDATE` writes a new **version** of the row and marks the old one as replaced, and each transaction reads through a **snapshot**, a record of which transactions had committed when it started looking. Two header fields on every version drive the whole thing: **`xmin`**, the ID of the transaction that created the version, and **`xmax`**, the ID of the one that replaced it (0 if nobody has). That's **multi-version concurrency control**, or MVCC, and it's why readers never wait for writers. It's also why the two doctors can each see a hospital where the other is still on call. This lab lets you be the scheduler for two transactions, T1 and T2, and watch every version and every visibility decision as it happens.
+
+The table in the middle is the real data: every version of every row, numbered in the order it was written, with its `xmin` and `xmax`. A transaction ID (an **xid**) marked with an asterisk belongs to a transaction that's still running, and a struck-out one aborted. The two dot columns say which versions T1 and T2 would see if they ran a statement right now. Below the table is the **commit log**, the record of whether each xid committed or aborted, which Postgres keeps in `pg_xact`. Each click runs one statement of one transaction, and the line at the bottom explains what happened and why.
+
+<MvccLab />
+
+## Things to try
+
+### 1. Two correct decisions, one broken rule
+
+Leave it on **Write skew** at **Repeatable read**. Step T1 once, then T2 once. Both take their snapshot and count 2 doctors on call. Now step T1 (it takes Alice off call), T2 (it takes Bob off call), and then commit T1.
+
+<Predict
+  q="T1 has committed. T2 updated a different row, bob, and now tries to commit. What happens?"
+  options={[
+    "T2 commits, and nobody is on call",
+    "T2 gets a serialization failure",
+    "T2 waits for T1's lock",
+    "Postgres notices the broken rule and rolls T2 back",
+  ]}
+  answer={0}
+>
+T2 commits. Look at the table: T1 wrote version #3 of alice and T2 wrote version #4 of bob. They never touched the same row, so neither needed a lock the other held, and the only conflict rule repeatable read has, that two transactions can't both replace the same version, never fired. Each transaction made a correct decision from a correct snapshot, and together they broke the rule. This is **write skew**: two transactions read overlapping data, then write different rows based on what they read.
+</Predict>
+
+Repeatable read in Postgres is **snapshot isolation**: one snapshot for the whole transaction, plus a rule that the first transaction to replace a row version wins and any later one fails. That rule only looks at writes. Here the problem is in the reads, since each transaction read a row the other one then changed, and snapshot isolation doesn't track reads at all.
+
+### 2. Why T2 still sees Alice on call
+
+Press Reset and use a different order: step T1 twice, so it counts 2 and writes version #3 (alice off call), but don't commit it. Now step T2 once.
+
+T2 counts 2, even though the table already holds a version saying Alice is off call. The narration shows the check Postgres runs on every version a scan finds, in its function `HeapTupleSatisfiesMVCC`. T2's snapshot reads `xmax 102, running [101]`. A snapshot's own `xmax` is the first xid that hadn't been handed out yet, and the list holds xids that were still running when it was taken. (The names clash with the version fields: on a version, `xmin` and `xmax` say who created and replaced it, while on a snapshot they bound which xids count as finished.) Version #3 has `xmin 101`, and 101 is in T2's running list, so as far as T2 is concerned that version doesn't exist yet. Version #1 has `xmax 101` for the same reason, so to T2 nobody has replaced it, and it's visible. One xid in a short list decides both.
+
+Commit T1. The dots in T2's column don't move, because T2's snapshot was fixed at its first statement and T1's commit came later. Step T2 again. Only now, on its first write, does it get an xid, 102. Postgres hands out xids that way, so a transaction that only reads never uses one, and a transaction's xid tells you when it first wrote, not when it began.
+
+Commit T2, and nobody is on call again. Write skew didn't need the two reads to happen at the same moment. It only needed each transaction to read before the other's write was visible to it. Press **Try every interleaving**: of the 20 orders the two three-statement scripts can run in, 18 leave nobody on call. The two that are safe are the ones where one transaction finishes completely before the other starts.
+
+### 3. A lost update, and the one snapshot isolation does stop
+
+Switch to **Lost update** and **Read committed**, the Postgres default. Each transaction reads a counter, adds 1 in the application, and writes the result back as a fixed number. Step T1, T2, T1, T2. T2's update has to wait: the version it wants to replace already has `xmax 101` from T1, which is still running, and T1 holds the row lock.
+
+<Predict
+  q="T1 commits, which wakes T2's waiting UPDATE. At read committed, what is n at the end?"
+  options={[
+    "2: both increments count",
+    "1, and T2 gets an error",
+    "1, and both transactions commit",
+    "0",
+  ]}
+  answer={2}
+>
+1, with no error. At read committed, a waiting update follows the row's chain of versions to the newest one, version #2 that T1 just wrote, checks that its `WHERE` clause still matches, and writes on top of it. But T2's new value, `n = 1`, was computed from the 0 it read earlier, so T1's increment is simply overwritten. That's a **lost update**.
+</Predict>
+
+Now switch to **Repeatable read** and press **Play T1, T2, T1, T2, T1, T2**. This time T2 wakes up and fails with `ERROR 40001: could not serialize access due to concurrent update`. The version in T2's snapshot was replaced by a transaction that committed after that snapshot was taken, and under first-updater-wins that's an error, not a silent overwrite. `40001` is the code for a **serialization failure**, Postgres's way of saying "you conflicted, run the whole transaction again". Press **Retry T2** and step it through: it reads 1, writes 2, and both increments count.
+
+The difference between the two scenarios is the whole lesson of snapshot isolation. Two writers of the same row always collide, so it stops lost updates. Two writers of different rows never collide, so it can't stop write skew. At read committed, writing `SET n = n + 1` in the `UPDATE` instead of a number computed in the application would also have been safe, because the waiting update re-evaluates that expression against the newest version.
+
+### 4. Serializable waits for a commit
+
+Switch back to **Write skew**, choose **Serializable**, and repeat the first experiment: T1, T2, T1, T2. Postgres implements this level as **serializable snapshot isolation** (SSI). It's snapshot isolation plus bookkeeping about reads. Each read leaves an **SIREAD lock**, a marker that blocks nobody and is only checked when someone writes. When a transaction writes something another concurrent transaction read, without that reader's snapshot being able to see the write, SSI records an **rw-antidependency**, drawn in the panel as an arrow from reader to writer. Cahill, Röhm and Fekete showed that every anomaly snapshot isolation allows contains two such arrows in a row, which the Postgres source calls the **dangerous structure**. With two transactions, that means an arrow each way.
+
+After T2's update both arrows are drawn.
+
+<Predict
+  q="Both rw arrows now exist and both transactions are still running. When does Postgres abort one of them?"
+  options={[
+    "Right now, on T2's UPDATE",
+    "When T1 commits, it aborts T1",
+    "It lets T1 commit and fails T2 at its next statement",
+    "Never: both commit",
+  ]}
+  answer={2}
+>
+It waits. An anomaly can only happen once one side commits, so Postgres takes no action while both are running. When T1 commits, it finds the dangerous structure with T2 still running, lets T1 through, and marks T2 to fail. T2's `COMMIT` then gets `ERROR 40001: could not serialize access due to read/write dependencies among transactions`. Choosing to abort the transaction that hasn't committed means its retry runs after T1's commit, sees only one doctor on call, and stays. Press Retry T2 to watch that happen.
+</Predict>
+
+Now try T1, T2, T1, T1 (commit), T2. T2 fails on its `UPDATE` this time, before writing anything, because the moment the second arrow forms, T1 has already committed and T2 is the only one that can still be stopped. Press **Try every interleaving** at serializable: all 18 orders that broke the rule now end in a serialization failure, and the two serial orders still run clean. Then try **Lost update** at serializable. It behaves exactly like repeatable read, because the first-updater-wins rule fires before SSI's arrows matter.
+
+## What this shows
+
+Every behaviour in this lab comes from a handful of numbers. Each version carries the xid that created it and the xid that replaced it, and each snapshot is a cutoff plus a short list of running xids. Read committed takes a fresh snapshot for every statement and, when a writer it waited for commits, writes on top of the newest version. Repeatable read keeps one snapshot and refuses to replace a version someone else replaced after that snapshot, which stops lost updates but not write skew. Serializable adds a record of what each transaction read and aborts when two rw arrows line up, which catches the doctors.
+
+The lab simplifies in a few ways. There are only two transactions and one tiny table, and every read is a full scan, so its SIREAD lock covers the whole table. Real Postgres locks individual rows and index pages when a query uses an index, and promotes many fine locks into coarse ones when memory runs short. It also has optimisations for read-only transactions, described in Ports and Grittner's paper on the implementation ("Serializable Snapshot Isolation in PostgreSQL", VLDB 2012), which the lab leaves out. One consequence: in the lab, every SSI abort prevents a real anomaly. In Postgres, a dangerous structure doesn't always close into a cycle, and coarse locks report conflicts that didn't happen, so SSI sometimes aborts transactions that would have been fine. Your application needs a retry loop for `40001` either way.
+
+## Where this comes from
+
+- [Transactions and isolation](/topics/19-transactions-isolation), the sections "Row versions and snapshots in Postgres" (the snapshot and the visibility check), "Lost updates", "Write skew" (the same two doctors) and "Serializable" (how SSI finds the cycle).
+- [Postgres internals](/topics/21-postgres), the section "Who sees which version", which shows the versions sitting in a real table page.

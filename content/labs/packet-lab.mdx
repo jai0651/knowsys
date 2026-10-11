@@ -1,0 +1,114 @@
+---
+title: "Packet Path Lab"
+dek: "Follow one write() of 2,896 bytes through every layer of the Linux send path, across the wire and up the receiving machine's stack, one hop per click. Watch the headers go on and come off, count the copies and interrupts, then break the trip in four different ways."
+---
+
+When your program calls `write()` on a TCP socket and gets back 2,896, it's tempting to picture those bytes at the other machine. They aren't there yet, and may never be. What the call actually did was hand the bytes to a long chain of kernel code: TCP numbers them, IP addresses them, a firewall gets a look at them, a queue decides when they leave, and the network card pushes them onto a cable. On the other machine a matching chain runs in reverse until a sleeping thread wakes up in `read()`. This lab lets you walk that chain one hop at a time and see what each layer adds, removes and costs.
+
+The example is small enough to check by hand. A program on 10.0.0.1 writes 2,896 bytes to a server listening on 10.0.0.2, port 8080. The two machines sit on the same Ethernet network, with the usual **MTU** (the largest packet the link carries) of 1,500 bytes. TCP timestamps are on, as they are by default on Linux, which makes the TCP header 32 bytes: 20 fixed bytes plus 12 bytes of options. So the most data one packet can carry, the **MSS** (maximum segment size), is 1,500 − 20 − 32 = 1,448 bytes, and our write is exactly two segments' worth.
+
+The left column is the sender's stack and the right column is the receiver's, with your program at the top and the network card at the bottom. The wire runs between the two cards. Below them, "The bytes now" shows the packet as it stands after the last hop, header by header with real sizes, and the panel beside it opens whichever header that hop touched, laid out in 4-byte rows the way the RFCs draw them. The counters keep a running bill, and the line at the bottom says what just happened and why.
+
+<PacketLab />
+
+## Things to try
+
+### 1. Count the copies
+
+Leave every toggle off and press **Next hop** until the ACK comes home. Before you start, guess what the trip costs the CPU in copying.
+
+<Predict
+  q="Your 2,896 bytes travel through about twenty hops between write() and read(). How many times does a CPU copy them?"
+  options={[
+    "Never: the card does everything by DMA",
+    "Twice: once into the kernel, once out of it",
+    "Four times: once per protocol layer on each side",
+    "Once per hop, about twenty",
+  ]}
+  answer={1}
+>
+Two. `tcp_sendmsg` copies your bytes into an **sk_buff** (skb), the record the kernel uses to describe a packet, and `tcp_recvmsg` copies them out of one into the reader's buffer. Everything in between moves a pointer, not the payload. Each layer adds its header in the skb's **headroom**, empty space reserved in front of the data for exactly this. TCP keeps a copy for retransmission by **cloning** the skb, which shares the data. The cards move bytes between memory and the wire by **DMA** (direct memory access), with no CPU involved.
+</Predict>
+
+Watch "The bytes now" on the way down. The skb starts with your 2,896 bytes and a dashed block of headroom. TCP pushes 32 bytes in front, IP pushes 20, and the neighbour layer, which knows the next machine's hardware address from its ARP table, pushes the 14-byte Ethernet header. At the card each frame also gets a 4-byte **FCS**, a checksum over the whole frame, so a full frame is 14 + 20 + 32 + 1,448 + 4 = 1,518 bytes. On the receiving side the same headers come off in reverse order. The FCS goes at the card, Ethernet in the driver's poll, IP after the INPUT hook, and TCP when the data joins the socket's receive queue.
+
+The other counters tell the same story. There are two syscalls, `write()` and `read()`, and only one **context switch**, when the scheduler puts the sleeping reader back on a CPU. Entering the kernel for `write()` is a mode switch on the same thread, which is much cheaper. There are three interrupts: the receiving card's arrival interrupt, the sending card's completion interrupt, and the ACK arriving back at the sender. One interrupt covers both arriving frames, because the receive side uses **NAPI**: the interrupt only schedules a softirq, and the softirq polls the ring for every frame waiting there.
+
+### 2. Who cuts the segment?
+
+Your write is two segments' worth, but TCP builds it as a single 2,896-byte skb marked with a segment size of 1,448. Someone has to cut it in two before it reaches the wire. With **TSO** (TCP segmentation offload) on, the card does it in hardware. Switch to **TSO off (GSO)** and step through again.
+
+<Predict
+  q="With TSO off, the kernel cuts the skb in software instead. What changes on the wire?"
+  options={[
+    "Twice as many frames go out",
+    "The frames are smaller",
+    "Nothing: the same two 1,518-byte frames",
+    "The receiver has to reassemble them itself",
+  ]}
+  answer={2}
+>
+Nothing on the wire changes. **GSO** (generic segmentation offload) does the same cut in software, as late as it can: after the qdisc, just before the driver, in `validate_xmit_skb`. Everything above that point still handles one big skb, so the saving TSO gives is mostly at the very bottom. You can see it in the **skbs to driver** counter, 1 with TSO and 2 without. The receiver can't tell the difference either, and its **GRO** (generic receive offload) merges the two frames back into one skb before IP sees them.
+</Predict>
+
+That's why Linux keeps GSO on even for cards with no TSO: the expensive part is the trip through the layers, and cutting late pays for it once per large skb.
+
+### 3. Lose it on the wire
+
+Turn on **Lose it on the wire** and step until the frames vanish. The receiving card sees that the FCS doesn't match and throws the frames away, and nothing tells the sender. The only thing that notices is a timer TCP started when it sent the data, the **retransmission timeout** or RTO.
+
+<Predict
+  q="Both frames are lost. When the RTO fires, what does TCP send?"
+  options={[
+    "Both segments again, straight away",
+    "Both segments, after about 200 ms",
+    "Only the first 1,448 bytes, after about 200 ms",
+    "Nothing until the application calls write() again",
+  ]}
+  answer={2}
+>
+The RTO on a fast local network is about 200 ms, because by default Linux never sets it lower than that. When it fires, Linux treats the timeout as a sign of serious congestion and cuts its **congestion window**, the amount it may have in flight, to a single segment. So the retransmission carries bytes 1 to 1,448, and the second half waits for that one's ACK. The application isn't involved: the bytes were in the kernel's retransmit queue all along, so no new copy is needed. Watch the receiver's `read()` return 1,448, which is a useful reminder that `read()` returns whatever has arrived, not what the other side wrote.
+</Predict>
+
+The timer-waits counter ends at 200 ms, against a trip that otherwise takes microseconds, which is why one lost packet shows up as a latency spike. One honest caveat: a stock kernel would usually recover faster, because it sends a **tail loss probe** after about two round trips, before the RTO. The lab models a kernel with that switched off (`net.ipv4.tcp_early_retrans=0`) so the RTO itself is visible.
+
+### 4. A firewall rule, on each side
+
+Put the **iptables DROP** on **INPUT**, the receiver's hook for traffic addressed to itself, and step through. Then move it to **OUTPUT**, the sender's hook for traffic it generates.
+
+<Predict
+  q="With a DROP rule on the receiver's INPUT hook, what does the sender's write() return?"
+  options={[
+    "An error, EPERM",
+    "An error, ECONNREFUSED",
+    "2,896, as if nothing were wrong",
+    "It blocks until the rule is removed",
+  ]}
+  answer={2}
+>
+`write()` returns 2,896, because it returned before the packet even left the sender. A DROP rule sends nothing back, so the sender only sees that no ACK arrives. It retransmits on the RTO, with the timeout doubling each time (200, 400, 800 ms and on), and only after `net.ipv4.tcp_retries2` attempts, 15 by default and about fifteen minutes in all, does the socket report an error, usually ETIMEDOUT. That's why a DROP rule makes a connection hang where a REJECT rule, which answers with an error packet, makes it fail fast.
+</Predict>
+
+On OUTPUT the drop happens on the sender's own machine, so netfilter can return an error (EPERM) to TCP straight away. Your program still never sees it, because TCP holds the data and simply tries again on a timer. Notice also which table each rule lives in. iptables' default filter table has INPUT, OUTPUT and FORWARD chains only, so a DROP at PREROUTING has to go in the raw or mangle table, and one at POSTROUTING in mangle. PREROUTING is the earliest iptables can drop on the receiver; the XDP hook, in the driver's poll before any skb exists, is earlier still.
+
+### 5. A receiver that isn't reading
+
+Clear the other toggles and turn on **Receive buffer full**. Here the receiving application has stopped calling `read()`, its socket's receive buffer has filled, and its last ACK told the sender its **window**, the room it has left, is 0.
+
+The sender doesn't send at all. TCP checks the window before transmitting, finds it closed, and leaves the skb on the write queue, and `write()` still returns 2,896. A **persist timer** makes TCP send a small **zero-window probe** now and then to ask whether the window has opened. The window opens only when the receiving app reads and its TCP sends a window update. At that point the send runs in the softirq that processed the update, not in your thread, which is why the driver step no longer mentions `write()` returning.
+
+TCP's window is flow control: a slow reader slows the sender down and nothing is lost. Chapter 10 shows UDP in the same situation, where datagrams are silently discarded at the full buffer.
+
+## What this shows
+
+A successful `write()` means the kernel has your bytes, nothing more. Everything after that runs on the kernel's schedule: inside the `write()` call if TCP may send at once, otherwise in a softirq later, and possibly many times over if packets are lost. The data crosses the user–kernel boundary only twice, and the trip through the layers in between is mostly pointer work on one skb, with headers pushed into reserved space and pulled off again.
+
+The costs that do pile up are per packet: a hop through every layer, an interrupt, a wake-up. That's why so much of the design is about doing them less often. TCP builds large skbs, GSO and TSO cut them as late as possible, NAPI takes many frames per interrupt, and GRO merges them again on arrival. And the failures that matter are quiet ones. A lost frame, a DROP rule and a full receive buffer all leave `write()` returning success, and you find out from a timer, a counter or a stalled connection.
+
+The model leaves things out on purpose. It has one connection and no other traffic, so qdiscs never queue and rings never fill, and it skips delayed ACKs, pacing and congestion-window growth beyond two segments.
+
+## Where this comes from
+
+- [Chapter 10, Linux networking](/topics/10-linux-networking), section 7, "The way back out", for the send path from `write()` to the TX ring; section 2, "From the wire into memory", for rings, DMA and NAPI; section 3, "A record for each packet, and the climb up the stack", for sk_buff, GRO and the netfilter hooks; and section 5.1, "The socket receive buffer", for the receive window and what UDP does instead.
+- [Chapter 07, Syscalls and the kernel boundary](/topics/07-syscalls-kernel-boundary), section 3, "Inside one write()", for the crossing into the kernel, and section 6, "Interrupts: the door from the other side".
+- [Chapter 48, eBPF](/topics/48-ebpf), section 5, "From C source to a dropped packet", for the XDP hook that runs before any of the receive path in this lab.
