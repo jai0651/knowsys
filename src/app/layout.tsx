@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from "next";
+import { Analytics } from "@vercel/analytics/next";
 import { SITE } from "@/lib/site";
 import { JetBrains_Mono, Plus_Jakarta_Sans } from "next/font/google";
 import "./globals.css";
@@ -67,6 +68,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       </head>
       <body className="min-h-screen">
         {children}
+        {/* Page views and referrers, cookieless. Reader notes and streaks
+            stay in the browser and are not part of it. */}
+        <Analytics />
       </body>
     </html>
   );
