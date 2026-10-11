@@ -4,12 +4,13 @@ import { Sidebar } from "@/components/sidebar";
 import { PageCard } from "@/components/page-card";
 import { groups, topics, labs } from "@/lib/manifest";
 import { cn } from "@/lib/utils";
+import { pageMeta } from "@/lib/site";
 
-export const metadata: Metadata = {
-  alternates: { canonical: "/sections" },
-  title: "Browse every chapter",
-  description: "Every chapter and lab, grouped by subject.",
-};
+export const metadata: Metadata = pageMeta(
+  "/sections",
+  "Browse every chapter",
+  "Every KnowSys chapter and lab, grouped by subject: the machine, the OS, concurrency, databases, distributed systems, the cloud and system design case studies.",
+);
 
 const DOT: Record<string, string> = {
   machine: "bg-machine", os: "bg-os", conc: "bg-conc", data: "bg-data",

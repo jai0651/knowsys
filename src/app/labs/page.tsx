@@ -3,12 +3,13 @@ import { TopNav } from "@/components/top-nav";
 import { Sidebar } from "@/components/sidebar";
 import { PageCard } from "@/components/page-card";
 import { labs } from "@/lib/manifest";
+import { pageMeta } from "@/lib/site";
 
-export const metadata: Metadata = {
-  title: "The Labs",
-  description:
-    "Step through one mechanism at a time, on an example small enough to check by hand.",
-};
+export const metadata: Metadata = pageMeta(
+  "/labs",
+  "The Labs",
+  "Interactive labs: run Raft by hand, watch cache lines bounce between cores, step through MVCC, follow a packet through Linux.",
+);
 
 export default function LabsPage() {
   return (

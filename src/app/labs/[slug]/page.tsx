@@ -1,3 +1,4 @@
+import { pageMeta } from "@/lib/site";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -21,7 +22,7 @@ export async function generateMetadata({
   const page = pageBySlug(slug);
   if (!page) return {};
   const description = readDoc("labs", slug)?.frontmatter.dek ?? page.hook;
-  return { title: page.title, description, alternates: { canonical: page.href } };
+  return pageMeta(page.href, page.title, description);
 }
 
 export default async function LabPage({ params }: { params: Promise<{ slug: string }> }) {

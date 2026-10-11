@@ -1,3 +1,5 @@
+import type { Metadata } from "next";
+
 /* One place for the facts every page's metadata repeats. */
 export const SITE = {
   url: "https://knowsys.tech",
@@ -11,3 +13,16 @@ export const SITE = {
     "performance engineering", "site reliability engineering", "learn systems programming",
   ],
 };
+
+/** Canonical URL plus share-card tags for a page. Pages that set none inherit
+ *  the layout's, which name the homepage, so a shared link to /labs would
+ *  preview as the homepage and tell crawlers it's a copy of "/". */
+export function pageMeta(path: string, title: string, description: string): Metadata {
+  return {
+    title,
+    description,
+    alternates: { canonical: path },
+    openGraph: { type: "website", siteName: SITE.name, locale: "en_US", url: path, title, description },
+    twitter: { card: "summary_large_image", title, description },
+  };
+}

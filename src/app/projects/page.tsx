@@ -4,12 +4,13 @@ import { ArrowRight } from "lucide-react";
 import { TopNav } from "@/components/top-nav";
 import { Difficulty } from "@/components/difficulty";
 import { allProjects } from "@/lib/projects";
+import { pageMeta } from "@/lib/site";
 
-export const metadata: Metadata = {
-  alternates: { canonical: "/projects" },
-  title: "Build it yourself",
-  description: "Game engines, browsers, kernels, containers, databases: the projects that teach systems best, with a roadmap for each.",
-};
+export const metadata: Metadata = pageMeta(
+  "/projects",
+  "Build it yourself",
+  "Game engines, browsers, kernels, containers, databases: the projects that teach systems best, with a roadmap for each.",
+);
 
 export default function ProjectsPage() {
   const projects = allProjects();

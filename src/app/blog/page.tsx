@@ -3,12 +3,13 @@ import Link from "next/link";
 import { ArrowRight } from "lucide-react";
 import { TopNav } from "@/components/top-nav";
 import { allPosts, formatDate } from "@/lib/posts";
+import { pageMeta } from "@/lib/site";
 
-export const metadata: Metadata = {
-  alternates: { canonical: "/blog" },
-  title: "Field notes",
-  description: "Outages, reproductions and wrong numbers, each told start to finish.",
-};
+export const metadata: Metadata = pageMeta(
+  "/blog",
+  "Field notes",
+  "Outages, reproductions and wrong numbers, each told start to finish.",
+);
 
 export default function BlogIndex() {
   const posts = allPosts();
