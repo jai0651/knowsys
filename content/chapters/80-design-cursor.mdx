@@ -1,0 +1,1101 @@
+---
+title: Designing Cursor
+dek: "Ananya changes one function signature in a 40,000-file repo, and her editor guesses the next thirty edits before she makes them. We'll design the AI code editor that does it, through the hard problems its makers solved: a suggestion on every keystroke, knowing when to stay quiet, rewriting a file at a thousand tokens a second, finding code in a huge repo and keeping that index private, checking the AI's work, and training their own models."
+readingTime: "~55 min"
+level: "Advanced"
+versions: "Figures from Cursor's blog, docs, security page and changelog, the Lex Fridman interview with its founders, Turbopuffer and Fireworks case studies, and filings, dated where they appear"
+prereqs: "the Claude Code case study (chapter 78) and the ChatGPT case study (chapter 54) help a lot; caching (chapter 25) and search engines (chapter 62) help"
+updated: "2026-11-09"
+---
+
+Ananya works on the payments team of a Bengaluru fintech, in a TypeScript monorepo of about 40,000 files. Today's job is small and tedious. A function called `formatAmount(paise)` turns an amount in paise into a string like "₹1,250.00", and now that the company takes payments in dirhams and dollars, it needs a second argument, `currency`. She opens `money/format.ts` in Cursor, types `, currency: Currency` into the signature, and before she has reached for the next file a faint grey suggestion appears further down: the line that builds the string, already rewritten to use `currency`. She presses Tab. The cursor jumps to the next line that needs changing, with that change also suggested. Tab again.
+
+Then she opens the chat panel and types: *update every caller of formatAmount to pass the currency; INR unless the order says otherwise.* The agent finds 31 call sites across 19 files, some of which never mention the name `formatAmount` directly because they go through a wrapper. Diffs appear in each file within a second or two of each other, the type checker goes quiet, and she reviews the changes file by file.
+
+It feels like a text editor with a clever friend inside it. But every part of that session was a hard engineering problem. The grey suggestion had to be computed by a model in a data centre, from about 13,000 tokens of her code, between two keystrokes, and four hundred million times a day across all users. A 600-line file had to be rewritten in a few seconds, not a minute. The agent had to find 31 call sites in 40,000 files, which means someone had to index a codebase they promised never to store. And the edits had to be checked against the type checker without touching her files until she agreed.
+
+So the question this case study answers is: **how does an editor put a model's suggestions into your code fast enough to keep up with your typing, and correct enough to trust, in a repository far too big for the model to read?** We'll start from the simplest AI editor, find where it breaks, and work through the hard problems Cursor's makers (a company called Anysphere) solved, in roughly the order they hit them. For each one we'll see why it's hard, how the obvious approach fails, what Cursor did and when, and what it cost. Chapter 78 covered the agent loop, compaction, prompt caching and sandboxing for Claude Code; we'll lean on that chapter and spend our time on what Cursor does differently.
+
+<SectionHeading n="01" id="requirements">What we're building, and how big</SectionHeading>
+
+<Sub n="1.1" title="What it has to do">
+
+Cursor is a code editor. It began in 2023 as a fork of Microsoft's open-source VS Code, so it looks and behaves like VS Code, with the same extensions, and adds AI features on top. Its job comes down to this list:
+
+1. **Predict the next edit as you type** and offer it inline, so pressing Tab accepts it. This feature is called **Tab**.
+2. **Answer questions and make changes from a chat panel**, from a one-line fix to a task across many files, carried out by an agent.
+3. **Apply a model's proposed change to a file** quickly and exactly, as a diff the developer can review.
+4. **Know the codebase**, including the parts the developer hasn't opened, without the developer pasting them in.
+5. **Check its own work** against the compiler, type checker and tests.
+6. **Run several agents at once**, locally or in the cloud, without them trampling each other's files.
+
+And the qualities it needs:
+
+- **Fast at keystroke speed**: a suggestion that arrives after the developer has typed the next character is worthless.
+- **Quiet when unsure**: a wrong suggestion interrupts the developer and trains them to ignore all suggestions.
+- **Private**: companies won't let an editor upload their source code to be stored, so whatever is kept on servers can't be the code.
+- **Affordable**: a flat monthly price has to cover models that charge per token.
+
+That first quality separates this case study from chapter 78. Claude Code's agent works for minutes; Cursor's Tab has a few hundred milliseconds, on every keystroke, and much of this chapter's first half is about that budget.
+
+</Sub>
+
+<Sub n="1.2" title="How big is it?">
+
+Cursor grew faster than almost any software company before it. Its own funding announcements give the milestones: in June 2025 it raised $900 million at a $9.9 billion valuation and said it had passed $500 million in annual recurring revenue, with customers including over half of the Fortune 500. In November 2025 it raised $2.3 billion at a $29.3 billion valuation and said annualised revenue had crossed $1 billion, with a staff of over 300. Bloomberg reported in March 2026 that the run rate had doubled again to over $2 billion in three months. In June 2026 SpaceX agreed to buy the company for $60 billion in stock, and SpaceX's quarterly filing records that the merger completed on 14 August 2026.
+
+For the engineering, the number that matters most comes from a September 2025 Cursor post: Tab was "handling over 400 million requests per day". In January 2025, Cursor said its new Tab model took about 13,000 tokens of context per request, up from 5,500.
+
+<Think
+  q="Take 400 million Tab requests a day, each carrying about 13,000 tokens of context and producing a suggestion of, say, 50 tokens. How many tokens per second does the model read, on average, and how does that compare with what it writes?"
+  hint="A day has 86,400 seconds. Then multiply by the tokens each request reads, and separately by the tokens each writes."
+>
+400 million ÷ 86,400 is about 4,600 requests a second on average, and probably two or three times that during working hours in the big time zones. Each reads about 13,000 tokens, so the model reads around **60 million tokens a second**, and writes about 4,600 × 50 ≈ 230,000. That's more than 250 tokens read for every token written.
+
+Two things follow. Like chapter 78's agent, Tab is dominated by reading (prefill), so its cost and its latency are decided by how much of each prompt can be reused from the previous one. And because a person typing sends a new request every keystroke, most of those requests are almost identical to the one before, differing by one character near the cursor. That's both the problem and the opportunity of section 3.
+</Think>
+
+(A **token** is the unit a language model reads and writes, a word or a piece of a word, as chapter 54 explains. **Prefill** is the pass in which a model reads its whole input before writing anything; chapter 54 covers it in detail.)
+
+</Sub>
+
+<SectionHeading n="02" id="v1">Version 1: a chat panel beside the editor</SectionHeading>
+
+<Sub n="2.1" title="The obvious design">
+
+Picture the simplest AI editor: an ordinary editor with a chat panel bolted on. When Ananya asks a question, the editor sends the open file and her message to a frontier model's API, the most capable general-purpose model it can buy, and shows the reply. If the reply contains code, there's a button to paste it in.
+
+<SystemDiagram
+  title="Version 1: an editor, a chat panel and a model API"
+  nodes={[
+    { id: "ananya", label: "Ananya", sub: "types, asks", kind: "users", col: 0, row: 0 },
+    { id: "editor", label: "Editor", sub: "open file", kind: "laptop", col: 1, row: 0 },
+    { id: "chat", label: "Chat panel", sub: "in the editor", kind: "client", col: 1, row: 1 },
+    { id: "api", label: "Frontier model", sub: "API, per token", kind: "external", col: 2, row: 1 },
+  ]}
+  edges={[
+    { from: "ananya", to: "editor" }, { from: "editor", to: "chat", label: "open file" },
+    { from: "chat", to: "api", label: "file + question" },
+  ]}
+  steps={[
+    { caption: "Ananya changes the signature of `formatAmount` and asks the chat panel to update the callers.", path: ["ananya", "editor", "chat"] },
+    { caption: "The panel sends the open file and her request to a frontier model. The model has never seen the other 39,999 files, so it can't know where the callers are.", path: ["chat", "api"] },
+    { caption: "Several seconds later a reply streams back with advice and code for the one file it saw. Ananya pastes it in by hand and goes looking for the callers herself.", path: ["api", "chat", "editor"] },
+  ]}
+  caption="The model is smart and far away. It sees one file, answers in seconds, and leaves Ananya to do the finding and the applying."
+/>
+
+This design breaks in four places, and each one is a section of this chapter.
+
+- **It's too slow for typing.** A frontier model takes a second or more just to start answering. That's fine for a chat, and useless for a suggestion between keystrokes (section 3).
+- **It doesn't know when to keep quiet.** If we did ask for a suggestion on every keystroke, most would be wrong or unwanted, and each one pulls Ananya's eyes away from what she's writing (section 4).
+- **It can't apply its own answer.** The model's reply is a snippet or a sketch with "... rest of the file unchanged". Turning that into a correct edit of a 600-line file is a problem of its own (section 5).
+- **It sees one file.** The callers are in 19 other files. Finding them means searching a codebase the model can't read in full (sections 6 to 8).
+
+We'll start with the first, because it shaped the company. Chapter 78's agent could afford to be slow. Tab couldn't.
+
+</Sub>
+
+<SectionHeading n="03" id="tab">Hard problem 1: a suggestion between two keystrokes</SectionHeading>
+
+<Sub n="3.1" title="Predict the next edit, not the next word">
+
+Early AI completion tools, such as GitHub Copilot in 2021, predicted the text that comes next at the cursor: you type `function isEven(n) {` and it suggests the body. That only helps when you're writing new code at the end of a line.
+
+Ananya isn't writing new code. She's changing existing code, and the change she just made in the signature implies other changes further down the file: the body has to use `currency`, the JSDoc comment has to mention it, the call inside the same file needs a new argument. None of those are at her cursor. Cursor's makers described the goal in their 2024 interview with Lex Fridman as eliminating "all the low entropy actions you take inside of the editor": once her intent is clear from the first edit, the rest is predictable, and the editor should "jump you forward in time".
+
+So Tab predicts a **next edit**: given the file, the cursor position and the edits she just made, what change, anywhere nearby, comes next? The suggestion can delete and replace text on several lines, not only insert at the cursor. In May 2024 Cursor extended this to predicting the next *location* as well, so pressing Tab can move the cursor to the line that needs changing and show the change there. In the interview one founder described it as pressing Tab and having the editor "go 18 lines down and then show you the next edit". Cursor calls these moves **jumps**.
+
+Predicting edits means training on sequences of edits, which a model trained on finished files has never seen. That's the first reason Cursor couldn't just call someone else's API.
+
+</Sub>
+
+<Sub n="3.2" title="Where the milliseconds go">
+
+Here's what has to happen between Ananya's keystroke and the grey text appearing:
+
+<Steps
+  title="One Tab request, keystroke to grey text"
+  lanes={[
+    { t: "Editor", s: "collect context" },
+    { t: "Network", s: "to the backend" },
+    { t: "Backend", s: "build the prompt" },
+    { t: "Model", s: "prefill + decode" },
+    { t: "Editor", s: "show the diff" },
+  ]}
+  steps={[
+    [0, "Ananya types a character. The editor gathers the file around the cursor, her recent edits and related snippets, about 13,000 tokens' worth."],
+    [1, "The request travels to Cursor's servers. Cursor runs latency-critical servers in Tokyo and London as well as the US, to keep this hop short."],
+    [2, "The backend assembles the final prompt in a fixed format and picks a model server."],
+    [3, "The model reads the 13,000 tokens (prefill) and writes the suggestion, a few dozen tokens (decode)."],
+    [4, "The editor turns the predicted text into a diff against the file and draws it in grey, unless Ananya has typed something new meanwhile."],
+  ]}
+/>
+
+Cursor published the server side of that budget when it released a new Tab model, which it called Fusion, in January 2025: the median server latency fell from 475 ms to 260 ms, while the context grew from 5,500 to 13,000 tokens and the suggestions got "over 10x longer". Network time comes on top. So the whole round trip lives in a few hundred milliseconds, about the time between two keystrokes for a fast typist.
+
+<Why>Why not use the best model available and accept the wait?</Why>
+
+Because the shape of the work is wrong for a big model. Section 1.2 showed that Tab reads about 13,000 tokens and writes a few dozen. With so few decode steps, the latency is dominated by prefill, the time to read the prompt, and prefill time grows with the size of the model. A frontier model with maybe hundreds of billions of active weights would spend most of the budget just reading. The founders explained their answer in the 2024 interview: Tab sees very long prompts of the user's code and needs very low latency, so "you need to train small models on this task", and "the perfect fit for that is using a sparse model, meaning an MOE model".
+
+A **mixture-of-experts** (MoE) model splits each layer's feed-forward network into many smaller networks called experts, and a small router picks a few of them for each token. The model holds many weights, so it knows a lot, but each token passes through only a fraction of them, so it costs about as much to run as a much smaller dense model. That fits a workload that reads a lot and must answer fast. Cursor hasn't published the size of its Tab models; judging by the latency, they're probably a small fraction of a frontier model's size.
+
+<Decision
+  q="Which model should produce inline suggestions?"
+  options={[
+    { name: "A frontier model's API", how: "Send each keystroke's context to the best general model.", good: ["The smartest model available", "Nothing to train or serve"], bad: ["Seconds to first token: too slow for typing", "Trained on finished code, not on edits", "Per-token prices on a workload that reads 250 tokens per token written"] },
+    { name: "A small custom model", how: "Train a sparse model on edit sequences; serve it on dedicated capacity.", good: ["A few hundred ms, including a long prompt", "Predicts edits and jumps, the actual task", "Can be retrained on users' accept and reject signals"], bad: ["A training and serving team to build", "Weaker at hard reasoning than frontier models"], chosen: true },
+  ]}
+>
+Cursor chose its own models for Tab from the start, when the feature was still called Copilot++, and its June 2025 security page lists the inference company Fireworks as the host of "our custom models". Chat and agents used frontier models from OpenAI, Anthropic and others. That split, small and fast models of its own for the high-frequency work and bought models for the hard reasoning, is the architecture's first big decision, and section 10 shows Cursor later pushing its own models into the agent too.
+</Decision>
+
+</Sub>
+
+<Sub n="3.3" title="Reusing the work between keystrokes">
+
+Even a small model has to read 13,000 tokens. So the trick is to avoid reading them from scratch every time.
+
+Chapter 54 explained the **KV cache**: as a model reads a prompt, it computes for every token and every layer a key and a value vector, and a later request that starts with exactly the same tokens can reuse those vectors instead of recomputing them. Chapter 78 showed how Claude Code arranges its prompts so each call shares a long prefix with the one before. Tab's case is more extreme. Between two of Ananya's keystrokes, almost everything in the prompt is the same: the same file, the same related snippets, the same recent edits. Only the region around the cursor changed.
+
+In the 2024 interview the founders described three ways Cursor exploits this:
+
+- **Caching-aware prompts.** "You need to design the actual prompts you use for the model such that they're caching aware". In practice that means the stable parts (other files, snippets from elsewhere in the repo) go first and the parts that change with every keystroke (the lines around the cursor) go last, so a new keystroke invalidates only the tail of the cached prefix.
+- **Warming the cache.** As soon as Ananya starts typing in a file, the editor can send the file's contents ahead of any suggestion request, so the model servers build the KV cache for it in advance: "you can immediately warm the cache with let's say the current file contents". When the real request arrives, most of the prefill is already done, which "will significantly lower" the time to the first token.
+- **Predicting ahead.** When a suggestion is shown, Cursor can already request the *next* suggestion, assuming she accepts this one, and cache it. If she presses Tab, the follow-up suggestion is ready at once. That's what makes a chain of Tab, Tab, Tab through a file feel instant.
+
+<Callout label="Design implication">
+When requests from one user are nearly identical and arrive many times a second, the cache is the product. Order the prompt so the volatile part is at the end, start computing the stable part before anyone asks, and spend spare capacity guessing the next request. All three only work if the same user's requests reach the machine that holds their cache, the sticky routing that chapter 78, section 10.2, describes.
+</Callout>
+
+</Sub>
+
+<Sub n="3.4" title="Throwing away stale requests">
+
+There's one more source of waste. Ananya types `, currency` as ten keystrokes in maybe a second. If the editor sent a request on every keystroke and every request ran to completion, the model would compute ten suggestions, nine of which are out of date before they arrive: they're predictions for a file she has already changed. They can't even be shown, because they'd be suggesting edits to text that no longer exists.
+
+Two standard fixes come from old user-interface practice. **Debouncing** waits until the typing pauses for a moment before sending a request at all. **Cancellation** sends requests freely but tells the server to stop working on a request as soon as a newer one from the same editor arrives. Cursor hasn't published its exact policy, and it's probably some mix of the two, so here's what each one buys, on a simulated burst of 30 keystrokes with each suggestion costing 250 ms of model time (an illustrative figure):
+
+<TryIt what="Keystroke requests: send every one, cancel stale ones, or debounce" lang="python" toolchain="Python 3.14">
+```python
+import random
+random.seed(11)
+
+# Ananya types 30 keystrokes, 60-220 ms apart, then stops to read.
+t, keys = 0, []
+for _ in range(30):
+    t += random.randint(60, 220)
+    keys.append(t)
+WORK = 250   # ms of model time to produce one suggestion (illustrative)
+
+def run(debounce=0, cancel=False):
+    sent = gpu = 0
+    for i, k in enumerate(keys):
+        nxt = keys[i + 1] if i + 1 < len(keys) else float("inf")
+        start = k + debounce
+        if start >= nxt:              # another key arrived during the wait: never sent
+            continue
+        sent += 1
+        gpu += min(WORK, nxt - start) if cancel else WORK
+    return sent, gpu, debounce + WORK  # the last request is the only one shown
+
+print(f"{'strategy':28} {'sent':>4} {'model ms':>9} {'wait after last key':>20}")
+for name, kw in [("every key, no cancel", {}),
+                 ("every key, cancel stale", {"cancel": True}),
+                 ("debounce 50 ms + cancel", {"debounce": 50, "cancel": True}),
+                 ("debounce 150 ms + cancel", {"debounce": 150, "cancel": True})]:
+    sent, gpu, wait = run(**kw)
+    print(f"{name:28} {sent:>4} {gpu:>9,} {wait:>17} ms")
+```
+<Output>
+```
+strategy                     sent  model ms  wait after last key
+every key, no cancel           30     7,500               250 ms
+every key, cancel stale        30     4,521               250 ms
+debounce 50 ms + cancel        30     3,071               300 ms
+debounce 150 ms + cancel       17       946               400 ms
+```
+</Output>
+</TryIt>
+
+Read the columns as a trade. Without cancellation, the model does 7.5 seconds of work for one useful suggestion. Cancelling stale requests cuts that by about 40% at no cost to Ananya, because the suggestion she sees still arrives 250 ms after her last key. Debouncing saves much more compute, but every millisecond of debounce is added to her wait. A 150 ms debounce cuts model time by almost 90% and makes every suggestion feel 60% slower.
+
+That's why the techniques in 3.3 matter so much: cache warming and predicting ahead cut the 250 ms itself, which is the only way to save compute *and* time together. A cancelled request's prefill isn't wasted either, if its KV cache stays around for the next request, which shares almost the same prefix.
+
+</Sub>
+
+<SectionHeading n="04" id="quiet">Hard problem 2: knowing when to stay quiet</SectionHeading>
+
+<Sub n="4.1" title="A wrong suggestion has a cost">
+
+Suppose Tab is fast. It still has to decide, on each of those 400 million requests, whether to show anything. A suggestion that Ananya rejects isn't free: she has to read it, judge it wrong and keep typing around it, and enough wrong ones teach her to stop looking at grey text, at which point even the good ones are wasted. So the system needs a policy for when to speak.
+
+An obvious design is a separate filter: train a small classifier that predicts, from the context and the candidate suggestion, whether the user will accept it, and show the suggestion only above some threshold. Cursor's September 2025 post on Tab sets its own approach against that one.
+
+</Sub>
+
+<Sub n="4.2" title="Training on accept and reject">
+
+Cursor's approach is **reinforcement learning** (RL): instead of learning from examples of correct output, the model produces outputs, receives a numerical reward for each, and is updated to make high-reward outputs more likely. Cursor's method is a **policy gradient**: nudge the model's weights in the direction that raises the probability of the actions that earned more reward than average, and lowers the others. Here, the "action" includes the option of suggesting nothing.
+
+Cursor's post gives an example of the reward: 0.75 for a suggestion the user accepts, −0.25 for one they reject, and 0 for showing nothing. (The production reward is more involved, it says.)
+
+<Predict
+  q="With those rewards, when does the model maximise its expected reward by showing a suggestion instead of staying quiet?"
+  options={["Whenever it has any suggestion at all", "When it thinks the chance of acceptance is above 25%", "When it thinks the chance of acceptance is above 50%", "When it thinks the chance of acceptance is above 75%"]}
+  answer={1}
+>
+Above 25%. If the model believes the acceptance probability is p, showing earns 0.75p − 0.25(1 − p) = p − 0.25 on average, and staying quiet earns 0. Showing is worth it exactly when p is above 0.25. Cursor's post makes the same point: the policy should suggest only "when it estimates the accept chance is at least 25%". Nobody writes that threshold into the code. The model learns it, because that's what the rewards pay for, and moving the threshold means changing the rewards.
+</Predict>
+
+Here's the hard part: policy gradient methods need **on-policy** data: rewards for suggestions made by the current model, not by some older one, because the update is about what *this* model would do. Cursor's users generate those rewards with every accept and reject, so the loop is to ship a new model, collect a few hours of accept and reject signals, train on them, and ship again. According to the post, rolling out a checkpoint and collecting the data for the next step takes "1.5 to 2 hours", so new Tab models went out several times a day.
+
+<StepSequence
+  title="One turn of Tab's online RL loop"
+  actors={["Tab model (v41)", "Ananya and other users", "Logging", "Trainer"]}
+  messages={[
+    { from: 0, to: 1, label: "suggestion, or nothing", note: "Version 41 is serving. For each request it either shows an edit or stays silent." },
+    { from: 1, to: 2, label: "accept / reject", note: "Each shown suggestion is accepted (reward 0.75) or rejected (−0.25). Silence scores 0." },
+    { from: 2, to: 3, label: "an hour or two of rewards", note: "Only data from v41 is used: the policy gradient needs rewards for the current policy's own choices." },
+    { from: 3, to: 0, label: "v42", note: "The trainer raises the probability of rewarded choices and lowers the others, and v42 rolls out. The whole turn takes about 1.5 to 2 hours." },
+  ]}
+/>
+
+From the same post, the result: the new model made 21% fewer suggestions than the previous one, and the ones it did make had a 28% higher accept rate. Fewer interruptions, more of them right.
+
+<Decision
+  q="How should Tab decide whether to show a suggestion?"
+  options={[
+    { name: "A separate accept classifier", how: "A second model scores each candidate; show it above a threshold.", good: ["Simple to train from logs", "The threshold is an explicit knob"], bad: ["Filters suggestions but can't make them better", "A second model on the latency path"] },
+    { name: "Online RL on the Tab model itself", how: "Reward accepts, penalise rejects, retrain several times a day on fresh data.", good: ["One model learns both what to suggest and when", "Improves from real usage continuously"], bad: ["Needs fast, reliable training and rollout infrastructure", "The reward is a product decision dressed as maths"], chosen: true },
+  ]}
+>
+Cursor described the switch in September 2025. Notice the dependency: online RL is only possible because Tab is Cursor's own model, retrainable at will, and because at 400 million requests a day a couple of hours yields plenty of fresh rewards. A company that called a frontier API for completions couldn't do this at all.
+</Decision>
+
+<Elsewhere items={[
+  { where: "Recommendation feeds", how: "Ranking a feed by predicted engagement and retraining on clicks and skips is the same loop (chapter 58); so is the risk of optimising the reward instead of the user." },
+  { where: "RLHF", how: "Chat models are tuned with rewards from human preferences; Tab's rewards are cheaper, implicit and arrive millions of times a day." },
+  { where: "Spam filters", how: "Showing a wrong suggestion and hiding a good email are both precision-versus-recall choices, set by how much each mistake costs." },
+]} />
+
+So Ananya's Tab, Tab, Tab is fast and mostly right. The chat request is another matter: the agent has decided what to change in `checkout/summary.ts`, and now that change has to land in a 600-line file.
+
+</Sub>
+
+<SectionHeading n="05" id="apply">Hard problem 3: applying an edit to a big file</SectionHeading>
+
+<Sub n="5.1" title="Diffs, snippets or the whole file?">
+
+When a model proposes a change, there are three ways it could express it, and each has a failure Cursor ran into.
+
+The model could write a **diff**: the lines to remove and the lines to add, with line numbers. That's compact, but models are bad at it. Cursor's May 2024 post on applying edits lists the reasons: line numbers are hard for tokenizers and models to get right, models have seen far fewer diffs than whole files in training, and "most models fail to output accurate diffs, with the exception of Claude Opus" (at the time). A diff with one wrong line number corrupts the file.
+
+Or it could write a **sketch**: the changed parts, with comments like `// ... existing code ...` for the rest. That's what chat models naturally produce, and it's what Ananya would get in Version 1. Something still has to work out where each changed part goes.
+
+Or the model could **rewrite the whole file**. That's the most reliable format. Cursor's post argues that more output tokens give the model "more forward passes to determine the correct solution", and that diffs "force the model to think in fewer tokens". But frontier models were slow and "lazy" on large rewrites, dropping chunks of the file or summarising them, and a 600-line file is several thousand tokens: at the 50 to 100 tokens a second of a big model in 2024, that's a minute or more.
+
+Cursor split the job in two. The chat or agent model, a frontier model, writes the sketch: what should change. A second, specialised **apply model** takes the original file and the sketch and writes out the complete new file. Then the editor diffs old and new to show Ananya the change. Writing a whole file is now the apply model's only job, and the remaining problem is speed.
+
+</Sub>
+
+<Sub n="5.2" title="Speculative edits">
+
+Chapter 54, section 11, described **speculative decoding**. Generating text is slow because a model produces one token per forward pass, and each pass has to read all of the model's weights from memory. But a pass that checks several tokens at once costs about the same as a pass that produces one. So a fast **draft** guesses the next few tokens, the big model checks them all in one pass, keeps the ones it agrees with up to the first disagreement, and adds its own token there. Normally the draft comes from a small second model.
+
+<Picture
+  src="/images/designs/cursor/speculative-decoding-accepted-rejected-tokens.png"
+  alt="Nine lines of text being generated, with draft tokens accepted in green, rejected in red and corrections in blue"
+  caption="Ordinary speculative decoding, from the paper that introduced it. Each line is one pass of the big model: green tokens are the draft model's guesses that it accepted, red the first guess it rejected, blue its own replacement. A pass that accepts five guesses produces six tokens for the price of one."
+  credit="Figure: Leviathan, Kalman and Matias, Fast Inference from Transformers via Speculative Decoding, CC BY 4.0"
+  href="https://arxiv.org/abs/2211.17192"
+  paper
+/>
+
+Cursor's observation, in the May 2024 post, was that an apply model doesn't need a draft model at all: "With code edits, we have a strong prior on the draft tokens at any point in time". When rewriting a 600-line file to change three lines, the output is the original file almost everywhere. In the founders' words, the prior "is literally the same exact code". So the draft is the original file itself, and they called the technique **speculative edits**.
+
+<Scene
+  title="Rewriting summary.ts with the old file as the draft"
+  regions={[
+    { id: "old", label: "Original file", sub: "the draft", col: 0, row: 0 },
+    { id: "model", label: "Apply model", sub: "one pass checks a chunk", col: 1, row: 0 },
+    { id: "out", label: "New file", sub: "written so far", col: 2, row: 0 },
+    { id: "edit", label: "The sketch", sub: "add currency here", col: 1, row: 1 },
+  ]}
+  itemWidth={124}
+  frames={[
+    { caption: "The apply model reads the original `summary.ts` and the agent's sketch of the change. Its output will start exactly like the original file.",
+      items: [{ id: "c1", at: "old", label: "lines 1–40", tone: "default" }, { id: "sk", at: "edit", label: "line 212 change", tone: "accent" }], focus: ["old", "edit"] },
+    { caption: "Instead of generating line 1 token by token, it feeds a chunk of the original as a guess and checks the whole chunk in **one forward pass**. Every token matches, so the chunk is accepted at once.",
+      change: [{ id: "c1", at: "out", tone: "ok" }], arrow: { from: "old", to: "out", label: "accept chunk" }, focus: ["model", "out"] },
+    { caption: "Chunk after chunk matches until the pass that reaches line 212, where the model's prediction differs from the draft: it wants `formatAmount(total, order.currency)`.",
+      add: [{ id: "c2", at: "model", label: "line 212", tone: "bad" }], focus: ["model"] },
+    { caption: "From the first mismatch, the model **generates** tokens one at a time, as normal decoding. The draft is ignored while the new code is written.",
+      change: [{ id: "c2", at: "out", label: "new line 212", tone: "new" }], arrow: { from: "model", to: "out", label: "decode" } },
+    { caption: "Once the model's recent output matches the original text again, the draft **re-aligns** to that spot in the old file and chunked checking resumes. The rest of the file streams out in big accepted chunks.",
+      add: [{ id: "c3", at: "out", label: "lines 213–600", tone: "ok" }], arrow: { from: "old", to: "out", label: "re-aligned" } },
+  ]}
+/>
+
+Fireworks, which served the model, spelled out the server-side mechanics in a June 2024 post by Fireworks, which served the model. The editor sends the original text in a `speculation` field of the request. The server decodes greedily, always taking the most likely token, and "will find the longest prefix of the 'speculation' field that matches the model's generation", then continues normal generation from there. Greedy decoding matters: with temperature zero there's exactly one correct output, so checking the draft is a plain comparison, and the speed-up can't change the answer. In the 2024 interview the founders added that after a disagreement, once enough of the model's tokens match the original again, it resumes speculating on the following chunks.
+
+<Zoom path={["Cursor", "Apply", "Speculative edits", "Original file as the draft"]} />
+
+This program counts forward passes for a 2,000-token file in which 40 tokens change, comparing plain decoding with speculative edits at several chunk sizes *k*:
+
+<TryIt what="Forward passes to rewrite a file: token by token, or with the old file as the draft" lang="python" toolchain="Python 3.14">
+```python
+import random
+random.seed(3)
+
+# The old file: 2,000 "tokens". The edit rewrites lines 1,200-1,239 (40 tokens);
+# the model's job is to output the whole new file.
+old = [f"t{i}" for i in range(2000)]
+new = old[:1200] + [f"n{i}" for i in range(40)] + old[1240:]
+
+def plain(new):
+    return len(new)                    # one forward pass per output token
+
+def speculative(old, new, k):
+    """Draft = the old file. Each pass checks up to k draft tokens at once and
+    keeps the matching run plus one token of the model's own."""
+    out, j, passes = [], 0, 0           # j: where in the old file the draft continues
+    while len(out) < len(new):
+        passes += 1
+        draft = old[j:j + k]
+        ok = 0
+        while ok < len(draft) and len(out) + ok < len(new) and draft[ok] == new[len(out) + ok]:
+            ok += 1
+        out += new[len(out):len(out) + ok]
+        j += ok
+        if len(out) < len(new):
+            tok = new[len(out)]         # the model's own token where the draft was wrong
+            out.append(tok)
+            if tok in old[j:]:          # back in old text: re-align the draft there
+                j = old.index(tok, j) + 1
+    return passes
+
+print(f"output tokens:              {len(new):,}")
+print(f"token by token:             {plain(new):,} passes")
+for k in (8, 16, 32, 64):
+    print(f"old file as draft, k = {k:>2}:  {speculative(old, new, k):,} passes")
+```
+<Output>
+```
+output tokens:              2,000
+token by token:             2,000 passes
+old file as draft, k =  8:  259 passes
+old file as draft, k = 16:  156 passes
+old file as draft, k = 32:  100 passes
+old file as draft, k = 64:  71 passes
+```
+</Output>
+</TryIt>
+
+Look at where the 71 passes go at *k* = 64: about 19 for the 1,200 unchanged tokens before the edit, 40 for the edit itself, one token per pass, since the draft is useless there, and about 12 for the 760 tokens after it. The unchanged parts are almost free, and the cost of a rewrite becomes roughly proportional to the size of the *change*, not of the file. (Each pass over 64 tokens costs a bit more than a one-token pass, so the real speed-up is smaller than 2,000 ÷ 71, but decoding is limited by reading weights from memory, so the difference is modest.)
+
+<Picture
+  src="/images/designs/cursor/speculative-decoding-wall-time-trace.png"
+  alt="Horizontal bars comparing the wall time of plain decoding with speculative decoding using 3 and 7 draft tokens"
+  caption="Where the time goes. Plain decoding (bottom row) is one long run of big-model steps in purple; with 3 or 7 guesses per round (upper rows), thin blue draft-model steps feed far fewer big-model passes. Speculative edits remove the draft model's bars entirely, because copying from the old file costs nothing."
+  credit="Figure: Leviathan, Kalman and Matias, Fast Inference from Transformers via Speculative Decoding, CC BY 4.0"
+  href="https://arxiv.org/abs/2211.17192"
+  paper
+/>
+
+Cursor's numbers, from the May 2024 post: its apply model, a fine-tuned Llama-3-70B, ran at about 1,000 tokens a second, around 3,500 characters, "a ~13x speedup over vanilla inference using Llama-3-70b" and about 9 times faster than its earlier deployment of speculative edits on GPT-4. On its own evaluation of about 450 full-file edits, the fine-tuned model "almost matches" Claude 3 Opus writing diffs, and beat GPT-4 Turbo and GPT-4o.
+
+<Decision
+  q="How should a proposed change be turned into an edited file?"
+  options={[
+    { name: "The model writes a diff", how: "Lines to remove and add, with positions.", good: ["Few output tokens", "One model call"], bad: ["Most models get line numbers and context wrong", "One bad hunk corrupts the file"] },
+    { name: "Search-and-replace blocks", how: "The model quotes the old text exactly and gives its replacement.", good: ["No line numbers", "Short output"], bad: ["Fails if the quote doesn't match exactly", "Ambiguous when the text appears twice"] },
+    { name: "Full rewrite by an apply model", how: "A fast fine-tuned model rewrites the file from the original plus a sketch, with the original as the speculative draft.", good: ["Most reliable output format", "Cost scales with the change, thanks to speculation"], bad: ["A second model to train and serve", "Very large files strain it"], chosen: true },
+  ]}
+>
+Cursor built the apply model in 2024, when frontier models were slow and unreliable at large edits; the post notes that large edits could trap an agent "in an infinite loop". Chapter 78's Claude Code takes the search-and-replace route instead: its Edit tool asks the model for an exact old string and a new one, and fails loudly if the old string isn't unique. As frontier models got better at exact edits, both styles seem to work well; the apply model's advantage is that the expensive model only has to say *what* changes.
+</Decision>
+
+<Elsewhere items={[
+  { where: "OpenAI Predicted Outputs", how: "An API option where the caller supplies the expected output, typically the old file, to speed up a rewrite; the same idea offered as a public feature (chapter 54, section 11)." },
+  { where: "Prompt lookup decoding", how: "An open-source technique that drafts tokens by copying matching n-grams from the prompt, which works for the same reason: outputs often repeat their inputs." },
+]} />
+
+The apply model knows how to change `summary.ts` once someone has found it. Finding it is next.
+
+</Sub>
+
+<SectionHeading n="06" id="index">Hard problem 4: finding the right code in 40,000 files</SectionHeading>
+
+<Sub n="6.1" title="Search by meaning">
+
+Ananya's request, "update every caller of formatAmount", has an easy part and a hard part. Its easy part is the 24 files that contain the string `formatAmount`; a text search finds them. The hard part is the rest: a `PriceTag` component that receives a formatter as a prop, a `useMoney()` hook that wraps it, an email template that calls a helper defined in another package. The agent also has to answer vaguer questions on other days, such as "where do we round currency amounts?", where the code it needs may not contain any of the words in the question.
+
+Chapter 78, section 3.3, laid out the two ways to find code: build an index ahead of time and look things up by meaning, or let the model search step by step with grep and file reads. Claude Code chose the second. For most of its life Cursor chose both, and in July 2026 it changed its mind. To see why each choice made sense when it was made, we'll build the index first.
+
+This index works by meaning. An **embedding model** turns a piece of text into a vector, a list of a few hundred or a few thousand numbers, trained so that pieces of code that do similar things get vectors that point in similar directions. Embed every piece of the codebase once, embed the question when it arrives, and the code most likely to be relevant is the code whose vectors are nearest to the question's. That's **semantic search**, and chapter 58, section 5, explains how a nearest-neighbour index finds the closest vectors among billions without comparing against all of them.
+
+</Sub>
+
+<Sub n="6.2" title="Cursor's index, 2023 to 2026">
+
+Each piece of code is a **chunk**. Cursor's docs (October 2025) said files were split along "functions, classes, and logical code blocks", instead of at arbitrary points, so a chunk is something meaningful on its own. Cutting at syntax boundaries needs a parser that understands each language, and the open-source **tree-sitter** library is the usual choice for that in editors, though Cursor hasn't said which parser it used.
+
+<Picture
+  src="/images/designs/cursor/abstract-syntax-tree-euclid.png"
+  alt="An abstract syntax tree for Euclid's algorithm, with nodes for a while loop, a condition, an if-else branch and assignments"
+  caption="A program parsed into a syntax tree. A chunker that cuts at syntax boundaries picks whole subtrees, a function or a loop body, so a chunk never starts halfway through an expression and always means something on its own."
+  credit="Image: Dcoetzee, CC0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Abstract_syntax_tree_for_Euclidean_algorithm.svg"
+  paper
+  narrow
+/>
+
+Cursor's security page (June 2025) described the rest of the pipeline in unusual detail. The server chunks and embeds the files and stores the vectors in **Turbopuffer**, a vector database built on object storage. With each vector it keeps the chunk's line range and an obfuscated file path, and nothing else: no code. Cursor trained its own embedding model. A November 2025 post explained how it was trained: from real agent sessions, a language model ranked which pieces of code would have helped at each step, and the embedding model was trained "to align its similarity scores with these LLM-generated rankings".
+
+A query then takes a route that looks roundabout until you notice what it avoids:
+
+<SystemDiagram
+  title="A semantic search, 2023–2026: the server finds, the laptop reads"
+  nodes={[
+    { id: "agent", label: "Agent", sub: "needs callers", kind: "service", col: 0, row: 0 },
+    { id: "editor", label: "Ananya's editor", sub: "has the files", kind: "laptop", col: 0, row: 1 },
+    { id: "backend", label: "Cursor backend", sub: "embeds the query", kind: "service", col: 1, row: 0 },
+    { id: "tpuf", label: "Turbopuffer", sub: "vectors, no code", kind: "db", col: 2, row: 0 },
+    { id: "llm", label: "Model", sub: "agent's next step", kind: "external", col: 2, row: 1 },
+  ]}
+  edges={[
+    { from: "agent", to: "backend", label: "query" }, { from: "backend", to: "tpuf", label: "nearest" },
+    { from: "backend", to: "editor", label: "paths + lines", dashed: true }, { from: "editor", to: "llm", label: "chunks" },
+  ]}
+  steps={[
+    { caption: "The agent asks a semantic search for \"where amounts are formatted for display\". The backend embeds that text with the same model used for the code.", path: ["agent", "backend"] },
+    { caption: "Turbopuffer finds the nearest chunk vectors in Ananya's codebase. All it holds is vectors, encrypted paths and line ranges.", path: ["backend", "tpuf"] },
+    { caption: "The backend sends back only the obfuscated paths and line ranges. The editor decrypts the paths and reads those lines from Ananya's own disk.", path: ["tpuf", "backend", "editor"] },
+    { caption: "The chunks go up with the agent's next model request, to be used and forgotten. For privacy-mode users no plaintext code is stored on Cursor's servers or in Turbopuffer.", path: ["editor", "llm"] },
+  ]}
+/>
+
+<Why>Why not keep the code on the server, next to the vectors?</Why>
+
+Because then Cursor would be holding a copy of every customer's source code, and companies won't allow that, and a breach would leak it all. With the roundabout route, the server stores only things that are hard to turn back into code, and the editor, which has the files anyway, supplies the text at the moment it's needed. The security page was candid about the limits: vectors aren't encryption, and "it is definitely possible for an adversary who breaks into our vector database to learn things about the indexed codebases". Section 7.3 comes back to the paths.
+
+<Decision
+  q="Where should the code index live?"
+  options={[
+    { name: "On the developer's laptop", how: "Embed and search locally.", good: ["Nothing leaves the machine", "No server to run"], bad: ["Embedding a large repo needs a GPU most laptops lack", "Cursor's founders said in 2024 that more than 80% of users were on Windows machines, far from uniform hardware"] },
+    { name: "On Cursor's servers, vectors only", how: "Embed on GPUs in the cloud; store vectors with encrypted paths and line ranges; read text from the laptop.", good: ["Fast embedding on shared GPUs", "Embeddings reusable across a team", "No plaintext code stored"], bad: ["A huge, ever-changing index to keep in sync", "Vectors still leak something about the code"], chosen: true },
+  ]}
+>
+Cursor chose the server, and in 2024 its founders described homomorphic encryption, computing on data without decrypting it, as the kind of research they'd want for a better answer. That choice put Cursor in the business of running one of the largest vector databases anywhere, which is the next problem.
+</Decision>
+
+</Sub>
+
+<Sub n="6.3" title="An index for every codebase">
+
+A web search engine has one huge index. Cursor needed millions of small ones: every user's copy of every codebase they open, each changing as they type, most of them idle at any moment.
+
+Turbopuffer's case study (as of late 2025) gives the shape. Each (user, codebase) pair was a separate **namespace**, an independent index, and there were over 10 million of them holding over 100 billion vectors, with write peaks of 10 GB a second. Turbopuffer keeps every namespace in object storage like S3 (chapter 32), the cheapest durable storage there is, and pulls the active ones into memory and NVMe SSD caches when they're queried. Inactive codebases "fade into object storage", costing almost nothing while nobody uses them. Cursor moved to Turbopuffer in November 2023 from a vector database with a "traditional storage architecture", where every index had to live on some server's disk whether it was used or not. The case study claims a 95% cost reduction; Cursor's Aman Sanger is quoted on "saving an order of magnitude in costs".
+
+<Picture
+  src="/images/designs/cursor/hnsw-nsg-speed-vs-recall.png"
+  alt="Curves of queries per second against recall for graph-based nearest-neighbour indexes with different numbers of edges per node"
+  caption="The bargain every vector index makes, from the Faiss library's paper: searching more of the graph finds more of the true nearest neighbours (recall, to the right) but answers fewer queries per second. A per-codebase index picks a point on this curve, and the agent never knows which true neighbours it missed."
+  credit="Figure: Douze et al., The Faiss library, CC BY 4.0"
+  href="https://arxiv.org/abs/2401.08281"
+  paper
+/>
+
+<Callout label="Design implication">
+When you have millions of small, mostly idle indexes, what matters most is what an idle index costs, more than how fast one search runs. Keeping each one on object storage and caching only the hot ones turns that cost from "a slice of a server per index" to "a few cents of storage", and that change made per-user codebase indexes affordable.
+</Callout>
+
+An index is only useful if it matches the code. Ananya's codebase changes every few seconds while she works, and sometimes by thousands of files when she switches branches. How does the server learn what changed, without being sent the code?
+
+</Sub>
+
+<SectionHeading n="07" id="sync">Hard problem 5: keeping the index fresh, cheap and private</SectionHeading>
+
+<Sub n="7.1" title="Which files changed? A Merkle tree">
+
+A naive way to keep the server's index current is to ask, every few minutes, "here are the hashes of all my files; which ones don't you have?" For Ananya's 40,000 files that's 40,000 hashes per check, per user, all day. Cursor's January 2026 post on indexing gives the size: for a 50,000-file workspace, the file names and SHA-256 hashes come to about 3.2 MB. Multiply by every open editor every few minutes and the founders' description of the naive approach in 2024, "absolutely ginormous network overhead", sounds about right.
+
+A better fix is the data structure chapter 66 used for Dropbox, applied to folders. A **hash** turns any amount of data into a short fixed-size fingerprint that changes if any byte changes. Give every file a hash of its contents. Give every folder a hash computed from the names and hashes of its children. Then the root folder's hash summarises the entire codebase: if any file anywhere changes, its hash changes, so its folder's hash changes, and so on up to the root. A tree of hashes built this way is a **Merkle tree**. One of the founders described the sync in 2024: "for every folder you can keep a hash, which is the hash of all of its children", and "you just try to reconcile the single hash, which is at the root of the project".
+
+<Picture
+  src="/images/designs/cursor/merkle-tree-proof-path.png"
+  alt="A hash tree: four data blocks at the bottom, each hashed, pairs of hashes combined and hashed again up to a single top hash, with one path highlighted"
+  caption="A Merkle tree over four blocks. Each box above the bottom row is a hash of the boxes below it, so the top hash changes if any block changes. The highlighted path shows how little of the tree you need to follow to reach one changed block: one hash per level, plus its siblings to compare."
+  credit="Image: MrTsepa, CC BY-SA 4.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:Hash_Tree_proof.svg"
+  paper
+  narrow
+/>
+
+Reconciling works top down. The editor and the server compare root hashes. If they match, as they usually do, nothing has changed and the check is over after one comparison. If they differ, compare the root's children, and descend only into the folders whose hashes differ. The changed files are found at the bottom of a few narrow paths. Cursor's security page (June 2025) described exactly this: compute a Merkle tree of all files, ignoring anything in `.gitignore` or `.cursorignore`, sync it to the server, and "every 10 minutes, we check for hash mismatches, and use the Merkle tree to figure out which files have changed and only upload those". (The docs in October 2025 said every 5 minutes; the interval seems to have been tuned.)
+
+This program builds Merkle trees for a 40,000-file repo before and after Ananya edits three files, and counts the hashes compared to find them:
+
+<TryIt what="Find three changed files among 40,000 by walking a Merkle tree" lang="python" toolchain="Python 3.14">
+```python
+import hashlib, random
+random.seed(7)
+
+def h(data):
+    return hashlib.sha256(data.encode()).hexdigest()
+
+# A repo of 40,000 files in nested folders: 20 top dirs x 20 subdirs x 100 files
+repo = {f"src/m{a}/p{b}/f{c}.py": f"code {a} {b} {c}"
+        for a in range(20) for b in range(20) for c in range(100)}
+
+def tree(files):
+    """Merkle tree: a file's hash is its content's hash; a folder's hash is
+    the hash of its children's names and hashes, so it changes if anything below it changes."""
+    root = {}
+    for path, text in files.items():
+        node = root
+        *dirs, name = path.split("/")
+        for d in dirs:
+            node = node.setdefault(d, {})
+        node[name] = h(text)
+    def seal(node):
+        kids = {k: (seal(v) if isinstance(v, dict) else (v, None)) for k, v in node.items()}
+        return h("".join(k + kids[k][0] for k in sorted(kids))), kids
+    return seal(root)
+
+def diff(client, server, path="", counter=None):
+    """Walk both trees from the root, going down only where hashes differ."""
+    counter[0] += 1
+    if client[0] == server[0]:
+        return []
+    if client[1] is None:                    # a file whose hash differs
+        return [path]
+    changed = []
+    for name, child in client[1].items():
+        other = server[1].get(name, ("missing", {}))
+        changed += diff(child, other, f"{path}/{name}" if path else name, counter)
+    return changed
+
+server = tree(repo)                          # what the server indexed last time
+edited = dict(repo)
+for p in random.sample(sorted(repo), 3):     # Ananya edits three files
+    edited[p] += " # changed"
+client = tree(edited)
+
+n = [0]
+changed = diff(client, server, "", n)
+print(f"files in repo:            {len(repo):,}")
+print(f"naive: hashes compared    {len(repo):,}")
+print(f"merkle: hashes compared   {n[0]:,}")
+for p in sorted(changed):
+    print("  re-upload", p)
+```
+<Output>
+```
+files in repo:            40,000
+naive: hashes compared    40,000
+merkle: hashes compared   382
+  re-upload src/m12/p8/f87.py
+  re-upload src/m18/p2/f29.py
+  re-upload src/m2/p8/f77.py
+```
+</Output>
+</TryIt>
+
+382 comparisons instead of 40,000, roughly a hundred times fewer, and the three changed files come out by name. Where do the 382 go? At each folder whose hash differs, the walk compares all of that folder's children: 20 at the top, 20 in each of the changed subfolders, 100 in each changed leaf folder. So the cost is roughly (number of changed files) × (depth) × (children per folder), and it doesn't grow with the size of the repo at all. When nothing has changed, the cost is one comparison. A real implementation sends hashes over the network a level at a time, so the comparisons become round trips and bytes saved.
+
+Only the three changed files are uploaded, chunked and embedded again. And even those are mostly unchanged: if Ananya edited one function in a 600-line file, most of the file's chunks are identical to before.
+
+</Sub>
+
+<Sub n="7.2" title="Embed each chunk once, ever">
+
+Embedding is the expensive step. In the 2024 interview Aman Sanger said "embeddings are the bottleneck", and described the fix: a cache "on the actual vectors computed from the hash of a given chunk". Before embedding a chunk, the server hashes its text and looks the hash up; if any user anywhere has embedded identical text before, the stored vector is reused. The security page says the cache lived in AWS, "indexed by the hash of the chunk".
+
+That cache does two jobs. When Ananya edits one function, only that function's chunk is new. And when her colleague opens the same repository for the first time, nearly every chunk is already in the cache, so "the nth person at a company" gets an index almost at once, in Sanger's words. It's the same move as the content-addressed blocks in chapter 66: name data by its hash, and identical data is stored and processed once.
+
+</Sub>
+
+<Sub n="7.3" title="Paths that hide their names">
+
+Each vector carries a file path, so that a search can be limited to a folder and so the editor knows which file to read. But a path like `payments/upi/refund_fraud_rules.ts` says a lot about a company. Cursor's security page described the scheme: "the path is split by '/' and '.' and each segment is encrypted with a secret key stored on the client and a deterministic short 6-byte nonce".
+
+Each piece of that sentence is a design choice:
+
+- **Per segment**, so `payments/upi/refund_fraud_rules.ts` becomes four encrypted pieces joined the same way. The server can still filter by folder, because every file under `payments/` shares the same first encrypted segment.
+- **Deterministic**, so the same name always encrypts to the same value. That's what makes filtering possible, and it's also a leak: the server can see that two files share a folder, and how deep the tree goes. Cursor's page says so: it "leaks information about directory hierarchy".
+- **The key stays on the client.** The server can't decrypt paths. For teammates to share an index they need the same key, so later versions derived it "from hashes of recent commit contents", something everyone with a copy of the repository can compute and nobody without one can.
+
+</Sub>
+
+<Sub n="7.4" title="Borrowing a teammate's index without seeing their code">
+
+One problem remained. When a new engineer opened a big repository, indexing it from scratch "can take hours", Cursor wrote in January 2026, even with the embedding cache, because every file still had to be uploaded, chunked and looked up. Yet someone in the same company had almost certainly indexed nearly the same code already: Cursor measured that "clones of the same codebase average 92% similarity across users within an organization".
+
+Reusing a teammate's index raises two questions. How do you find a similar index without comparing Merkle trees file by file against every index in the company? And how do you make sure the newcomer can't see search results for files they don't have, such as a folder their teammate has access to and they don't?
+
+For the first, the editor computes a **simhash** of its Merkle tree. An ordinary hash changes completely if one input bit changes; a simhash is built so that similar inputs give similar hashes. Roughly: hash each file, and for each of the 64 bit positions add one if a file's hash has a 1 there and subtract one if it has a 0; the simhash has a 1 wherever the total is positive. Two repositories that share 92% of their files get simhashes that differ in only a few bits, so finding a similar index becomes a nearest-neighbour search on simhashes. The server searches the simhashes of the team's existing indexes and, above a similarity threshold, copies the closest one as a starting point in the background while the Merkle sync fixes the differences.
+
+For the second, the Merkle tree doubles as proof. The editor uploads its whole tree, which ties each encrypted path to the hash of its contents, and the server keeps it as a set of **content proofs**. A search over the borrowed index might return a chunk from a file the newcomer doesn't have; the server checks it against the proofs, and "if the client can't prove it has a file, the result is dropped". Once the newcomer's own index has caught up and the Merkle roots match, the proofs are deleted.
+
+| Time to first search, new users (Cursor, January 2026) | Before | After |
+|---|---|---|
+| Median | 7.87 s | 525 ms |
+| 90th percentile | 2.82 min | 1.87 s |
+| 99th percentile | 4.03 hours | 21 s |
+
+<Elsewhere items={[
+  { where: "Git", how: "A commit's tree object is a Merkle tree of the repository, so `git status` and fetching can skip unchanged folders by comparing one hash." },
+  { where: "Cassandra and DynamoDB anti-entropy", how: "Replicas compare Merkle trees of their key ranges to find which keys disagree without sending all the data (chapter 28)." },
+  { where: "Near-duplicate web pages", how: "Simhash was popularised by Google's crawler for spotting near-duplicate pages among billions with a quick bit comparison." }
+]} />
+
+All of that machinery, the Merkle sync, the chunk cache, the encrypted paths, simhashes and proofs, served one goal: getting semantic search to work for big codebases without storing code. In 2026 Cursor decided it no longer needed it.
+
+</Sub>
+
+<SectionHeading n="08" id="grep">Hard problem 6: grep that keeps up, and a change of mind</SectionHeading>
+
+<Sub n="8.1" title="When grep takes fifteen seconds">
+
+Cursor's agent never relied on semantic search alone. Its November 2025 post said: "Our agent makes heavy use of grep as well as semantic search, and the combination of these two leads to the best outcomes". That post's numbers were the case for keeping the index: with semantic search available, agents answered questions about codebases 12.5% more accurately on average (6.5% to 23.5% depending on the model), and the share of agent-written code that users kept rose by 0.3%, or 2.6% on codebases of 1,000 files or more.
+
+But the other half of the combination was getting slow. Agents call grep far more often than people do, and in a big monorepo each call scans every file. Cursor's March 2026 post on regex search said: "We routinely see `rg` invocations that take more than 15 seconds". A model waiting 15 seconds per search, maybe a dozen searches per task, spends most of its time waiting.
+
+</Sub>
+
+<Sub n="8.2" title="An index for regular expressions">
+
+A textbook way to make text search fast is an **inverted index**, the structure chapter 62 builds for search engines: a map from each term to the list of documents that contain it, called its **posting list**. Code search can't use words as terms, because a regular expression like `format[A-Z]\w*\(` matches inside words. So code search engines index **trigrams**, every run of three consecutive characters. The file containing `formatAmount` has the trigrams `for`, `orm`, `rma`, `mat` and so on. A query for `formatAmount` must match a file that contains all of that query's trigrams, so intersecting their posting lists gives a short list of candidate files, and only those are scanned with the full regular expression. Google Code Search worked this way in 2006, and GitHub's code search is built on the same idea.
+
+Trouble comes from common trigrams, like `ion` or `   ` (three spaces), which appear in nearly every file, so their posting lists are huge and filter nothing. Cursor's March 2026 post described its fix, **sparse n-grams**: give every pair of adjacent characters a weight from a fixed table, built from how often pairs occur across "a couple terabytes of Open-Source code", and cut text into n-grams of varying length at the points the weights choose. Rare sequences end up in long, selective n-grams; the boundaries depend only on the text, so the same string is always cut the same way in the file and in the query. At index time the editor extracts every n-gram a file could need; at query time it picks the few that cover the query. "We're paying a high upfront cost when indexing so that we can have very fast queries at query time."
+
+This index lives on Ananya's machine. Its file format is a posting-list file and a sorted table of n-gram hashes with offsets into it; only the table is memory-mapped and binary-searched. Storing hashes instead of n-grams can't give wrong answers: a hash collision only makes a posting list a little longer, and the final regex scan removes any false candidates. The index is anchored to a git commit, and "user and agent changes are stored as a layer on top of it", so it doesn't rescan the repo as files change. Cursor calls the feature **Instant Grep**.
+
+</Sub>
+
+<Sub n="8.3" title="July 2026: turning the semantic index off">
+
+In July 2026 Cursor's staff explained on its forum why the semantic index was disappearing from users' settings. one wrote on 21 July that models had become very good at using grep and indexed search, so the dedicated semantic search path "was rapidly no longer helping in a meaningful way"; another said the next day that "semantic/embeddings indexing is being turned down in favor of grep-based retrieval". Cursor "no longer needs to build a semantic index of your codebase which means we're no longer computing embeddings of your code or storing them on our servers for search". The Instant Grep index is kept per repository, under `.git/cursor/`, at about half the size of the source it indexes. Cursor's docs now say Instant Grep "builds and queries its index on your machine".
+
+<Decision
+  q="How should the agent find code in a large repository?"
+  options={[
+    { name: "Semantic index on servers (2023–mid 2026)", how: "Chunk, embed and store vectors per codebase; Merkle sync; grep alongside.", good: ["Finds code by meaning when names differ", "12.5% more accurate answers in Cursor's 2025 tests"], bad: ["A vast synced index and its privacy machinery", "Vectors on servers leak something", "Its benefit shrank as models got better at searching"] },
+    { name: "Plain grep (ripgrep)", how: "The agent searches files directly, step by step.", good: ["Always current", "Nothing stored anywhere"], bad: ["15 seconds or more per search in big monorepos"] },
+    { name: "Local regex index (mid 2026 on)", how: "Sparse n-gram index on the laptop, layered over a git commit; agentic grep on top.", good: ["Fast exact search, even in monorepos", "No code or vectors leave the machine", "Nothing to sync or secure on servers"], bad: ["Finds strings, not meanings: the model must think of the right words", "Index size about half the source, on the user's disk"], chosen: true },
+  ]}
+>
+Cursor's change of mind is instructive because nothing about the index broke. It worked, it was fast, and in 2025 it measurably helped. What changed was the model on the other end. An agent that can run twenty precise searches in a few seconds, and is smart enough to try `useMoney` after reading the definition of `formatAmount`, gets most of what semantic search offered, and the large, privacy-sensitive server-side index stopped paying for itself. Claude Code (chapter 78) reached the same conclusion from the other direction in 2025, choosing agentic search from the start. Cursor's contribution was making grep fast enough that the choice cost nothing.
+</Decision>
+
+<Callout label="Common mistake" kind="warn">
+Treating a design decision as permanent because it was right when made. Cursor's index was the right call in 2023, when models searched badly, and a liability by 2026. Write down *why* a component exists, in terms of what the rest of the system can't yet do, so you notice when that stops being true.
+</Callout>
+
+</Sub>
+
+<Sub n="8.4" title="Assembling the prompt">
+
+Whatever finds the code, something has to decide what goes into each model request, and a recurring theme of Cursor's design is that it decides on its servers. Its security page said that requests "always hit our infrastructure on AWS even if you have configured your own API key", because "our prompt-building happens on our server". That's where the system prompt, tool definitions and the team's rules are combined with what the editor sent.
+
+For Tab, the founders described in 2024 a prompt renderer they called **Preempt**, in which prompts are written like React components, each piece of context with a priority. For the lines around the cursor, "that line has the highest priority, and then you subtract one for every line that is farther away". The renderer fills the token budget in priority order, so whatever the budget, the most important context is always in and the least important is cut first.
+
+For the agent, the team's standing instructions come from **rules** files. A project keeps them in `.cursor/rules` as Markdown files with a small header that says when each applies: always, when the agent judges it relevant from a one-line description, only for files matching a pattern (`money/**/*.ts`), or only when mentioned by name. Cursor also reads `AGENTS.md` files, the cross-tool equivalent of Claude Code's CLAUDE.md. A January 2026 post described **dynamic context discovery**: long tool outputs and terminal sessions are written to files the agent can search instead of being pasted into the window, and MCP tool descriptions sit in per-server folders with only their names in the prompt. For runs that used MCP tools, that cut total agent tokens by 46.9% in an A/B test. It's chapter 78's "handles instead of contents" principle, reached independently.
+
+Privacy is enforced on the same servers. Every request carries a header saying whether the user is in privacy mode (if it's missing, the server assumes yes), and a proxy sends each service's traffic to one of "two near-identical replicas", one for privacy-mode requests, where logging is switched off, and one for the rest. In June 2025 Cursor said more than half of its users had privacy mode on.
+
+</Sub>
+
+<SectionHeading n="09" id="checking">Hard problem 7: checking the AI's work without touching your files</SectionHeading>
+
+<Sub n="9.1" title="Lints for an edit nobody has saved">
+
+The agent has rewritten 19 files. Some of the rewrites are wrong in ways a compiler would spot at once: a caller that passes `order.currency` where `order` can be undefined, a wrapper whose type now needs a second parameter. Ananya's editor knows about these errors within a second of a file changing, because a **language server** is running beside it: a separate process that understands one language (the TypeScript server, `gopls` for Go, `rust-analyzer` for Rust) and reports errors, warnings and definitions to the editor over the **Language Server Protocol** (LSP). The red squiggles in her editor are its output. An agent that could see those diagnostics before showing its edits could fix its own mistakes.
+
+<Picture
+  src="/images/designs/cursor/lsp-message-sequence.png"
+  alt="A sequence diagram between an editor and a language server: didOpen, didChange, publishDiagnostics, a definition request and response, and didClose"
+  caption="The Language Server Protocol in one session. The editor tells the server when a document opens and changes; the server answers with diagnostics (the red squiggles) and with replies to requests such as go-to-definition. Notice that the server's view of a file is whatever the editor last told it."
+  credit="Image: Language Server Protocol documentation (Microsoft), CC BY 4.0"
+  href="https://github.com/microsoft/language-server-protocol/blob/gh-pages/_overviews/lsp/img/language-server-sequence.png"
+  paper
+/>
+
+But a language server reports on files as the editor has them. If the agent writes its proposed edits into Ananya's files to get them checked, she sees half-finished changes appearing in her editor while she's typing, and her own edits and the agent's can collide. Cursor's September 2024 post on the problem put the requirement bluntly: "independence is absolutely critical". The AI needs to see lints for its version of the code while Ananya keeps working on hers.
+
+</Sub>
+
+<Sub n="9.2" title="The shadow workspace">
+
+Cursor's post walks through the options it considered and rejected, which are a good lesson in how many layers a simple-sounding requirement touches.
+
+- **Copy the file in the editor's memory and lint the copy.** The language server would then see two versions of the same file and get confused: go-to-references, Go's package scope and Rust's module system all assume one file per path.
+- **Start a second copy of each language server.** That means separate processes for `tsc`, `gopls` and `rust-analyzer`, each with its own configuration, for every language anyone uses.
+- **Copy the folder on disk.** `cp -r` is far too slow for a project with a `node_modules` folder; hard links and copy-on-write clones risk the agent changing the originals.
+- **Fake the folder in the kernel.** Present a virtual folder that looks like the real one with the AI's edits laid over it. On Linux, FUSE does that. macOS and Windows have no built-in equivalent, and shipping a kernel extension to every user wasn't practical.
+
+<Picture
+  src="/images/designs/cursor/vscode-electron-process-architecture.png"
+  alt="VS Code's process architecture: the main process, renderer windows, and an extension host process that talks to a language server and a debug adapter"
+  caption="Inside VS Code, and so inside Cursor: each window has its own extension host process, and extensions such as the TypeScript language support start their language servers from there. Open a second, hidden window and you get a second extension host and second language servers for free, which is what the shadow workspace relies on."
+  credit="Image: Visual Studio Code documentation, CC BY 3.0"
+  href="https://github.com/microsoft/vscode-docs/blob/main/api/language-extensions/images/language-server-extension-guide/extensibility-architecture.png"
+  paper
+/>
+
+What shipped was the **shadow workspace**: a second, hidden window of Cursor itself, opened on the same folder. Because Cursor is a VS Code fork, a window brings its own extension host and language servers, so the hidden window has its own TypeScript server seeing the same project, which is probably why this option won. The AI's edits are applied in the hidden window's memory and never saved to disk, its language servers report diagnostics, and those go back to the AI. "The core code required to hide the window is just one line," the post notes.
+
+<SystemDiagram
+  title="The shadow workspace: lints for the AI's version, Ananya's version untouched"
+  nodes={[
+    { id: "ananya", label: "Ananya's window", sub: "her edits", kind: "laptop", col: 0, row: 0 },
+    { id: "ai", label: "Agent", sub: "proposed edits", kind: "service", col: 0, row: 1 },
+    { id: "shadow", label: "Hidden window", sub: "same folder", kind: "client", col: 1, row: 1 },
+    { id: "lsp", label: "TS server", sub: "in hidden window", kind: "compute", col: 2, row: 1 },
+    { id: "disk", label: "Files on disk", sub: "unchanged", kind: "db", col: 1, row: 0 },
+  ]}
+  edges={[
+    { from: "ananya", to: "disk", both: true }, { from: "ai", to: "shadow", label: "apply in memory" },
+    { from: "shadow", to: "lsp", both: true }, { from: "shadow", to: "disk", label: "reads", dashed: true },
+  ]}
+  steps={[
+    { caption: "Ananya keeps typing in her own window. Her files on disk change only when she saves.", path: ["ananya", "disk"] },
+    { caption: "The agent sends its edit to `checkout/summary.ts` to the hidden window, which applies it in memory without saving.", path: ["ai", "shadow"] },
+    { caption: "The hidden window's own TypeScript server checks the edited file against the rest of the project, read from disk.", path: ["shadow", "lsp"] },
+    { caption: "It reports one error, `order` possibly undefined, which goes back to the agent. The agent fixes its edit before Ananya ever sees it.", path: ["lsp", "shadow", "ai"] },
+  ]}
+/>
+
+Memory was the cost: a second window "naively comes with a 2x increase in memory usage". Cursor cut that by running fewer extensions in the hidden window and killing it after 15 minutes idle, and made the feature opt-in. Rust wasn't supported, because `rust-analyzer` checks code by running `cargo check` on files on disk, and the shadow workspace never writes to disk. Running the code, not just linting it, was left for later; the post noted that a file-system-level solution was the only general answer.
+
+</Sub>
+
+<Sub n="9.3" title="Later: sandboxes and terminals">
+
+That later answer arrived as agents grew more capable. An agent that runs tests needs a real copy of the files, and by Cursor 2.0 (October 2025) its agent's terminal commands ran sandboxed by default on macOS, with read and write access to the workspace and no internet for commands not on an allow list. Chapter 78, section 5, covers how such sandboxes are built from operating-system features. For running several agents without them editing each other's files, Cursor used separate copies of the repository, which is the subject of section 11.
+
+
+</Sub>
+
+<SectionHeading n="10" id="models">Hard problem 8: paying for intelligence</SectionHeading>
+
+<Sub n="10.1" title="A flat price on a per-token bill">
+
+Every chat and agent request in Cursor's early years went to a frontier model bought by the token, while users paid Cursor a flat subscription. Chapter 78, section 8, showed how quickly agent tokens add up: one 50-step task can read five million. As agents got longer, a $20-a-month user could probably cost Cursor more than $20 in a week.
+
+Cursor's first plan counted requests: in mid-2025, Pro included 500 a month, with some models counting double. On 16 June 2025 it changed Pro to "$20 of included usage" at the model providers' API prices, plus unlimited Tab, and added a $200 Ultra plan. Heavy users of expensive models ran through the allowance in days and were charged for more, many without understanding the change. On 4 July 2025 the CEO, Michael Truell, published an apology, "We recognize that we didn't handle this pricing rollout well, and we're sorry", and offered refunds for unexpected charges between 16 June and 4 July.
+
+That episode exposed a structural problem: a company that resells other companies' models at a flat price is squeezed from both sides, by its suppliers' prices and by its users' growing appetite. One way out is to own more of the intelligence.
+
+</Sub>
+
+<Sub n="10.2" title="Composer: training an agent model in real repositories">
+
+On 29 October 2025, with Cursor 2.0, the company released **Composer**, its own model for agent work. Its post describes a mixture-of-experts model (section 3.2) trained with reinforcement learning on "real-world software engineering challenges in large codebases". During training the model works through tasks with the same tools the product's agent has: reading and editing files, semantic search, grep and terminal commands. Cursor said it generates code "four times faster than similar models" and completes most agent turns in under 30 seconds.
+
+<Why>Why train in real environments instead of on examples of good code?</Why>
+
+Because an agent's skill is in the sequence: which file to open next, which search to run, when to run the tests, when to stop. Examples of finished code don't contain any of that. RL lets the model try whole tasks and rewards it for outcomes, the same idea as Tab's accept and reject in section 4, stretched over hundreds of steps. But each attempt needs a real machine with a real repository, its dependencies installed, and a terminal the model can run commands in. Cursor's post says training needed "hundreds of thousands of concurrent sandboxed coding environments in the cloud", which it built by adapting the infrastructure it had made for its cloud agents (section 11) and rewriting the scheduler for virtual machines to cope with training's bursts.
+
+<SystemDiagram
+  title="Composer's RL loop: the product's own agent, run as training"
+  nodes={[
+    { id: "trainer", label: "RL trainer", sub: "PyTorch + Ray", kind: "compute", col: 0, row: 0, count: "×1000s GPUs" },
+    { id: "infer", label: "Rollout model", sub: "current weights", kind: "compute", col: 1, row: 0 },
+    { id: "vms", label: "Sandbox VMs", sub: "repo + tools", kind: "compute", col: 2, row: 0, count: "×100,000s" },
+    { id: "grade", label: "Grader", sub: "tests, reviews", kind: "service", col: 2, row: 1 },
+    { id: "tasks", label: "Task set", sub: "real codebases", kind: "db", col: 0, row: 1 },
+  ]}
+  edges={[
+    { from: "tasks", to: "vms", label: "start" }, { from: "infer", to: "vms", label: "tool calls", both: true },
+    { from: "vms", to: "grade" }, { from: "grade", to: "trainer", label: "rewards" }, { from: "trainer", to: "infer", label: "new weights" },
+  ]}
+  steps={[
+    { caption: "Each training task, a real repository and a request, starts in its own sandboxed virtual machine.", path: ["tasks", "vms"] },
+    { caption: "The model works the task like the product's agent: search, read, edit, run commands, read the output, many times.", path: ["infer", "vms"] },
+    { caption: "When it stops, the result is graded, for example by whether the tests pass, and becomes a reward.", path: ["vms", "grade"] },
+    { caption: "The trainer updates the weights to make high-reward behaviour more likely, and the new weights go back to the rollout servers.", path: ["grade", "trainer", "infer"] },
+  ]}
+/>
+
+Underneath is a training system of its own. Its post mentions low-precision MXFP8 kernels for the mixture-of-experts layers, expert parallelism and sharded data parallelism across "thousands of NVIDIA GPUs", and an asynchronous RL stack on PyTorch and Ray, so rollouts in slow sandboxes don't leave GPUs idle.
+
+Two later versions show the direction. **Composer 1.5** (February 2026) scaled the RL "20x further on the same pretrained model", so far that the post-training compute exceeded the compute used to pretrain the base. It also trained **self-summarization** into the model: when its context fills, it writes its own summary and carries on, learned during RL instead of prompted, which is chapter 78's compaction built into the weights. **Composer 2** (March 2026) added Cursor's first continued pretraining run before RL. On Cursor's own benchmark of real agent requests, CursorBench, the three versions scored 38.0, 44.2 and 61.3; on the public Terminal-Bench 2.0, 40.0, 47.9 and 61.7. Cursor priced Composer 2 at $0.50 per million input tokens and $2.50 per million output tokens. Its post didn't name the base model; press reports in March 2026 said it was Moonshot AI's open-weight Kimi K2.5.
+
+<Decision
+  q="Should an AI editor train its own agent model?"
+  options={[
+    { name: "Resell frontier models", how: "Route every agent request to the best model you can buy.", good: ["Best quality on hard tasks", "No training cost"], bad: ["Margins set by suppliers who are also competitors", "Can't shape the model to your tools or latency"] },
+    { name: "Train your own, keep frontier models as options", how: "RL a fast model in your own agent environment; let users pick others.", good: ["Speed and price you control", "The model learns your tools exactly", "Usage data improves it"], bad: ["Huge training and sandbox infrastructure", "Must keep up with labs that spend far more"], chosen: true },
+  ]}
+>
+Cursor did both: Composer as the fast default, frontier models from Anthropic, OpenAI, Google and others selectable. TechCrunch reported in April 2026 that Cursor had become slightly gross-margin positive after launching Composer. The same logic, owning the high-volume work and buying the rare hard work, is the one section 3 applied to Tab in 2023.
+</Decision>
+
+</Sub>
+
+<SectionHeading n="11" id="parallel">Hard problem 9: many agents, one repository</SectionHeading>
+
+<Sub n="11.1" title="Worktrees and cloud machines">
+
+Once agents work for minutes at a time, developers want several at once: one updating the callers of `formatAmount`, another writing tests for the new currency logic, a third trying an alternative design. On one copy of the repository they'd overwrite each other's files and break each other's test runs.
+
+Cursor 2.0 (October 2025) answered with the tool git already has. A **git worktree** is a second working directory attached to the same repository, checked out on its own branch, sharing the object store so creating one is quick. Cursor 2.0 could run "up to eight agents in parallel on a single prompt", each in its own worktree or on a remote machine, "to prevent file conflicts". Running several models on the same problem and keeping the best result, its post said, "significantly improves the final output". Cursor 3.0 (April 2026) added an agents window to manage them, and commands such as `/worktree` and `/best-of-n`.
+
+For work that should continue while the laptop is closed, **cloud agents** (launched as background agents in a May 2025 preview, available to all users in June 2025) run in isolated virtual machines with a full development environment, cloned from the team's GitHub or GitLab, set up from a snapshot or a Dockerfile, and they push a branch when done. Those are the same machines that, multiplied by hundreds of thousands, became Composer's training environments.
+
+<SystemDiagram
+  title="Three agents on Ananya's task, without collisions"
+  nodes={[
+    { id: "ananya", label: "Ananya", sub: "one prompt", kind: "laptop", col: 0, row: 1 },
+    { id: "wt1", label: "Worktree A", sub: "branch: callers", kind: "client", col: 1, row: 0 },
+    { id: "wt2", label: "Worktree B", sub: "branch: tests", kind: "client", col: 1, row: 1 },
+    { id: "cloud", label: "Cloud VM", sub: "branch: alt", kind: "compute", col: 1, row: 2 },
+    { id: "git", label: "Git repo", sub: "shared objects", kind: "db", col: 2, row: 1 },
+  ]}
+  edges={[
+    { from: "ananya", to: "wt1" }, { from: "ananya", to: "wt2" }, { from: "ananya", to: "cloud" },
+    { from: "wt1", to: "git" }, { from: "wt2", to: "git" }, { from: "cloud", to: "git", label: "push" },
+  ]}
+  steps={[
+    { caption: "Ananya starts three agents. Two run locally, each in its own git worktree on its own branch.", path: ["ananya", "wt1"], focus: ["wt2"] },
+    { caption: "Each has its own files and terminal, so agent B's test run never sees agent A's half-finished edits.", path: ["ananya", "wt2"] },
+    { caption: "The third runs in a cloud VM with a clone, and keeps going when she closes her laptop.", path: ["ananya", "cloud"] },
+    { caption: "All three commit to branches of the same repository. Ananya compares the results and merges what she wants.", path: ["wt1", "git"], focus: ["wt2", "cloud"] },
+  ]}
+/>
+
+Reviewing agents' output becomes the next bottleneck, and Cursor points agents at that too: **Bugbot**, launched in July 2025, reviews pull requests, more than two million a month by January 2026.
+
+</Sub>
+
+<SectionHeading n="12" id="whole">The whole system</SectionHeading>
+
+<Sub n="12.1" title="Every box, and why it's there">
+
+<SystemDiagram
+  title="Cursor, from Ananya's keystroke to the models"
+  nodes={[
+    { id: "editor", label: "Editor", sub: "VS Code fork", kind: "laptop", col: 0, row: 0 },
+    { id: "grep", label: "Instant Grep", sub: "local n-grams", kind: "cache", col: 0, row: 1 },
+    { id: "shadow", label: "Shadow window", sub: "LSP lints", kind: "client", col: 0, row: 2 },
+    { id: "backend", label: "Backend", sub: "prompt building", kind: "lb", col: 1, row: 1 },
+    { id: "tab", label: "Tab model", sub: "small MoE, KV cache", kind: "compute", col: 2, row: 0, count: "×many" },
+    { id: "apply", label: "Apply model", sub: "speculative edits", kind: "compute", col: 2, row: 1 },
+    { id: "agent", label: "Agent models", sub: "Composer, frontier", kind: "compute", col: 2, row: 2 },
+    { id: "rl", label: "RL training", sub: "rewards, sandboxes", kind: "service", col: 3, row: 0 },
+    { id: "cloud", label: "Cloud agents", sub: "VMs, worktrees", kind: "compute", col: 3, row: 2 },
+  ]}
+  zones={[{ label: "Ananya's laptop", nodes: ["editor", "grep", "shadow"] }, { label: "Cursor's servers and providers", nodes: ["backend", "tab", "apply", "agent"] }]}
+  edges={[
+    { from: "editor", to: "backend" }, { from: "backend", to: "tab" }, { from: "backend", to: "apply" }, { from: "backend", to: "agent" },
+    { from: "editor", to: "grep", both: true }, { from: "editor", to: "shadow", both: true },
+    { from: "tab", to: "rl", label: "accept/reject", dashed: true }, { from: "rl", to: "tab", dashed: true },
+    { from: "agent", to: "cloud", dashed: true },
+  ]}
+  steps={[
+    { caption: "Ananya types. The editor sends caching-aware context to the backend, which routes it to a Tab model server that already holds most of the prompt's KV cache. Stale requests are cancelled.", path: ["editor", "backend", "tab"] },
+    { caption: "She accepts or rejects; those signals train the next Tab model within a couple of hours.", path: ["tab", "rl", "tab"] },
+    { caption: "She asks the agent to update the callers. The agent model searches with Instant Grep on her laptop, reads files, and decides what to change.", path: ["editor", "backend", "agent"], focus: ["grep"] },
+    { caption: "Each change is written into the file by the apply model, with the original file as its speculative draft.", path: ["agent", "backend", "apply"] },
+    { caption: "Edits are checked in the hidden shadow window against the language server before she sees them.", path: ["editor", "shadow"] },
+    { caption: "Longer or parallel work runs in worktrees or cloud VMs, each on its own branch.", path: ["agent", "cloud"] },
+  ]}
+/>
+
+| Component | What it does | Added because |
+|---|---|---|
+| Tab model | A small sparse model that predicts the next edit and jump | Frontier models are too slow and weren't trained on edits (§3) |
+| Caching-aware prompts, cache warming, predict-ahead | Reuse prefill between keystrokes | Each request reads ~13,000 tokens and they barely differ (§3.3) |
+| Cancellation of stale requests | Stop work nobody will see | Typing outruns the model (§3.4) |
+| Online RL on accept/reject | Teach Tab when to stay quiet | Wrong suggestions cost attention (§4) |
+| Apply model with speculative edits | Rewrite files at ~1,000 tokens/s | Diffs are unreliable; full rewrites were slow (§5) |
+| Semantic index, Merkle sync, chunk cache, encrypted paths (2023–2026) | Search by meaning without storing code | The model couldn't read the whole repo (§6, §7) |
+| Instant Grep (2026) | Fast regex search from a local index | Grep took 15 s in monorepos; models got good at searching (§8) |
+| Server-side prompt building, privacy replicas | One place to assemble context and enforce privacy | Rules, tools and privacy must apply to every model (§8.4) |
+| Shadow workspace | Lints for the AI's edits, off to the side | Checking edits in the user's files disrupts them (§9) |
+| Composer and its RL sandboxes | A fast agent model Cursor owns | Reselling per-token models at a flat price didn't pay (§10) |
+| Worktrees and cloud agents | Parallel agents on separate copies | Agents on one copy trample each other (§11) |
+
+</Sub>
+
+<Sub n="12.2" title="From top to bottom">
+
+| Level | The choice | Data structure or algorithm |
+|---|---|---|
+| Product | Own models for high-volume work, buy the rare hard work | Small MoE for Tab; Composer for agents; frontier APIs as options |
+| Tab latency | Reuse computation between keystrokes | KV cache with stable-first prompt order; priority-based prompt renderer |
+| Tab quality | Learn when to speak | Policy gradient; reward 0.75 / −0.25 / 0 implies a 25% threshold |
+| Apply | Rewrite the file, fast | Speculative decoding with the original file as the draft; greedy verification and re-alignment |
+| Sync | Find changes without sending the repo | Merkle tree of file and folder hashes, walked top down |
+| Index cost | Embed each chunk once | Content-addressed cache keyed by chunk hash |
+| Privacy | Store vectors, not code | Per-segment deterministic path encryption; content proofs from the Merkle tree |
+| Index reuse | Start from a teammate's index | Simhash of the tree; nearest-neighbour search on simhashes |
+| Exact search | Narrow files before scanning | Sparse n-gram inverted index, hashed and memory-mapped, layered over a git commit |
+| Isolation | Separate copies for separate actors | Hidden editor window; git worktrees; sandbox VMs |
+
+</Sub>
+
+<SectionHeading n="13" id="breaks">What goes wrong, and what it cost</SectionHeading>
+
+<Sub n="13.1" title="Failures this design has to survive">
+
+| What happens | What the user sees | What the design does |
+|---|---|---|
+| Ananya types faster than suggestions arrive | Nothing, or a suggestion for text already changed | Stale requests are cancelled; only a suggestion for the current text is drawn |
+| The Tab model is unsure | No suggestion | RL has taught it to stay quiet below about a 25% chance of acceptance |
+| The apply model's rewrite diverges from the original | A wrong hunk in the diff | Greedy verification keeps output faithful to the model; the user reviews the diff |
+| A vector database is breached | Some information about code leaks | Only vectors, encrypted paths and line ranges were stored; no plaintext |
+| A newcomer borrows a teammate's index | Could see results for files they lack | Content proofs drop any result for a file they can't prove they have |
+| The agent's edit doesn't type-check | Red squiggles | The shadow workspace shows the lints to the agent first |
+| Two agents edit the same files | Conflicts, broken test runs | Each agent gets its own worktree or VM and branch |
+| Heavy users outspend their plan | Surprise charges (June 2025) | Usage-based plans, an apology and refunds; cheaper own models |
+
+</Sub>
+
+<Sub n="13.2" title="The tradeoffs, in one table">
+
+| Decision | Chosen | Given up | Why it was worth it |
+|---|---|---|---|
+| Inline suggestions | Own small sparse model | Frontier-level reasoning | Hundreds of ms with a 13,000-token prompt, trained on edits |
+| When to suggest | Online RL on accept/reject | A simple, explicit threshold knob | 21% fewer suggestions, 28% higher accept rate |
+| Applying edits | Full rewrite with speculative edits | Fewest output tokens (diffs) | Reliable output, cost proportional to the change |
+| Finding code (2023–2026) | Server-side embeddings plus grep | Simplicity, some privacy | 12.5% more accurate answers when models searched poorly |
+| Finding code (2026 on) | Local regex index plus agentic grep | Search by meaning | Models search well now; nothing leaves the laptop |
+| Sync | Merkle tree, every few minutes | Instant freshness | One hash compared when nothing changed |
+| Checking edits | A hidden second window | Memory (up to 2×) | Real lints without touching the user's files |
+| Agent model | Train Composer with RL | Training and sandbox costs | Speed, price and margins under Cursor's control |
+
+</Sub>
+
+<SectionHeading n="14" id="summary">Summary</SectionHeading>
+
+1. **An AI editor's hardest budget is the keystroke**: Tab reads about 13,000 tokens and writes a few dozen, 400 million times a day, in a few hundred milliseconds.
+2. **Tab predicts edits and jumps, not the next word**, which needs models trained on edit sequences, so Cursor trains its own small sparse models.
+3. **Consecutive keystrokes share almost the whole prompt**, so caching-aware prompt order, cache warming and requesting the next suggestion ahead turn reuse into speed; cancelling stale requests saves the rest.
+4. **Knowing when to stay quiet is learned**: with rewards of 0.75 for accept and −0.25 for reject, a policy-gradient model learns to suggest only above a 25% chance, retrained every couple of hours.
+5. **Rewriting the whole file is the most reliable edit format**, and speculative edits make it cheap by using the original file as the draft, so cost tracks the size of the change.
+6. **Cursor's semantic index stored vectors, not code**: chunks embedded on servers, kept in Turbopuffer namespaces on object storage, and read back from the user's own disk by line range.
+7. **A Merkle tree finds changed files in a handful of comparisons**, and a cache keyed by chunk hash means each piece of code is embedded once for everyone.
+8. **Privacy shaped every detail**: per-segment deterministic path encryption, content proofs before sharing a teammate's index, and simhashes to find that index.
+9. **In 2026 Cursor turned the semantic index off**, because better models with a fast local regex index (sparse n-grams over a git commit) found code as well, converging on Claude Code's choice.
+10. **The shadow workspace checks AI edits in a hidden window**, giving the agent real compiler errors without touching the user's files.
+11. **Owning the high-volume intelligence is the economic spine**: Tab from the start, the apply model in 2024, and Composer, trained by RL in hundreds of thousands of sandboxes, from 2025.
+
+<SectionHeading n="15" id="build">Build this</SectionHeading>
+
+**A small next-edit engine and an index that syncs.**
+
+- Take any small open code model you can run locally. Write an editor plugin (or a script that replays a recorded editing session) that sends the file and cursor position after each keystroke. Measure time to first token with and without keeping the KV cache between requests, with the file at the start of the prompt and the cursor region at the end.
+- Add cancellation: when a new keystroke arrives, abort the running generation. Log how much generation time is saved, and compare with a 100 ms debounce.
+- Implement speculative edits: given an old file and an instruction, run greedy decoding but feed chunks of the old file as draft tokens and accept the longest matching prefix. Count forward passes for a three-line change in a 500-line file.
+- Build a Merkle tree over a real repository, store it, make some edits and switch branches, and walk the trees to find the changed files. Count hashes compared against the number of files.
+
+<SectionHeading n="16" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Why can't an AI editor use the most capable model for inline completions?">
+Inline suggestions must arrive between keystrokes, in a few hundred milliseconds, and each one reads a long prompt (around 13,000 tokens for Cursor's Tab) to write a short suggestion. Reading the prompt dominates the time, and it grows with model size, so a frontier model is far too slow and too expensive at hundreds of millions of requests a day. A small sparse model trained specifically on edits, with its KV cache reused between keystrokes, fits the budget.
+</QA>
+
+<QA level="intermediate" q="How does speculative decoding work when there's no draft model?">
+When a model rewrites a file to make a small change, most of its output is identical to the original file. So use the original as the draft: feed a chunk of it, check the whole chunk in one forward pass with greedy decoding, keep the longest prefix that matches the model's own choices, and generate normally where they differ. Once the output matches the original again, re-align and resume checking in chunks. Cost becomes roughly proportional to the size of the change, and the output is exactly what the model would have written token by token.
+</QA>
+
+<QA level="intermediate" q="How can a server provide semantic search over code it never stores?">
+Store only embeddings, line ranges and encrypted file paths. At query time, embed the query, find the nearest vectors, and return paths and line ranges to the client, which decrypts the paths and reads the text from its own disk before sending it with the model request. Encrypt each path segment deterministically with a client-held key so folder filtering still works, accepting that the folder structure leaks. Cursor ran this design until 2026, and noted that embeddings can still reveal something about the code.
+</QA>
+
+<QA level="deep" q="Cursor built a large semantic code index and then turned it off. Was the index a mistake?">
+No. In 2023 to 2025, models used search tools poorly, and semantic search measurably improved answers (12.5% on Cursor's tests). The index cost a lot: Merkle sync, embedding pipelines, a vector database with millions of namespaces, path encryption and content proofs. As models became good at running many precise searches, the marginal benefit shrank while the cost and privacy exposure stayed, and a fast local regex index made agentic grep quick even in monorepos. A good lesson: tie each component to the limitation it compensates for, and to remove it when that limitation goes away.
+</QA>
+
+<SectionHeading n="17" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="Tab's rewards are changed to +0.5 for an accepted suggestion and −0.5 for a rejected one. Above what acceptance chance will the model learn to show suggestions?">
+    50%. Showing earns 0.5p − 0.5(1 − p) = p − 0.5 on average, which is
+    positive only when p is above 0.5. The model would suggest less often, and
+    be right more often when it did.
+  </Q>
+  <Q q="Ananya switches to a branch that touches 3,000 of her 40,000 files. Does the Merkle tree still help?">
+    Less. The walk has to descend into every folder that contains a changed
+    file, so it compares many more hashes, though still fewer than 40,000 if
+    the changes are concentrated in a few folders. The upload of 3,000 files is
+    the larger cost, and the chunk-hash cache helps there: chunks that exist on
+    other branches have been embedded before.
+  </Q>
+  <Q q="Why does speculative editing use greedy decoding?">
+    With greedy decoding the model's output is fully determined, so checking a
+    draft token is a plain comparison with the model's top choice, and the
+    accepted output is exactly what token-by-token decoding would produce. With
+    sampling, verification needs a probabilistic acceptance rule, as in
+    chapter 54's speculative decoding.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Editing Files at 1000 Tokens per Second (Cursor blog, 2024)">
+    The apply model, why full rewrites beat diffs, and speculative edits with
+    the original file as the draft. Fireworks' post on serving it explains the
+    speculation API.
+  </WildCard>
+  <WildCard name="Improving Cursor Tab with online RL (Cursor blog, 2025)">
+    Policy gradients on accept and reject, the reward example, and the
+    two-hour on-policy loop.
+  </WildCard>
+  <WildCard name="A New Tab Model (Cursor blog, January 2025)">
+    Next edits, jumps, and the latency and context numbers for the Fusion model.
+  </WildCard>
+  <WildCard name="Shadow Workspaces (Cursor blog, 2024)">
+    Every option considered for giving an AI lints without touching your files,
+    and why a hidden window won.
+  </WildCard>
+  <WildCard name="Securely indexing large codebases (Cursor blog, 2026)">
+    Merkle trees, simhash-based index reuse and content proofs, with the
+    time-to-first-query numbers.
+  </WildCard>
+  <WildCard name="Fast regex search: indexing text for agent tools (Cursor blog, 2026)">
+    Trigram indexes, sparse n-grams and a memory-mapped on-disk format built for
+    agents' grep calls.
+  </WildCard>
+  <WildCard name="Composer: Building a fast frontier model with RL (Cursor blog, 2025)">
+    Mixture of experts, RL in hundreds of thousands of sandboxes, and the
+    training infrastructure; the Composer 1.5 and 2 posts continue the story.
+  </WildCard>
+  <WildCard name="Cursor Team on the Lex Fridman Podcast (#447, 2024)">
+    The founders on Tab, caching, speculative edits, Merkle-tree indexing and
+    scaling, in their own words.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="18" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Designing Claude Code">
+    The agent loop, agentic search, sandboxing, compaction and prompt caching,
+    the parts of a coding agent this chapter builds on.
+    [Chapter 78](/topics/78-design-claude-code).
+  </WildCard>
+  <WildCard name="Designing ChatGPT">
+    KV caches, prefix caching and speculative decoding on the serving side.
+    [Chapter 54](/topics/54-design-chatgpt).
+  </WildCard>
+  <WildCard name="Search Engines">
+    Inverted indexes, posting lists and hybrid lexical and vector search.
+    [Chapter 62](/topics/62-search-engines).
+  </WildCard>
+  <WildCard name="Designing Dropbox">
+    Content hashes, hash trees and syncing only what changed.
+    [Chapter 66](/topics/66-design-dropbox).
+  </WildCard>
+  <WildCard name="Caching">
+    Hit rates, warming and invalidation, the ideas behind Tab's KV reuse.
+    [Chapter 25](/topics/25-caching).
+  </WildCard>
+  <WildCard name="Distributed Training">
+    Data, expert and pipeline parallelism behind training models like Composer.
+    [Chapter 59](/topics/59-distributed-training).
+  </WildCard>
+</CardGrid>

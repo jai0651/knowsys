@@ -1,0 +1,1156 @@
+---
+title: Designing Perplexity
+dek: "Rohan asks a question about last month's Postgres release, and a few seconds later he's reading a short answer with numbered sources. We'll design the answer engine behind it: crawling and indexing the web, hybrid retrieval, ranking cascades, grounded answers with citations, multi-step research and the GPUs that write it all, and the hard problems Perplexity had to solve at each step."
+readingTime: "~55 min"
+level: "Intermediate"
+versions: "Figures from Perplexity's research and engineering posts, Vespa, NVIDIA and Cloudflare posts, and court and press records, dated where they appear"
+prereqs: "the ChatGPT case study (chapter 54) and search engines (chapter 62) help a lot; caching (chapter 25) helps"
+updated: "2026-11-09"
+---
+
+Rohan is a database engineer at a payments company in Hyderabad. His team is planning an upgrade, and he's heard that the newest PostgreSQL release reads data from disk in a new way. Between meetings he opens Perplexity on his phone and types: *does Postgres 18 have async I/O, and how much faster does it make scans?*
+
+Under the box a short list appears almost at once: *Searching… postgresql.org, a docs page, a mailing-list thread.* Then text starts to stream in. PostgreSQL 18 added an asynchronous I/O subsystem **[1]**, which can make sequential scans up to three times faster when reading from storage **[1]**, and the method is chosen with the `io_method` setting **[2]**. Each little number links to the page it came from. Rohan taps **[2]**, sees the documentation page, and types a follow-up: *how do I turn it on?*
+
+From Rohan's side it looks like a chatbot with links. But the model that wrote the answer was trained long before Postgres 18 shipped, so it couldn't have known any of this on its own. In the three or so seconds before the text began, something found three relevant paragraphs among hundreds of billions of web pages, threw away an old blog post that confidently said Postgres has no async I/O, handed the right paragraphs to a model, and made the model say only what those paragraphs support, with the right number on each sentence. And it did that for tens of millions of questions that day, most of them about things that changed recently.
+
+So the question this case study answers is: **when Rohan asks a question about something that happened last month, how does Perplexity find the few right paragraphs on the whole web and write a cited answer from them, in a few seconds, for a cost a subscription can pay for?** We'll start from the most obvious design, watch it break, and fix it one hard problem at a time, going from boxes on a diagram down to posting lists, embedding bytes, reranking budgets and the GPU kernels that move tokens between machines.
+
+<SectionHeading n="01" id="requirements">What we're building, and how big</SectionHeading>
+
+<Sub n="1.1" title="What it has to do">
+
+An **answer engine** takes a question in plain words, searches the web for it, and writes a short answer built from what it found, with each claim linked to its source. Perplexity's job comes down to this list:
+
+1. **Understand the question**, including follow-ups like *how do I turn it on?* that only make sense next to the previous question.
+2. **Find the relevant passages** on the web, including pages published minutes or days ago.
+3. **Write an answer** from those passages, in plain prose.
+4. **Cite every claim**, so the reader can check it against the page it came from.
+5. **Go deeper when asked**: plan a multi-step investigation, run many searches, and write a report.
+
+And the qualities it needs while doing that:
+
+- **Fast**: the first words should appear in a second or two. Rohan is comparing this with a search box that answers in a few hundred milliseconds.
+- **Fresh**: an answer about a release from last month must not come from a page written two years ago.
+- **Grounded**: the answer must say what the sources say, no more, and the citations must point at the right sources.
+- **Affordable**: most people pay nothing, and subscribers pay a flat monthly fee, so every question has to cost a small fraction of a cent to a few cents.
+
+Compare the ChatGPT case study in chapter 54, where the model answered from training and the hard part was generating tokens. Here the model is only the last step, and most of this chapter is about what happens before it writes its first word.
+
+</Sub>
+
+<Sub n="1.2" title="How big is it?">
+
+At Bloomberg's Tech Summit on 5 June 2025, Perplexity's CEO Aravind Srinivas said the service had handled 780 million queries in May 2025, and that query volume was growing by more than 20% a month. Vespa, the company whose search engine Perplexity used, quotes the same 780 million a month on its case-study page. Six months earlier, in December 2024, an NVIDIA post about Perplexity's serving stack put the figure at more than 435 million a month.
+
+Underneath, the search system is bigger than those numbers suggest. In September 2025 Perplexity's research team wrote that its search infrastructure processed 200 million queries a day and tracked over 200 billion unique URLs, with an "exabyte-scale" index and crawling system running on tens of thousands of CPUs and hundreds of terabytes of RAM. That search stack also serves Perplexity's paid Search API, so not every one of those 200 million searches comes from someone like Rohan, but the gap between the two figures hints at something we'll see throughout this chapter: one question usually turns into several searches.
+
+<Think
+  q="Take 780 million questions a month. Suppose each answer is written from about ten passages of 300 tokens each, plus about 2,000 tokens of instructions and conversation, and the answer itself is about 400 tokens. Roughly how many tokens does the model read and write per second, on average?"
+  hint="Per day first: 780 million divided by 30. Then multiply by the tokens per question, and divide by the 86,400 seconds in a day."
+>
+780 million a month is about 26 million questions a day, or about 300 a second on average (more at the daily peak). Each question makes the model read about 10 × 300 + 2,000 = 5,000 tokens and write about 400.
+
+So the model reads about 26 million × 5,000 = 130 billion tokens a day, roughly 1.5 million tokens a second, and writes about 10 billion tokens a day, roughly 120,000 a second. And that's only the final answer. Every question also has to be searched, ranked and trimmed down to those ten passages before the model sees anything, and a multi-step research question repeats all of it many times.
+
+Two things follow. Reading outweighs writing roughly twelve to one, which pushes the design towards cheap reading (chapter 54's prefill). And every question costs compute twice, once in search and once in the model, so each has to be made cheap separately.
+</Think>
+
+(A **token** is the unit a language model reads and writes, a word or a piece of a word; chapter 54 shows how text is cut into them. A rough rule for English is three or four characters per token.)
+
+</Sub>
+
+<SectionHeading n="02" id="v1">Version 1: search, fetch, stuff, generate</SectionHeading>
+
+<Sub n="2.1" title="The obvious design">
+
+Here's the design most people sketch first, and it's roughly what a weekend prototype of an answer engine looks like. Rohan's question goes to a server. The server sends it, unchanged, to a commercial web search API, such as Bing's or a service that returns Google's results, and gets back ten links. It downloads those ten pages, strips the HTML, pastes all the text into one long prompt together with the question and the instruction "answer this using the pages below", and sends the prompt to a hosted language model. When the model has finished writing, the server sends the answer back to Rohan's phone.
+
+This pattern has a name, **retrieval-augmented generation (RAG)**: retrieve documents first, then let a language model generate an answer from them. It fixes the model's biggest problem for Rohan's question, which is that the model alone has never heard of Postgres 18.
+
+<SystemDiagram
+  title="Version 1: every step in a line, everything rented"
+  nodes={[
+    { id: "rohan", label: "Rohan's phone", kind: "phone", col: 0, row: 0 },
+    { id: "app", label: "App server", kind: "service", col: 1, row: 0 },
+    { id: "serp", label: "Search API", sub: "10 links", kind: "external", col: 2, row: 0 },
+    { id: "web", label: "The web", sub: "10 live fetches", kind: "external", col: 2, row: 1 },
+    { id: "llm", label: "Hosted LLM", sub: "whole pages in", kind: "external", col: 3, row: 0 },
+  ]}
+  edges={[
+    { from: "rohan", to: "app", label: "question" },
+    { from: "app", to: "serp" },
+    { from: "app", to: "web", label: "GET ×10" },
+    { from: "app", to: "llm", label: "prompt" },
+  ]}
+  steps={[
+    { caption: "Rohan's question reaches the app server exactly as he typed it.", path: ["rohan", "app"] },
+    { caption: "The server asks a commercial search API for the top ten links. That's one paid call and a few hundred milliseconds to a second.", path: ["app", "serp"] },
+    { caption: "It downloads each of the ten pages from their own sites. Some answer in 200 ms, some in five seconds, some never.", path: ["app", "web"] },
+    { caption: "It pastes the text of all ten pages into one prompt and sends it to a hosted model, then waits for the whole answer.", path: ["app", "llm"] },
+    { caption: "Only when the last word is written does Rohan see anything.", path: ["llm", "app", "rohan"] },
+  ]}
+  caption="It works for a demo. At Perplexity's scale, every arrow in it is too slow, too expensive or too coarse."
+/>
+
+</Sub>
+
+<Sub n="2.2" title="Where it breaks">
+
+Walk Rohan's question through it and count the problems.
+
+- **It's slow, and slow in the worst way.** The steps run one after another, and the slowest page of the ten decides when the prompt can be sent. Then the model has to write the whole answer before Rohan sees a word. Section 3 puts numbers on this.
+- **It's expensive.** Perplexity wrote in 2025 that one leading search provider charged $200 per thousand queries. That's 20 cents for every search, before the model costs anything. At 26 million questions a day, one search per question would cost about $5 million a day, and as we've seen, a question usually needs several.
+- **It returns pages when the model needs paragraphs.** Rohan's answer lives in two sentences of a long release announcement and one line of a settings page. Pasting ten whole pages into the prompt makes the model read tens of thousands of tokens of menus, banners and unrelated sections to find a few hundred useful ones.
+- **It can be stale.** A search provider's index is refreshed on its own schedule. For a question about last month's release, a page from two years ago that says "Postgres doesn't support asynchronous I/O" can rank well because it's old, popular and well linked.
+- **Nothing makes the model stay on the pages.** The prompt says "use the pages below", but the model also remembers a great deal from training, and when the pages don't say something, it may fill the gap from memory, or invent it, and the answer will read just as confidently.
+
+Each of these is one of the hard problems Perplexity has written or spoken about, and the rest of the chapter takes them one at a time. We'll start with the one Rohan feels first: waiting.
+
+</Sub>
+
+<SectionHeading n="03" id="latency">Hard problem 1: a few seconds for everything</SectionHeading>
+
+<Sub n="3.1" title="Where the seconds go">
+
+Rohan is used to a search box that shows ten links in a few hundred milliseconds. Srinivas made the comparison himself in a June 2024 podcast with Lex Fridman: Google is faster than Perplexity, he said, because it renders links instantly, in roughly 300 to 400 milliseconds. An answer engine has to do everything a search engine does and then write prose on top. So the budget has to be split between steps, and each step has to be fast almost every time, which is a much harder target than fast on average.
+
+Here's Version 1's path again, as a pipeline of stages, with the time each one takes:
+
+<Steps
+  title="Rohan's question through Version 1, one stage after another"
+  lanes={[
+    { t: "Understand", s: "rewrite, route" },
+    { t: "Search", s: "find candidates" },
+    { t: "Fetch", s: "get the text" },
+    { t: "Rank", s: "pick passages" },
+    { t: "Prefill", s: "model reads" },
+    { t: "Decode", s: "model writes" },
+  ]}
+  steps={[
+    [0, "Version 1 skips this stage: the question goes out exactly as typed. The fixed design adds a small model here, which costs tens of milliseconds."],
+    [1, "A third-party search call: a few hundred milliseconds to more than a second, depending on the provider."],
+    [2, "Ten live page downloads. In parallel, the stage takes as long as the **slowest** of the ten, which is often seconds."],
+    [3, "Version 1 has no ranking stage: everything goes into the prompt. That makes the next stage slower."],
+    [4, "**Prefill**: the model reads the whole prompt before writing anything. Tens of thousands of tokens of whole pages take far longer to read than a few thousand tokens of chosen passages."],
+    [5, "**Decode**: the model writes one token at a time. At 50 tokens a second, a 400-token answer takes 8 seconds; at 1,200 a second, a third of a second."],
+  ]}
+/>
+
+Two numbers describe how fast this feels. **Time to first token (TTFT)** is how long Rohan waits before the first word of the answer appears; it covers every stage up to and including prefill. **Output speed**, in tokens per second, is how fast the rest arrives. Srinivas named both in the same podcast as the numbers that matter most for the model, and he added a point about measuring them: trying a few queries and seeing that they're fast tells you little. You have to track the **90th and 99th percentile** latencies, written p90 and p99: the time that 90% or 99% of requests beat. A median of one second with a p99 of nine seconds means one question in a hundred hangs for nine seconds, and someone who asks thirty questions a day hits that most days.
+
+</Sub>
+
+<Sub n="3.2" title="The slowest of ten pages">
+
+Fetching is where the tail gets bad, and it's worth seeing why. When a request has to wait for several things that run in parallel, it finishes when the **slowest** of them finishes. If each page has only a small chance of being slow, the chance that *at least one* of ten is slow is much bigger. Jeff Dean and Luiz Barroso called this "the tail at scale" in a 2013 paper about Google's servers.
+
+This program simulates 10,000 questions, each fetching 8 pages. A typical page takes around 300 milliseconds, with some spread, and 3% of sites are slow or stuck and take 3 to 10 seconds. It compares fetching the pages one after another, fetching all of them at once and waiting for the last, and fetching all at once but giving up on any page that hasn't arrived after one second. `random.lognormvariate` draws a skewed latency, mostly near the median with a long right tail, the usual shape of real network timings. `pct` reads off a percentile from the sorted list.
+
+<TryIt what="Fetching eight pages: in a row, all at once, or with a deadline" lang="python" toolchain="Python 3.14">
+```python
+import random
+random.seed(7)
+
+def fetch_ms():
+    """One live page fetch: usually a few hundred ms, sometimes very slow."""
+    if random.random() < 0.03:                 # 3% of sites are slow or stuck
+        return random.uniform(3000, 10000)
+    return random.lognormvariate(5.7, 0.5)     # median about 300 ms
+
+def pct(xs, p):
+    xs = sorted(xs)
+    return xs[int(p / 100 * (len(xs) - 1))]
+
+PAGES, DEADLINE, RUNS = 8, 1000, 10_000
+serial, parallel, deadline, kept = [], [], [], []
+for _ in range(RUNS):
+    t = [fetch_ms() for _ in range(PAGES)]
+    serial.append(sum(t))                      # one page after another
+    parallel.append(max(t))                    # all at once, wait for the slowest
+    deadline.append(min(max(t), DEADLINE))     # all at once, stop waiting at 1 s
+    kept.append(sum(x <= DEADLINE for x in t))
+
+print(f"{'strategy':28} {'p50':>7} {'p95':>7} {'p99':>7}")
+for name, xs in [("serial fetch, 8 pages", serial),
+                 ("parallel, wait for all 8", parallel),
+                 ("parallel, 1 s deadline", deadline)]:
+    print(f"{name:28} {pct(xs,50):6.0f}ms {pct(xs,95):6.0f}ms {pct(xs,99):6.0f}ms")
+print(f"questions where a page was slower than 1 s: "
+      f"{sum(k < PAGES for k in kept) / RUNS:.0%}")
+print(f"pages kept with the deadline, on average: {sum(kept) / RUNS:.2f} of {PAGES}")
+```
+<Output>
+```
+strategy                         p50     p95     p99
+serial fetch, 8 pages          2852ms  11200ms  15557ms
+parallel, wait for all 8        669ms   8394ms   9699ms
+parallel, 1 s deadline          669ms   1000ms   1000ms
+questions where a page was slower than 1 s: 26%
+pages kept with the deadline, on average: 7.70 of 8
+```
+</Output>
+</TryIt>
+
+Fetching in a row is hopeless: nearly three seconds at the median. Fetching in parallel fixes the median, 669 ms, but not the tail: with only 3% of sites slow, a quarter of all questions include a slow page, so the p95 is over eight seconds. A deadline caps the wait at one second and loses about a third of a page per question. Every fan-out system makes that trade: decide how long to wait, and answer with whatever arrived.
+
+<Why>Why not just fetch the pages faster?</Why>
+
+Even with a deadline, the good case spends 669 ms of the budget waiting on other people's servers. The real fix is to download nothing while Rohan waits: fetch pages long before anyone asks, cut them into passages, and keep them in an index of your own, where reading a passage takes milliseconds. That's the second hard problem, in section 4.
+
+</Sub>
+
+<Sub n="3.3" title="Show something early, then stream">
+
+Two more design choices make the wait feel shorter without making any stage faster.
+
+The first is **streaming**: sending each token to the phone as soon as the model writes it (chapter 54 shows how). Rohan starts reading when decoding starts instead of when it ends.
+
+The second is **showing the work**. Before the answer starts, Perplexity's interface lists the searches it's running and the sources it found. In a 2024 interview with LangChain about Pro Search, Perplexity engineer William Zhang said the team found that users were willing to wait longer when they could see intermediate progress. The sources arrive before the answer anyway, because they have to exist before the model can read them, so sending them to the screen first costs nothing.
+
+And then there's raw output speed. In February 2025 Perplexity launched a new default model, Sonar, built on Meta's open Llama 3.3 70B model, further trained for factuality and readability, and served on Cerebras hardware at about 1,200 tokens a second. At that speed Rohan's 400-token answer takes about a third of a second, so nearly all of the wait is before the first token.
+
+<Callout label="Design implication">
+Set a latency budget per stage and hold each stage to its p99, not its median. In a pipeline of six stages, six medians that each look fine add up to an answer that's slow one time in ten, because some stage is in its tail. Stages that wait on many parallel calls need deadlines, because their tails multiply.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="04" id="index">Hard problem 2: an index of your own</SectionHeading>
+
+<Sub n="4.1" title="Renting search, then building it">
+
+Section 3 ended with the idea of fetching pages ahead of time and keeping them in an index of our own. That's a big decision. Building a web index means building a **crawler**, a program that downloads pages from the web and follows their links to find more, plus the machines to store and search what it finds. Google and Microsoft spent decades on theirs. Renting someone else's is far easier.
+
+Perplexity started by renting, and moved away in stages. Its November 2023 post introducing its "online" models, fine-tuned from the open Mistral 7B and Llama 2 70B models, already credited its "in-house search, indexing, and crawling infrastructure" for their fresh answers. By September 2025, its research team listed four reasons the third-party search APIs it had used didn't fit an AI system:
+
+- **Price**: one leading provider charged $200 per thousand queries.
+- **Granularity**: they returned whole documents, ranked for humans who would click one link.
+- **Freshness and speed**: some indexes were updated too rarely, and the services that scraped another engine's results page were slow, because they had to query a third-party engine on every call.
+- **Retrieval method**: providers offered either keyword search or meaning-based search, rarely both together (section 5 explains why you want both).
+
+<Decision
+  q="Rent web search, or build an index?"
+  options={[
+    { name: "Third-party search API", how: "Send each query to Bing, Google or a reseller; get back links and snippets.", good: ["Nothing to build or run", "Decades of ranking work for free"], bad: ["About $200 per thousand queries from one provider (2025)", "Whole-page results, ranked for humans", "Freshness and latency set by someone else"] },
+    { name: "Own crawler and index", how: "Crawl and parse the web yourself; store passages in your own search engine.", good: ["Passage-level results tuned for a model", "Control over freshness and latency", "Marginal cost per search far lower"], bad: ["Tens of thousands of CPUs and an exabyte-scale store to run", "Crawling raises politeness and consent problems (section 11)"], chosen: true },
+  ]}
+>
+Perplexity built its own, gradually: an in-house index existed by late 2023, and by September 2025 it handled 200 million queries a day over 200 billion tracked URLs and was sold to other companies as the Perplexity Search API, at $5 per thousand requests per Perplexity's API docs in 2026. Srinivas's summary of the strategy, quoted on Vespa's case-study page, was "First solve search, then solve everything else."
+</Decision>
+
+</Sub>
+
+<Sub n="4.2" title="Crawling: completeness against freshness">
+
+A crawler's basic loop is simple. Keep a queue of URLs to visit. A **scheduler** takes URLs from the queue, a **downloader** fetches them, the text and metadata are stored, and every link found in a page goes back into the queue.
+
+<Picture
+  src="/images/designs/perplexity/web-crawler-architecture.png"
+  alt="A diagram: a scheduler with a queue sends URLs to a multi-threaded downloader, which fetches pages from the web, stores text and metadata, and sends newly found URLs back to the queue"
+  caption="The textbook crawler. Every interesting decision hides in the scheduler: which URL to fetch next, and when to fetch a page it has already seen."
+  credit="Image: dnet, based on an image by ChaTo, CC BY-SA 3.0, via Wikimedia Commons"
+  href="https://commons.wikimedia.org/wiki/File:WebCrawlerArchitecture.svg"
+  paper
+  narrow
+/>
+
+Most of the difficulty is in the scheduler, because the web is effectively infinite and the crawler isn't. Perplexity's 2025 article states the tension directly: for a fixed indexing budget, refreshing pages it already has competes with indexing pages it has never seen. Rohan's question needs both: the release page discovered soon after it appeared, and older pages that were edited to mention Postgres 18 fetched again.
+
+Perplexity's answer, per the same article, is to let models decide. One model predicts whether a candidate URL needs indexing at all, from how important it's likely to be and how often it changes; others decide when to schedule each indexing operation. Named signals include authoritative domains and topics the index covers poorly. Storage is tiered too: learned models and rules decide which documents are kept "hot", in fast storage, and which can sit in cheaper, slower "warm" or "cold" storage.
+
+Two smaller problems make crawling harder than the diagram suggests. Pages that build their content with JavaScript arrive as empty shells, so, as Srinivas said in the 2024 podcast, the crawler has to "headless render" them in a browser with no screen. And a crawler has to be polite. Each site can publish a file called **robots.txt** listing which crawlers may fetch which paths, and the article says PerplexityBot follows those limits and keeps its request rate to each domain predictable. Section 11 comes back to robots.txt, where Perplexity's engineering met its biggest public controversy.
+
+</Sub>
+
+<Sub n="4.3" title="Parsing and cutting pages into spans">
+
+A downloaded page is HTML: menus, ads, footers, comment threads, and somewhere in the middle, the content. A parser has to find the content, keep its structure (headings, lists, tables, code) and drop the rest. Perplexity's article describes its parsing rules as being refined in a loop: frontier language models grade the parser's output for completeness and quality, the rules are improved, and pages that get a lot of traffic are re-parsed with the newest rules.
+
+Then the content is cut up. Version 1 handed the model whole pages; the article says Perplexity's index instead splits each document into **self-contained spans**, each of which can be retrieved and ranked on its own, aiming for "the most atomic units possible". For Rohan, the release announcement becomes dozens of spans, and the one that matters is the paragraph about the new I/O subsystem. Chunk sizes aren't published.
+
+Cutting creates its own problem. A span is only useful if it makes sense alone, and many don't. A paragraph that says "this release adds an asynchronous I/O subsystem" never says *which* release; that was in the page title. Perplexity's February 2026 embedding models (section 5) include a "contextual" variant for this case: each span is embedded with its surrounding document in view, so "this release" can still be found by a search for "Postgres 18".
+
+<SystemDiagram
+  title="From the web to searchable spans, ahead of time"
+  nodes={[
+    { id: "web", label: "The web", sub: "200B+ URLs tracked", kind: "external", col: 0, row: 0 },
+    { id: "sched", label: "Crawl scheduler", sub: "ML: what, when", kind: "compute", col: 1, row: 0 },
+    { id: "fetch", label: "Fetchers", sub: "render, robots.txt", kind: "service", col: 2, row: 0 },
+    { id: "parse", label: "Parser", sub: "content, spans", kind: "compute", col: 3, row: 0 },
+    { id: "embed", label: "Embedder", sub: "GPU, INT8", kind: "compute", col: 3, row: 1 },
+    { id: "build", label: "Index builder", sub: "offline jobs", kind: "compute", col: 2, row: 1 },
+    { id: "store", label: "Object store", sub: "built indexes", kind: "blob", col: 1, row: 1 },
+    { id: "serve", label: "Search nodes", sub: "hot in RAM/SSD", kind: "db", col: 0, row: 1 },
+  ]}
+  edges={[
+    { from: "sched", to: "fetch", label: "URLs" }, { from: "fetch", to: "web" },
+    { from: "fetch", to: "parse" }, { from: "parse", to: "embed" },
+    { from: "embed", to: "build" }, { from: "build", to: "store" }, { from: "store", to: "serve" },
+    { from: "parse", to: "sched", label: "new links", dashed: true },
+  ]}
+  steps={[
+    { caption: "The scheduler's models decide which URLs to fetch next: new ones worth discovering, and known ones likely to have changed.", path: ["sched", "fetch", "web"] },
+    { caption: "Fetchers download and, where needed, render each page, staying inside its robots.txt limits.", path: ["web", "fetch"] },
+    { caption: "The parser extracts the content and cuts it into self-contained spans. New links go back to the scheduler.", path: ["fetch", "parse", "sched"] },
+    { caption: "Each span is turned into an embedding on GPUs, alongside its text and metadata.", path: ["parse", "embed"] },
+    { caption: "Separate jobs build index files and publish them to object storage; search nodes load them and keep the most-used parts hot.", path: ["embed", "build", "store", "serve"] },
+  ]}
+  caption="None of this runs while Rohan waits. By the time he asks, the release page is already parsed, cut into spans and indexed."
+/>
+
+We now have the passages stored ahead of time. The next problem is finding the right three among billions, and it turns out there are two different senses of "right".
+
+</Sub>
+
+<SectionHeading n="05" id="retrieval">Hard problem 3: finding passages by words and by meaning</SectionHeading>
+
+<Sub n="5.1" title="Two ways to match a question">
+
+Rohan typed *does Postgres 18 have async I/O, and how much faster does it make scans?* The release announcement doesn't contain the word "async"; it says "asynchronous". It doesn't say "faster scans"; it says "performance improvements when reading from storage". And the settings page never mentions scans at all.
+
+The classic way to search text is **lexical** retrieval: match the words. Chapter 62 builds it from scratch: an **inverted index** maps every word to the list of documents containing it, and a scoring formula called **BM25** ranks matches by how often the query's words appear in a document, giving rare words more weight than common ones. Lexical search is fast and precise for exact terms like `io_method` or a version number, but misses "async" against "asynchronous" unless told they're the same.
+
+The other way is **dense** retrieval. A neural network called an **embedding model** turns a piece of text into a list of numbers, a vector of a thousand or so dimensions, placed so that texts with similar meanings end up close together. Rohan's question and the release paragraph land near each other even though they share few exact words. Finding the passages nearest to the question's vector, among billions, is an **approximate nearest-neighbour** search, and chapter 58 explains the graph index (HNSW) most systems use for it.
+
+<Why>Why not use embeddings for everything?</Why>
+
+Neither is enough alone. Srinivas put it bluntly in the 2024 podcast: vector embeddings "are not magically working for text", and packing everything about a web page into one vector is very hard; that's why BM25 still matters and why "pure embeddings and vector spaces are not going to solve the search problem". To an embedding model, "Postgres 18" and "Postgres 17" are nearly the same text, and that's exactly the difference Rohan cares about.
+
+So Perplexity runs both. Its 2025 article says it queries the index both ways and merges the results into one **hybrid** candidate set, aiming at this stage for completeness over precision. Chapter 62 (section 11) shows the standard way to merge two ranked lists, reciprocal rank fusion. Perplexity hasn't published its merge formula.
+
+<Decision
+  q="Lexical, dense, or both?"
+  options={[
+    { name: "Lexical (BM25)", how: "Inverted index of words; score by term frequency and rarity.", good: ["Exact versions, names and codes", "Cheap, well understood, explainable"], bad: ["Misses paraphrases and synonyms"] },
+    { name: "Dense (embeddings)", how: "Embed question and passages; nearest-neighbour search.", good: ["Matches meaning across different wording", "Works across languages"], bad: ["Blurs exact tokens like '17' vs '18'", "Large vector storage; approximate search"] },
+    { name: "Hybrid", how: "Run both and merge the candidate lists before ranking.", good: ["Each covers the other's misses", "Later stages get a complete candidate set"], bad: ["Two indexes to build, store and serve"], chosen: true },
+  ]}
+>
+Perplexity's September 2025 article describes hybrid retrieval as the first stage, and the Vespa case study says Perplexity picked Vespa partly because "vector databases could not reliably support even simple boolean filters", the kind of exact filter ("published after 2025-09-01", "language = English") that a fresh answer engine needs on every query.
+</Decision>
+
+</Sub>
+
+<Sub n="5.2" title="What the vectors cost">
+
+Dense retrieval has a storage problem that lexical retrieval doesn't. Every span needs its own vector, and there are a lot of spans.
+
+<Think
+  q="Suppose the index holds embeddings for 200 billion pages, about 10 spans per page, each embedding 1,024 numbers. How much storage do the vectors take as 32-bit floats? As 8-bit integers? As one bit per number?"
+  hint="Two trillion vectors. A 32-bit float is 4 bytes, an 8-bit integer 1 byte, and 1,024 bits is 128 bytes."
+>
+That's 2 × 10¹² vectors.
+
+- 32-bit floats: 1,024 × 4 = 4,096 bytes each, so about **8 petabytes**.
+- 8-bit integers: 1,024 bytes each, about **2 petabytes**.
+- One bit per number: 128 bytes each, about **256 terabytes**.
+
+(The 200 billion is how many URLs Perplexity's index tracks; how many of them carry embeddings, and for how many spans each, isn't published, so treat this as an order of magnitude.) The point is the ratio. Dense retrieval wants vectors in fast memory, and the difference between 8 petabytes and a quarter of a petabyte is the difference between unaffordable and merely expensive.
+</Think>
+
+That's why Perplexity's own embedding models, `pplx-embed`, released in February 2026 under the MIT licence, are trained to produce small vectors directly. They're built on Alibaba's Qwen3 language models at two sizes, 0.6 billion and 4 billion parameters, with 1,024 and 2,560 dimensions, and they output 8-bit integers by default, four times smaller than 32-bit floats. They can also produce **binary** embeddings, one bit per dimension (the sign of each number), 32 times smaller than floats. Perplexity reports that for the 4B model, going binary costs under 1.6 points of retrieval quality, and 2 to 4 points for the smaller one. The post calls embeddings "the first stage of our retrieval pipeline": the step that decides which of billions of pages ever reach the rankers and the model.
+
+Binary vectors are also cheap to compare: XOR two of them and count the 1 bits, 64 dimensions per CPU instruction. Searching binary vectors first and rescoring the top few hundred with the 8-bit versions is a common pattern, though Perplexity hasn't said whether it uses it.
+
+<Elsewhere items={[
+  { where: "Elasticsearch, OpenSearch, Vespa", how: "All three run BM25 and vector search in one query and merge the lists, usually by reciprocal rank fusion (chapter 62, section 11)." },
+  { where: "Recommendation systems", how: "Netflix-style candidate generation is the same two-tower embedding plus nearest-neighbour search (chapter 58)." },
+  { where: "Product quantisation", how: "Vector databases such as FAISS compress vectors into short codes for the same reason binary embeddings exist: the full vectors don't fit in RAM." },
+]} />
+
+So Rohan's question now produces a few thousand candidate spans, by words and by meaning. Those candidates have to come out of an index spread across many machines, quickly, every time, and keeping that tail fast was a problem big enough that Perplexity eventually replaced its search engine.
+
+</Sub>
+
+<SectionHeading n="06" id="serving-index">Hard problem 4: serving the index with a short tail</SectionHeading>
+
+<Sub n="6.1" title="Vespa, and why Perplexity left it">
+
+Storing billions of spans with their text, vectors and metadata, keeping them updated as the crawler delivers new versions, and answering a hybrid query over all of them in milliseconds is the job of a search engine. Chapter 62 explains the general shape: the index is cut into **shards**, each machine holds some shards, a query is sent to every shard at once (scatter), and the best results from each are merged (gather).
+
+In April 2025, Vespa.ai, the company behind the open-source Vespa search engine that came out of Yahoo, announced that Perplexity used Vespa for its search. Vespa's posts said each document was indexed as text and as vectors along with metadata and signals, updated in real time, ranked with machine-learned models, and that the work had to fit in about a hundred milliseconds, thousands of times a second.
+
+By late 2026 that had changed. Vespa's case-study page now says Perplexity moved its web index to a purpose-built internal search system and still uses Vespa elsewhere. On 24 September 2026 Perplexity published a post about **Photon**, a retrieval and ranking engine built from scratch to replace "an open-source engine that we adapted to our system", run as its own fork; the post doesn't name it. Its reasons for leaving are a good list of what's hard about serving a web index:
+
+- **Cost.** Documents grew in number and in data per document (about 2.5 times more per document by the end), and the old engine's data formats needed more RAM than Perplexity wanted to pay for.
+- **Tail latency.** The old engine's p99 was about 800 ms. The dataset no longer fit in RAM, so reads that missed memory became **major page faults**: the process touched a part of a memory-mapped file that wasn't in RAM, and the operating system blocked it while reading the page from disk (chapter 04 explains page faults). During background index merges, the p99 rose to about 1.2 seconds for 10 to 15 minutes at a time.
+- **Recovery.** Bringing up an additional cluster and synchronising its data could take more than a week, and while nodes recovered, more queries got partial answers from fewer shards, which measurably lowered answer quality.
+
+After the move, the post reports, the p99 of Photon's internal retrieval and ranking stages fell to about 65 ms, on about 20% fewer serving machines. A new copy of the data deploys in about half an hour, and the whole web index rebuilds in "a single-digit number of hours".
+
+<Decision
+  q="Adapt an open-source search engine, or build one?"
+  options={[
+    { name: "Open-source engine, forked (to 2026)", how: "Run an existing engine (Vespa's posts describe Perplexity on Vespa in 2025) and patch it.", good: ["Hybrid retrieval, filters and ranking from day one", "Years of other people's engineering"], bad: ["General-purpose formats cost RAM at this size", "Page-fault and merge-time tail latency", "Week-long cluster recovery; a fork to maintain"] },
+    { name: "Build a specialised engine (Photon, 2026)", how: "Write retrieval and ranking for exactly this corpus and query mix.", good: ["Compact formats; explicit control of what's in memory", "p99 of internal stages from ~800 ms to ~65 ms", "About 20% fewer machines"], bad: ["A search engine is a huge thing to own", "Every feature the old one had must be rebuilt"], chosen: true },
+  ]}
+>
+It's the same path Perplexity took with web search: rent to move fast, then build once the workload is big and specific enough. The 65 ms covers Photon's internal stages; a whole call to the Photon-based "fast" Search API preset takes 160 ms at the median and 230 ms at p95.
+</Decision>
+
+</Sub>
+
+<Sub n="6.2" title="One query through Photon">
+
+The Photon post describes the request path. A load balancer sends the query to a **broker**. The broker picks one **shard group**, a complete copy of the index split across many machines, and sends the query to every shard in it at once. Each shard runs retrieval and two stages of ranking over its own part of the index and returns its best candidates. The broker merges them, fetches the fields the caller needs, and returns the result.
+
+<SystemDiagram
+  title="Rohan's search inside Photon"
+  nodes={[
+    { id: "q", label: "Answer service", sub: "Rohan's query", kind: "service", col: 0, row: 1 },
+    { id: "lb", label: "Load balancer", kind: "lb", col: 1, row: 1 },
+    { id: "broker", label: "Broker", sub: "scatter, merge", kind: "service", col: 2, row: 1 },
+    { id: "s1", label: "Shard 1", sub: "retrieve + rank", kind: "db", col: 3, row: 0 },
+    { id: "s2", label: "Shard 2", sub: "retrieve + rank", kind: "db", col: 3, row: 1 },
+    { id: "s3", label: "Shard N", sub: "retrieve + rank", kind: "db", col: 3, row: 2 },
+    { id: "g2", label: "Other groups", sub: "full copies", kind: "db", col: 4, row: 1 },
+  ]}
+  zones={[{ label: "One shard group", nodes: ["s1", "s2", "s3"] }]}
+  edges={[
+    { from: "q", to: "lb" }, { from: "lb", to: "broker" },
+    { from: "broker", to: "s1" }, { from: "broker", to: "s2" }, { from: "broker", to: "s3" },
+    { from: "broker", to: "g2", dashed: true },
+  ]}
+  steps={[
+    { caption: "The answer service sends Rohan's rewritten query, with its words and its embedding, to Photon's load balancer.", path: ["q", "lb", "broker"] },
+    { caption: "The broker chooses a shard group and sends the query to every shard in it. Each shard holds a slice of the documents.", path: ["broker", "s1"], focus: ["s2", "s3"] },
+    { caption: "Each shard finds candidates in its own index, scores them, reranks its best, and returns a short list. The release-notes span comes from shard 2.", path: ["s2", "broker"] },
+    { caption: "The broker merges the shards' lists, fetches the fields the caller asked for, and returns the top candidates. Its latency is set by the slowest shard, the tail problem from section 3 again.", path: ["broker", "lb", "q"] },
+    { caption: "Other shard groups hold full copies. During a deploy, a controller takes one group out of the broker's rotation at a time, loads the new index, warms its caches with real queries from the search logs, and puts it back.", focus: ["g2"] },
+  ]}
+  caption="Scatter-gather, as in chapter 62. Every shard is on the critical path, so every shard's p99 matters."
+/>
+
+Notice the last step. Index building runs as separate jobs on separate machines, and serving machines only load finished files, so the merge-time spikes of the old engine, where merging happened on the machines answering queries, can't happen.
+
+</Sub>
+
+<Sub n="6.3" title="Inside a shard: posting lists and docblobs">
+
+<Zoom path={["Perplexity", "Search", "Photon shard", "Posting list blocks"]} />
+
+Here's where the tail latency was won, so it's worth going down to the data structures. Start from the inverted index of chapter 62. For each term, like `asynchronous`, there's a **posting list**: the sorted list of document IDs that contain it. A query intersects or unions these lists. Photon stores them in different formats depending on their shape:
+
+| List shape | Format | Why |
+|---|---|---|
+| Very short (a rare term) | Stored inline, right next to the term | One read gets everything; no pointer to follow |
+| Long and sparse in a range | Fixed blocks covering a range of document IDs, each a sorted array of offsets | Jumping to a target ID inside a block uses **galloping search**: check positions 1, 2, 4, 8… until you pass it, then binary-search the last gap |
+| Long and dense in a range | The same block as a **bitmap**, one bit per document ID in the range | When most IDs in the range contain the term, a bit per ID is smaller than a list of IDs, and testing membership is one bit lookup |
+
+Choosing the format per block, instead of per index, means a common word like `postgresql` and a rare one like `io_method` are both stored in whichever form is smallest and fastest for them. Photon also places frequently queried lists near each other on disk, and numbers documents in order of a usefulness signal, so the most useful documents have the smallest IDs and are met first.
+
+Matching doesn't score every document that contains any query word. Photon uses a **WAND-like** traversal (chapter 62, section 7 explains WAND): a few "driving" lists propose candidate documents, and "probe" lists are checked only to adjust those candidates' scores. It first runs a strict pass that requires good coverage of the query, and relaxes it only if too few candidates come back.
+
+Once a document is a candidate, ranking needs details about how the query's terms appear in it: how often, in which fields (title, body, URL), at which positions. Photon keeps these in a per-document record it calls a **docblob**. Inside it, the document's terms are stored as an **Elias-Fano** encoded list, a compact way to store a sorted list of integers (roughly two bits per item plus the low bits of each value) that still allows jumping straight to the *k*-th item. Ranking decodes only the terms the query matched, so scoring a candidate costs one lookup per document instead of one per term.
+
+</Sub>
+
+<Sub n="6.4" title="Reading from disk without page faults">
+
+One piece remains: how data gets from SSD into memory. The old engine relied on **memory-mapping**: the index file appears as an array in the process's address space, and the operating system loads pages on demand. It's simple, but a miss is invisible to the program until it happens, and then the thread just stops until the read finishes. Pinning everything in RAM with `mlock` would avoid that, but the post estimates that pinning Photon's dataset would take about 4.6 times the memory Photon uses.
+
+<Why>Why not let the operating system page the index in?</Why>
+
+So Photon reads explicitly. Each thread has its own **io_uring**, Linux's interface for submitting many disk reads at once through a shared ring buffer and collecting the completions later, without a system call per read. For a query, Photon works out every block it needs, checks the whole batch against its own cache first, and submits the misses together, using file descriptors and buffer pools registered in advance so the kernel doesn't redo that setup per read. The cache evicts with **CLOCK**, an approximation of least-recently-used eviction that sweeps a pointer around a ring and clears a "recently used" bit as it goes (the same algorithm chapter 04 describes for page replacement), and it prefetches blocks it expects to need.
+
+What changed is control. A page fault is one blocking read the program didn't plan; a batch of io_uring reads is many reads the program planned, overlapped, and can account for. That's how a dataset bigger than RAM can still answer within a predictable time.
+
+<Callout label="Design implication">
+Memory-mapping a dataset that doesn't fit in RAM hands your tail latency to the kernel's page cache. If your p99 matters and your data doesn't fit, read explicitly, in batches, through a cache you control, and keep heavy background work like merging off the machines that serve queries.
+</Callout>
+
+<Elsewhere items={[
+  { where: "Lucene", how: "Lucene also stores postings in fixed-size compressed blocks with skip data, and its block-max WAND skips whole blocks that can't beat the current top ten (chapter 62, section 7)." },
+  { where: "Roaring bitmaps", how: "Druid, Pinot, ClickHouse and Lucene's filter caches use Roaring, which picks an array or a bitmap per 65,536-ID chunk: the same per-block choice as Photon's postings." },
+]} />
+
+Each shard now returns its best few candidates, and the broker has a merged list of a few hundred spans. Rohan's model can't read a few hundred. Choosing which ten it does read is the next hard problem.
+
+</Sub>
+
+<SectionHeading n="07" id="ranking">Hard problem 5: ranking in stages</SectionHeading>
+
+<Sub n="7.1" title="Cheap scorers, then a cross-encoder">
+
+There are two ways to score how well a passage answers a question with a neural network, and they trade accuracy for cost in opposite directions.
+
+A **bi-encoder** is the embedding model from section 5: it encodes the question and the passage separately, each into its own vector, and compares the vectors. Because passages are encoded once, at indexing time, scoring a passage at query time is just a dot product. But the question and the passage never "see" each other, so the score can't account for, say, the question asking about version 18 and the passage being about version 17.
+
+A **cross-encoder** reads the question and the passage together, as one input, and outputs a relevance score. Every word of the question can attend to every word of the passage, so it's far more accurate. It's also far more expensive: nothing can be computed in advance, and every (question, passage) pair needs its own pass through the model.
+
+<div className="grid gap-4 sm:grid-cols-2">
+
+<Picture
+  src="/images/designs/perplexity/bi-vs-cross-encoder.png"
+  alt="Left: two separate BERT encoders turn sentence A and sentence B into vectors u and v, compared by cosine similarity. Right: one BERT reads sentence A and sentence B together and a classifier outputs a score between 0 and 1"
+  caption="A bi-encoder (left) encodes the two texts separately and compares vectors; a cross-encoder (right) reads them together. Only the left one can be precomputed."
+  credit="Image: sentence-transformers documentation, UKP Lab, Apache License 2.0"
+  href="https://github.com/UKPLab/sentence-transformers/blob/main/docs/img/Bi_vs_Cross-Encoder.png"
+  paper
+/>
+
+<Picture
+  src="/images/designs/perplexity/retrieve-rerank-pipeline.png"
+  alt="A search query goes to a bi-encoder retrieval stage over a document collection, which passes candidates to a cross-encoder re-ranker that outputs ranked hits"
+  caption="The standard answer: retrieve many candidates cheaply, then rerank only those with the expensive model."
+  credit="Image: sentence-transformers documentation, UKP Lab, Apache License 2.0"
+  href="https://github.com/UKPLab/sentence-transformers/blob/main/docs/img/InformationRetrieval.png"
+  paper
+/>
+
+</div>
+
+So search systems rank in a **cascade**: a sequence of stages where each stage is more accurate and more expensive than the one before and sees fewer candidates. Perplexity's 2025 article describes exactly this: early stages use lexical and embedding-based scorers "optimized for speed", and the final ordering comes from "more powerful cross-encoder reranker models". Ranking happens for documents and for spans, after cheap filters remove clearly irrelevant or stale content. Which models, and how many candidates each stage keeps, isn't published.
+
+Here's the cascade on Rohan's question, with a handful of the spans it might meet. The counts per stage are illustrative.
+
+<Scene
+  title="Rohan's candidates through the ranking cascade"
+  regions={[
+    { id: "idx", label: "Hybrid retrieval", sub: "thousands", col: 0, row: 0 },
+    { id: "cheap", label: "Fast scorers", sub: "BM25 + vectors", col: 1, row: 0 },
+    { id: "ce", label: "Cross-encoder", sub: "tens of pairs", col: 2, row: 0 },
+    { id: "out", label: "Dropped", sub: "filtered or outranked", col: 0, row: 1, span: 2 },
+    { id: "llm", label: "Model's context", sub: "about ten spans", col: 2, row: 1 },
+  ]}
+  itemWidth={124}
+  frames={[
+    { caption: "Hybrid retrieval returns thousands of candidates. Five of them matter for this walkthrough: the **release notes**, the **io_method docs**, a 2023 blog saying Postgres has no async I/O, a Postgres 17 page and a forum thread.",
+      items: [
+        { id: "rel", at: "idx", label: "PG18 release", sub: "2025", tone: "accent" },
+        { id: "doc", at: "idx", label: "io_method docs", sub: "settings page" },
+        { id: "old", at: "idx", label: "2023 blog", sub: "'no async I/O'" },
+        { id: "v17", at: "idx", label: "PG17 page", sub: "near-duplicate" },
+        { id: "fx", at: "idx", label: "Forum thread", sub: "benchmarks" },
+      ], focus: ["idx"] },
+    { caption: "Cheap filters run first. The query is about a 2025 release, so the 2023 blog that predates it is dropped as stale.",
+      change: [{ id: "old", at: "out", tone: "bad" }], focus: ["out"] },
+    { caption: "Fast scorers rank the rest by BM25 and vector similarity. All four survive into the top few hundred, including the Postgres 17 page, because to a bi-encoder '17' and '18' look almost the same.",
+      change: [{ id: "rel", at: "cheap" }, { id: "doc", at: "cheap" }, { id: "v17", at: "cheap" }, { id: "fx", at: "cheap" }], focus: ["cheap"], arrow: { from: "idx", to: "cheap", label: "top few hundred" } },
+    { caption: "The cross-encoder reads the question and each surviving span together. It sees that the PG17 page answers the wrong version and scores it low.",
+      change: [{ id: "rel", at: "ce" }, { id: "doc", at: "ce" }, { id: "fx", at: "ce" }, { id: "v17", at: "out", tone: "bad" }], focus: ["ce"], arrow: { from: "cheap", to: "ce", label: "top tens" } },
+    { caption: "The top spans go into the model's prompt, numbered so they can be cited: [1] the release notes, [2] the io_method docs, [3] the forum benchmarks.",
+      change: [{ id: "rel", at: "llm", label: "[1] PG18 release", tone: "ok" }, { id: "doc", at: "llm", label: "[2] io_method", tone: "ok" }, { id: "fx", at: "llm", label: "[3] forum", tone: "ok" }], focus: ["llm"], arrow: { from: "ce", to: "llm", label: "numbered" } },
+  ]}
+/>
+
+</Sub>
+
+<Sub n="7.2" title="How deep should the expensive stage go?">
+
+In a cascade, the hard question is how many candidates each stage passes on. Pass too few to the cross-encoder and the cheap stage's mistakes become final: a good passage the fast scorers ranked 150th never gets a second look. Pass too many and the cross-encoder's cost and latency grow in direct proportion.
+
+This program makes that trade concrete. It invents 1,000 candidates with a hidden true relevance, which the fast scorer sees with a lot of noise and the cross-encoder with a little. For each cut-off *k*, it keeps the fast scorer's top *k*, reranks them with the cross-encoder, keeps the top 10, and measures how many of the true best 10 made it. It also counts the tokens the cross-encoder must read per search, assuming 512 tokens per (question, passage) pair. `random.gauss(0, 1)` draws a number from a bell curve centred on zero, which is how the noise is added.
+
+<TryIt what="A two-stage ranking cascade: quality against reranker cost" lang="python" toolchain="Python 3.14">
+```python
+import random
+random.seed(3)
+
+N, FINAL, TRIALS = 1000, 10, 300   # candidates from retrieval, passages kept
+TOKENS_PER_PAIR = 512              # query + passage, read by the reranker
+
+def trial(k):
+    # each candidate has a true relevance we can't see directly
+    true = [random.gauss(0, 1) for _ in range(N)]
+    cheap = [t + random.gauss(0, 1.0) for t in true]   # fast scorer: noisy
+    deep = [t + random.gauss(0, 0.2) for t in true]    # cross-encoder: sharp
+    best = set(sorted(range(N), key=lambda i: -true[i])[:FINAL])
+    stage1 = sorted(range(N), key=lambda i: -cheap[i])[:k]     # cheap cut to k
+    stage2 = sorted(stage1, key=lambda i: -deep[i])[:FINAL]    # rerank the k
+    return len(best & set(stage2)) / FINAL
+
+print(f"{'reranked (k)':>12} {'best 10 found':>14} {'reranker tokens/search':>23}")
+for k in (10, 30, 100, 300, 1000):
+    found = sum(trial(k) for _ in range(TRIALS)) / TRIALS
+    print(f"{k:>12} {found:>13.0%} {k * TOKENS_PER_PAIR:>23,}")
+```
+<Output>
+```
+reranked (k)  best 10 found  reranker tokens/search
+          10           26%                   5,120
+          30           49%                  15,360
+         100           70%                  51,200
+         300           77%                 153,600
+        1000           79%                 512,000
+```
+</Output>
+</TryIt>
+
+In the output, the first row is a cascade with no second stage at all: the fast scorer's top 10 contain only about a quarter of the true best 10. Reranking 100 gets 70%. Going from 100 to 1,000 costs ten times as much and gains 9 points, because by then the limit is the cross-encoder's own noise, not the candidates it's given. Real curves have different numbers but the same shape: steep, then flat. Somewhere on the flat part is where you stop paying.
+
+Now multiply by volume. At 200 million searches a day, reranking 100 candidates of 512 tokens each is about 10 trillion tokens a day through the cross-encoder, roughly 120 million tokens a second. That's far more than the final answer model reads (section 1 estimated about 1.5 million a second). The reranker is small, which makes a token much cheaper than one through a 70-billion-parameter answer model, but this is why cross-encoder depth is a budget decision, and why the fast stages get so much engineering.
+
+<Predict
+  q="A team doubles the number of candidates its cross-encoder reranks, from 100 to 200. What's most likely to happen?"
+  options={[
+    "Answer quality roughly doubles",
+    "Reranker cost roughly doubles, and quality improves a little",
+    "Nothing, because the cross-encoder only keeps 10 either way",
+    "Latency halves, because the cross-encoder has more to choose from",
+  ]}
+  answer={1}
+>
+The cross-encoder runs once per candidate, so its cost and latency grow with the number of candidates. Quality improves only by the good passages that were ranked between 101 and 200 by the fast stage, which past the steep part of the curve is a few. Doubling depth is worth it only when the fast stage is often wrong about which passages are in the top 100.
+</Predict>
+
+Rohan's answer model now has three numbered spans to read. Nothing yet makes it stick to them.
+
+</Sub>
+
+<SectionHeading n="08" id="grounding">Hard problem 6: saying only what the sources say</SectionHeading>
+
+<Sub n="8.1" title="The rule, and how a prompt carries it">
+
+Srinivas has explained where Perplexity's central rule came from. In the 2024 podcast he recalled being told, while writing his first research paper, that every sentence in a paper should be backed by a citation, and that anything else is closer to opinion. Perplexity applies that to a chatbot: force it to only say things it can find on the internet, ideally from multiple sources. "The principle in Perplexity," he said, "is you're not supposed to say anything that you don't retrieve."
+
+He described the pipeline in the same terms: combine traditional search, read the links, extract the relevant paragraphs, feed them to a language model, and ask it to write a concise answer "with the appropriate citation". Perplexity's November 2023 post called those paragraphs **snippets**, and said its online models were fine-tuned to use them well. Concretely, the prompt the answer model receives for Rohan looks something like this (Perplexity's real prompt isn't published):
+
+- instructions: answer only from the numbered sources below; after each sentence, cite the source numbers that support it; if the sources don't answer the question, say so
+- `[1]` the release-notes span, with its URL and date
+- `[2]` the `io_method` docs span
+- `[3]` the forum benchmark span
+- the conversation so far, and Rohan's question
+
+As it writes, the model puts `[1]`, `[2]` after its sentences as ordinary tokens. The server replaces each marker with a link to the source's URL as it streams to the phone. That's the whole mechanism of a citation: a number the model writes, pointing into a numbered list the system gave it.
+
+</Sub>
+
+<Sub n="8.2" title="Why grounded answers still go wrong">
+
+A prompt can state the rule, but a model can still break it. Srinivas listed the ways in the same podcast, and they map onto the pipeline we've built:
+
+- **The model misunderstands the question**, so it answers a slightly different one from correct sources.
+- **The snippets are stale or thin**, so the model fills in from memory. This is why freshness filters belong before ranking, as the 2023 blog showed in section 7.
+- **Too much detail** goes into the prompt, so the right sentence is buried and the model latches on to the wrong one.
+- **Irrelevant documents** get retrieved, and the model treats them as relevant because they're in its sources.
+
+And there are failures specific to citations. The model can write a true sentence and cite the wrong source, cite a source for a number the source doesn't contain, or write a sentence with no citation at all. The figure below, from a 2023 paper on a technique called Self-RAG, shows how ordinary RAG produces these: the model is handed three passages, one of them irrelevant, and writes an answer that mixes supported claims with a contradicted one and a claim that appears in none of the passages.
+
+<Picture
+  src="/images/designs/perplexity/rag-vs-self-rag.png"
+  alt="Left: standard RAG retrieves three passages and the model writes an answer containing a contradictory claim and a claim found in no passage. Right: Self-RAG retrieves on demand, generates a segment per passage, labels each as relevant or irrelevant and supported or partially supported, and keeps the best"
+  caption="Left: plain RAG, with an answer that is part supported, part contradicted and part invented. Right: the Self-RAG paper's fix, in which the model also critiques each segment against its passage. Perplexity hasn't published its own checking method; the failures on the left are the ones any such method has to catch."
+  credit="Image: Asai et al., 'Self-RAG' (2023), arXiv:2310.11511, CC BY 4.0"
+  href="https://arxiv.org/abs/2310.11511"
+  paper
+/>
+
+Every answer engine needs some check that each sentence is supported by the source it cites. Production systems use trained models, usually a classifier that decides whether a passage entails a claim, but the idea can be shown with something much cruder. This program checks each sentence of a draft answer to Rohan against the passage it cites: are the sentence's content words mostly in that passage, and does every number in the sentence appear there? The three passages are shortened versions of what the Postgres release notes and docs say. `re.findall` pulls the citation markers and numbers out of each sentence.
+
+<TryIt what="Check each sentence of an answer against the source it cites" lang="python" toolchain="Python 3.14">
+```python
+import re
+
+passages = {
+    1: "PostgreSQL 18 introduces an asynchronous I/O subsystem that can speed up "
+       "sequential scans, bitmap heap scans and vacuums, with up to 3x faster "
+       "reads from storage.",
+    2: "The io_method setting selects the method for asynchronous I/O. Possible "
+       "values are worker (the default), io_uring and sync.",
+    3: "PostgreSQL does not support asynchronous I/O; every read is synchronous.",
+}
+answer = [
+    "PostgreSQL 18 added an asynchronous I/O subsystem [1].",
+    "Sequential scans can read from storage up to 3x faster [1].",
+    "You choose the method with the io_method setting, and worker is the default [2].",
+    "Using io_uring makes scans 5x faster [2].",
+    "Asynchronous I/O is turned on with io_method set to io_uring [1].",
+    "Earlier versions read every block synchronously.",
+]
+STOP = set("a an the is are and or with to of from can up you it by on set".split())
+
+def words(s):
+    return {w for w in re.findall(r"[a-z0-9_]+", s.lower()) if w not in STOP}
+
+def numbers(s):
+    return set(re.findall(r"\d+x?", s))
+
+def support(claim, pid):
+    w = words(claim)
+    return len(w & words(passages[pid])) / len(w)
+
+for sentence in answer:
+    cited = [int(n) for n in re.findall(r"\[(\d+)\]", sentence)]
+    claim = re.sub(r"\s*\[\d+\]", "", sentence)
+    if not cited:
+        verdict = "NO CITATION"
+    else:
+        pid = cited[0]
+        missing = numbers(claim) - numbers(passages[pid])
+        if missing:
+            verdict = f"NUMBER {', '.join(sorted(missing))} NOT IN [{pid}]"
+        elif support(claim, pid) >= 0.6:
+            verdict = f"supported by [{pid}] ({support(claim, pid):.0%} of words)"
+        else:
+            best = max(passages, key=lambda p: support(claim, p))
+            verdict = f"WEAK: [{pid}] has {support(claim, pid):.0%}, [{best}] has {support(claim, best):.0%}"
+    print(f"{claim[:44]:46} {verdict}")
+```
+<Output>
+```
+PostgreSQL 18 added an asynchronous I/O subs   supported by [1] (86% of words)
+Sequential scans can read from storage up to   supported by [1] (83% of words)
+You choose the method with the io_method set   supported by [2] (83% of words)
+Using io_uring makes scans 5x faster.          NUMBER 5x NOT IN [2]
+Asynchronous I/O is turned on with io_method   WEAK: [1] has 50%, [2] has 83%
+Earlier versions read every block synchronou   NO CITATION
+```
+</Output>
+</TryIt>
+
+Sentences one to three are fine. Sentence four invents a number, the classic hallucination, and a number check catches it because "5x" appears in no source. Sentence five is true but cites the wrong source; the checker notices that a different passage supports it much better, and a system could fix the marker to `[2]`. Sentence six has no citation; it happens to be supported by passage 3, the stale blog, which says something true about older versions, so a system could either attach `[3]` or drop the sentence. Word overlap is far too crude for production (it would pass "Postgres 18 *removed* asynchronous I/O"), so real checkers are trained models. But the three kinds of failure are the real ones.
+
+</Sub>
+
+<Sub n="8.3" title="Training the model to stay grounded, and how well it works">
+
+Prompting and checking are two of the defences. The third is training the answer model itself on the task. Perplexity's models have been fine-tuned for it since the start: the November 2023 online models were fine-tuned to use snippets, and the February 2025 Sonar model, built on Llama 3.3 70B, was "further trained to enhance answer factuality and readability" for Perplexity's default search mode. Which data and which training methods it used aren't published.
+
+How well does it all work? The most careful outside test is from the Tow Center for Digital Journalism at Columbia, published on 6 March 2025. Researchers gave eight AI search tools excerpts from 200 news articles, 10 from each of 20 publishers, and asked each tool to identify the article's headline, publisher, date and URL: 1,600 queries. Collectively the tools answered more than 60% incorrectly. Perplexity did best of the eight and was still wrong on 37%. Tools also often cited syndicated copies of articles instead of the original publisher: supported, but pointing at the wrong place. Each excerpt was queried once, and results probably vary between runs, as the authors note.
+
+So grounding is the most important property of an answer engine and also the least solved. The architecture makes the right passage likely to be in the prompt and the model likely to cite it, but "likely" over tens of millions of answers a day still means a great many wrong ones.
+
+<Callout label="Common mistake" kind="warn">
+Treating a citation as proof. A citation marker means the model *wrote* a number next to a sentence; it doesn't mean the source says that. Systems that show citations need a support check per sentence, and readers should spot-check the sources for anything that matters, the way Rohan tapped [2].
+</Callout>
+
+</Sub>
+
+<SectionHeading n="09" id="query">Hard problem 7: understanding the question, and asking several</SectionHeading>
+
+<Sub n="9.1" title="Follow-ups need rewriting">
+
+Rohan's second message was *how do I turn it on?* As a search query, that's useless: no index anywhere can tell what "it" is. The question only makes sense next to the conversation before it.
+
+So before searching, the system rewrites the question into a standalone query using the conversation: *how to enable asynchronous I/O in PostgreSQL 18, io_method setting*. That's **query rewriting**, and it's usually done by a language model, a small fast one, because it sits in front of every search and adds directly to time-to-first-token. Perplexity hasn't published how its rewriting works. The same step can split a two-part question into two searches, add a date filter for "latest" questions, or skip search entirely ("thanks!").
+
+This step also decides which model answers. NVIDIA's December 2024 post described small classifier models that detect the user's intent and route each task to a specific model on its own pool of GPUs; Perplexity then served more than 20 models, including Llama 3.1 at 8, 70 and 405 billion parameters.
+
+</Sub>
+
+<Sub n="9.2" title="Pro Search: plan, then search step by step">
+
+Some questions can't be answered from one search. *Which Postgres 18 settings should I change for a write-heavy workload on NVMe, and what did people measure?* needs the release notes, the docs for several settings, and benchmark write-ups, and what to search for in the third step depends on what the first two found.
+
+Perplexity's July 2024 upgrade to Pro Search handled this by planning. In LangChain's interview with William Zhang, he described the design: the system first writes a plan for the question, separate from carrying it out; each step of the plan generates its own search queries; steps run one after another, each seeing the results of the earlier ones; each step's results are grouped and filtered to the most relevant documents; and a final model call writes the answer from everything gathered. Specialised tools, a code interpreter and Wolfram Alpha, handle calculations.
+
+<StepSequence
+  title="A Pro Search question, as a plan and its steps"
+  actors={["Rohan", "Planner", "Search", "Answer model"]}
+  messages={[
+    { from: 0, to: 1, label: "PG18 settings for writes on NVMe?", note: "A question that one search can't answer." },
+    { from: 1, to: 1, label: "plan: 3 steps", note: "1: what changed in PG18 I/O. 2: which settings affect write-heavy loads. 3: published benchmarks. The plan is shown on screen." },
+    { from: 1, to: 2, label: "step 1 queries", note: "Two or three rewritten queries for step 1." },
+    { from: 2, to: 1, label: "spans: io_method, AIO", note: "Results are grouped and filtered; only the best spans are kept." },
+    { from: 1, to: 2, label: "step 2 queries", note: "Written using what step 1 found, so they name io_method and io_workers." },
+    { from: 2, to: 1, label: "spans: docs, tuning", note: "" },
+    { from: 1, to: 2, label: "step 3 queries", note: "Benchmarks, filtered to dates after the release." },
+    { from: 1, to: 3, label: "all kept spans", note: "One final call writes the answer, citing spans from all three steps." },
+    { from: 3, to: 0, label: "answer [1]…[9]", note: "Streamed, with the steps still expandable above it." },
+  ]}
+/>
+
+Planning costs latency, a trade the team weighed with A/B tests: each step is a full round of rewriting, searching and ranking, and dependent steps can't run in parallel.
+
+Deep Research, launched on 14 February 2025, pushed the same loop further. Perplexity described it as running "dozens of searches" and reading "hundreds of sources", reasoning about what to do next after each round, and finishing most reports in under three minutes. It reported 21.1% on the Humanity's Last Exam benchmark and 93.9% on SimpleQA, a factual-question benchmark, at launch.
+
+</Sub>
+
+<Sub n="9.3" title="Search as code">
+
+In the step-by-step loop, each step is one call to one search pipeline, and steps run one at a time. In June 2026 Perplexity described its new reference architecture, **Search as Code**: the model writes a Python program against an SDK whose functions are search's building blocks (retrieval, ranking, filtering, fan-out), and a sandbox runs it, with its loops, batching and retries. Single tasks have made "hundreds or even thousands" of retrieval calls within a few minutes.
+
+What changes is where filtering happens. In the loop, every search result passes through the model's context; with code, the program searches, filters and counts inside the sandbox, and only a small result comes back to the model. On one case study, answering questions about more than 200 security vulnerabilities, Perplexity reported token use dropping from 288,700 to 42,900, an 85% reduction, with accuracy going up. Those are Perplexity's own single-run benchmarks.
+
+<Decision
+  q="Who decides what to search for: a fixed pipeline, or the model?"
+  options={[
+    { name: "Fixed pipeline", how: "One rewrite, one search, one answer, the same for every question.", good: ["Fast and predictable", "Cheap"], bad: ["Fails on questions that need several dependent searches"] },
+    { name: "Model plans steps (Pro Search, 2024)", how: "The model writes a plan; each step searches; the answer uses all of them.", good: ["Handles multi-part questions", "Steps can be shown to the user"], bad: ["Each step adds a full round of latency", "Every result passes through the model's context"] },
+    { name: "Model writes code (Search as Code, 2026)", how: "The model writes Python against a search SDK; a sandbox runs it.", good: ["Thousands of searches per turn, filtered outside the context", "Large token savings on wide tasks"], bad: ["Needs a secure sandbox per task", "Harder to bound cost and time"], chosen: true },
+  ]}
+>
+Perplexity kept all three: the quick default answer for most questions, and the heavier modes for the questions that need them, with a classifier and the user's choice of mode deciding which one runs. What changed between 2024 and 2026 was the most capable mode, from a plan the model follows to a program the model writes.
+</Decision>
+
+<Elsewhere items={[
+  { where: "Claude Code and other coding agents", how: "The same loop of a model asking for tools, reading results and deciding what's next (chapter 78), including subagents that keep bulky results out of the main context." },
+]} />
+
+All of these modes end in the same place: a large language model reading a few thousand tokens of sources and writing an answer. At Perplexity's volume, running those models is a hard problem of its own.
+
+</Sub>
+
+<SectionHeading n="10" id="inference">Hard problem 8: running the models yourself</SectionHeading>
+
+<Sub n="10.1" title="From renting models to ROSE">
+
+Version 1 sent every prompt to another company's hosted model. Subscribers can still pick other labs' models, but the default answer and the many small models around it (rewriting, classifying, embedding, reranking, suggesting follow-ups) run on models Perplexity fine-tuned, on GPUs it rents and runs. NVIDIA's December 2024 post gives one reason in dollars: about $1 million a year saved by serving the Related Questions models this way instead of through a third-party API.
+
+The serving stack changed along the way. In November 2023 Perplexity wrote about serving Llama 2 70B with NVIDIA's TensorRT-LLM library on H100 GPUs. By December 2024, NVIDIA described pods of H100s managed by its Triton inference server, with an in-house scheduler routing traffic by load, alongside Perplexity's own runtimes. In 2025 and 2026 Perplexity's posts describe its own inference engine, **ROSE**, which serves everything from embedding models to trillion-parameter language models and shares GPU kernels between them.
+
+Chapter 54 explains the machinery every LLM server needs: the KV cache, continuous batching, paged KV memory and prefix caching. Here we'll look at the problems Perplexity wrote about that come from its particular workload.
+
+</Sub>
+
+<Sub n="10.2" title="Prefill-heavy traffic, and splitting it off">
+
+Section 1's estimate showed the shape: an answer engine's model reads about twelve times more tokens than it writes. Chapter 54 calls the reading phase **prefill**, which processes all the input tokens at once and is limited by the GPU's arithmetic, and the writing phase **decode**, which produces one token per step and is limited by how fast the GPU can read the model's weights from memory. When both run on the same GPUs, a big prefill (Rohan's 5,000-token prompt arriving) stalls every decode in the batch, and everyone else's answer stutters.
+
+Perplexity's August 2025 post describes separating them. Some GPU nodes only prefill; others only decode. A prefiller computes a request's KV cache and sends it over the network, using **RDMA** (remote direct memory access, where one machine's network card writes straight into another machine's GPU memory without either CPU copying the data), to a decoder, which then writes the answer. The transfer starts layer by layer, as soon as each layer's KV entries exist, instead of waiting for the whole prefill to finish.
+
+<Picture
+  src="/images/designs/perplexity/kv-transfer-prefill-decode.png"
+  alt="A prefiller node with two GPUs, each attached to two network cards, sends KV cache blocks and context over InfiniBand to two decoder nodes, which receive them into pre-allocated slots"
+  caption="Perplexity's prefill/decode split, from its paper on the transfer library. A request arrives at a decoder, which reserves KV pages and asks a prefiller to fill them; each prefiller GPU writes its slice of the KV cache directly into the decoder's GPU memory through its nearest network cards."
+  credit="Image: Licker, Hu, Zaytsev and Chen (Perplexity AI), 'fabric-lib: RDMA Point-to-Point Communication for LLM Systems' (2025), arXiv:2510.27656, CC BY 4.0"
+  href="https://arxiv.org/abs/2510.27656"
+  paper
+/>
+
+It costs Rohan something. Moving the KV cache, the post says, adds about 100 ms to time-to-first-token. In return, decode runs smoothly: on DeepSeek-R1, mixing prefill and decode struggled to sustain 50 tokens a second per user because prefills interrupted decoding for hundreds of milliseconds, while one prefiller feeding three decoder nodes sustained over 90.
+
+<Why>Why accept a slower first token to get a faster answer?</Why>
+
+Because the two numbers fail differently. A 100 ms longer TTFT is a fixed cost, paid once, and it's small next to the search stages. A decode that stalls for hundreds of milliseconds every time someone else's long prompt arrives makes the answer stutter for everyone, unpredictably, and at an answer engine's prompt sizes that happens constantly. It trades a small, predictable cost for a large, unpredictable one.
+
+</Sub>
+
+<Sub n="10.3" title="Models too big for one machine">
+
+The largest open models in 2025 and 2026 are **mixture-of-experts (MoE)** models. Each MoE layer holds many separate small networks, the experts, and a router sends each token to only a few of them. DeepSeek-V3, for example, has 671 billion parameters but activates only 37 billion per token: each MoE layer has 256 routed experts plus one shared one, and each token goes to 8.
+
+<Picture
+  src="/images/designs/perplexity/mixture-of-experts-layer.png"
+  alt="A router sends each input to two of several stacked expert networks, and their outputs are combined using the router's gating weights"
+  caption="One MoE layer: the router picks a few experts per token and weights their outputs. Only the chosen experts compute, so a 671-billion-parameter model can cost about as much per token as a 37-billion one, as long as the experts are where the tokens are."
+  credit="Image: Jiang et al., 'Mixtral of Experts' (2024), arXiv:2401.04088, CC BY 4.0"
+  href="https://arxiv.org/abs/2401.04088"
+  paper
+/>
+
+That last condition is the hard part. DeepSeek-V3 doesn't fit on a machine with eight 80 GB H100s, so Perplexity's April 2025 post spreads it over many machines with **expert parallelism**: each GPU holds a few experts, and for every MoE layer, every token is sent over the network to the GPUs holding its experts (**dispatch**) and the results are sent back (**combine**). With 128-way expert parallelism over 16 machines, each GPU holds 2 of the 256 experts. Perplexity reported about 5 times the throughput of one 8-GPU machine at the same per-user speed, and a layer about 29% faster when each batch is split in two so one half's communication overlaps the other's computation.
+
+<Picture
+  src="/images/designs/perplexity/moe-dispatch-combine-timeline.png"
+  alt="A timeline with lanes for NVLink, GPU, CPU and NIC, showing dispatch and combine phases: counting, shuffling, routing and transfers over the network overlapping with the shared expert and MoE computation"
+  caption="Every MoE layer, every token: dispatch to the experts' GPUs, compute, combine back. Perplexity's kernels overlap the network transfers (NIC lane) with computation (GPU lane) so the GPUs aren't idle while tokens are in flight."
+  credit="Image: Licker, Hu, Zaytsev and Chen (Perplexity AI), 'fabric-lib' (2025), arXiv:2510.27656, CC BY 4.0"
+  href="https://arxiv.org/abs/2510.27656"
+  paper
+/>
+
+Dispatch and combine happen on every layer for every token, so their latency adds straight to every token Rohan reads. Perplexity's November 2025 post ported its kernels to AWS's EFA network adapters, which can't let the GPU start transfers itself, so a CPU thread relays between GPU and network card. It reported dispatch-plus-combine latencies of 459 to 692 microseconds at 16- to 64-way expert parallelism, and used the kernels to serve Kimi K2, a model with a trillion parameters.
+
+</Sub>
+
+<Sub n="10.4" title="Faster decoding by guessing">
+
+Output speed has one more lever. Perplexity's June 2025 post describes using **speculative decoding** on its Sonar models: a small, fast "draft" model guesses the next few tokens, and the big model checks all the guesses in one pass, keeping the ones it agrees with. Checking several tokens costs about the same as generating one, because decode is limited by reading the weights, not by arithmetic, so every accepted guess is a token for free. Chapter 54, section 11 explains the mechanism in detail.
+
+<Picture
+  src="/images/designs/perplexity/speculative-decoding-trace.png"
+  alt="Nine lines of a sentence being generated; on each line, green tokens are accepted guesses from a small model, red tokens are rejected, and a blue token is the large model's correction"
+  caption="Each line is one pass of the large model. Green tokens were guessed by the small model and accepted; red ones were rejected and replaced by the large model's own choice (blue). Most passes accept several tokens."
+  credit="Image: Leviathan, Kalman and Matias, 'Fast Inference from Transformers via Speculative Decoding' (2022), arXiv:2211.17192, CC BY 4.0"
+  href="https://arxiv.org/abs/2211.17192"
+  paper
+/>
+
+Perplexity's draft for Sonar was a fine-tuned Llama 1B, trained on the same data as the big model so its guesses match. It isn't free: the post notes that a draft model takes KV cache memory of its own and adds a bit of prefill time, and so a bit of time-to-first-token.
+
+<Callout label="Design implication">
+For an answer engine, model serving is shaped by the retrieval in front of it: long prompts full of sources, short answers, and strict time-to-first-token. That favours separating prefill from decode, keeping time-to-first-token costs small and fixed, and spending effort on output speed, because once the first token is out, the user is reading as fast as the model writes.
+</Callout>
+
+</Sub>
+
+<SectionHeading n="11" id="cost">Hard problem 9: paying for it, and the publishers</SectionHeading>
+
+<Sub n="11.1" title="What one answer costs">
+
+Every hard problem so far has been partly a cost problem in disguise. Put the pieces together for one of Rohan's questions:
+
+| Step | Version 1 | The design we've built |
+|---|---|---|
+| Search | A third-party API at about $200 per thousand queries (2025), for each of several searches | An own index; Perplexity sells searches on it at $5 per thousand in 2026, and $1 per thousand for the Photon-based fast preset |
+| Fetch | Ten live page downloads per question | None at question time; crawling is paid once per page, not per question |
+| Ranking | None; whole pages to the model | A cascade that spends cross-encoder time only on the top candidates |
+| Model input | Tens of thousands of tokens of whole pages | About ten spans, a few thousand tokens |
+| Model | A hosted model's per-token price | Fine-tuned models on own GPUs; $1 million a year saved on one small feature alone (2024) |
+
+Those middle-column prices are what Perplexity charges other companies, not its internal cost, which isn't published. They still show the scale of the change: the search step went from 20 cents to well under one cent.
+
+What about caching whole answers for popular questions? Perplexity hasn't published whether it does. Most questions are phrased uniquely, many are about things that change, and an answer belongs to its conversation, so an answer cache would probably hit rarely and need short lifetimes. Caching lower in the stack is easier: search results for a popular rewritten query can be shared for a few minutes, and the KV cache for a fixed system prompt is reused on every request (chapter 54's prefix caching; chapter 25 covers the general trade of hit rate against staleness).
+
+On the revenue side there's a free tier, subscriptions (Pro at $20 a month) and API sales. A subscriber who asks thirty questions a day asks about 900 a month, so even a few cents per question would swallow most of a $20 fee. That's the pressure behind every per-stage optimisation in this chapter.
+
+</Sub>
+
+<Sub n="11.2" title="Robots.txt and the crawling dispute">
+
+There's a cost that isn't measured in GPUs. An answer engine's product is built from other people's pages, and when it answers well, the reader may never visit the page. Publishers have pushed back in three ways: technically, legally and commercially.
+
+On the technical side, the lever is robots.txt. Perplexity's documentation describes two separate agents. **PerplexityBot** is the crawler that builds the search index, and the docs say it respects robots.txt. **Perplexity-User** fetches a page when a user's request needs it, for example when Rohan pastes a link and asks for a summary, and the docs say that because a user requested the fetch, it "generally ignores robots.txt rules". Perplexity's position is that a fetch on a user's behalf is like the user's own browser, not a crawler.
+
+That distinction is where the conflict came from. Reports in 2024, by developer Robb Knight and by Wired, said that Perplexity appeared to reach pages that blocked its crawler. On 4 August 2025 Cloudflare, which sits in front of a large share of websites, published the results of a test. It created new, unpublished domains, set their robots.txt to disallow all bots, and blocked Perplexity's declared agents with firewall rules. Perplexity could still answer questions about those sites' content. Cloudflare reported that, with the declared agents blocked, requests came from a user agent impersonating Chrome on macOS, from IP addresses outside Perplexity's published ranges, rotating across networks: 3 to 6 million a day, against 20 to 25 million from the declared agents. It removed Perplexity from its list of known good bots and blocked the undeclared traffic for all customers, and contrasted OpenAI's ChatGPT-User, which in the same test read robots.txt and stopped.
+
+Perplexity replied the same day. It argued that its assistants fetch pages only in response to a user's question, don't store them or train on them, and are comparable to Google's user-triggered fetchers; and it said much of the undeclared traffic came from Browserbase, a third-party cloud browser service it used for fewer than 45,000 requests a day. Cloudflare disputed that, and who sent which requests remains contested.
+
+<Picture
+  src="/images/designs/perplexity/ai-crawlers-robots-txt-2026.png"
+  alt="A bar chart of the share of top 10,000 websites whose robots.txt disallows each AI crawler: CCBot 17.2%, GPTBot 16.2%, ClaudeBot 15.1%, PerplexityBot 9.3%, ChatGPT-User 8.1%, and others"
+  caption="In November 2026, 9.3% of the top websites that serve a robots.txt disallowed PerplexityBot entirely, fewer than block the crawlers that collect AI training data. The chart's own footnote matters: a robots.txt rule is a request, and it doesn't stop a crawler that ignores it."
+  credit="Chart: Vsnary, CC BY 4.0, via Wikimedia Commons. Data: CrawlCheck agentic-web census, 1–2 November 2026, CC BY 4.0"
+  href="https://commons.wikimedia.org/wiki/File:AI_crawlers_disallowed_in_robots.txt,_top_10,000_sites,_November_2026.svg"
+  paper
+/>
+
+The legal lever: in October 2024 Dow Jones and the New York Post sued Perplexity for copyright infringement in New York, and in December 2025 The New York Times sued too, also alleging that Perplexity attributed made-up text to the Times. The commercial lever: Perplexity has offered publishers money. In August 2025 it announced Comet Plus, a $5-a-month subscription of which it said 80% would go to participating publishers, with an initial $42.5 million pool, paid out according to human visits, citations in answers and actions taken by its agents.
+
+<Decision
+  q="Should a fetch on a user's behalf obey robots.txt?"
+  options={[
+    { name: "Obey, like a crawler", how: "Treat every automated fetch as a bot; skip pages robots.txt disallows.", good: ["Clear consent rules for publishers", "No accusations of evasion"], bad: ["Some user questions about a specific page can't be answered", "Answers fall back to less direct sources"] },
+    { name: "Treat it like the user's browser", how: "Fetch pages a user asked about, regardless of robots.txt, without storing them.", good: ["Answers what the user actually asked", "Matches how browsers and some fetchers behave"], bad: ["Publishers see it as a crawler ignoring their rules", "Blocked at the network level by CDNs; lawsuits and lost trust"] },
+  ]}
+>
+Perplexity documents the second policy for Perplexity-User and the first for PerplexityBot. Neither option is marked here, because this isn't an engineering trade with a settled answer: it's a dispute over what consent on the web means when the reader is software acting for a person. What's settled is the engineering lesson. A system whose answers depend on other people's content needs those people to keep letting it in, and that is as much a part of the design as the index.
+</Decision>
+
+</Sub>
+
+<SectionHeading n="12" id="whole">The whole system</SectionHeading>
+
+<Sub n="12.1" title="Every box, and why it's there">
+
+<SystemDiagram
+  title="Perplexity, end to end"
+  nodes={[
+    { id: "rohan", label: "Rohan's phone", sub: "streamed answer", kind: "phone", col: 0, row: 1 },
+    { id: "orch", label: "Answer service", sub: "rewrite, route", kind: "service", col: 1, row: 1 },
+    { id: "agent", label: "Research loop", sub: "plan, code", kind: "compute", col: 1, row: 0 },
+    { id: "photon", label: "Search engine", sub: "hybrid, shards", kind: "db", col: 2, row: 1 },
+    { id: "rank", label: "Rerankers", sub: "cross-encoder", kind: "compute", col: 2, row: 0 },
+    { id: "llm", label: "Answer model", sub: "prefill / decode", kind: "compute", col: 3, row: 1 },
+    { id: "check", label: "Citation check", sub: "per sentence", kind: "service", col: 3, row: 0 },
+    { id: "crawl", label: "Crawler", sub: "ML-scheduled", kind: "service", col: 3, row: 2 },
+    { id: "build", label: "Index builder", sub: "spans, vectors", kind: "compute", col: 2, row: 2 },
+    { id: "web", label: "The web", kind: "external", col: 4, row: 2 },
+  ]}
+  zones={[{ label: "Ahead of time", nodes: ["crawl", "build", "web"] }]}
+  edges={[
+    { from: "rohan", to: "orch" }, { from: "orch", to: "agent", dashed: true },
+    { from: "orch", to: "photon", label: "query" }, { from: "photon", to: "rank" },
+    { from: "orch", to: "llm", label: "spans" }, { from: "llm", to: "check" },
+    { from: "crawl", to: "web" }, { from: "crawl", to: "build" }, { from: "build", to: "photon" },
+  ]}
+  steps={[
+    { caption: "Long before Rohan asks, the crawler fetches the Postgres 18 release page, and the builder cuts it into spans, embeds them and ships new index files to the search engine.", path: ["web", "crawl", "build", "photon"] },
+    { caption: "Rohan's follow-up arrives. The answer service rewrites *how do I turn it on?* into a standalone query and a classifier picks the quick mode and the model.", path: ["rohan", "orch"] },
+    { caption: "The search engine scatters the query across shards; each runs hybrid retrieval and fast ranking, and the broker merges a few hundred candidates.", path: ["orch", "photon"] },
+    { caption: "A cross-encoder reranks the top candidates; the best spans come back numbered.", path: ["photon", "rank", "orch"] },
+    { caption: "The answer model reads the spans (prefill on one pool of GPUs) and writes the answer (decode on another), and the tokens stream to Rohan as they're written.", path: ["orch", "llm", "orch", "rohan"] },
+    { caption: "A checker compares each sentence with the source it cites. For a research question, the loop above repeats many times inside the research mode before the final answer.", path: ["llm", "check"], focus: ["agent"] },
+  ]}
+  caption="Two systems joined by an index: one that reads the web ahead of time, and one that answers in seconds from what it read."
+/>
+
+| Component | What it does | Added because |
+|---|---|---|
+| Crawler and scheduler | Fetches and refetches pages; models choose what and when | Live fetching at question time is slow and its tail is worse (§3, §4) |
+| Parser and span cutter | Extracts content; cuts it into self-contained spans | Whole pages bury the answer and waste prompt tokens (§2, §4) |
+| Embedder | Turns spans into small vectors | Lexical search misses paraphrases (§5) |
+| Search engine (Vespa, then Photon) | Hybrid retrieval over sharded indexes | Billions of spans, a tight p99 (§5, §6) |
+| Ranking cascade | Fast scorers, then a cross-encoder | The model can read about ten spans, and they must be the right ten (§7) |
+| Answer model with citations | Writes from numbered spans only | The model alone doesn't know recent facts and may invent (§8) |
+| Citation check | Compares each sentence with its cited source | Citations can be wrong even when the answer reads well (§8) |
+| Rewriter, router, research loop | Standalone queries, model choice, multi-step plans or code | Follow-ups and multi-part questions (§9) |
+| Own inference (ROSE) | Prefill/decode split, expert parallelism, speculation | Prompt-heavy traffic, cost, output speed (§10) |
+
+</Sub>
+
+<Sub n="12.2" title="From top to bottom">
+
+| Level | The choice | Data structure or algorithm |
+|---|---|---|
+| System | Do the slow work ahead of time | Crawl and index offline; answer from the index online |
+| Crawling | Spend a fixed budget on new versus changed pages | Learned priority per URL; hot, warm and cold storage tiers |
+| Documents | Retrieve spans, not pages | Self-contained spans; contextual embeddings |
+| Retrieval | Words and meaning together | Inverted index with BM25; INT8 or binary vectors with nearest-neighbour search; merged lists |
+| Search serving | Scatter-gather with a bounded tail | Inline, sorted-array and bitmap posting blocks; galloping search; WAND-like driving and probe lists; Elias-Fano docblobs; io_uring batches; CLOCK cache |
+| Ranking | Spend expensive compute on few candidates | Bi-encoder, then cross-encoder cascade |
+| Grounding | Say only what is retrieved | Numbered sources in the prompt; per-sentence support checks |
+| Query | Rewrite, route, plan | Small classifiers; plans; model-written programs in sandboxes |
+| Inference | Fit the model to the traffic | Prefill/decode split over RDMA; MoE dispatch and combine; speculative decoding |
+
+</Sub>
+
+<SectionHeading n="13" id="breaks">What goes wrong, and what it cost</SectionHeading>
+
+<Sub n="13.1" title="Failures this design has to survive">
+
+| What happens | What Rohan sees | What the design does |
+|---|---|---|
+| A source site is slow or down | Nothing, at question time | Pages were fetched ahead of time; the crawler retries later and backs off from struggling sites |
+| A page changed after it was indexed | An outdated claim | Freshness-aware crawl scheduling; date filters before ranking; for very fresh topics, documents reach the index within minutes |
+| One search shard is slow | A slower answer, or slightly fewer sources | The broker's latency is set by its slowest shard; deadlines and spare shard groups bound it |
+| The cheap stage misranks the right passage | A thinner or wrong answer | Rerank deep enough; keep both lexical and dense candidates |
+| The model invents a number or cites the wrong source | A confident wrong sentence | Grounded training, per-sentence support checks; still the least solved problem (§8.3) |
+| A publisher blocks the crawler | Answers from other sources | robots.txt for the index crawler; the user-fetch policy is disputed (§11.2) |
+
+</Sub>
+
+<Sub n="13.2" title="The tradeoffs, in one table">
+
+| Decision | Chosen | Given up | Why it was worth it |
+|---|---|---|---|
+| Web search | Own crawler and index (from 2023) | Simplicity; someone else's decades of ranking | 20 cents a search was unaffordable, and pages were the wrong unit |
+| Search engine | Vespa (2025), then Photon (2026) | A mature general engine | p99 of internal stages from ~800 ms to ~65 ms on fewer machines |
+| Retrieval | Hybrid lexical and dense | One index instead of two | Each covers the other's misses |
+| Vectors | INT8 or binary embeddings | A little retrieval quality | 4 to 32 times less storage |
+| Ranking | Cascade ending in a cross-encoder | Cross-encoder quality on every candidate | Its cost grows with every candidate it reads |
+| Answers | Only from retrieved, cited spans | The model's own knowledge | Freshness and checkability |
+| Hard questions | Plans (2024), then model-written code (2026) | Speed and predictable cost | Questions that need many dependent searches |
+| Serving | Own models and engine | Renting with no ops | Cost, output speed, control over time-to-first-token |
+| Prefill and decode | Separate GPUs | About 100 ms of time-to-first-token | Smooth decoding for everyone |
+
+</Sub>
+
+<SectionHeading n="14" id="summary">Summary</SectionHeading>
+
+1. **An answer engine is mostly search**: the model writes the last step, from passages the rest of the system chose, and reads about ten tokens for every one it writes.
+2. **Version 1 fails on every axis**: serial steps and live fetches are slow, a rented search API costs about 20 cents a call, whole pages bury the answer, and nothing keeps the model on its sources.
+3. **Latency is decided by the tail**: fan-out waits for its slowest call, so stages need deadlines, and page fetching has to leave the question path entirely.
+4. **An own index needs an ML-scheduled crawler** that splits a fixed budget between new and changed pages, and cuts pages into self-contained spans ahead of time.
+5. **Retrieval needs words and meaning**: BM25 for exact terms, embeddings for paraphrases, merged; INT8 or binary vectors make the dense half affordable.
+6. **Serving the index is a tail-latency problem**: Photon's per-block posting formats, WAND-like matching, Elias-Fano docblobs and io_uring reads cut the internal p99 from about 800 ms to 65 ms.
+7. **Ranking is a cascade**: cheap scorers on many candidates, a cross-encoder on few, with the expensive stage's depth set by a steep-then-flat quality curve.
+8. **Grounding means saying only what was retrieved**: numbered sources, citations written as tokens, per-sentence support checks, and trained models, yet outside tests still find many wrong citations.
+9. **Questions get rewritten, routed and sometimes planned**, as plans in 2024 and as model-written programs running thousands of searches in 2026.
+10. **The models run on Perplexity's own stack**: ROSE, prefill split from decode, expert parallelism for MoE models, and speculative decoding.
+11. **The content isn't free**: robots.txt, the 2025 Cloudflare dispute, lawsuits and revenue sharing are part of the design, because the index exists only while publishers let it in.
+
+<SectionHeading n="15" id="build">Build this</SectionHeading>
+
+**A tiny answer engine over one documentation site.**
+
+- Download a few thousand pages of one project's docs, strip the HTML, and cut each page into spans of a few sentences, keeping the page title with each.
+- Index them twice: BM25 (SQLite FTS5, chapter 62) and INT8 embeddings from an open model such as `pplx-embed-v1-0.6b`, searched by brute force with NumPy.
+- Merge the top 50 of each with reciprocal rank fusion, rerank the top 30 with an open cross-encoder, keep 6, and send them numbered to any language model with the instruction to cite every sentence.
+- Add the citation checker from section 8.2 with an open entailment model in place of word overlap, and count each kind of failure over 50 questions.
+- Change one thing at a time and measure: drop BM25, drop the reranker, rerank 10 or 100, send whole pages instead of spans.
+
+<SectionHeading n="16" id="interview">Interview questions</SectionHeading>
+
+<QA level="beginner" q="Why doesn't an answer engine just ask a language model, without searching?">
+A model knows only what was in its training data, which ends months before anyone uses it, and when it doesn't know something it may still answer fluently and wrongly. Searching first and answering only from what was found gives it current facts, and the citations let every claim be checked.
+</QA>
+
+<QA level="beginner" q="What's the difference between lexical and dense retrieval, and why use both?">
+Lexical retrieval matches words through an inverted index, scored by something like BM25: precise for versions, codes and setting names, blind to paraphrase. Dense retrieval compares embedding vectors: good at meaning, poor at exact tokens like "17" versus "18". Merging both gives the later stages a candidate set that covers each one's misses.
+</QA>
+
+<QA level="intermediate" q="Your answer engine's p50 latency is fine but p99 is terrible. Where do you look?">
+At every stage that fans out (page fetches, search shards, research steps), because it waits for its slowest call. Then at anything that blocks unpredictably: page faults when the index outgrows RAM, merges on serving machines, long prefills stalling decode. The fixes are deadlines, moving fetching out of the request path, explicit batched reads, separating indexing from serving, and splitting prefill from decode.
+</QA>
+
+<QA level="intermediate" q="How do you decide how many candidates a cross-encoder should rerank?">
+Plot quality against depth on real queries. The curve rises steeply, then flattens once the reranker's own accuracy is the limit, while cost grows linearly with depth, and at hundreds of millions of searches a day the reranker can read more tokens than the answer model. Stop at the knee, and improve the cheap stages if the knee is too deep.
+</QA>
+
+<QA level="deep" q="How would you make sure an answer engine's citations are correct?">
+Upstream, keep the prompt to a few fresh, relevant spans, since stale or irrelevant sources cause most unsupported claims. Number the sources, require a citation per sentence, and train the model on that format. After generation, check each sentence against its cited span with an entailment model plus exact checks on numbers and names, and fix, drop or regenerate failures. Then measure continuously, because outside studies like the Tow Center's in 2025 still found many wrong citations.
+</QA>
+
+<QA level="deep" q="Why did Perplexity build its own search engine after using Vespa?">
+Per its 2026 Photon post, documents and data per document kept growing, the old engine's formats needed too much RAM, and once data spilled out of memory, page faults and on-machine merges pushed p99 to 800 ms and up to 1.2 s; adding a cluster took over a week. Compact posting formats, explicit io_uring reads through its own cache, and separate index building brought the internal p99 to about 65 ms on 20% fewer machines. Owning a search engine only pays at that scale.
+</QA>
+
+<SectionHeading n="17" id="resources">Go deeper</SectionHeading>
+
+<Quiz>
+  <Q q="A request fetches 10 pages in parallel, and each has a 2% chance of being very slow. Roughly how often is the whole request very slow?">
+    About 1 − 0.98¹⁰ ≈ 18% of the time, because the request waits for its
+    slowest page. That's why fan-out needs a deadline, and why an answer engine
+    reads from its own index instead of fetching pages while the user waits.
+  </Q>
+  <Q q="Why can't a dense retriever alone reliably tell Postgres 17 pages from Postgres 18 pages?">
+    The embedding of a passage captures its overall meaning, and two passages
+    that differ only in a version number mean almost the same thing to it. Exact
+    tokens like "18" are what lexical retrieval and the cross-encoder, which
+    reads the question and passage together, are good at.
+  </Q>
+  <Q q="Splitting prefill and decode onto different GPUs adds about 100 ms to time-to-first-token. What does it buy?">
+    Decode no longer stalls whenever a long prompt arrives for prefill, so
+    output speed stays steady for every user. Perplexity reported DeepSeek-R1
+    going from struggling to hold 50 tokens a second to over 90.
+  </Q>
+</Quiz>
+
+<CardGrid>
+  <WildCard name="Architecting and evaluating an AI-first Search API (Perplexity, 2025)">
+    The crawl budget, ML-driven scheduling, spans, hybrid retrieval, the ranking
+    cascade, and the open search_evals benchmark harness.
+  </WildCard>
+  <WildCard name="Photon: building a retrieval and ranking engine from scratch (Perplexity, 2026)">
+    Why the open-source engine was replaced, and the posting formats, docblobs,
+    io_uring reads and deployment rotation that cut the tail.
+  </WildCard>
+  <WildCard name="pplx-embed (Perplexity, 2026) and 'Diffusion-Pretrained Dense and Contextual Embeddings' (arXiv:2602.11151)">
+    Bidirectional embedding models with native INT8 and binary output, and
+    contextual embeddings for spans.
+  </WildCard>
+  <WildCard name="Perplexity's inference posts (2025)">
+    Multi-node DeepSeek deployment, disaggregated prefill and decode,
+    speculative decoding for Sonar, and MoE kernels on AWS EFA; the fabric-lib
+    paper (arXiv:2510.27656) has the transfer details.
+  </WildCard>
+  <WildCard name="Rethinking search as code generation (Perplexity, 2026)">
+    The Search as Code architecture: a search SDK, sandboxes, and models as the
+    control plane.
+  </WildCard>
+  <WildCard name="Lex Fridman Podcast #434, Aravind Srinivas (June 2024)">
+    The citation principle, why embeddings alone don't solve search, crawling,
+    and why p90 and p99 latency matter.
+  </WildCard>
+  <WildCard name="AI Search Has a Citation Problem (Columbia Journalism Review, 2025)">
+    The Tow Center's test of eight AI search tools on 1,600 citation queries.
+  </WildCard>
+  <WildCard name="Cloudflare (4 August 2025) and Perplexity's reply ('Agents or bots', 2025)">
+    Both sides of the dispute over crawling, user-triggered fetches and
+    robots.txt.
+  </WildCard>
+</CardGrid>
+
+<SectionHeading n="18" id="related">Related chapters</SectionHeading>
+
+<CardGrid>
+  <WildCard name="Designing ChatGPT">
+    KV cache, continuous batching, prefix caching, prefill/decode
+    disaggregation and speculative decoding in depth.
+    [Chapter 54](/topics/54-design-chatgpt).
+  </WildCard>
+  <WildCard name="Search Engines">
+    Inverted indexes, BM25, WAND, segments, scatter-gather and reciprocal rank
+    fusion, built from scratch. [Chapter 62](/topics/62-search-engines).
+  </WildCard>
+  <WildCard name="Designing Claude Code">
+    Another system built around a model's loop of tool calls and a context
+    window to manage. [Chapter 78](/topics/78-design-claude-code).
+  </WildCard>
+  <WildCard name="Netflix recommendations">
+    Embeddings, two-tower retrieval and HNSW nearest-neighbour search.
+    [Chapter 58](/topics/58-design-netflix-recommendations).
+  </WildCard>
+  <WildCard name="Caching">
+    Hit rates, lifetimes and staleness, for search results and prompt prefixes.
+    [Chapter 25](/topics/25-caching).
+  </WildCard>
+  <WildCard name="Virtual Memory">
+    Page faults and CLOCK, behind Photon's move off memory-mapping.
+    [Chapter 04](/topics/04-virtual-memory).
+  </WildCard>
+</CardGrid>
