@@ -1,7 +1,7 @@
 "use client";
 
-import { useRef, useState } from "react";
-import { Check, Copy } from "lucide-react";
+import { Children, isValidElement, useRef, useState } from "react";
+import { Check, ChevronDown, Copy } from "lucide-react";
 
 const LANG: Record<string, string> = {
   cpp: "C++", c: "C", sh: "Shell", bash: "Shell", shell: "Shell", console: "Shell",
@@ -10,6 +10,23 @@ const LANG: Record<string, string> = {
   json: "JSON", text: "Output", txt: "Output", diff: "Diff", swift: "Swift",
 };
 
+/* Blocks longer than FOLD lines start folded to PEEK lines, so a long
+   listing doesn't push the explanation off the screen. The count comes from
+   rehype-pretty-code's [data-line] spans, so it's known at render time and
+   the page doesn't jump after load. */
+const FOLD = 16;
+const PEEK = 12;
+
+function countLines(children: React.ReactNode): number {
+  let n = 0;
+  Children.forEach(children, (c) => {
+    if (!isValidElement<{ children?: React.ReactNode; "data-line"?: string }>(c)) return;
+    if (c.props["data-line"] !== undefined) n++;
+    else n += countLines(c.props.children);
+  });
+  return n;
+}
+
 /* Every fenced block gets a header with its language and a copy button.
    Copying reads the rendered text, so what lands on the clipboard is exactly
    what's on the page. */
@@ -17,6 +34,10 @@ export function CodeBlock(props: React.ComponentProps<"pre"> & { "data-language"
   const ref = useRef<HTMLPreElement>(null);
   const [done, setDone] = useState(false);
   const lang = props["data-language"];
+  const lines = countLines(props.children);
+  const foldable = lines > FOLD;
+  const [folded, setFolded] = useState(true);
+  const isFolded = foldable && folded;
 
   async function copy() {
     const text = ref.current?.innerText ?? "";
@@ -40,11 +61,27 @@ export function CodeBlock(props: React.ComponentProps<"pre"> & { "data-language"
           {done ? "Copied" : "Copy"}
         </button>
       </div>
-      <pre
-        {...props}
-        ref={ref}
-        className="overflow-x-auto py-4 text-[13.5px] leading-[1.65]"
-      />
+      <div className="relative">
+        <pre
+          {...props}
+          ref={ref}
+          style={isFolded ? { maxHeight: `calc(${PEEK} * 1.65 * 13.5px + 1rem)`, overflow: "hidden" } : undefined}
+          className="overflow-x-auto py-4 text-[13.5px] leading-[1.65]"
+        />
+        {isFolded && <div className="code-fade pointer-events-none absolute inset-x-0 bottom-0 h-20" aria-hidden />}
+      </div>
+      {foldable && (
+        <button
+          onClick={() => {
+            if (!folded) ref.current?.closest(".code-block")?.scrollIntoView({ block: "nearest" });
+            setFolded(!folded);
+          }}
+          className="code-fold flex w-full items-center justify-center gap-1.5 border-t border-line py-2 font-[family-name:var(--font-inter)] text-[12.5px] font-medium text-muted transition hover:bg-surface-2 hover:text-ink"
+        >
+          <ChevronDown className={`size-3.5 transition-transform ${folded ? "" : "rotate-180"}`} />
+          {folded ? `Show all ${lines} lines` : "Fold it back"}
+        </button>
+      )}
     </div>
   );
 }

@@ -5,7 +5,7 @@ import { SectionHeading, Why } from "./section";
 import { Steps, StepSequence } from "./steps";
 import { Scene } from "./scene";
 import { SystemDiagram } from "./system-diagram";
-import { Think, Decision, Elsewhere, Zoom, Picture } from "./design";
+import { Think, Decision, Elsewhere, Zoom, Picture, DeepDive, Stack, Insight, Checkpoint } from "./design";
 import { Predict } from "./predict";
 import { RaceLab } from "./labs/race-lab";
 import { LockLab } from "./labs/lock-lab";
@@ -43,6 +43,10 @@ export const mdxComponents: MDXComponents = {
   Elsewhere,
   Zoom,
   Picture,
+  DeepDive,
+  Stack,
+  Insight,
+  Checkpoint,
   Predict,
   RaceLab,
   LockLab,

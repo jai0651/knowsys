@@ -70,6 +70,38 @@ A million drivers every four seconds is 250,000 updates a second, all day. (Uber
 The second half of the question matters more. Once a newer position for Ravi arrives, the older one is useless for matching. So the workload is enormous in volume but tiny in what it needs to keep: just the latest position of each car. That's a very different shape from a bank ledger, where every write must be kept forever, and it pushes the design towards memory instead of disk, as we'll see.
 </Think>
 
+<DeepDive
+  kind="api"
+  id="dd-api"
+  title="The API the two phones call"
+  answer="Plain HTTPS for actions that happen once (estimate, request, accept), each with an idempotency key, and one long-lived connection per phone for everything that streams (locations up, trip updates down)."
+>
+
+In an interview, the API comes straight after the requirements, because it pins down what the rest of the design must serve. Uber's internal API isn't public, so this is the shape a design needs, split by how often each call happens:
+
+| Call | Who | How often | Transport |
+|---|---|---|---|
+| `GET /v1/fare-estimate?pickup=…&dropoff=…` | rider | a few times per trip | HTTPS |
+| `POST /v1/rides` with an `Idempotency-Key` header | rider | once per trip | HTTPS |
+| `POST /v1/offers/{offer_id}/accept` | driver | once per offer | HTTPS |
+| location `{lat, lng, heading, speed, ts}` | driver | every 4 s | the open connection, upstream |
+| trip updates (driver assigned, car position, ETA) | server → both | every few seconds | the open connection, downstream |
+
+Two things in that table trip people up. Locations don't go over a fresh HTTPS request each time. Think about it: a TLS handshake every four seconds from millions of phones costs more than the forty-odd bytes of position it carries, so the update rides the same long-lived connection the server pushes on (section 8.1 is about that channel). And the rider's `POST /v1/rides` carries an idempotency key, a random ID the phone generates once and resends on every retry. Priya is on patchy station Wi-Fi; if her first request reaches the server but the reply is lost, the phone retries, and the server sees the same key and returns the ride it already created instead of booking a second car.
+
+```sql
+-- the server's side of an idempotency key: the UNIQUE constraint does the work
+CREATE TABLE ride_requests (
+  idempotency_key  UUID PRIMARY KEY,
+  rider_id         BIGINT NOT NULL,
+  trip_id          BIGINT,          -- filled in once matched
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- INSERT ... ON CONFLICT (idempotency_key) DO NOTHING RETURNING trip_id;
+```
+
+</DeepDive>
+
 </Sub>
 
 <SectionHeading n="02" id="v1">Version 1: a table of drivers</SectionHeading>
@@ -94,9 +126,52 @@ The most obvious design is a database table with one row per driver: driver ID, 
   caption="Simple, and wrong twice over: 250,000 overwrites a second hammer one table, and each request has to compute the distance to every driver to find the closest."
 />
 
-Both halves break at Uber's scale. The writes are the first problem: a quarter of a million updates a second to a database on disk, each one written durably even though it will be useless four seconds later. The reads are the second: "order by distance from Priya" means computing the distance from Priya to every free driver and sorting. An ordinary database index can't help, because an index sorts by one value, and distance from Priya isn't a value stored in any row; it depends on where Priya is.
+Both halves break at Uber's scale. Writes are the first problem: a quarter of a million updates a second to a database on disk, each one written durably even though it will be useless four seconds later. Reads are the second: "order by distance from Priya" means computing the distance from Priya to every free driver and sorting. An ordinary database index can't help, because an index sorts by one value, and distance from Priya isn't a value stored in any row; it depends on where Priya is.
 
-So we need two things: a place to keep the latest positions that can absorb constant overwrites, and a way to find the drivers near a point without looking at all of them. The first is the easy part. Since only the latest position matters and it's replaced every few seconds anyway, it can live in memory. The rest of this section's trouble, finding nearby drivers without scanning everyone, takes the whole of the next section.
+<Insight>An index can only sort by something stored in the row. Distance from Priya isn't stored anywhere, so no ordinary index can sort by it.</Insight>
+
+So we need two things: a place to keep the latest positions that can absorb constant overwrites, and a way to find the drivers near a point without looking at all of them. Keeping positions is the easy part. Since only the latest position matters and it's replaced every few seconds anyway, it can live in memory. The rest of this section's trouble, finding nearby drivers without scanning everyone, takes the whole of the next section.
+
+<DeepDive
+  kind="index"
+  id="dd-btree"
+  title="Which index would Postgres use, and why isn't it enough?"
+  answer="A B-tree on (lat, lng) only narrows one coordinate; a PostGIS GiST index can answer 'nearest 10' properly, but Postgres can't absorb 250,000 updates a second to indexed rows."
+>
+
+Try the obvious index first. A composite B-tree on `(lat, lng)` sorts drivers by latitude, and by longitude only among drivers with exactly the same latitude. A box query like this one can use the index for the latitude range, but then has to check the longitude of every driver in that horizontal strip. Across a whole country, that strip holds most of them:
+
+```sql
+CREATE INDEX drivers_lat_lng ON drivers (lat, lng);
+
+SELECT id FROM drivers
+WHERE lat BETWEEN 18.52 AND 18.54     -- the index narrows this
+  AND lng BETWEEN 73.86 AND 73.89     -- this is checked row by row
+  AND state = 'available';
+```
+
+A B-tree is a one-dimensional structure, so no ordering of two columns makes "close in both" cheap. Postgres's answer is a different kind of index. With the PostGIS extension, a **GiST** index stores an R-tree, a tree of nested bounding boxes, and supports a distance operator `<->` that walks the tree nearest-first. This query really does find the ten closest drivers without scanning everyone:
+
+```sql
+CREATE INDEX drivers_geo ON drivers USING GIST (location);
+
+SELECT id FROM drivers
+WHERE state = 'available'
+ORDER BY location <-> ST_MakePoint(73.8743, 18.5286)::geography
+LIMIT 10;
+```
+
+So the read side is solvable inside a database. Writes are what kill it. In Postgres an `UPDATE` doesn't change a row in place; it writes a new version of the row, logs it to the write-ahead log, and updates the indexes to point at the new version, leaving the old one for `VACUUM` to clean up. At 250,000 updates a second that's 250,000 new row versions, WAL records and index changes a second, all made durable for data that's worthless four seconds later. A single Postgres primary probably handles a few tens of thousands of writes like that a second, maybe more on very good hardware, but nowhere near 250,000.
+
+| Option | Finds nearest quickly? | Takes 250k updates/s? | Survives a crash? |
+|---|---|---|---|
+| B-tree on (lat, lng) | No: one coordinate only | No | Yes |
+| PostGIS GiST (R-tree) | Yes | No: MVCC + WAL per update | Yes |
+| In-memory cells, sharded | Yes | Yes | No, but drivers resend in 4 s |
+
+Look at the last column. Durability is the expensive thing here, and it's exactly what this data doesn't need. (PostGIS is still what I'd reach for with slow-changing shapes: city boundaries, airport pickup zones, restaurant locations.)
+
+</DeepDive>
 
 </Sub>
 
@@ -152,7 +227,7 @@ same driver found: True, 24 m away
 </Output>
 </TryIt>
 
-The grid found the same driver after looking at 1,456 drivers instead of a million, about 250 times faster (the exact times vary from run to run). The program has a deliberate shortcut: it assumes the nearest driver is within one cell of Priya, which is true here because the city is evenly packed with drivers. With sparse drivers, the search has to widen ring by ring until it finds someone.
+So the grid found the same driver after looking at 1,456 drivers instead of a million, about 250 times faster (the exact times vary from run to run). There's a deliberate shortcut in the program: it assumes the nearest driver is within one cell of Priya, which is true here because the city is evenly packed with drivers. With sparse drivers, the search has to widen ring by ring until it finds someone.
 
 That last caveat is the grid's real weakness, because real cities are not evenly packed. At 6 pm a 500-metre square in central Mumbai might hold hundreds of cars while one on the outskirts holds none. A single cell size is too coarse downtown, where every cell holds too many cars, and too fine in the suburbs, where Priya's search has to step through many empty cells. The fixes are smarter ways to cut space into cells, and there are four well-known ones.
 
@@ -212,7 +287,7 @@ Pune station and Koregaon Park, about two kilometres apart, share the first five
   href="https://commons.wikimedia.org/wiki/File:Geohash-grid.png"
 />
 
-The word "usually" in that paragraph is the catch. The halving traces a zig-zag path through space called a Z-order curve, and where the curve jumps, two points a few metres apart on either side of a cell boundary can have completely different prefixes. A geohash search therefore always has to check the eight neighbouring cells too, just like the grid. Geohash cells also get narrower towards the poles, so a "cell" isn't the same size everywhere.
+The word "usually" in that paragraph is the catch. Halving like this traces a zig-zag path through space called a Z-order curve, and where the curve jumps, two points a few metres apart on either side of a cell boundary can have completely different prefixes. A geohash search therefore always has to check the eight neighbouring cells too, just like the grid. Geohash cells also get narrower towards the poles, so a "cell" isn't the same size everywhere.
 
 </Sub>
 
@@ -248,7 +323,7 @@ Google's **S2** library takes the hierarchy of squares and makes it global and f
 
 In 2018 Uber open-sourced its own grid system, **H3**, and it isn't made of squares at all. H3 covers the Earth with hexagons.
 
-The reason is the neighbours. Look at a square cell: four neighbours share an edge with it, and four more touch it only at a corner, about 1.4 times further away. Any calculation that spreads out from a cell, such as "demand in this area and the areas around it", has to treat those two kinds of neighbour differently. A hexagon has six neighbours, all sharing an edge and all at the same distance. Uber's 2018 post puts it plainly: hexagons have only one distance between a cell's centre and its neighbours', where squares have two.
+It's about the neighbours. Look at a square cell: four neighbours share an edge with it, and four more touch it only at a corner, about 1.4 times further away. Any calculation that spreads out from a cell, such as "demand in this area and the areas around it", has to treat those two kinds of neighbour differently. A hexagon has six neighbours, all sharing an edge and all at the same distance. Uber's 2018 post puts it plainly: hexagons have only one distance between a cell's centre and its neighbours', where squares have two.
 
 <div className="grid gap-4 sm:grid-cols-2">
 
@@ -282,7 +357,7 @@ H3 offers 16 resolutions, from cells the size of continents down to cells under 
 | 9 | 0.11 km² | 0.20 km | about 4.8 billion |
 | 15 | 0.9 m² | 0.58 m | about 570 trillion |
 
-A city-scale question uses resolutions around 7 to 9: a resolution-8 hexagon is roughly a neighbourhood, half a kilometre across. Which resolution Uber uses for each job isn't published.
+A city-scale question uses resolutions around 7 to 9: a resolution-8 hexagon is roughly a neighbourhood, half a kilometre across. Which resolution Uber uses for each job isn't published; my guess would be somewhere around 7 or 8 for surge, but nobody outside Uber can say for sure.
 
 "Find drivers near Priya" in H3 becomes: find Priya's cell, then ask for every cell within *k* steps of it. That operation is called **gridDisk** (it was named kRing in earlier versions). With *k* = 1 it returns Priya's cell and its 6 neighbours, 7 cells. In general it returns 3*k*² + 3*k* + 1 cells, so 19 for *k* = 2, and the search widens ring by ring until enough drivers turn up.
 
@@ -310,7 +385,7 @@ Hexagons have one drawback, and it's built into geometry: you can't divide a hex
 
 <Zoom path={["Uber", "Location index", "H3 cell", "64-bit ID"]} />
 
-An H3 cell is identified by a single 64-bit integer, which is what makes it cheap to store, hash and compare. The bits are laid out like this:
+An H3 cell is identified by a single 64-bit integer, so it's cheap to store, hash and compare. The bits are laid out like this:
 
 | Bits | Field | What it holds |
 |---|---|---|
@@ -331,7 +406,7 @@ So an ID is literally a path: start from one of the 122 base cells and take one 
     { name: "H3 hexagons", how: "Hexagons at 16 resolutions, each about a seventh of the one above.", good: ["Every neighbour at the same distance", "Smooth for spreading and aggregating values", "One 64-bit ID per cell"], bad: ["Children only approximately fill their parent", "12 pentagons at every resolution need special care"], chosen: true },
   ]}
 >
-Uber built H3 because its most demanding spatial questions were about *areas*, not points: demand and supply per neighbourhood, smoothed across adjacent neighbourhoods for surge pricing, and analysed across a whole city. Equal-distance neighbours make that smoothing simple and unbiased. For pure "which drivers are near this point" lookups, the choice matters less; any of the four works with a neighbour search, which is why Uber's 2015 dispatch system could use S2 cells.
+Uber built H3 because its most demanding spatial questions were about *areas*, not points: demand and supply per neighbourhood, smoothed across adjacent neighbourhoods for surge pricing, and analysed across a whole city. Equal-distance neighbours make that smoothing simple and unbiased. For pure "which drivers are near this point" lookups, the choice matters less; any of the four works with a neighbour search. Uber's 2015 dispatch system used S2 cells and got along fine.
 </Decision>
 
 <Elsewhere items={[
@@ -343,11 +418,24 @@ Uber built H3 because its most demanding spatial questions were about *areas*, n
 
 </Sub>
 
+<Checkpoint
+  n={1}
+  have={[
+    "The map is cut into cells (H3 hexagons), and each cell keeps a list of the drivers inside it",
+    "Finding nearby drivers means looking at a ring of cells (gridDisk) instead of a million rows",
+    "A cell ID is a 64-bit integer, so it's cheap to hash, store and compare",
+  ]}
+  broken="All of this sits on one machine, and 250,000 updates a second plus every rider's search is too much for it. If it dies, nobody gets a ride."
+  q="Why does a geohash search still have to check the eight neighbouring cells?"
+>
+Two points a few metres apart can sit on opposite sides of a cell boundary where the Z-order curve jumps, so their prefixes share nothing. If you only searched the prefix, you'd miss a driver right next to Priya.
+</Checkpoint>
+
 <SectionHeading n="04" id="supply">Keeping the live map of drivers</SectionHeading>
 
 <Sub n="4.1" title="Too much for one machine">
 
-We now know how to find nearby drivers in a grid. The next question is where that grid lives. Holding the latest position of a few million drivers takes only a few hundred megabytes, which fits on one machine easily. The problem is the traffic: a quarter of a million updates a second, plus every rider's search, plus the fact that one machine is one machine, and when it fails, nobody can get a ride anywhere.
+We now know how to find nearby drivers in a grid. So where does that grid live? Holding the latest position of a few million drivers takes only a few hundred megabytes, which fits on one machine easily. The problem is the traffic: a quarter of a million updates a second, plus every rider's search, plus the fact that one machine is one machine, and when it fails, nobody can get a ride anywhere.
 
 So the index is split across many machines, and the natural way to split it is by cell. Each machine owns some set of cells and holds the drivers currently inside them. Ravi's location update goes to whichever machine owns his current cell. Priya's search goes to the machines that own the cells in her gridDisk, usually just one or two, since nearby cells tend to be on the same machine.
 
@@ -379,6 +467,35 @@ So the index is split across many machines, and the natural way to split it is b
 />
 
 One property of this workload makes failures far less painful than usual. Because every driver resends their position every four seconds, a node that crashes and restarts empty is fully repopulated within a few seconds, without any backup or replica. The data heals itself. That's a big part of why it can live in memory at all.
+
+<Insight>If every record gets resent every four seconds anyway, you don't need to back it up. A crashed node refills itself.</Insight>
+
+<DeepDive
+  kind="cache"
+  id="dd-redis-geo"
+  title="Could the location index just be Redis?"
+  answer="For most companies, yes: Redis GEO sets keyed by city or coarse cell work well. Uber built its own in 2015 because matching needs more than position: state, vehicle type, and drivers about to finish a trip."
+>
+
+Redis is the usual interview answer for "latest location of every driver", and it's a good one. Redis keeps everything in memory, executes each command on one thread so commands never interleave, and has GEO commands built in. Under the hood, `GEOADD` turns a position into a 52-bit geohash and stores it as the score of a sorted set member, so a radius search is a handful of score-range lookups, the prefix trick from section 3.2.
+
+```text
+# one sorted set per coarse area, so no key gets too big or too hot
+GEOADD drivers:pune:avail 73.8743 18.5286 driver:ravi
+GEOSEARCH drivers:pune:avail FROMLONLAT 73.8750 18.5290 BYRADIUS 2 km ASC COUNT 20
+
+# a sorted-set member can't expire on its own, so track freshness separately
+ZADD drivers:pune:seen 1762850000 driver:ravi     # score = last update, unix seconds
+ZRANGEBYSCORE drivers:pune:seen 0 1762849970      # sweeper: anyone silent for 30 s
+```
+
+A few design choices hide in those lines. The key is per area, not one global set, because a single key lives on one Redis node; Mumbai's set and Pune's set can then sit on different shards of a Redis Cluster. Availability is part of the key (`:avail`), so a search never has to filter out busy drivers; when Ravi accepts a trip he's removed from that set in the same step. And because Redis can't expire one member of a set, a second sorted set records when each driver last reported, and a small sweeper removes drivers whose phones went quiet.
+
+Capacity math is reassuring here. A sorted-set entry with a short member name probably costs on the order of 100 bytes (it depends on the encoding Redis picks), so a million drivers comes to roughly 100 MB. That fits in memory with room to spare. One Redis node handles somewhere around 100,000 simple commands a second, so 250,000 updates a second needs a few primary shards plus replicas. Small cluster.
+
+So why didn't Uber just use it? Its 2015 talks describe a custom supply service in Node.js, sharded with Ringpop, and I think the answer is in what dispatch actually asks: not "who's within 2 km" but "who's within a few minutes, is free *or about to be free*, drives the right vehicle type, and hasn't just declined". That's a query over position plus several other fields, evaluated thousands of times a second, and it's easier to answer in a service that holds driver objects in memory than in a key-value store holding points. If you're designing this in an interview, Redis GEO is a sound first answer; the custom service is what you move to when the query outgrows it.
+
+</DeepDive>
 
 </Sub>
 
@@ -418,11 +535,13 @@ Dispatch now has a list of candidate drivers near Priya. The next mistake to avo
 
 So matching is done on **estimated time of arrival (ETA)**, computed along the actual road network, not on straight-line distance. Uber's own description of its marketplace says it directly: closest doesn't always mean quickest, because of traffic, overpasses, rivers and other geography. The straight-line search from section 3 still has a job, though. It cheaply narrows millions of drivers down to a few dozen, and only those few dozen get the expensive road-based ETA calculation, which section 6 covers.
 
+<Insight>Filter cheaply, then measure expensively. A straight-line cell search cuts millions of drivers to a few dozen, and only those few dozen get a real road ETA.</Insight>
+
 </Sub>
 
 <Sub n="5.2" title="One rider at a time, or a batch?">
 
-The second mistake is subtler. Suppose two riders request within a second of each other, and two free drivers are nearby.
+There's a second, subtler mistake. Suppose two riders request within a second of each other, and two free drivers are nearby.
 
 <Think
   q="Priya requests first, then Sam a second later. Ravi is 2 minutes from Priya and 3 from Sam. Meena is 4 minutes from Priya and 9 from Sam. If each rider in turn takes the nearest free driver, what's the total waiting time? Can you do better?"
@@ -470,7 +589,7 @@ batched  {'Priya': 'Meena', 'Sam': 'Ravi'}  waits {'Priya': 4, 'Sam': 3}  total 
 </Output>
 </TryIt>
 
-Pairing riders with drivers to minimise the total cost is a classic problem called **bipartite matching**, or the **assignment problem**. Trying every pairing, as the program does, works for two riders and two drivers, but the number of pairings grows factorially, so real solvers use algorithms such as the Hungarian algorithm, which solves it in polynomial time, or min-cost flow. Uber hasn't published which solver it uses.
+Pairing riders with drivers to minimise the total cost is a classic problem called **bipartite matching**, or the **assignment problem**. Trying every pairing, as the program does, works for two riders and two drivers, but the number of pairings grows factorially, so real solvers use algorithms such as the Hungarian algorithm, which solves it in polynomial time, or min-cost flow. Uber hasn't published which solver it uses. At that size it's probably something closer to min-cost flow than a textbook Hungarian, but that's a guess.
 
 <Decision
   q="Should each request be matched the moment it arrives?"
@@ -520,7 +639,7 @@ Here, for the first time, correctness matters more than speed. Two dispatch proc
   ]}
 />
 
-The state names here are illustrative; Uber's internal ones aren't public. What is public is how its thinking changed. Uber's original trip platform was built, in its engineers' words, on the premise of trading consistency for availability and latency, using Node.js, Ringpop, Cassandra and Redis. In 2021 Uber described rebuilding it in Java on Google Cloud Spanner, a database that offers transactions across shards, and modelling each driver, rider and trip as a hierarchical state machine. The rebuilt platform served over a million concurrent users in over 10,000 cities.
+These state names are illustrative; Uber's internal ones aren't public. What is public is how its thinking changed. Uber's original trip platform was built, in its engineers' words, on the premise of trading consistency for availability and latency, using Node.js, Ringpop, Cassandra and Redis. In 2021 Uber described rebuilding it in Java on Google Cloud Spanner, a database that offers transactions across shards, and modelling each driver, rider and trip as a hierarchical state machine. The rebuilt platform served over a million concurrent users in over 10,000 cities.
 
 <Decision
   q="For driver and trip state, favour availability or consistency?"
@@ -529,10 +648,59 @@ The state names here are illustrative; Uber's internal ones aren't public. What 
     { name: "Consistency first (2021 rebuild)", how: "Transactions across shards; each state change happens exactly once.", good: ["A driver can't be in two trips", "Simpler code for complex flows"], bad: ["A distributed database with higher write latency", "Depends on the database's availability"], chosen: true },
   ]}
 >
-The location index and the trip state ended up with opposite answers, and that's the right outcome: locations are overwritten every four seconds and heal themselves, so losing one costs nothing; a trip is a promise to a rider and a driver, so losing or doubling one costs a great deal. Chapter 19 covers what "transactions across shards" requires, and chapter 31 what it costs.
+Location index and trip state ended up with opposite answers, and that's the right outcome: locations are overwritten every four seconds and heal themselves, so losing one costs nothing; a trip is a promise to a rider and a driver, so losing or doubling one costs a great deal. Chapter 19 covers what "transactions across shards" requires, and chapter 31 what it costs.
 </Decision>
 
+<DeepDive
+  kind="consistency"
+  id="dd-claim"
+  title="How do you stop two dispatchers offering Ravi at once?"
+  answer="Make the claim a single compare-and-set: change Ravi from available to offered only if he's still available, and treat 'zero rows changed' as losing the race. A lease (TTL) on the offer cleans up after crashes."
+>
+
+Here's the race. Dispatcher A reads Ravi's row, sees `available`, and decides to offer him to Sam. Dispatcher B reads the same row a millisecond later, also sees `available`, and offers him to someone else. Both write `offered`. If you read first and write second, no amount of care in the code fixes this, because the gap between the read and the write is where the other dispatcher gets in.
+
+So don't read first. Put the check inside the write, and let the database do both in one step:
+
+```sql
+UPDATE drivers
+SET    state = 'offered', offer_id = :offer, offer_expires = now() + interval '15 seconds'
+WHERE  driver_id = :ravi AND state = 'available';
+-- 1 row updated  → you own Ravi
+-- 0 rows updated → somebody else got him; pick the next candidate
+```
+
+That's a **compare-and-set**: the `WHERE state = 'available'` is the compare, and the database's row lock makes the compare and the set one atomic thing. The same idea in Redis is `SET lock:driver:ravi offer123 NX PX 15000`, which only succeeds if the key doesn't exist yet and deletes itself after 15 seconds.
+
+Why the expiry? Say dispatcher A claims Ravi and then crashes before sending the offer. Without a timeout, Ravi sits in `offered` forever and never gets another ride. With one, the claim is really a **lease**: it's yours for 15 seconds, and a sweeper (or the next claim, checking `offer_expires < now()`) frees it after that.
+
+When Ravi taps Accept, two rows have to change together: his state goes to `en_route`, and a trip row is created. On one database that's an ordinary transaction. Once drivers and trips live on different shards, it's a distributed transaction, and that's a big part of why Uber moved this platform onto Spanner in 2021: Spanner does multi-row, multi-shard transactions natively, so "driver is busy" and "trip exists" can't end up disagreeing.
+
+| Approach | Stops the double offer? | Cleans up after a crash? | Where it fits |
+|---|---|---|---|
+| Read, then write | No | No | Nowhere, honestly |
+| Conditional UPDATE | Yes | With an expiry column + sweeper | One SQL database |
+| Redis `SET NX PX` | Yes, mostly | Yes, the key expires | Fast claims, if a rare double offer is tolerable |
+| Spanner / multi-shard transaction | Yes | Yes | Claim and trip creation as one step across shards |
+
+Why "mostly" for Redis? With a single Redis primary and async replication, a failover can lose a lock that was just granted, so the new primary hands it out again. For an offer that a driver can still decline that's survivable. For money it isn't.
+
+</DeepDive>
+
 </Sub>
+
+<Checkpoint
+  n={2}
+  have={[
+    "Locations live in memory, split across nodes by cell, with a hash ring deciding who owns what",
+    "Dispatch batches requests for a few seconds and solves the assignment problem for everyone at once",
+    "Claiming a driver is one atomic compare-and-set, so nobody gets offered twice",
+  ]}
+  broken="Matching runs on ETAs, and we haven't said where a fast, traffic-aware ETA comes from. Plain A* takes about 120 ms per query, and dispatch needs dozens per request."
+  q="Dispatcher A reads Ravi as available, then dispatcher B does too. What stops both offering him?"
+>
+Neither of them should be reading first. Each one runs `UPDATE … SET state = 'offered' WHERE driver_id = ravi AND state = 'available'`, and the database runs those one at a time on the row. Whoever goes first changes one row; the other changes zero and moves on to the next candidate.
+</Checkpoint>
 
 <SectionHeading n="06" id="eta">How long will it take?</SectionHeading>
 
@@ -561,9 +729,9 @@ Matching needs an ETA for each candidate driver, and the app shows ETAs all the 
 
 </div>
 
-The textbook algorithm for shortest paths is **Dijkstra's algorithm**, which explores outward from the start in order of distance until it reaches the destination. On a city graph with millions of edges, that exploration touches a large part of the city for every query. **A\*** speeds it up by preferring nodes in the direction of the destination, and Uber's 2015 post on its routing engine measured a city-scale A\* query with live traffic at about 120 milliseconds. That sounds fast, but it's far too slow when every request needs dozens of ETAs and the whole platform asks for hundreds of thousands a second.
+For shortest paths, the textbook algorithm is **Dijkstra's algorithm**, which explores outward from the start in order of distance until it reaches the destination. On a city graph with millions of edges, that exploration touches a large part of the city for every query. **A\*** speeds it up by preferring nodes in the direction of the destination, and Uber's 2015 post on its routing engine measured a city-scale A\* query with live traffic at about 120 milliseconds. That sounds fast, but it's far too slow when every request needs dozens of ETAs and the whole platform asks for hundreds of thousands a second.
 
-The standard trick for fast routing is to precompute. **Contraction hierarchies** rank the nodes by importance and add "shortcut" edges that skip over unimportant nodes, so a query can climb quickly onto major roads and come back down near the destination, answering in milliseconds. The catch is the precomputation: Uber's post notes that building the contracted graph for all the roads of the world takes about 12 hours, which makes folding in live traffic, which changes by the minute, very hard.
+The standard trick for fast routing is to precompute. **Contraction hierarchies** rank the nodes by importance and add "shortcut" edges that skip over unimportant nodes, so a query can climb quickly onto major roads and come back down near the destination, answering in milliseconds. Precomputation is the catch, though: Uber's post notes that building the contracted graph for all the roads of the world takes about 12 hours, which makes folding in live traffic, which changes by the minute, very hard.
 
 <Decision
   q="How should ETAs be computed?"
@@ -576,7 +744,7 @@ The standard trick for fast routing is to precompute. **Contraction hierarchies*
 Uber's in-house routing engine, Gurafu, launched in 2015 and divides the graph into a hierarchy of cells, so that small sections can be preprocessed independently and in parallel, aiming for single-digit-millisecond answers at hundreds of thousands of requests a second. On top of it, since 2022, a model called DeepETA predicts the *difference* between the routing engine's estimate and the real arrival time, learning effects such as pickups at airports or slow drop-offs that a sum of road segments can't know about.
 </Decision>
 
-DeepETA is worth a moment, because it's a neat design pattern. The routing engine computes an ETA as a sum of segment travel times. Then a neural network, which Uber says replaced one of the largest gradient-boosted tree ensembles in the world, predicts how wrong that sum will be, given the time of day, the type of request and other features. Learning only the correction keeps the model's job small and lets the routing engine keep doing what it's good at. Uber's ETAs feed fares, pickup estimates, matching and delivery planning, which is why DeepETA is described as its highest-traffic model.
+DeepETA is worth a moment, because it's a neat design pattern. The routing engine computes an ETA as a sum of segment travel times. Then a neural network, which Uber says replaced one of the largest gradient-boosted tree ensembles in the world, predicts how wrong that sum will be, given the time of day, the type of request and other features. Learning only the correction keeps the model's job small and lets the routing engine keep doing what it's good at. Uber's ETAs feed fares, pickup estimates, matching and delivery planning, and Uber describes DeepETA as its highest-traffic model.
 
 <Elsewhere items={[
   { where: "Google Maps and OSRM", how: "Contraction hierarchies and related precomputed-shortcut techniques power most fast routing engines; OSRM is an open-source one you can run yourself." },
@@ -617,6 +785,62 @@ Uber's 2018 H3 post says it plainly: surge is calculated by measuring supply and
 
 Uber's 2021 paper on its real-time data infrastructure describes surge's choices directly: the pipeline favours fresh data and availability over consistency, and events that arrive late for their window are dropped. It runs in several regions at once, and if one region fails, the surge calculation fails over to another. A price computed from slightly incomplete counts a few seconds ago is far better than no price at all.
 
+<DeepDive
+  kind="stream"
+  id="dd-kafka"
+  title="Why Kafka for the event log, and not RabbitMQ, SQS or Redis Streams?"
+  answer="Because many teams read the same events for different jobs, at different speeds, and sometimes need to replay yesterday. Kafka keeps the log on disk for days and lets each reader keep its own position; a queue deletes a message once it's handled."
+>
+
+Start with who reads these events. Surge counts requests per hexagon. Fraud looks for drivers whose GPS jumps impossibly. The ETA team wants every completed trip to train DeepETA. Analytics wants all of it in the warehouse. That's four consumers of one stream, and they don't run at the same speed: surge is seconds behind, the warehouse load might be an hour behind, and when someone ships a bug in the fraud job, they'll want to rewind to this morning and run it again.
+
+A traditional queue like RabbitMQ or SQS is built for a different job. A message goes to one worker, the worker acknowledges it, and it's gone. You can fake multiple readers by copying every message into one queue per consumer, but replaying last Tuesday is off the table, because last Tuesday was deleted.
+
+Kafka is a log, not a queue. Producers append to the end of a **partition**, an ordered file on disk; each **consumer group** remembers its own offset (how far it has read); messages stay for as long as the retention setting says, whether anyone has read them or not. Adding a fifth consumer costs nothing on the producer side, and replay means resetting an offset.
+
+| | Kafka | RabbitMQ | SQS | Redis Streams |
+|---|---|---|---|---|
+| Many independent readers | Yes, consumer groups | Copy per queue | Copy per queue (SNS fan-out) | Yes, consumer groups |
+| Replay old events | Yes, until retention | No | No | Only while it fits in memory |
+| Ordering | Per partition | Per queue | FIFO queues only, lower throughput | Per stream |
+| Throughput | Millions/s per cluster | Tens of thousands/s per node | Managed, scales, per-call cost | High, memory-bound |
+| Good at | Event logs, pipelines | Task queues, routing rules | Simple managed work queues | Small, fast streams |
+
+Uber is about as committed to Kafka as a company gets. Its 2021 SIGMOD paper describes Kafka carrying trillions of messages and petabytes of data a day, feeding Flink jobs like surge, Pinot for real-time analytics, and the Hive warehouse.
+
+#### The partition key matters more than the broker
+
+Within a topic, Kafka only keeps order inside a partition, and each partition is read by one consumer in a group. So the key you partition by decides what a single Flink task gets to see. For surge, partition by **hexagon** (a coarse H3 cell, say resolution 6 or 7): every request and every free-driver event for one area lands on the same partition, so one task can count them without talking to anyone. Partition by `driver_id` and each driver's events stay in order, but a hexagon's events end up spread across every partition, and counting them needs a shuffle.
+
+The hexagon key has its own failure mode, and it shows up at exactly the wrong time. When a concert ends, one hexagon's partition gets a flood while the rest idle. Usual fixes are a coarser key that mixes busy and quiet areas, or salting the hot key (`hex:8a2a1072b59ffff:3`) across a few partitions and summing the pieces afterwards. I don't know which, if either, Uber does; the paper doesn't say.
+
+#### Windows and late events
+
+Flink counts per **tumbling window**, back-to-back non-overlapping buckets of, say, one minute. Phones on bad networks send events late, so Flink tracks a **watermark**, its estimate of "everything before time T has arrived", and closes a window when the watermark passes its end. An event that turns up after its window closed is late; the surge job simply drops it, as the 2021 paper describes. Being a few events short beats publishing the price late.
+
+</DeepDive>
+
+<DeepDive
+  kind="cache"
+  id="dd-surge-store"
+  title="Where the surge multiplier lives, and why it has a TTL"
+  answer="In a key-value store keyed by hexagon, overwritten every window, with an expiry slightly longer than the window, so a dead pipeline fails back to no surge rather than freezing a stale 3x price."
+>
+
+Reads here are tiny and hot: given Priya's hexagon, what's the multiplier? Every fare estimate in a city asks that, many times a second, so it lives in memory, in Redis or an equivalent:
+
+```text
+SET surge:8a60145b2a4ffff  1.8  EX 120     # written by the Flink job each window
+GET surge:8a60145b2a4ffff                  # read by the pricing service
+                                           # (nil) → no surge, charge 1.0x
+```
+
+The `EX 120` is the important part. If the stream job dies, nobody refreshes these keys, and without an expiry the last value would stay forever: a hexagon that surged to 3x during a storm would still charge 3x at 4 am. With a two-minute expiry, a stalled pipeline means surge quietly disappears. That's the failure you want, because undercharging for a few minutes is cheap and overcharging makes the news.
+
+There's a second, separate store in the flow. Once Priya sees a fare and taps Request, the price she saw is the price she pays (Uber calls these upfront fares), even if surge changes a second later. So the estimate is saved as a **quote**: `quote:{id} → {fare, surge, expires}` with a short TTL, and `POST /v1/rides` passes the quote ID. The pricing service charges what the quote says, and an expired quote means showing her a new price.
+
+</DeepDive>
+
 <Callout label="Design implication">
 Ask of every piece of data: what does it cost if this is slightly stale or slightly wrong? Driver locations and surge counts can be approximate and recover by themselves within seconds, so they live in memory and in streams that prefer freshness. A trip and a payment can't be approximate, so they go into transactional storage. Most of the architecture follows from sorting the data this way.
 </Callout>
@@ -633,6 +857,28 @@ Uber's fix, described in 2020, was a push platform called RAMEN: each app keeps 
 
 That's the same decision WhatsApp made in its section 2, for the same reason: when the server knows first that something has changed, it should tell the phone, not wait to be asked.
 
+<DeepDive
+  kind="realtime"
+  id="dd-push"
+  title="Polling, SSE, WebSockets or gRPC streams?"
+  answer="Uber went polling → Server-Sent Events (RAMEN, one-way) → bidirectional gRPC streams in 2022. Honestly, the protocol isn't the hard part; it's knowing which of thousands of gateway servers holds Sam's connection."
+>
+
+There are four ways to get "Ravi is 2 minutes away" onto Sam's screen:
+
+| Option | How it works | Cost | Problem |
+|---|---|---|---|
+| Polling | Phone asks every few seconds | A request per phone per interval, mostly "nothing new" | 80% of Uber's gateway traffic, at one point |
+| Long polling | Phone asks, server holds the request open until there's news | One open request per phone, re-opened after each answer | Fiddly with proxies and timeouts |
+| Server-Sent Events | One HTTP response that never ends; server writes events into it | One connection per phone | One-way: the phone can't acknowledge on it |
+| WebSocket / gRPC stream | One connection, both directions | One connection per phone, plus your own heartbeats | Stateful servers; you need routing |
+
+Uber's RAMEN was built on Server-Sent Events. That's how you end up with the 30-second blind spot from the section above: acks had to come back some other way, so the server couldn't tell for a while whether a message had landed. Moving to bidirectional gRPC in 2022 put the ack on the same stream.
+
+Whichever protocol you pick, the same question comes next, and it's the one interviewers actually push on. Sam's phone is connected to one gateway server out of thousands. When dispatch wants to tell Sam something, which server does it send to? You need a **connection registry**: when Sam connects, the gateway writes `conn:sam → gateway-417` to a fast store (Redis, or a consistent hash ring of gateways so the mapping is computable). Dispatch looks it up and sends the message to gateway 417, which writes it down Sam's socket. When Sam's phone reconnects to a different gateway after going through a tunnel, the entry is overwritten, and anything sent in between needs to be held and replayed, so messages carry sequence numbers and the phone says "I last saw 1,204" when it reconnects.
+
+</DeepDive>
+
 </Sub>
 
 <Sub n="8.2" title="Where trips are stored">
@@ -643,6 +889,80 @@ That design later evolved into Docstore, which added Raft-based replication with
 
 <Zoom path={["Uber", "Trips", "Schemaless", "(row, column, version) → JSON"]} />
 
+<DeepDive
+  kind="schema"
+  id="dd-trips-schema"
+  title="The trips table: keys, shard key and indexes"
+  answer="Shard by trip_id so writes spread evenly; then 'Priya's last 20 trips' needs a secondary index keyed by rider_id, which on a sharded store lives on different shards and is updated asynchronously, exactly what Schemaless did."
+>
+
+Here's the table you'd sketch on a whiteboard. Uber's real schema isn't public, so this is the logical shape, not their columns:
+
+```sql
+CREATE TABLE trips (
+  trip_id        BIGINT PRIMARY KEY,          -- time-ordered ID, e.g. Snowflake-style
+  rider_id       BIGINT NOT NULL,
+  driver_id      BIGINT,
+  city_id        INT NOT NULL,
+  status         TEXT NOT NULL,               -- requested / en_route / on_trip / completed / cancelled
+  quote_id       UUID NOT NULL,               -- the fare Priya agreed to
+  requested_at   TIMESTAMPTZ NOT NULL,
+  pickup_h3      BIGINT, dropoff_h3 BIGINT,
+  fare_paise     BIGINT,                      -- money as integers, never floats
+  version        INT NOT NULL DEFAULT 1       -- for optimistic concurrency
+);
+
+-- "my trips" screen, newest first
+CREATE INDEX trips_by_rider  ON trips (rider_id,  requested_at DESC);
+-- the driver's earnings page
+CREATE INDEX trips_by_driver ON trips (driver_id, requested_at DESC);
+-- live operations only care about unfinished trips: a partial index stays small
+CREATE INDEX trips_active    ON trips (city_id, status)
+  WHERE status IN ('requested', 'en_route', 'on_trip');
+```
+
+Each index exists because a screen or a job asks a specific question. `(rider_id, requested_at DESC)` is a composite index: the B-tree is sorted by rider, then by time within a rider, so "Priya's 20 most recent trips" is one seek and a short forward scan, with no sort. The partial index only holds the few percent of trips that are still live, so the operations dashboard doesn't drag billions of finished rows through memory.
+
+#### Then you shard it, and the indexes get hard
+
+One machine can't hold every trip, so the table is split across shards. Which column decides the shard? `trip_id` spreads writes evenly and makes "fetch trip X" a one-shard lookup. But now Priya's trips are scattered across all 4,096 shards, and `trips_by_rider` can't be a local index any more, since a local index on each shard only knows that shard's rows. Asking all 4,096 shards for every "my trips" screen doesn't scale.
+
+You fix it with a **global secondary index**: a separate table, sharded by `rider_id`, holding `(rider_id, requested_at) → trip_id`. That's what Schemaless did. Its 2016 design post describes indexes declared on fields inside the JSON cells, sharded by the indexed field, and updated **asynchronously** after the main write, so an index can lag the data briefly. For a trip history screen that's fine. Priya probably won't even notice her trip showing up a second late.
+
+| Shard key | Fast | Slow or awkward |
+|---|---|---|
+| `trip_id` | Writes spread evenly; fetch by trip ID | Anything by rider or driver needs a global index |
+| `rider_id` | Rider history is one shard | Driver earnings need a global index; a few heavy users make hot shards |
+| `city_id` | City-wide operations | Mumbai's shard is enormous and Shimla's idle |
+
+</DeepDive>
+
+<DeepDive
+  kind="database"
+  id="dd-trip-db"
+  title="Postgres, then MySQL + Schemaless, then Spanner. Why each move?"
+  answer="Postgres ran out of headroom for Uber's update-heavy, index-heavy workload in 2014–16; MySQL's index layout and replication suited it better; Spanner arrived in 2021 when cross-shard transactions mattered more than raw write latency."
+>
+
+Uber published unusually candid reasons for each move, so this one's a good story to have ready for an interview.
+
+**Postgres → MySQL (2014–2016).** Uber's 2016 post "Why Uber Engineering Switched from Postgres to MySQL" mostly comes down to how each database points its indexes at rows. In Postgres, every secondary index stores the row's *physical location*. An update writes a new copy of the row somewhere else, so every index on the table has to be updated too, even indexes on columns that didn't change. (Postgres has an optimisation called HOT updates that sometimes avoids this, but only when no indexed column changes and the new version fits on the same page.) In MySQL's InnoDB, secondary indexes store the **primary key** instead, so updating `status` doesn't touch the index on `rider_id` at all. For a table with several indexes and a stream of status updates, that's a big difference in write amplification. The post also lists replication: Postgres replicated the physical write-ahead log, all those index changes included, across data centres, and that cost bandwidth.
+
+**Why not Cassandra?** Uber used Cassandra elsewhere, and it takes huge write volumes. But trips need things Cassandra makes hard: conditional updates on a row, secondary indexes that work, and an operational model the team already trusted. Uber's Schemaless post says it chose to build on MySQL partly because MySQL was what its engineers knew how to run.
+
+**MySQL + Schemaless → Spanner (2021).** Schemaless gave Uber scale and append-only history but no transactions across shards. The 2021 fulfilment rewrite needed "driver is busy" and "trip is created" to happen together, even though drivers and trips live on different shards. Spanner does that with synchronised clocks (TrueTime) and two-phase commit, and pays some write latency for it, likely a few milliseconds more per commit than a single MySQL primary.
+
+| | Postgres (single) | Cassandra | MySQL + Schemaless | Spanner |
+|---|---|---|---|---|
+| Scales writes horizontally | No | Yes | Yes, 4,096 shards | Yes |
+| Transactions across rows on different shards | n/a | No (lightweight transactions are per partition) | No | Yes |
+| Secondary indexes | Local, rich | Limited | Global, asynchronous | Global, consistent |
+| What it cost Uber | Write amplification, replication | Weak conditional updates | Hand-built consistency | Latency, cloud dependency |
+
+If an interviewer asks "SQL or NoSQL for trips?", Uber's history is a decent answer in itself: a relational engine underneath every step, and the layer on top changed as the consistency needs did.
+
+</DeepDive>
+
 <Elsewhere items={[
   { where: "Event sourcing", how: "Storing every change as a new immutable version, and deriving the current state from them, is the event-sourcing pattern; it's also how a database's write-ahead log works (chapter 18)." },
   { where: "Bigtable and HBase", how: "Schemaless's (row, column, version) cells are the same three-dimensional map that Google's Bigtable introduced." },
@@ -650,13 +970,27 @@ That design later evolved into Docstore, which added Raft-based replication with
 
 </Sub>
 
+<Checkpoint
+  n={3}
+  have={[
+    "ETAs come from a partitioned road graph plus DeepETA's learned correction",
+    "Surge is counted per hexagon by Flink reading Kafka, and served from a key-value store with a TTL",
+    "Phones get pushed updates over one long-lived connection, found through a connection registry",
+    "Trips sit in a sharded, transactional store with global indexes by rider and driver",
+  ]}
+  broken="Everything above assumes the data centre is up. What happens to Sam's trip, halfway to the airport, when it isn't?"
+  q="Why does the surge key in the cache have an expiry at all, if Flink rewrites it every window?"
+>
+In case Flink stops rewriting it. Without an expiry, a crashed pipeline would freeze the last multiplier in place, maybe a storm-time 3x, for hours. With one, surge falls back to 1.0x within a couple of minutes, and undercharging briefly is the cheaper mistake.
+</Checkpoint>
+
 <SectionHeading n="09" id="failover">When a data centre fails mid-trip</SectionHeading>
 
 <Sub n="9.1" title="The phone remembers the trip">
 
 Sam is halfway to the airport when the data centre handling Pune goes dark. The trip is in progress, Ravi is driving, and the servers that knew about the trip are unreachable.
 
-Uber's 2016 description of its stack says that each city is assigned to the closest data centre and backed up in another, and that if one data centre fails, trips fail over to another. The interesting part is what makes that possible for trips already in progress. According to write-ups of a 2015 Uber talk, the dispatch system periodically sent each driver's phone an encrypted digest of the trip's state. If the data centre failed, the phone's next request would land in the backup data centre, which wouldn't recognise the trip, ask the phone for its digest, and rebuild the trip's state from it. The phone, which is present for the whole trip anyway, acts as a backup of its own trip.
+Uber's 2016 description of its stack says that each city is assigned to the closest data centre and backed up in another, and that if one data centre fails, trips fail over to another. What's interesting is how that works for trips already in progress. According to write-ups of a 2015 Uber talk, the dispatch system periodically sent each driver's phone an encrypted digest of the trip's state. If the data centre failed, the phone's next request would land in the backup data centre, which wouldn't recognise the trip, ask the phone for its digest, and rebuild the trip's state from it. The phone, which is present for the whole trip anyway, acts as a backup of its own trip.
 
 On the app side, Uber described in 2020 a small state machine in its mobile client with four states, primary, failover, backup and recovery, that decides which network path to use and moves back only after test requests succeed.
 
@@ -712,6 +1046,23 @@ Treating "the data centre failed" as rare enough to ignore. For a service where 
 | Surge pipeline | Supply and demand per hexagon, as a stream | Prices must react to local demand within seconds (§7) |
 | Push channel | One long-lived connection per app | Polling was 80% of API traffic (§8) |
 | Trip store | Durable, transactional record of every trip | A trip is a promise that can't be lost or doubled (§5.3, §8) |
+
+Here's the same design one level down: the actual technology at each layer, what it beat, and a link to the box that argues it.
+
+<Stack
+  rows={[
+    { layer: "API", pick: "HTTPS + idempotency keys for actions; one persistent connection for streams", why: "Retries on bad networks mustn't book two cars; locations every 4 s can't pay a TLS handshake each", href: "#dd-api" },
+    { layer: "Driver locations", pick: "In-memory index sharded by cell (Uber: custom, Ringpop); Redis GEO is a fine start", why: "250k overwrites/s of data that heals itself in 4 s", over: "Postgres + PostGIS: right query, can't take the write rate", href: "#dd-redis-geo" },
+    { layer: "Spatial index", pick: "H3 cells, gridDisk", why: "Equal-distance neighbours for area maths; 64-bit IDs", over: "B-tree on (lat, lng), geohash, S2", href: "#dd-btree" },
+    { layer: "Driver claim", pick: "Atomic compare-and-set with a lease", why: "Two dispatchers must never offer one driver", over: "Read-then-write", href: "#dd-claim" },
+    { layer: "Event log", pick: "Kafka, partitioned by hexagon for surge", why: "Many consumers, own offsets, replay", over: "RabbitMQ, SQS: delete on ack, no replay", href: "#dd-kafka" },
+    { layer: "Stream processing", pick: "Flink, one-minute tumbling windows, late events dropped", why: "Fresh counts per hexagon; late beats never", href: "#dd-kafka" },
+    { layer: "Surge + quotes", pick: "Key-value cache with TTLs", why: "Hot tiny reads; a dead pipeline fails to 1.0x", href: "#dd-surge-store" },
+    { layer: "Push", pick: "SSE (RAMEN), then bidirectional gRPC streams (2022)", why: "Polling was 80% of gateway traffic; acks need a return path", over: "Polling, long polling", href: "#dd-push" },
+    { layer: "Trips", pick: "MySQL + Schemaless (2014), Docstore, Spanner for fulfilment (2021)", why: "Durable, sharded, then cross-shard transactions", over: "Single Postgres, Cassandra", href: "#dd-trip-db" },
+    { layer: "Trip indexes", pick: "Shard by trip_id; global secondary indexes by rider and driver", why: "Even writes, and history screens are still one lookup", href: "#dd-trips-schema" },
+  ]}
+/>
 
 </Sub>
 

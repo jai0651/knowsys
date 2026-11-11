@@ -64,6 +64,16 @@ Every `<Sub>` number must match its section (`2.1` under `02`).
   "my first attempt". Numbers are stated as facts about the system, rounded and
   given a sense of scale. `toolchain` on TryIt is for maintainers and isn't shown.
 
+## Breaking up long chapters
+
+- `<Insight>` is one sentence worth leaving the section with. 3–5 per chapter.
+- `<Checkpoint n={1} have={[…]} broken="…" q="…">answer</Checkpoint>` after a
+  long stretch: what we have so far, what still breaks, a closed self-check.
+- `<DeepDive kind title answer id>` holds detail most readers can skip (schemas,
+  indexes, why X over Y). Closed by default; `answer` shows while closed.
+  `<Stack rows>` summarises the picks and links to the boxes by `#id`.
+- Fenced code over 16 lines folds to 12 with a "Show all N lines" button.
+
 ## What to keep from the old chapters
 
 Every fact, number, version, source link, `<SourceRead>` quote, `<TryIt>` /

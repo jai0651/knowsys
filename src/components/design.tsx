@@ -1,7 +1,9 @@
 "use client";
 
-import { useState } from "react";
-import { Check, ChevronRight, Lightbulb, Minus, Plus } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import {
+  Activity, Boxes, Check, ChevronRight, Flag, Sparkles, TriangleAlert, Database, Gauge, Layers, Lightbulb, ListTree, Lock, Minus, Network, Plug, Plus, Zap,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 
 /* Components for system design case studies.
@@ -11,7 +13,16 @@ import { cn } from "@/lib/utils";
      <Decision>   the options that were on the table, what each costs, which
                   one was chosen; the reasons go in the children
      <Elsewhere>  the same idea in other systems, for readers who want depth
-     <Zoom>       where we are, from the whole system down to a data structure */
+     <Zoom>       where we are, from the whole system down to a data structure
+     <DeepDive>   a closed box of engineering detail (schema, indexes, why this
+                  database or queue and not the others); the one-line answer
+                  shows while it's closed, the rest opens on demand
+     <Insight>    one sentence the reader should leave the section holding;
+                  3–5 per chapter, never one per section
+     <Checkpoint> after a long stretch: what the design has so far, what still
+                  breaks, and an optional self-check that starts closed
+     <Stack>      the technology picked for each layer, why, and what it beat;
+                  each row can link to the DeepDive that argues it */
 
 export function Think({
   q, hint, children,
@@ -154,5 +165,162 @@ export function Picture({
         </span>
       </figcaption>
     </figure>
+  );
+}
+
+/* ── DeepDive ───────────────────────────────────────────────────────────
+   Closed by default so the story reads straight through. The kind chip and
+   the one-line answer are visible while closed, so a reader skimming for
+   "which database, and why" gets the answer without opening anything. */
+
+const KINDS = {
+  database:    { label: "Database",      icon: Database, tone: "text-data bg-data/10 border-data/30" },
+  schema:      { label: "Schema",        icon: Layers,   tone: "text-data bg-data/10 border-data/30" },
+  index:       { label: "Index",         icon: ListTree, tone: "text-accent bg-accent/10 border-accent/30" },
+  stream:      { label: "Queue / stream", icon: Activity, tone: "text-dist bg-dist/10 border-dist/30" },
+  cache:       { label: "Cache",         icon: Zap,      tone: "text-machine bg-machine/10 border-machine/30" },
+  api:         { label: "API",           icon: Plug,     tone: "text-accent-2 bg-accent-2/10 border-accent-2/30" },
+  realtime:    { label: "Real-time",     icon: Network,  tone: "text-cloud bg-cloud/10 border-cloud/30" },
+  consistency: { label: "Consistency",   icon: Lock,     tone: "text-bad bg-bad/10 border-bad/30" },
+  scaling:     { label: "Scaling",       icon: Gauge,    tone: "text-ops bg-ops/10 border-ops/30" },
+  storage:     { label: "Storage",       icon: Boxes,    tone: "text-os bg-os/10 border-os/30" },
+} as const;
+
+export type DeepDiveKind = keyof typeof KINDS;
+
+export function DeepDive({
+  kind, title, answer, id, children,
+}: {
+  kind: DeepDiveKind;
+  /** the engineering question, e.g. "Why Kafka for the event log, not RabbitMQ?" */
+  title: string;
+  /** one sentence: the answer, visible while the box is closed */
+  answer: string;
+  /** anchor, so a <Stack> row can link here */
+  id?: string;
+  children: React.ReactNode;
+}) {
+  const k = KINDS[kind];
+  const Icon = k.icon;
+  const ref = useRef<HTMLDetailsElement>(null);
+  // a link to #id (from a <Stack> row, or shared) opens the box it points at
+  useEffect(() => {
+    if (!id) return;
+    const open = () => {
+      if (location.hash === `#${id}` && ref.current) {
+        ref.current.open = true;
+        ref.current.scrollIntoView({ block: "start" });
+      }
+    };
+    open();
+    window.addEventListener("hashchange", open);
+    return () => window.removeEventListener("hashchange", open);
+  }, [id]);
+  return (
+    <details ref={ref} id={id} className="group my-8 scroll-mt-24 overflow-hidden rounded-xl border border-line bg-surface shadow-[var(--shadow)] lg:-mx-6">
+      <summary className="flex cursor-pointer list-none items-start gap-3 px-5 py-4 font-[family-name:var(--font-inter)] transition-colors hover:bg-surface-2 [&::-webkit-details-marker]:hidden">
+        <span className={cn("mt-0.5 flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-wide", k.tone)}>
+          <Icon className="size-3" /> {k.label}
+        </span>
+        <span className="flex-1">
+          <span className="block text-[15.5px] font-semibold leading-snug text-ink">{title}</span>
+          <span className="mt-1 block text-[14px] leading-snug text-muted">{answer}</span>
+        </span>
+        <span className="mt-0.5 flex shrink-0 items-center gap-1 text-[12px] text-faint">
+          <span className="hidden sm:inline group-open:hidden">Open</span>
+          <span className="hidden group-open:sm:inline">Close</span>
+          <ChevronRight className="size-4 transition-transform duration-200 group-open:rotate-90" />
+        </span>
+      </summary>
+      <div className="border-t border-line px-5 pb-2 pt-5 text-[16px] [&_h4]:mb-2 [&_h4]:mt-6 [&_h4]:font-[family-name:var(--font-inter)] [&_h4]:text-[13px] [&_h4]:font-semibold [&_h4]:uppercase [&_h4]:tracking-[0.06em] [&_h4]:text-faint [&_h4:first-child]:mt-0">
+        {children}
+      </div>
+    </details>
+  );
+}
+
+/* ── Stack ──────────────────────────────────────────────────────────────
+   The engineering blueprint: one row per layer of the design. */
+export function Stack({
+  title = "The engineering blueprint", rows,
+}: {
+  title?: string;
+  rows: { layer: string; pick: string; why: string; over?: string; href?: string }[];
+}) {
+  return (
+    <div className="not-prose my-10 overflow-hidden rounded-2xl border border-line bg-surface font-[family-name:var(--font-inter)] shadow-[var(--shadow)] lg:-mx-6">
+      <div className="border-b border-line px-5 py-3 text-[12px] font-semibold uppercase tracking-[0.07em] text-faint">{title}</div>
+      <div className="divide-y divide-line">
+        {rows.map((r) => (
+          <div key={r.layer} className="grid gap-1 px-5 py-3.5 sm:grid-cols-[150px_1fr] sm:gap-4">
+            <div className="text-[13px] font-semibold uppercase tracking-wide text-muted">{r.layer}</div>
+            <div>
+              <div className="text-[15px] font-semibold text-ink">
+                {r.href ? <a href={r.href} className="underline decoration-line-2 underline-offset-2 hover:decoration-current">{r.pick}</a> : r.pick}
+              </div>
+              <div className="mt-0.5 text-[14px] leading-snug text-muted">{r.why}</div>
+              {r.over && <div className="mt-1 text-[13px] leading-snug text-faint"><b className="font-semibold">Over:</b> {r.over}</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ── Insight ────────────────────────────────────────────────────────────── */
+export function Insight({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="not-prose my-8 flex gap-3 border-l-[3px] border-accent bg-accent/[0.06] py-3 pl-4 pr-5 font-[family-name:var(--font-inter)] lg:-mx-6">
+      <Sparkles className="mt-1 size-4 shrink-0 text-accent" />
+      <div>
+        <div className="mb-0.5 text-[11.5px] font-semibold uppercase tracking-[0.07em] text-accent">Insight</div>
+        <div className="font-[family-name:var(--font-serif)] text-[17.5px] leading-snug text-ink [&_code]:font-mono [&_code]:text-[0.85em]">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Checkpoint ─────────────────────────────────────────────────────────── */
+export function Checkpoint({
+  n, have, broken, q, children,
+}: {
+  n: number;
+  /** what the design can do now, one short line each */
+  have: string[];
+  /** the problem the next section picks up */
+  broken?: string;
+  /** optional self-check; its answer is the children, closed until asked */
+  q?: string;
+  children?: React.ReactNode;
+}) {
+  return (
+    <div id={`checkpoint-${n}`} className="not-prose my-12 scroll-mt-24 rounded-2xl border border-ok/30 bg-ok/[0.04] p-5 font-[family-name:var(--font-inter)] lg:-mx-6">
+      <div className="mb-3 flex items-center gap-2 text-[12px] font-semibold uppercase tracking-[0.07em] text-ok">
+        <Flag className="size-3.5" /> Checkpoint {n}: where the design stands
+      </div>
+      <ul className="space-y-1.5">
+        {have.map((h) => (
+          <li key={h} className="flex gap-2 text-[14.5px] leading-snug text-ink">
+            <Check className="mt-0.5 size-4 shrink-0 text-ok" strokeWidth={2.5} />{h}
+          </li>
+        ))}
+      </ul>
+      {broken && (
+        <div className="mt-3 flex gap-2 rounded-lg bg-warn/10 px-3 py-2 text-[14px] leading-snug text-ink">
+          <TriangleAlert className="mt-0.5 size-4 shrink-0 text-warn" />
+          <span><b className="font-semibold">Still broken:</b> {broken}</span>
+        </div>
+      )}
+      {q && (
+        <details className="group mt-3 rounded-lg border border-line bg-surface">
+          <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-[14px] text-ink [&::-webkit-details-marker]:hidden">
+            <ChevronRight className="size-4 shrink-0 text-faint transition-transform group-open:rotate-90" />
+            <span><b className="font-semibold">Check yourself:</b> {q}</span>
+          </summary>
+          <div className="border-t border-line px-3 py-2.5 text-[14px] leading-relaxed text-muted [&>p:last-child]:mb-0 [&>p]:mb-2">{children}</div>
+        </details>
+      )}
+    </div>
   );
 }

@@ -17,6 +17,22 @@ Load `.claude/skills/write-chapter/SKILL.md` and `docs/CHAPTER_FORMAT.md` first;
 - `<Elsewhere>` after key techniques: where the same idea shows up in other systems.
 - Tail: interview-style `<QA>`s, a `<Quiz>`, Go-deeper `<CardGrid>` of primary sources, Related chapters. Copy the Uber tail's structure.
 
+## Engineering boxes (required)
+
+A story alone doesn't get anyone through an interview. Readers also want to know which database, which queue, which cache, which index, and why each one won. That detail goes in closed boxes so the story still reads straight through. Uber (ch 50) is the reference for all of these.
+
+- **6–10 `<DeepDive kind title answer id>`s**, placed where the story makes the choice, not saved up for the end. `answer` is the one-line answer and stays visible while the box is closed. Inside go real artefacts: `CREATE TABLE` / `CREATE INDEX` with a comment on which query each index serves, Redis/Kafka commands, partition keys, TTLs, and a comparison table of the options (Kafka vs RabbitMQ vs SQS, Postgres vs Cassandra vs Spanner…) with what the company actually picked and when. Use `####` for sub-headings inside a box.
+- Every case study covers at least: the **API** (endpoints, transport, idempotency), the **primary database and why**, the **schema with its indexes and shard key**, the **queue/stream** and its partition key, the **cache** (key design, TTL, what happens when it's stale), and the **real-time channel** if there is one. Kinds: `database schema index stream cache api realtime consistency scaling storage`.
+- **One `<Stack rows>` blueprint** in "The whole system": layer, pick, why, `over` (what it beat), `href="#dd-…"` to the box that argues it.
+- **3 `<Checkpoint n have broken q>`s** at the big turns (roughly a third, half and three quarters through): what the design has now, what still breaks (the next section's problem), and a self-check whose answer is the children.
+- **3–5 `<Insight>`s**, one sentence each, at the ideas a reader should leave holding. Never one per section; that's the "lesson at the end of every section" tell.
+- Where the company's internals aren't public, say so inside the box and give the standard design ("this is the shape a design needs, not their columns").
+- Code blocks over 16 lines fold automatically; don't split code to dodge that.
+
+## Voice
+
+Run `node ~/.claude/skills/tech-blog/scripts/check.js` on the chapter, and on the DeepDive text alone (strip code and tables). Both must read within the human range: contractions, the odd aside and question, honest hedges where internals are guessed, few sentences opening with "The", no "rather than" / "the reason is" / "which is why".
+
 ## Visuals (required)
 
 - **4+ `<SystemDiagram>`s** with animated step-through request paths (see `src/components/` for the props; copy usage from ch 49/50). The final one is the full design.
@@ -31,4 +47,4 @@ Load `.claude/skills/write-chapter/SKILL.md` and `docs/CHAPTER_FORMAT.md` first;
 
 ## Checks before handing back
 
-Run the four checks in `docs/CHAPTER_FORMAT.md` (check:mdx clean, 0 AI tells, tech-blog checker in human range, MDX compiles), and confirm every image path exists. Don't edit `content/manifest.json`, shared components or other chapters; report the manifest entry (title, hook, short) instead.
+Confirm the engineering boxes above are all present. Run the four checks in `docs/CHAPTER_FORMAT.md` (check:mdx clean, 0 AI tells, tech-blog checker in human range, MDX compiles), and confirm every image path exists. Don't edit `content/manifest.json`, shared components or other chapters; report the manifest entry (title, hook, short) instead.
