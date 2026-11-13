@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Check } from "lucide-react";
+import { ArrowRight, Check } from "lucide-react";
 import { useDone } from "@/lib/progress";
 import { cn } from "@/lib/utils";
 
@@ -51,6 +51,9 @@ export function StartPath({
           );
         })}
       </ol>
+      <Link href="/roadmaps" className="mt-4 flex items-center gap-1 border-t border-line pt-4 text-[13.5px] font-semibold text-accent">
+        Or follow a full roadmap, with checkpoints <ArrowRight className="size-3.5" />
+      </Link>
     </aside>
   );
 }

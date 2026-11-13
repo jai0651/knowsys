@@ -9,6 +9,7 @@ import { groups, livePages } from "@/lib/manifest";
 
 const LINKS = [
   { href: "/sections", label: "Chapters" },
+  { href: "/roadmaps", label: "Roadmaps" },
   { href: "/projects", label: "Projects" },
   { href: "/labs", label: "Labs" },
   { href: "/blog", label: "Field notes" },

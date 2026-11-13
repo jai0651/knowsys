@@ -47,6 +47,7 @@ export function MobileMenu({ groups }: { groups: Pick<Group, "slug" | "name" | "
             </div>
             <div className="mb-5 flex gap-4 border-b border-line pb-4 text-[14.5px]">
               <Link href="/sections" className="text-muted hover:text-ink">All chapters</Link>
+              <Link href="/roadmaps" className="text-muted hover:text-ink">Roadmaps</Link>
               <Link href="/blog" className="text-muted hover:text-ink">Field notes</Link>
               <Link href="/projects" className="text-muted hover:text-ink">Projects</Link>
               <Link href="/labs" className="text-muted hover:text-ink">Labs</Link>

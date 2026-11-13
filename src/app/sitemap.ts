@@ -25,6 +25,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
   return [
     { url: u("/"), ...newest([...chapters, ...posts]), changeFrequency: "weekly", priority: 1 },
     { url: u("/sections"), ...newest(chapters), changeFrequency: "weekly", priority: 0.8 },
+    { url: u("/roadmaps"), changeFrequency: "monthly", priority: 0.8 },
     { url: u("/projects"), changeFrequency: "monthly", priority: 0.8 },
     { url: u("/blog"), ...newest(posts), changeFrequency: "weekly", priority: 0.7 },
     { url: u("/labs"), changeFrequency: "monthly", priority: 0.7 },
